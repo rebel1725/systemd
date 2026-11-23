@@ -1,24 +1,23 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "errno-util.h"
+#include "log.h"
 #include "password-quality-util-pwquality.h"
 
 #if HAVE_PWQUALITY
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBPWQUALITY
+#  error "missing libpwquality_cflags in meson dependency."
+#endif
 
 #include <pwquality.h>
 #include <stdio.h>
 #include <unistd.h>
 
-#include "sd-dlopen.h"
-
 #include "alloc-util.h"
 #include "dlfcn-util.h"
-#include "errno-util.h"
-#include "log.h"
 #include "password-quality-util.h"
 #include "string-util.h"
 #include "strv.h"
-
-static void *pwquality_dl = NULL;
 
 static DLSYM_PROTOTYPE(pwquality_check) = NULL;
 static DLSYM_PROTOTYPE(pwquality_default_settings) = NULL;
@@ -39,29 +38,24 @@ static void pwq_maybe_disable_dictionary(pwquality_settings_t *pwq) {
         assert(pwq);
 
         r = sym_pwquality_get_str_value(pwq, PWQ_SETTING_DICT_PATH, &path);
-        if (r < 0) {
-                log_debug("Failed to read libpwquality dictionary path, ignoring: %s",
-                          sym_pwquality_strerror(buf, sizeof(buf), r, NULL));
-                return;
-        }
+        if (r < 0)
+                return (void) log_debug("Failed to read libpwquality dictionary path, ignoring: %s",
+                                        sym_pwquality_strerror(buf, sizeof(buf), r, /* auxerror= */ NULL));
 
-        if (isempty(path)) {
-                log_debug("Weird, no dictionary file configured, ignoring.");
-                return;
-        }
+        if (isempty(path))
+                return (void) log_debug("Weird, no dictionary file configured, ignoring.");
 
         if (access(path, F_OK) >= 0)
                 return;
 
-        if (errno != ENOENT) {
-                log_debug_errno(errno, "Failed to check if dictionary file %s exists, ignoring: %m", path);
-                return;
-        }
+        if (errno != ENOENT)
+                return (void) log_debug_errno(errno, "Failed to check if dictionary file %s exists, ignoring: %m",
+                                              path);
 
-        r = sym_pwquality_set_int_value(pwq, PWQ_SETTING_DICT_CHECK, 0);
+        r = sym_pwquality_set_int_value(pwq, PWQ_SETTING_DICT_CHECK, /* value= */ 0);
         if (r < 0)
                 log_debug("Failed to disable libpwquality dictionary check, ignoring: %s",
-                          sym_pwquality_strerror(buf, sizeof(buf), r, NULL));
+                          sym_pwquality_strerror(buf, sizeof(buf), r, /* auxerror= */ NULL));
 }
 
 static int pwq_allocate_context(pwquality_settings_t **ret) {
@@ -72,7 +66,7 @@ static int pwq_allocate_context(pwquality_settings_t **ret) {
 
         assert(ret);
 
-        r = dlopen_pwquality();
+        r = dlopen_pwquality(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -80,7 +74,7 @@ static int pwq_allocate_context(pwquality_settings_t **ret) {
         if (!pwq)
                 return -ENOMEM;
 
-        r = sym_pwquality_read_config(pwq, NULL, &auxerror);
+        r = sym_pwquality_read_config(pwq, /* cfgfile= */ NULL, &auxerror);
         if (r < 0)
                 log_debug("Failed to read libpwquality configuration, ignoring: %s",
                           sym_pwquality_strerror(buf, sizeof(buf), r, auxerror));
@@ -113,7 +107,7 @@ int suggest_passwords(void) {
                 r = sym_pwquality_generate(pwq, 64, suggestions + i);
                 if (r < 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to generate password, ignoring: %s",
-                                               sym_pwquality_strerror(buf, sizeof(buf), r, NULL));
+                                               sym_pwquality_strerror(buf, sizeof(buf), r, /* auxerror= */ NULL));
         }
 
         joined = strv_join(suggestions, " ");
@@ -153,16 +147,14 @@ int check_password_quality(const char *password, const char *old, const char *us
 
 #endif
 
-int dlopen_pwquality(void) {
+int dlopen_pwquality(int log_level) {
 #if HAVE_PWQUALITY
-        SD_ELF_NOTE_DLOPEN(
-                        "pwquality",
-                        "Support for password quality checks",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libpwquality.so.1");
+        static void *pwquality_dl = NULL;
+
+        LIBPWQUALITY_NOTE(suggested);
 
         return dlopen_many_sym_or_warn(
-                        &pwquality_dl, "libpwquality.so.1", LOG_DEBUG,
+                        &pwquality_dl, "libpwquality.so.1", log_level,
                         DLSYM_ARG(pwquality_check),
                         DLSYM_ARG(pwquality_default_settings),
                         DLSYM_ARG(pwquality_free_settings),
@@ -172,6 +164,7 @@ int dlopen_pwquality(void) {
                         DLSYM_ARG(pwquality_set_int_value),
                         DLSYM_ARG(pwquality_strerror));
 #else
-        return -EOPNOTSUPP;
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libpwquality support is not compiled in.");
 #endif
 }

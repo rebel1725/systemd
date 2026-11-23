@@ -1,8 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <linux/magic.h>
+#include <linux/nsfs.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
+#include "sd-daemon.h"
 #include "sd-json.h"
 #include "sd-netlink.h"
 
@@ -14,6 +17,7 @@
 #include "format-util.h"
 #include "fs-util.h"
 #include "json-util.h"
+#include "namespace-util.h"
 #include "path-util.h"
 #include "recurse-dir.h"
 #include "rm-rf.h"
@@ -23,6 +27,7 @@
 #include "uid-classification.h"
 #include "user-util.h"
 #include "userns-registry.h"
+#include "userns-restrict.h"
 
 int userns_registry_open_fd(void) {
         int fd;
@@ -31,7 +36,7 @@ int userns_registry_open_fd(void) {
                         "/run/systemd/nsresource/registry",
                         /* root= */ NULL,
                         CHASE_MKDIR_0755,
-                        O_CLOEXEC|O_DIRECTORY|O_CREAT,
+                        O_DIRECTORY|O_CREAT,
                         /* ret_path= */ NULL);
         if (fd < 0)
                 return log_debug_errno(fd, "Failed to open registry dir: %m");
@@ -50,7 +55,7 @@ int userns_registry_lock(int dir_fd) {
                 dir_fd = registry_fd;
         }
 
-        lock_fd = xopenat_lock_full(dir_fd, "lock", O_CREAT|O_RDWR|O_CLOEXEC, /* xopen_flags= */ 0, 0600, LOCK_BSD, LOCK_EX);
+        lock_fd = xopenat_lock_full(dir_fd, "lock", O_CREAT|O_RDWR, /* xopen_flags= */ 0, 0600, LOCK_BSD, LOCK_EX);
         if (lock_fd < 0)
                 return log_debug_errno(lock_fd, "Failed to open nsresource registry lock file: %m");
 
@@ -65,14 +70,7 @@ void delegated_userns_info_done(DelegatedUserNamespaceInfo *info) {
         info->n_ancestor_userns = 0;
 }
 
-void delegated_userns_info_done_many(DelegatedUserNamespaceInfo infos[], size_t n) {
-        assert(infos || n == 0);
-
-        FOREACH_ARRAY(info, infos, n)
-                delegated_userns_info_done(info);
-
-        free(infos);
-}
+static DEFINE_ARRAY_FREE_FUNC(delegated_userns_info_free_array, DelegatedUserNamespaceInfo, delegated_userns_info_done);
 
 UserNamespaceInfo* userns_info_new(void) {
         UserNamespaceInfo *info = new(UserNamespaceInfo, 1);
@@ -85,6 +83,7 @@ UserNamespaceInfo* userns_info_new(void) {
                 .target_uid = UID_INVALID,
                 .start_gid = GID_INVALID,
                 .target_gid = GID_INVALID,
+                .setgroups_deny = -1,
         };
 
         return info;
@@ -97,7 +96,7 @@ UserNamespaceInfo *userns_info_free(UserNamespaceInfo *userns) {
         free(userns->cgroups);
         free(userns->name);
 
-        delegated_userns_info_done_many(userns->delegates, userns->n_delegates);
+        delegated_userns_info_free_array(userns->delegates, userns->n_delegates);
 
         strv_free(userns->netifs);
 
@@ -154,12 +153,10 @@ static int dispatch_delegates_array(const char *name, sd_json_variant *variant, 
         size_t n = 0;
         int r;
 
-        CLEANUP_ARRAY(delegates, n, delegated_userns_info_done_many);
+        CLEANUP_ARRAY(delegates, n, delegated_userns_info_free_array);
 
         if (sd_json_variant_is_null(variant)) {
-                delegated_userns_info_done_many(info->delegates, info->n_delegates);
-                info->delegates = NULL;
-                info->n_delegates = 0;
+                CLEANUP_ARRAY(info->delegates, info->n_delegates, delegated_userns_info_free_array);
                 return 0;
         }
 
@@ -199,7 +196,7 @@ static int dispatch_delegates_array(const char *name, sd_json_variant *variant, 
                 n++;
         }
 
-        delegated_userns_info_done_many(info->delegates, info->n_delegates);
+        delegated_userns_info_free_array(info->delegates, info->n_delegates);
         info->delegates = TAKE_PTR(delegates);
         info->n_delegates = n;
 
@@ -245,17 +242,19 @@ static int dispatch_ancestor_userns_array(const char *name, sd_json_variant *var
 static int userns_registry_load(int dir_fd, const char *fn, UserNamespaceInfo **ret) {
 
         static const sd_json_dispatch_field dispatch_table[] = {
-                { "owner",     SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid,  offsetof(UserNamespaceInfo, owner),        SD_JSON_MANDATORY },
-                { "name",      SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,   offsetof(UserNamespaceInfo, name),         SD_JSON_MANDATORY },
-                { "userns",    SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint64,   offsetof(UserNamespaceInfo, userns_inode), SD_JSON_MANDATORY },
-                { "size",      SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,   offsetof(UserNamespaceInfo, size),         0                 },
-                { "start",     SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid,  offsetof(UserNamespaceInfo, start_uid),    0                 },
-                { "target",    SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid,  offsetof(UserNamespaceInfo, target_uid),   0                 },
-                { "startGid",  SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid,  offsetof(UserNamespaceInfo, start_gid),    0                 },
-                { "targetGid", SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid,  offsetof(UserNamespaceInfo, target_gid),   0                 },
-                { "cgroups",   SD_JSON_VARIANT_ARRAY,    dispatch_cgroups_array,    0,                                         0                 },
-                { "netifs",    SD_JSON_VARIANT_ARRAY,    sd_json_dispatch_strv,     offsetof(UserNamespaceInfo, netifs),       0                 },
-                { "delegates", SD_JSON_VARIANT_ARRAY,    dispatch_delegates_array,  0,                                         0                 },
+                { "owner",         SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid,  offsetof(UserNamespaceInfo, owner),          SD_JSON_MANDATORY },
+                { "name",          SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,   offsetof(UserNamespaceInfo, name),           SD_JSON_MANDATORY },
+                { "userns",        SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint64,   offsetof(UserNamespaceInfo, userns_inode),   SD_JSON_MANDATORY },
+                { "usernsId",      SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint64,   offsetof(UserNamespaceInfo, userns_id),      0                 },
+                { "size",          SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint32,   offsetof(UserNamespaceInfo, size),           0                 },
+                { "start",         SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid,  offsetof(UserNamespaceInfo, start_uid),      0                 },
+                { "target",        SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid,  offsetof(UserNamespaceInfo, target_uid),     0                 },
+                { "startGid",      SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid,  offsetof(UserNamespaceInfo, start_gid),      0                 },
+                { "targetGid",     SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uid_gid,  offsetof(UserNamespaceInfo, target_gid),     0                 },
+                { "setgroupsDeny", SD_JSON_VARIANT_BOOLEAN,  sd_json_dispatch_tristate, offsetof(UserNamespaceInfo, setgroups_deny), 0                 },
+                { "cgroups",       SD_JSON_VARIANT_ARRAY,    dispatch_cgroups_array,    0,                                           0                 },
+                { "netifs",        SD_JSON_VARIANT_ARRAY,    sd_json_dispatch_strv,     offsetof(UserNamespaceInfo, netifs),         0                 },
+                { "delegates",     SD_JSON_VARIANT_ARRAY,    dispatch_delegates_array,  0,                                           0                 },
                 {}
         };
 
@@ -272,7 +271,7 @@ static int userns_registry_load(int dir_fd, const char *fn, UserNamespaceInfo **
                 dir_fd = registry_fd;
         }
 
-        r = sd_json_parse_file_at(NULL, dir_fd, fn, 0, &v, NULL, NULL);
+        r = sd_json_parse_file_at(NULL, dir_fd, fn, /* flags= */ 0, &v, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
         if (r < 0)
                 return r;
 
@@ -280,7 +279,7 @@ static int userns_registry_load(int dir_fd, const char *fn, UserNamespaceInfo **
         if (!userns_info)
                 return -ENOMEM;
 
-        r = sd_json_dispatch(v, dispatch_table, 0, userns_info);
+        r = sd_json_dispatch(v, dispatch_table, /* flags= */ 0, userns_info);
         if (r < 0)
                 return r;
 
@@ -368,23 +367,6 @@ int userns_registry_name_exists(int dir_fd, const char *name) {
 
         fn = strjoin("n", name, ".userns");
         if (!fn)
-                return -ENOMEM;
-
-        if (faccessat(dir_fd, fn, F_OK, AT_SYMLINK_NOFOLLOW) < 0)
-                return errno == ENOENT ? false : -errno;
-
-        return true;
-}
-
-int userns_registry_inode_exists(int dir_fd, uint64_t inode) {
-        _cleanup_free_ char *fn = NULL;
-
-        assert(dir_fd >= 0);
-
-        if (inode <= 0)
-                return -EINVAL;
-
-        if (asprintf(&fn, "i%" PRIu64 ".userns", inode) < 0)
                 return -ENOMEM;
 
         if (faccessat(dir_fd, fn, F_OK, AT_SYMLINK_NOFOLLOW) < 0)
@@ -492,6 +474,153 @@ int userns_registry_load_by_userns_inode(int dir_fd, uint64_t inode, UserNamespa
         return 0;
 }
 
+static void release_userns_inode_resources(struct userns_restrict_bpf *bpf, uint64_t inode) {
+        int r;
+
+        assert(inode != 0);
+
+        if (bpf) {
+                r = userns_restrict_reset_by_inode(bpf, inode);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to remove namespace inode from BPF map, ignoring: %m");
+        }
+
+        r = sd_notifyf(/* unset_environment= */ false,
+                       "FDSTOREREMOVE=1\n"
+                       "FDNAME=userns-%" PRIu64 "\n", inode);
+        if (r < 0)
+                log_warning_errno(r, "Failed to send fd store removal message, ignoring: %m");
+}
+
+void userns_registry_release_by_info(struct userns_restrict_bpf *bpf, int dir_fd, UserNamespaceInfo *info) {
+        int r;
+
+        assert(dir_fd >= 0);
+        assert(info);
+        assert(info->userns_inode != 0);
+
+        if (DEBUG_LOGGING) {
+                if (uid_is_valid(info->start_uid))
+                        log_debug("Removing user namespace mapping %" PRIu64 " for UID " UID_FMT ".", info->userns_inode, info->start_uid);
+                else
+                        log_debug("Removing user namespace mapping %" PRIu64 ".", info->userns_inode);
+        }
+
+        release_userns_inode_resources(bpf, info->userns_inode);
+
+        r = userns_info_remove_cgroups(info);
+        if (r < 0)
+                log_warning_errno(r, "Failed to remove cgroups of user namespace, ignoring: %m");
+
+        r = userns_info_remove_netifs(info);
+        if (r < 0)
+                log_warning_errno(r, "Failed to remove netifs of user namespace, ignoring: %m");
+
+        r = userns_registry_remove(dir_fd, info);
+        if (r < 0)
+                log_warning_errno(r, "Failed to remove user namespace '%s', ignoring.", info->name);
+}
+
+void userns_registry_release_by_userns_inode(struct userns_restrict_bpf *bpf, int dir_fd, uint64_t inode) {
+        _cleanup_(userns_info_freep) UserNamespaceInfo *userns_info = NULL;
+        int r;
+
+        assert(dir_fd >= 0);
+        assert(inode != 0);
+
+        r = userns_registry_load_by_userns_inode(dir_fd, inode, &userns_info);
+        if (r >= 0)
+                return userns_registry_release_by_info(bpf, dir_fd, userns_info);
+
+        log_full_errno(r == -ENOENT ? LOG_DEBUG : LOG_WARNING, r,
+                       "Failed to find userns for inode %" PRIu64 ", ignoring: %m", inode);
+        log_debug("Removing user namespace mapping %" PRIu64 ".", inode);
+
+        /* No registry entry — still clean up the inode-keyed kernel resources (BPF map allowlist and
+         * fdstore fd), which can outlive a missing registry record. */
+        release_userns_inode_resources(bpf, inode);
+}
+
+int userns_registry_reap_if_dead(struct userns_restrict_bpf *bpf, int dir_fd, uint64_t inode, UserNamespaceInfo **ret_info) {
+        _cleanup_(userns_info_freep) UserNamespaceInfo *info = NULL;
+        int r;
+
+        assert(dir_fd >= 0);
+        assert(inode != 0);
+
+        if (ret_info)
+                *ret_info = NULL;
+
+        /* This is the shared engine behind both the runtime allocation hot path and the startup
+         * registry sweep: it reclaims ranges blocked by a dead namespace that no BPF death event
+         * cleaned up, without waiting for the manager to restart. */
+
+        r = userns_registry_load_by_userns_inode(dir_fd, inode, &info);
+        if (r == -ENOENT)
+                /* No entry is registered for this inode any more (already gone) — e.g. a dead ancestor
+                 * still referenced by a delegation chain. Nothing to reap. */
+                return USERNS_REAP_INDETERMINATE;
+        if (r < 0)
+                return r;
+
+        if (info->userns_id == 0) {
+                /* Entry predates ns id tracking, can't probe authoritatively. */
+                if (ret_info)
+                        *ret_info = TAKE_PTR(info);
+                return USERNS_REAP_INDETERMINATE;
+        }
+
+        _cleanup_close_ int probe_fd = namespace_open_by_id(info->userns_id);
+        if (probe_fd >= 0) {
+                /* Still alive (or the inode was recycled for a live namespace). */
+                if (ret_info)
+                        *ret_info = TAKE_PTR(info);
+                return USERNS_REAP_ALIVE;
+        }
+        if (ERRNO_IS_NEG_PRIVILEGE(probe_fd) || ERRNO_IS_NEG_NOT_SUPPORTED(probe_fd) || probe_fd == -EINVAL) {
+                /* EPERM/EACCES (not in the initial user namespace, missing CAP_SYS_ADMIN), or
+                 * ENOTSUP/ENOSYS/EINVAL (kernel new enough for NS_GET_ID but too old for
+                 * open_by_handle_at() lookup by id on nsfs) — we can't confirm death for this or any
+                 * other entry. The userns_id == 0 case is already handled above, so -EINVAL here means
+                 * the lookup is unsupported rather than a bad id. */
+                if (ret_info)
+                        *ret_info = TAKE_PTR(info);
+                return USERNS_REAP_UNSUPPORTED;
+        }
+        if (probe_fd != -ESTALE)
+                return probe_fd; /* Unexpected probe error. */
+
+        log_debug("User namespace %" PRIu64 " (id %" PRIu64 ") refers to a dead namespace, reclaiming its resources.",
+                  inode, info->userns_id);
+
+        userns_registry_release_by_info(bpf, dir_fd, info);
+        return USERNS_REAP_RELEASED;
+}
+
+int userns_info_verify_fd(int userns_fd, const UserNamespaceInfo *info) {
+        uint64_t live_id;
+
+        assert(userns_fd >= 0);
+        assert(info);
+
+        /* Verifies that userns_fd refers to the same user namespace described by info, distinguishing a
+         * live namespace from a different one that happens to have inherited the same inode after the
+         * original was destroyed. Returns 0 on match (also when the check cannot be performed because
+         * the stored or live id is unavailable on older kernels), -ESTALE on mismatch, or another
+         * negative errno on unexpected failure. */
+
+        if (info->userns_id == 0)
+                return 0;
+
+        if (ioctl(userns_fd, NS_GET_ID, &live_id) < 0) {
+                if (ERRNO_IS_IOCTL_NOT_SUPPORTED(errno))
+                        return 0;
+                return -errno;
+        }
+
+        return live_id == info->userns_id ? 0 : -ESTALE;
+}
+
 int userns_registry_load_by_name(int dir_fd, const char *name, UserNamespaceInfo **ret) {
         _cleanup_(userns_info_freep) UserNamespaceInfo *userns_info = NULL;
         _cleanup_close_ int registry_fd = -EBADF;
@@ -574,27 +703,24 @@ int userns_registry_store(int dir_fd, UserNamespaceInfo *info) {
                         SD_JSON_BUILD_PAIR_UNSIGNED("owner", info->owner),
                         SD_JSON_BUILD_PAIR_STRING("name", info->name),
                         SD_JSON_BUILD_PAIR_UNSIGNED("userns", info->userns_inode),
+                        SD_JSON_BUILD_PAIR_CONDITION(info->userns_id != 0, "usernsId", SD_JSON_BUILD_UNSIGNED(info->userns_id)),
                         SD_JSON_BUILD_PAIR_CONDITION(info->size > 0, "size", SD_JSON_BUILD_UNSIGNED(info->size)),
                         SD_JSON_BUILD_PAIR_CONDITION(uid_is_valid(info->start_uid), "start", SD_JSON_BUILD_UNSIGNED(info->start_uid)),
                         SD_JSON_BUILD_PAIR_CONDITION(uid_is_valid(info->target_uid), "target", SD_JSON_BUILD_UNSIGNED(info->target_uid)),
                         SD_JSON_BUILD_PAIR_CONDITION(gid_is_valid(info->start_gid), "startGid", SD_JSON_BUILD_UNSIGNED(info->start_gid)),
                         SD_JSON_BUILD_PAIR_CONDITION(gid_is_valid(info->target_gid), "targetGid", SD_JSON_BUILD_UNSIGNED(info->target_gid)),
+                        SD_JSON_BUILD_PAIR_CONDITION(info->setgroups_deny >= 0, "setgroupsDeny", SD_JSON_BUILD_BOOLEAN(info->setgroups_deny > 0)),
                         SD_JSON_BUILD_PAIR_CONDITION(!!cgroup_array, "cgroups", SD_JSON_BUILD_VARIANT(cgroup_array)),
                         JSON_BUILD_PAIR_STRV_NON_EMPTY("netifs", info->netifs),
                         SD_JSON_BUILD_PAIR_CONDITION(!!delegates_array, "delegates", SD_JSON_BUILD_VARIANT(delegates_array)));
         if (r < 0)
                 return r;
 
-        _cleanup_free_ char *def_buf = NULL;
-        r = sd_json_variant_format(def, 0, &def_buf);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to format userns JSON object: %m");
-
         _cleanup_free_ char *reg_fn = NULL, *link1_fn = NULL, *link2_fn = NULL, *link3_fn = NULL, *owner_fn = NULL, *uid_fn = NULL;
         if (asprintf(&reg_fn, "i%" PRIu64 ".userns", info->userns_inode) < 0)
                 return log_oom_debug();
 
-        r = write_string_file_at(dir_fd, reg_fn, def_buf, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC);
+        r = json_variant_write_file_at(dir_fd, reg_fn, def, /* format_flags= */ 0, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC);
         if (r < 0)
                 return log_debug_errno(r, "Failed to write userns data to '%s' in registry: %m", reg_fn);
 
@@ -660,7 +786,7 @@ int userns_registry_store(int dir_fd, UserNamespaceInfo *info) {
         /* Store delegation files */
         FOREACH_ARRAY(delegate, info->delegates, info->n_delegates) {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *delegate_def = NULL, *ancestor_array = NULL;
-                _cleanup_free_ char *delegate_buf = NULL, *delegate_uid_fn = NULL, *delegate_gid_fn = NULL;
+                _cleanup_free_ char *delegate_uid_fn = NULL, *delegate_gid_fn = NULL;
 
                 if (asprintf(&delegate_uid_fn, "u" UID_FMT ".delegate", delegate->start_uid) < 0) {
                         r = log_oom_debug();
@@ -708,13 +834,7 @@ int userns_registry_store(int dir_fd, UserNamespaceInfo *info) {
                 if (r < 0)
                         goto fail;
 
-                r = sd_json_variant_format(delegate_def, /* flags= */ 0, &delegate_buf);
-                if (r < 0) {
-                        log_debug_errno(r, "Failed to format delegation JSON object: %m");
-                        goto fail;
-                }
-
-                r = write_string_file_at(dir_fd, delegate_uid_fn, delegate_buf, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC);
+                r = json_variant_write_file_at(dir_fd, delegate_uid_fn, delegate_def, /* format_flags= */ 0, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to write delegation data to '%s' in registry: %m", delegate_uid_fn);
                         goto fail;
@@ -847,13 +967,14 @@ int userns_registry_remove(int dir_fd, UserNamespaceInfo *info) {
                         continue;
                 }
 
-                _cleanup_free_ char *delegate_uid_fn = NULL;
+                _cleanup_free_ char *delegate_uid_fn = NULL, *delegate_gid_fn = NULL;
                 if (asprintf(&delegate_uid_fn, "u" UID_FMT ".delegate", delegate->start_uid) < 0)
+                        return log_oom_debug();
+                if (asprintf(&delegate_gid_fn, "g" GID_FMT ".delegate", delegate->start_gid) < 0)
                         return log_oom_debug();
 
                 if (existing.n_ancestor_userns > 0) {
                         _cleanup_(sd_json_variant_unrefp) sd_json_variant *delegate_def = NULL, *ancestor_array = NULL;
-                        _cleanup_free_ char *delegate_buf = NULL;
 
                         /* Pop the last ancestor userns inode to become the new owner */
                         uint64_t new_owner = existing.ancestor_userns[existing.n_ancestor_userns - 1];
@@ -880,15 +1001,19 @@ int userns_registry_remove(int dir_fd, UserNamespaceInfo *info) {
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to build delegate JSON object: %m");
 
-                        r = sd_json_variant_format(delegate_def, /* flags= */ 0, &delegate_buf);
-                        if (r < 0)
-                                return log_debug_errno(r, "Failed to format delegation JSON object: %m");
-
-                        r = write_string_file_at(dir_fd, delegate_uid_fn, delegate_buf, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC);
-                        if (r < 0)
+                        r = json_variant_write_file_at(dir_fd, delegate_uid_fn, delegate_def, /* format_flags= */ 0, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC);
+                        if (r < 0) {
                                 RET_GATHER(ret, log_debug_errno(r, "Failed to write restored delegation data to '%s' in registry: %m", delegate_uid_fn));
+                                continue;
+                        }
 
-                        /* GID link already points to the UID file, no need to update it */
+                        /* The atomic write above replaced the UID file with a new inode, so the
+                         * hardlink to the GID file is now broken. Re-create it to keep the two in
+                         * sync. */
+                        r = linkat_replace(dir_fd, delegate_uid_fn, dir_fd, delegate_gid_fn);
+                        if (r < 0)
+                                RET_GATHER(ret, log_debug_errno(r, "Failed to re-link '%s' to '%s' in registry: %m", delegate_uid_fn, delegate_gid_fn));
+
                         continue;
                 }
 
@@ -899,10 +1024,6 @@ int userns_registry_remove(int dir_fd, UserNamespaceInfo *info) {
                 r = RET_NERRNO(unlinkat(dir_fd, delegate_uid_fn, 0));
                 if (r < 0)
                         RET_GATHER(ret, log_debug_errno(r, "Failed to remove %s: %m", delegate_uid_fn));
-
-                _cleanup_free_ char *delegate_gid_fn = NULL;
-                if (asprintf(&delegate_gid_fn, "g" GID_FMT ".delegate", delegate->start_gid) < 0)
-                        return log_oom_debug();
 
                 r = RET_NERRNO(unlinkat(dir_fd, delegate_gid_fn, 0));
                 if (r < 0)
@@ -965,9 +1086,9 @@ static int userns_destroy_cgroup(uint64_t cgroup_id) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to extract name of cgroup %" PRIu64 ", ignoring: %m", cgroup_id);
 
-        parent_fd = openat(cgroup_fd, "..", O_CLOEXEC|O_DIRECTORY);
+        parent_fd = xopenat(cgroup_fd, "..", O_DIRECTORY);
         if (parent_fd < 0)
-                return log_debug_errno(errno, "Failed to open parent cgroup of %" PRIu64 ", ignoring: %m", cgroup_id);
+                return log_debug_errno(parent_fd, "Failed to open parent cgroup of %" PRIu64 ", ignoring: %m", cgroup_id);
 
         /* Safety check, never leave cgroupfs */
         r = fd_is_fs_type(parent_fd, CGROUP2_SUPER_MAGIC);
@@ -1075,7 +1196,7 @@ bool userns_name_is_valid(const char *name) {
                 return false;
 
         const char *u = strjoina("ns-", name, "-65535"); /* Make sure we can turn this into valid user names */
-        if (!valid_user_group_name(u, 0))
+        if (!valid_user_group_name(u, /* flags= */ 0))
                 return false;
 
         return true;
@@ -1099,7 +1220,7 @@ int userns_registry_per_uid(int dir_fd, uid_t owner) {
 
         _cleanup_free_ DirectoryEntries *de = NULL;
 
-        r = readdir_all_at(dir_fd, uid_fn, RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_ENSURE_TYPE, &de);
+        r = readdir_all_at(dir_fd, uid_fn, RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_MUST_BE_REGULAR, &de);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
@@ -1107,9 +1228,6 @@ int userns_registry_per_uid(int dir_fd, uid_t owner) {
 
         FOREACH_ARRAY(i, de->entries, de->n_entries) {
                 struct dirent *e = *i;
-
-                if (e->d_type != DT_REG)
-                        continue;
 
                 if (!startswith(e->d_name, "i") || !endswith(e->d_name, ".userns"))
                         continue;

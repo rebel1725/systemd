@@ -5,12 +5,13 @@ basic_sources = files(
         'af-list.c',
         'alloc-util.c',
         'ansi-color.c',
+        'ansi-seq.c',
         'architecture.c',
         'argv-util.c',
         'arphrd-util.c',
         'assert-util.c',
         'audit-util.c',
-        'btrfs.c',
+        'btrfs-util.c',
         'build.c',
         'build-path.c',
         'bus-label.c',
@@ -35,13 +36,14 @@ basic_sources = files(
         'escape.c',
         'ether-addr-util.c',
         'extract-word.c',
+        'fanotify-util.c',
         'fd-util.c',
+        'fiber-ops.c',
         'fileio.c',
         'filesystems.c',
         'format-ifname.c',
         'format-util.c',
         'fs-util.c',
-        'gcrypt-util.c',
         'glob-util.c',
         'glyph-util.c',
         'gunicode.c',
@@ -53,17 +55,19 @@ basic_sources = files(
         'in-addr-util.c',
         'initrd-util.c',
         'inotify-util.c',
+        'io-uring-util.c',
         'io-util.c',
         'iovec-util.c',
         'iovec-wrapper.c',
         'keyring-util.c',
-        'label.c',
+        'label-util.c',
         'limits-util.c',
         'locale-util.c',
         'lock-util.c',
         'log.c',
         'log-context.c',
         'login-util.c',
+        'math-util.c',
         'memfd-util.c',
         'memory-util.c',
         'mempool.c',
@@ -118,6 +122,7 @@ basic_sources = files(
         'user-util.c',
         'utf8.c',
         'virt.c',
+        'web-util.c',
         'xattr-util.c',
 )
 
@@ -154,13 +159,13 @@ foreach item : [
                 gperf_file = custom_target(
                         input : list_txt,
                         output : '@0@-from-name.gperf'.format(item[0]),
-                        command : [generate_gperfs, item[0], item[2], '@INPUT@'] + item[3],
+                        command : [python, generate_gperfs, item[0], item[2], '@INPUT@'] + item[3],
                         capture : true)
 
                 target = custom_target(
                         input : gperf_file,
                         output : '@0@-from-name.inc'.format(item[0]),
-                        command : [gperf,
+                        command : [gperf_cmdline,
                                 '-L', 'ANSI-C', '-t', '--ignore-case',
                                 '-N', 'lookup_@0@'.format(item[0]),
                                 '-H', 'hash_@0@_name'.format(item[0]),
@@ -180,7 +185,8 @@ basic_sources += generated_gperf_headers
 filesystem_sets_py = files('filesystem-sets.py')
 filesystem_sets_c = custom_target(
         output : 'filesystem-sets.c',
-        command : [filesystem_sets_py,
+        command : [python,
+                   filesystem_sets_py,
                    'fs-type-to-string',
                    'filesystem-sets',
                    'fs-in-group'],
@@ -188,22 +194,22 @@ filesystem_sets_c = custom_target(
 
 filesystems_gperf_gperf = custom_target(
         output : 'filesystems-gperf.gperf',
-        command : [filesystem_sets_py,
+        command : [python,
+                   filesystem_sets_py,
                    'gperf'],
         capture : true)
 
 filesystems_gperf_h = custom_target(
         input : filesystems_gperf_gperf,
         output : 'filesystems-gperf.h',
-        command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
+        command : [gperf_cmdline, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 generated_sources += [filesystem_sets_c, filesystems_gperf_gperf, filesystems_gperf_h]
 basic_sources += [filesystem_sets_c, filesystems_gperf_h]
 
 test('kernel-filesystem-magics',
      filesystem_sets_py,
-     args : ['check'],
-     env : ['CPP=@0@'.format(cpp)])
+     args : ['check', cpp, system_include_args])
 
 libbasic_static = static_library(
         'basic',
@@ -211,14 +217,11 @@ libbasic_static = static_library(
         fundamental_sources,
         include_directories : basic_includes,
         implicit_include_directories : false,
-        dependencies : [libdl,
-                        libgcrypt_cflags,
+        dependencies : [libbzip2_cflags,
                         liblz4_cflags,
-                        libm,
-                        librt,
                         libxz_cflags,
+                        libz_cflags,
                         libzstd_cflags,
-                        threads,
                         userspace],
         c_args : ['-fvisibility=default'],
         build_by_default : false)

@@ -19,6 +19,17 @@ custom_target(
         install : true,
         install_dir : bashcompletiondir)
 
+if want_ukify
+        custom_target(
+                'ukify-bash-completion',
+                input : ukify,
+                output : 'ukify',
+                command : [python, '@INPUT@', 'completion', 'bash'],
+                capture : true,
+                install : true,
+                install_dir : bashcompletiondir)
+endif
+
 foreach item : [
         ['bootctl',             ''],
         ['busctl',              ''],
@@ -34,8 +45,10 @@ foreach item : [
         ['networkctl',          'ENABLE_NETWORKD'],
         ['oomctl',              'ENABLE_OOMD'],
         ['portablectl',         'ENABLE_PORTABLED'],
+        ['ptyctl',              ''],
         ['resolvectl',          'ENABLE_RESOLVE'],
         ['run0',                ''],
+        ['storagectl',          'ENABLE_STORAGE'],
         ['systemd-analyze',     ''],
         ['systemd-cat',         ''],
         ['systemd-cgls',        ''],
@@ -46,16 +59,24 @@ foreach item : [
         ['systemd-delta',       ''],
         ['systemd-detect-virt', ''],
         ['systemd-dissect',     'HAVE_BLKID'],
+        ['systemd-hwdb',        'ENABLE_HWDB'],
         ['systemd-id128',       ''],
+        ['systemd-manifest',    ''],
+        ['systemd-notify',      ''],
         ['systemd-nspawn',      'ENABLE_NSPAWN'],
         ['systemd-path',        ''],
+        ['systemd-pty-forward', ''],
+        ['systemd-repart',      'ENABLE_REPART'],
         ['systemd-resolve',     'ENABLE_RESOLVE'],
         ['systemd-run',         ''],
         ['systemd-sysext',      'ENABLE_SYSEXT'],
+        ['systemd-sysinstall',  'ENABLE_SYSINSTALL'],
+        ['systemd-sysupdate',   'ENABLE_SYSUPDATE'],
         ['systemd-vmspawn',     'ENABLE_VMSPAWN'],
         ['systemd-vpick',       ''],
         ['timedatectl',         'ENABLE_TIMEDATED'],
         ['udevadm',             ''],
+        ['updatectl',           'ENABLE_SYSUPDATED'],
         ['userdbctl',           'ENABLE_USERDB'],
         ['varlinkctl',          ''],
 ]

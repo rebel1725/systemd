@@ -3,8 +3,9 @@
 
 #include "sd-id128.h"
 
-#include "btrfs.h"      /* IWYU pragma: export */
-#include "shared-forward.h"
+#include "forward.h"
+
+#include "../basic/btrfs-util.h"      /* IWYU pragma: export */
 
 typedef struct BtrfsSubvolInfo {
         uint64_t subvol_id;
@@ -43,18 +44,21 @@ typedef enum BtrfsRemoveFlags {
 
 int btrfs_is_subvol_at(int dir_fd, const char *path);
 static inline int btrfs_is_subvol_fd(int fd) {
-        return btrfs_is_subvol_at(fd, NULL);
+        return btrfs_is_subvol_at(fd, /* path= */ NULL);
 }
 static inline int btrfs_is_subvol(const char *path) {
         return btrfs_is_subvol_at(AT_FDCWD, path);
 }
 
-int btrfs_get_block_device_at(int dir_fd, const char *path, dev_t *ret);
+int btrfs_get_block_device_at_full(int dir_fd, const char *path, uint64_t *ret_devid, char **ret_path, dev_t *ret);
+static inline int btrfs_get_block_device_at(int dir_fd, const char *path, dev_t *ret) {
+        return btrfs_get_block_device_at_full(dir_fd, path, /* ret_devid= */ NULL, /* ret_path= */ NULL, ret);
+}
 static inline int btrfs_get_block_device(const char *path, dev_t *ret) {
         return btrfs_get_block_device_at(AT_FDCWD, path, ret);
 }
 static inline int btrfs_get_block_device_fd(int fd, dev_t *ret) {
-        return btrfs_get_block_device_at(fd, "", ret);
+        return btrfs_get_block_device_at(fd, /* path= */ NULL, ret);
 }
 
 int btrfs_defrag_fd(int fd);
@@ -69,7 +73,7 @@ int btrfs_quota_scan_ongoing(int fd);
 
 int btrfs_subvol_snapshot_at_full(int dir_fdf, const char *from, int dir_fdt, const char *to, BtrfsSnapshotFlags flags, copy_progress_path_t progress_path, copy_progress_bytes_t progress_bytes, void *userdata);
 static inline int btrfs_subvol_snapshot_at(int dir_fdf, const char *from, int dir_fdt, const char *to, BtrfsSnapshotFlags flags) {
-        return btrfs_subvol_snapshot_at_full(dir_fdf, from, dir_fdt, to, flags, NULL, NULL, NULL);
+        return btrfs_subvol_snapshot_at_full(dir_fdf, from, dir_fdt, to, flags, /* progress_path= */ NULL, /* progress_bytes= */ NULL, /* userdata= */ NULL);
 }
 
 int btrfs_subvol_remove_at(int dir_fd, const char *path, BtrfsRemoveFlags flags);
@@ -79,7 +83,7 @@ static inline int btrfs_subvol_remove(const char *path, BtrfsRemoveFlags flags) 
 
 int btrfs_subvol_set_read_only_at(int dir_fd, const char *path, bool b);
 static inline int btrfs_subvol_set_read_only_fd(int fd, bool b) {
-        return btrfs_subvol_set_read_only_at(fd, NULL, b);
+        return btrfs_subvol_set_read_only_at(fd, /* path= */ NULL, b);
 }
 static inline int btrfs_subvol_set_read_only(const char *path, bool b) {
         return btrfs_subvol_set_read_only_at(AT_FDCWD, path, b);
@@ -133,3 +137,6 @@ bool btrfs_might_be_subvol(const struct stat *st) _pure_;
 int btrfs_forget_device(const char *path);
 
 int btrfs_get_file_physical_offset_fd(int fd, uint64_t *ret);
+
+int btrfs_replace(int fdmntpnt, uint64_t device_id, const char *target);
+int btrfs_resize_max(int fdmntpnt, uint64_t devid);

@@ -8,6 +8,48 @@ set -o pipefail
 # shellcheck source=test/units/util.sh
 . "$(dirname "$0")"/util.sh
 
+# Two subtests below change the log level (the transactions-with-cycles one to info, the
+# RestartRandomizedDelaySec= one to debug) and restore it inline when they pass. On abort,
+# the EXIT handler restores the boot-time level and cleans up the transient unit the
+# aborting subtest had in flight, as in TEST-26-SYSTEMCTL.sh.
+ORIG_LOG_LEVEL="$(systemctl log-level)"
+
+at_exit() {
+    set +e
+
+    systemctl log-level "$ORIG_LOG_LEVEL"
+
+    # The "systemctl wait" subtest leaves units in failed state behind (wait-sigkill.service may even still
+    # be running its "sleep 60" if the subtest aborted midway), which would leak into the remaining subtests
+    # of this file, hence clean up unconditionally here.
+    local -a wait_units=(
+        wait2.service
+        wait5fail.service
+        wait-exit7.service
+        wait-sigkill.service
+        wait-long.service
+        wait-log.service
+        wait-gc.service
+        wait-watcher.service
+    )
+    systemctl stop "${wait_units[@]}"
+    systemctl reset-failed "${wait_units[@]}"
+    rm -f /tmp/wait-log.fifo /tmp/wait-watcher.log
+
+    if [[ -e /etc/dbus-1/system.d/systemd-test-deny-ref.conf ]]; then
+        rm -f /etc/dbus-1/system.d/systemd-test-deny-ref.conf
+        systemctl reload dbus.service
+    fi
+
+    if [[ -v UNIT_NAME && -e /run/systemd/system/"$UNIT_NAME" ]]; then
+        systemctl stop "$UNIT_NAME"
+        rm -f /run/systemd/system/"$UNIT_NAME"
+        systemctl daemon-reload
+    fi
+}
+
+trap at_exit EXIT
+
 # Simple test for that daemon-reexec works in container.
 # See: https://github.com/systemd/systemd/pull/23883
 systemctl daemon-reexec
@@ -43,6 +85,16 @@ systemctl start --no-block hello-after-sleep.target
 systemctl try-restart --job-mode=fail hello.service
 systemctl try-restart hello.service
 systemctl stop hello.service sleep.service hello-after-sleep.target
+
+# Test that a job can be canceled through the private bus, where messages have no sender
+systemctl start --no-block hello-after-sleep.target
+timeout 10 bash -c "until systemctl list-jobs | tee /root/list-jobs.txt | grep 'sleep\.service.*running'; do sleep .1; done"
+grep 'hello\.service.*waiting' /root/list-jobs.txt
+systemctl cancel "$(systemctl show -P Job hello.service)"
+systemctl list-jobs >/root/list-jobs.txt
+(! grep 'hello\.service' /root/list-jobs.txt)
+grep 'sleep\.service.*running' /root/list-jobs.txt
+systemctl stop sleep.service hello-after-sleep.target
 
 # TODO: add more job queueing/merging tests here.
 
@@ -96,16 +148,143 @@ END_SEC=$(date -u '+%s')
 ELAPSED=$((END_SEC-START_SEC))
 [[ "$ELAPSED" -ge 5 ]]
 
+# Test "systemctl wait"
+# An already inactive unit terminates the wait immediately, successfully
+systemctl wait --wait-timeout=5 wait2.service
+
+# A running unit is waited for until it terminates
+systemctl --no-block start wait2.service
+START_SEC=$(date -u '+%s')
+systemctl wait --wait-timeout=10 wait2.service
+END_SEC=$(date -u '+%s')
+ELAPSED=$((END_SEC-START_SEC))
+[[ "$ELAPSED" -ge 1 ]]
+
+# The exit status of the unit's main process is propagated
+systemctl --no-block start wait5fail.service
+assert_rc 1 systemctl wait --wait-timeout=10 wait5fail.service
+systemd-run --no-block --unit=wait-exit7.service bash -c 'sleep 2; exit 7'
+assert_rc 7 systemctl wait --wait-timeout=10 wait-exit7.service
+# ... with termination by signal reported as 255
+systemd-run --unit=wait-sigkill.service sleep 60
+systemctl kill --signal=SIGKILL wait-sigkill.service
+assert_rc 255 systemctl wait --wait-timeout=10 wait-sigkill.service
+# ... with timeout reported as 124
+systemd-run --unit=wait-long.service sleep 60
+assert_rc 124 systemctl wait --wait-timeout=0 wait-long.service
+assert_rc 124 systemctl wait --wait-timeout=3 wait-long.service
+
+# A summary is shown on stdout, unless --quiet is given
+systemctl --no-block start wait2.service
+systemctl wait --wait-timeout=10 wait2.service | grep "Finished with result" >/dev/null
+systemctl --no-block start wait2.service
+OUT="$(systemctl --quiet wait --wait-timeout=10 wait2.service)"
+[[ -z "$OUT" ]]
+
+# --verbose forwards the unit's log output. To make this race-free, run "systemctl wait" as a Type=notify
+# service: it sends READY=1 once it is fully set up, including the journal follow logic, hence any log output
+# of the unit generated after systemd-run returned is guaranteed to be caught. Block the unit on a FIFO until
+# then, so that it doesn't log too early.
+#
+# Note that the output of the watcher service is written to a file rather than checked via the journal: when
+# stderr is connected to the journal, "systemctl" logs via the native journal socket, and journald looks up
+# the sender's metadata (unit, invocation ID, ...) from /proc only once it processes the datagram. Since
+# "systemctl wait" exits right after logging, journald might not be able to attribute the log messages to
+# the unit anymore, and hence a lookup by invocation ID would be racy.
+mkfifo /tmp/wait-log.fifo
+systemd-run --unit=wait-log.service bash -c 'read -r </tmp/wait-log.fifo; echo hello-from-wait'
+systemd-run --unit=wait-watcher.service --service-type=notify --property=StandardOutput=truncate:/tmp/wait-watcher.log systemctl --verbose wait wait-log.service
+echo go >/tmp/wait-log.fifo
+systemctl wait --wait-timeout=10 wait-watcher.service
+grep hello-from-wait /tmp/wait-watcher.log >/dev/null
+rm /tmp/wait-log.fifo
+
+# A non-existent unit is treated as terminated successfully, with a message in place of the summary
+systemctl wait --wait-timeout=10 nonexistent.service | grep "does not exist" >/dev/null
+OUT="$(systemctl --quiet wait --wait-timeout=10 nonexistent.service)"
+[[ -z "$OUT" ]]
+run0 -u testuser systemctl wait --wait-timeout=10 nonexistent.service | grep "does not exist" >/dev/null
+OUT="$(run0 -u testuser systemctl --quiet wait --wait-timeout=10 nonexistent.service)"
+[[ -z "$OUT" ]]
+
+# A unit type without a Result property (e.g. a target) exits successfully once inactive
+systemctl wait --wait-timeout=5 hello-after-sleep.target
+
+# Template unit names are refused
+(! systemctl wait 'foo@.service')
+
+# Test that "systemctl wait" notices if the unit it waits for is removed from the service manager while
+# waiting. Normally "systemctl wait" pins the unit via Ref(), so that it is not garbage collected before its
+# final state was collected. Hence deny Ref() via D-Bus policy, and make the unit be garbage collected
+# aggressively via CollectMode=inactive-or-failed. "systemctl wait" itself runs as a Type=notify service: it
+# sends READY=1 once it is fully subscribed to the unit's state changes, so that we can synchronize on that.
+mkdir -p /etc/dbus-1/system.d/
+cat >/etc/dbus-1/system.d/systemd-test-deny-ref.conf <<EOF
+<?xml version="1.0"?>
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+        "https://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+        <policy context="mandatory">
+                <deny send_destination="org.freedesktop.systemd1" send_interface="org.freedesktop.systemd1.Unit" send_member="Ref"/>
+        </policy>
+</busconfig>
+EOF
+systemctl reload dbus.service
+
+systemd-run --unit=wait-gc.service --property=CollectMode=inactive-or-failed sleep infinity
+systemd-run --unit=wait-watcher.service --service-type=notify --property=StandardOutput=truncate:/tmp/wait-watcher.log systemctl wait wait-gc.service
+systemctl is-active wait-watcher.service
+# Stopping the unit makes it disappear right-away, which "systemctl wait" must notice and report as failure
+systemctl stop wait-gc.service
+assert_rc 1 systemctl wait --wait-timeout=10 wait-watcher.service
+grep "has been removed while waiting for it" /tmp/wait-watcher.log >/dev/null
+systemctl reset-failed wait-watcher.service
+
+# A daemon-reload while waiting removes and re-adds the unit, which must not confuse "systemctl wait"
+systemd-run --unit=wait-gc.service --property=CollectMode=inactive-or-failed sleep infinity
+systemd-run --unit=wait-watcher.service --service-type=notify --property=StandardOutput=truncate:/tmp/wait-watcher.log systemctl wait wait-gc.service
+systemctl daemon-reload
+systemctl is-active wait-watcher.service
+systemctl is-active wait-gc.service
+# ... but once the unit is stopped and garbage collected, "systemctl wait" must notice again
+systemctl stop wait-gc.service
+assert_rc 1 systemctl wait --wait-timeout=10 wait-watcher.service
+grep "has been removed while waiting for it" /tmp/wait-watcher.log >/dev/null
+(! grep "removed during service manager reload" /tmp/wait-watcher.log >/dev/null)
+systemctl reset-failed wait-watcher.service
+
+# With Ref() allowed again the unit is pinned, and hence not garbage collected before its final state was
+# collected, even with an aggressive CollectMode= and a daemon-reload while waiting
+rm /etc/dbus-1/system.d/systemd-test-deny-ref.conf
+systemctl reload dbus.service
+
+systemd-run --unit=wait-gc.service --property=CollectMode=inactive-or-failed sleep infinity
+systemd-run --unit=wait-watcher.service --service-type=notify --property=StandardOutput=truncate:/tmp/wait-watcher.log systemctl wait wait-gc.service
+systemctl daemon-reload
+systemctl is-active wait-watcher.service
+systemctl stop wait-gc.service
+systemctl wait --wait-timeout=10 wait-watcher.service
+grep "Finished with result: success" /tmp/wait-watcher.log >/dev/null
+
+# The same must hold for a daemon-reexec, where the Reloading(true) signal might not reach "systemctl wait",
+# and it has to fall back to noticing the loss of the service manager's bus name instead
+systemd-run --unit=wait-gc.service --property=CollectMode=inactive-or-failed sleep infinity
+systemd-run --unit=wait-watcher.service --service-type=notify --property=StandardOutput=truncate:/tmp/wait-watcher.log systemctl wait wait-gc.service
+systemctl daemon-reexec
+systemctl is-active wait-watcher.service
+systemctl is-active wait-gc.service
+systemctl stop wait-gc.service
+systemctl wait --wait-timeout=10 wait-watcher.service
+grep "Finished with result: success" /tmp/wait-watcher.log >/dev/null
+(! grep "removed during service manager reload" /tmp/wait-watcher.log >/dev/null)
+
 # Test time-limited scopes
 START_SEC=$(date -u '+%s')
-set +e
-systemd-run --scope --property=RuntimeMaxSec=3s sleep 30
-RESULT=$?
+(! systemd-run --scope --property=RuntimeMaxSec=3s sleep 30)
 END_SEC=$(date -u '+%s')
 ELAPSED=$((END_SEC-START_SEC))
 [[ "$ELAPSED" -ge 3 ]]
 [[ "$ELAPSED" -le 10 ]]
-[[ "$RESULT" -ne 0 ]]
 
 # Test transactions with cycles
 # Provides coverage for issues like https://github.com/systemd/systemd/issues/26872
@@ -119,14 +298,35 @@ Requires=transaction-cycle$(((i + 1) % 20)).service
 ExecStart=true
 EOF
 done
+
+# The image boots with systemd.log_level=debug, so the daemon-reload and the 20 cyclic starts
+# below make PID1 emit thousands of debug messages per second. Under that burst journald falls
+# behind and PID1's journal socket sends time out after 10ms (src/basic/log.c). A timed-out
+# message is either dropped outright, since log_struct() ignores the send result, or falls back
+# to kmsg, where the structured TRANSACTION_ID= field is lost, so the TRANSACTION_ID= matches
+# below cannot find it. Run this section at log level info instead: the asserted messages are
+# emitted at err and warning (src/core/transaction.c) and are unaffected.
+systemctl log-level info
+
 systemctl daemon-reload
+
+# Let journald drain anything the preceding subtests already queued at debug level, so no
+# earlier backlog is still competing with the messages asserted on below.
+journalctl --sync
+
 for i in {0..19}; do
-    systemctl start "transaction-cycle$i.service"
+    # This intentionally fails with:
+    #   Failed to start transaction-cycle0.service: Transaction order is cyclic. See system logs for details.
+    systemctl start "transaction-cycle$i.service" || :
 done
 
 IDS_FILE="/tmp/TEST-03-JOBS-CYCLE-IDS-$RANDOM"
 varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Manager.Describe '{}' | jq '.runtime.TransactionsWithOrderingCycle' >"$IDS_FILE"
+
+systemctl log-level "$ORIG_LOG_LEVEL"
+
 [[ "$(jq length "$IDS_FILE")" -ge 20 ]]
+journalctl --sync
 for i in {0..19}; do
     journalctl -b TRANSACTION_ID="$(jq -r ".[$i]" "$IDS_FILE")" --grep "cycle starting with"
 done
@@ -146,7 +346,7 @@ systemctl --quiet is-active sleep-infinity-simple.service
 systemctl restart propagatestopto-only.target
 assert_rc 3 systemctl --quiet is-active sleep-infinity-simple.service
 
-systemctl start propagatesstopto-indirect.target propagatestopto-and-pullin.target
+systemctl start propagatestopto-indirect.target propagatestopto-and-pullin.target
 systemctl --quiet is-active propagatestopto-indirect.target
 systemctl --quiet is-active propagatestopto-and-pullin.target
 
@@ -168,6 +368,8 @@ assert_rc 3 systemctl --quiet is-active succeeds-on-restart.target
 systemctl start fails-on-restart.target || :
 assert_rc 3 systemctl --quiet is-active fails-on-restart.target
 
+systemctl stop fails-on-restart.service
+
 COUNTER_FILE=/tmp/test-03-restart-counter
 export FAILURE_FLAG_FILE=/tmp/test-03-restart-failure-flag
 
@@ -175,6 +377,7 @@ assert_rc 3 systemctl --quiet is-active sleep-infinity-restart-normal.service
 assert_rc 3 systemctl --quiet is-active sleep-infinity-restart-direct.service
 assert_rc 3 systemctl --quiet is-active counter.service
 echo 0 >"$COUNTER_FILE"
+rm -f "$FAILURE_FLAG_FILE"
 
 systemctl start counter.service
 assert_eq "$(cat "$COUNTER_FILE")" "1"
@@ -182,15 +385,32 @@ systemctl --quiet is-active sleep-infinity-restart-normal.service
 systemctl --quiet is-active sleep-infinity-restart-direct.service
 systemctl --quiet is-active counter.service
 
-systemctl kill --signal=KILL sleep-infinity-restart-direct.service
-systemctl --quiet is-active counter.service
-assert_eq "$(cat "$COUNTER_FILE")" "1"
-[[ ! -f "$FAILURE_FLAG_FILE" ]]
-
-systemctl kill --signal=KILL sleep-infinity-restart-normal.service
-timeout 10 bash -c 'while [[ ! -f $FAILURE_FLAG_FILE ]]; do sleep .5; done'
+# RestartMode=direct + restart: explicit restart should get propagated as TRY_RESTART to the still active
+# counter.service
+systemctl restart sleep-infinity-restart-direct.service
 timeout 10 bash -c 'while ! systemctl --quiet is-active counter.service; do sleep .5; done'
 assert_eq "$(cat "$COUNTER_FILE")" "2"
+[[ ! -f "$FAILURE_FLAG_FILE" ]]
+
+# RestartMode=direct + kill: the fail/inactive state shouldn't get propagated to the counter.service
+systemctl kill --signal=KILL sleep-infinity-restart-direct.service
+systemctl --quiet is-active counter.service
+assert_eq "$(cat "$COUNTER_FILE")" "2"
+[[ ! -f "$FAILURE_FLAG_FILE" ]]
+
+# RestartMode=normal + restart: explicit restart should get propagated as TRY_RESTART to the still active
+# counter.service
+systemctl restart sleep-infinity-restart-normal.service
+timeout 10 bash -c 'while ! systemctl --quiet is-active counter.service; do sleep .5; done'
+assert_eq "$(cat "$COUNTER_FILE")" "3"
+[[ ! -f "$FAILURE_FLAG_FILE" ]]
+
+# RestartMode=normal + kill: the fail/inactive state should get propagated to the counter.service, which in
+# turn should be stopped
+systemctl kill --signal=KILL sleep-infinity-restart-normal.service
+timeout 10 bash -c 'while [[ ! -f $FAILURE_FLAG_FILE ]]; do sleep .5; done'
+timeout 10 bash -c 'while systemctl --quiet is-active counter.service; do sleep .5; done'
+assert_eq "$(cat "$COUNTER_FILE")" "3"
 
 # Test shortcutting auto restart
 
@@ -217,5 +437,70 @@ assert_eq "$(systemctl show "$UNIT_NAME" -P NRestarts)" "1"
 [[ ! -f "$TMP_FILE" ]]
 
 rm /run/systemd/system/"$UNIT_NAME"
+
+# Test RestartRandomizedDelaySec=
+
+export UNIT_NAME="TEST-03-JOBS-restart-randomized-delay.service"
+
+cat >"/run/systemd/system/$UNIT_NAME" <<EOF
+[Service]
+Type=simple
+ExecStart=false
+Restart=on-failure
+RestartSec=1
+RestartRandomizedDelaySec=1
+StartLimitIntervalSec=0
+EOF
+
+systemctl daemon-reload
+
+# The option should be parsed and exposed on the bus in usec.
+assert_eq "$(systemctl show "$UNIT_NAME" -P RestartRandomizedDelayUSec)" "1s"
+
+# The chosen delay is logged at debug level when the unit enters auto-restart, so we can read it without
+# waiting for the delay to elapse.
+systemctl log-level debug
+
+# Stores the "<total>|<delay>" line in $RESTART_INTERVAL. Run as a normal command (not in command
+# substitution), so that errexit catches a failing setup step (e.g. the service never entering
+# auto-restart) instead of it being swallowed; only the final value is captured.
+get_restart_interval() {
+    # Enter auto-restart once, read the logged "<total>|<delay>", then stop again so it never has to elapse.
+    systemctl start --no-block "$UNIT_NAME"
+    timeout 10 bash -c 'while [[ "$(systemctl show "'"$UNIT_NAME"'" -P SubState)" != "auto-restart" ]]; do sleep .2; done'
+    systemctl stop "$UNIT_NAME"
+    journalctl --sync
+    # needed because of -o pipefail
+    RESTART_INTERVAL="$({ journalctl -q --no-pager -o cat -b -u "$UNIT_NAME" --grep="Next restart interval calculated as" || true; } |
+        sed -n 's/.*calculated as: \(.*\) (randomized delay: \(.*\))$/\1|\2/p' | tail -n1)"
+}
+
+# Several samples + "not all equal": two draws could rarely render identically (~1e-6) and falsely fail.
+DELAYS=()
+TOTALS=()
+for _ in {1..4}; do
+    get_restart_interval
+    IFS='|' read -r total delay <<<"$RESTART_INTERVAL"
+    TOTALS+=("$total")
+    DELAYS+=("$delay")
+done
+
+systemctl log-level "$ORIG_LOG_LEVEL"
+
+: "Chosen randomized restart delays: ${DELAYS[*]} (totals: ${TOTALS[*]})"
+for delay in "${DELAYS[@]}"; do
+    assert_neq "$delay" ""
+    # Within bound: a value below 1s never renders a bare "<digit>s" token (only ms/us).
+    if [[ "$delay" =~ [0-9]s ]]; then
+        echo "FAIL: randomized restart delay '$delay' exceeds the configured 1s bound" >&2
+        exit 1
+    fi
+done
+# Total must vary, proving the jitter is folded into the armed timer (not merely logged).
+all_equal=1
+for total in "${TOTALS[@]}"; do
+    [[ "$total" == "${TOTALS[0]}" ]] || all_equal=0
+done
+assert_eq "$all_equal" "0"
 
 touch /testok

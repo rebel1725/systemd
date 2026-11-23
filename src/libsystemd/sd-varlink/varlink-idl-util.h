@@ -4,13 +4,14 @@
 #include "sd-varlink.h"
 #include "sd-varlink-idl.h"
 
-#include "sd-forward.h"
+#include "forward.h"
 
 bool varlink_idl_field_name_is_valid(const char *name);
 bool varlink_idl_symbol_name_is_valid(const char *name);
 bool varlink_idl_interface_name_is_valid(const char *name);
 
 int varlink_idl_qualified_symbol_name_is_valid(const char *name);
+int varlink_idl_split_qualified_symbol_name(const char *symbol, char **ret_interface, const char **ret_name);
 
 int varlink_idl_consistent(const sd_varlink_interface *interface, int level);
 

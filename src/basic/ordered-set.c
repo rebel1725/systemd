@@ -9,6 +9,8 @@
 #include "strv.h"
 
 int ordered_set_ensure_allocated(OrderedSet **s, const struct hash_ops *ops) {
+        assert(s);
+
         if (*s)
                 return 0;
 
@@ -21,6 +23,8 @@ int ordered_set_ensure_allocated(OrderedSet **s, const struct hash_ops *ops) {
 
 int ordered_set_ensure_put(OrderedSet **s, const struct hash_ops *ops, void *p) {
         int r;
+
+        assert(s);
 
         r = ordered_set_ensure_allocated(s, ops);
         if (r < 0)
@@ -108,7 +112,7 @@ void ordered_set_print(FILE *f, const char *field, OrderedSet *s) {
         fputs(field, f);
 
         ORDERED_SET_FOREACH(p, s)
-                fputs_with_separator(f, p, NULL, &space);
+                fputs_with_separator(f, p, /* separator= */ NULL, &space);
 
         fputc('\n', f);
 }

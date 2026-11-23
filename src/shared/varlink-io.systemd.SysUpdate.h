@@ -1,0 +1,14 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+#pragma once
+
+#include "sd-varlink-idl.h"
+
+extern const sd_varlink_symbol vl_type_TargetClass;
+extern const sd_varlink_symbol vl_type_TargetIdentifier;
+extern const sd_varlink_symbol vl_type_ComponentSuccessAction;
+extern const sd_varlink_symbol vl_type_ComponentFailureAction;
+extern const sd_varlink_symbol vl_type_Target;
+
+extern const sd_varlink_symbol vl_error_NoSuchTarget;
+
+extern const sd_varlink_interface vl_interface_io_systemd_SysUpdate;

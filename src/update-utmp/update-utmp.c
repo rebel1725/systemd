@@ -7,12 +7,20 @@
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-util.h"
+#include "dlopen-note.h"
 #include "libaudit-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "time-util.h"
 #include "utmp-wtmp.h"
 #include "verbs.h"
+
+COMMAND(
+        "systemd-update-utmp\0",
+        "Write audit and utmp records at bootup and shutdown.",
+        .man_page = "systemd-update-utmp.service(8)",
+        .option_namespace = "common",
+);
 
 typedef struct Context {
         sd_bus *bus;
@@ -51,16 +59,17 @@ static int get_startup_monotonic_time(Context *c, usec_t *ret) {
         return 0;
 }
 
+VERB_NOARG(verb_on_reboot, "reboot", "Record that startup is finished");
 static int verb_on_reboot(int argc, char *argv[], uintptr_t _data, void *userdata) {
         Context *c = ASSERT_PTR(userdata);
         usec_t t = 0, boottime;
         int r, q = 0;
 
-        /* We finished start-up, so let's write the utmp record and send the audit msg. */
+        /* We finished startup, so let's write the utmp record and send the audit msg. */
 
 #if HAVE_AUDIT
         if (c->audit_fd >= 0)
-                if (sym_audit_log_user_comm_message(c->audit_fd, AUDIT_SYSTEM_BOOT, "", "systemd-update-utmp", NULL, NULL, NULL, 1) < 0 &&
+                if (sym_audit_log_user_comm_message(c->audit_fd, AUDIT_SYSTEM_BOOT, "", "update-utmp", /* hostname= */ NULL, /* addr= */ NULL, /* tty= */ NULL, 1) < 0 &&
                     errno != EPERM)
                         q = log_error_errno(errno, "Failed to send audit message: %m");
 #endif
@@ -80,16 +89,17 @@ static int verb_on_reboot(int argc, char *argv[], uintptr_t _data, void *userdat
         return q;
 }
 
+VERB_NOARG(verb_on_shutdown, "shutdown", "Record that shutdown has started");
 static int verb_on_shutdown(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r, q = 0;
 
-        /* We started shut-down, so let's write the utmp record and send the audit msg. */
+        /* We started shutdown, so let's write the utmp record and send the audit msg. */
 
 #if HAVE_AUDIT
         Context *c = ASSERT_PTR(userdata);
 
         if (c->audit_fd >= 0)
-                if (sym_audit_log_user_comm_message(c->audit_fd, AUDIT_SYSTEM_SHUTDOWN, "", "systemd-update-utmp", NULL, NULL, NULL, 1) < 0 &&
+                if (sym_audit_log_user_comm_message(c->audit_fd, AUDIT_SYSTEM_SHUTDOWN, "", "update-utmp", /* hostname= */ NULL, /* addr= */ NULL, /* tty= */ NULL, 1) < 0 &&
                     errno != EPERM)
                         q = log_error_errno(errno, "Failed to send audit message: %m");
 #endif
@@ -102,23 +112,25 @@ static int verb_on_shutdown(int argc, char *argv[], uintptr_t _data, void *userd
 }
 
 static int run(int argc, char *argv[]) {
-        static const Verb verbs[] = {
-                { "reboot",   1, 1, 0, verb_on_reboot   },
-                { "shutdown", 1, 1, 0, verb_on_shutdown },
-                {}
-        };
-
         _cleanup_(context_clear) Context c = {
                 .audit_fd = -EBADF,
         };
+        int r;
+
+        LIBAUDIT_NOTE(recommended);
 
         log_setup();
 
         umask(0022);
 
+        char **args = NULL;
+        r = common_parse_argv(argc, argv, &args);
+        if (r <= 0)
+                return r;
+
         c.audit_fd = open_audit_fd_or_warn();
 
-        return dispatch_verb(argc, argv, verbs, &c);
+        return dispatch_verb(args, &c);
 }
 
 DEFINE_MAIN_FUNCTION(run);

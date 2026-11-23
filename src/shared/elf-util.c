@@ -1,6 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #if HAVE_ELFUTILS
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBELF
+#  error "missing libelf_cflags in meson dependency."
+#endif
+
 #include <dwarf.h>
 #include <elfutils/libdwelf.h>
 #include <elfutils/libdwfl.h>
@@ -8,7 +12,6 @@
 #endif
 #include <unistd.h>
 
-#include "sd-dlopen.h"
 #include "sd-json.h"
 
 #include "alloc-util.h"
@@ -38,9 +41,6 @@
 
 #if HAVE_ELFUTILS
 
-static void *dw_dl = NULL;
-static void *elf_dl = NULL;
-
 /* libdw symbols */
 static DLSYM_PROTOTYPE(dwarf_attr_integrate) = NULL;
 static DLSYM_PROTOTYPE(dwarf_diename) = NULL;
@@ -56,9 +56,12 @@ static DLSYM_PROTOTYPE(dwfl_begin) = NULL;
 static DLSYM_PROTOTYPE(dwfl_build_id_find_elf) = NULL;
 static DLSYM_PROTOTYPE(dwfl_core_file_attach) = NULL;
 static DLSYM_PROTOTYPE(dwfl_core_file_report) = NULL;
-#if HAVE_DWFL_SET_SYSROOT
+/* New in elfutils 0.192. Always redeclare so DLSYM_PROTOTYPE's typeof() resolves on older headers; suppress
+ * the warning when newer libdw already declared it. */
+DISABLE_WARNING_REDUNDANT_DECLS;
+extern int dwfl_set_sysroot(Dwfl *dwfl, const char *sysroot); /* NOLINT(readability-redundant-declaration) */
+REENABLE_WARNING;
 static DLSYM_PROTOTYPE(dwfl_set_sysroot) = NULL;
-#endif
 static DLSYM_PROTOTYPE(dwfl_end) = NULL;
 static DLSYM_PROTOTYPE(dwfl_errmsg) = NULL;
 static DLSYM_PROTOTYPE(dwfl_errno) = NULL;
@@ -91,18 +94,15 @@ static DLSYM_PROTOTYPE(gelf_getnote) = NULL;
 
 #endif
 
-int dlopen_dw(void) {
+int dlopen_dw(int log_level) {
 #if HAVE_ELFUTILS
+        static void *dw_dl = NULL;
         int r;
 
-        SD_ELF_NOTE_DLOPEN(
-                        "dw",
-                        "Support for backtrace and ELF package metadata decoding from core files",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libdw.so.1");
+        LIBDW_NOTE(suggested);
 
         r = dlopen_many_sym_or_warn(
-                        &dw_dl, "libdw.so.1", LOG_DEBUG,
+                        &dw_dl, "libdw.so.1", log_level,
                         DLSYM_ARG(dwarf_getscopes),
                         DLSYM_ARG(dwarf_getscopes_die),
                         DLSYM_ARG(dwarf_tag),
@@ -121,9 +121,6 @@ int dlopen_dw(void) {
                         DLSYM_ARG(dwfl_module_getelf),
                         DLSYM_ARG(dwfl_begin),
                         DLSYM_ARG(dwfl_core_file_report),
-#if HAVE_DWFL_SET_SYSROOT
-                        DLSYM_ARG(dwfl_set_sysroot),
-#endif
                         DLSYM_ARG(dwfl_report_end),
                         DLSYM_ARG(dwfl_getmodules),
                         DLSYM_ARG(dwfl_core_file_attach),
@@ -139,24 +136,35 @@ int dlopen_dw(void) {
         if (r <= 0)
                 return r;
 
+        /* Optional symbol: present in libdw 0.192+. NULL pointer is fine; call sites check at use. */
+        DLSYM_OPTIONAL(dw_dl, dwfl_set_sysroot);
+
         return 1;
 #else
-        return -EOPNOTSUPP;
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libdw support is not compiled in.");
 #endif
 }
 
-int dlopen_elf(void) {
+bool dlopen_dw_has_dwfl_set_sysroot(void) {
 #if HAVE_ELFUTILS
+        if (dlopen_dw(LOG_DEBUG) < 0)
+                return false;
+        return sym_dwfl_set_sysroot;
+#else
+        return false;
+#endif
+}
+
+int dlopen_elf(int log_level) {
+#if HAVE_ELFUTILS
+        static void *elf_dl = NULL;
         int r;
 
-        SD_ELF_NOTE_DLOPEN(
-                        "elf",
-                        "Support for backtraces and reading ELF package metadata from core files",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libelf.so.1");
+        LIBELF_NOTE(suggested);
 
         r = dlopen_many_sym_or_warn(
-                        &elf_dl, "libelf.so.1", LOG_DEBUG,
+                        &elf_dl, "libelf.so.1", log_level,
                         DLSYM_ARG(elf_begin),
                         DLSYM_ARG(elf_end),
                         DLSYM_ARG(elf_getphdrnum),
@@ -173,7 +181,8 @@ int dlopen_elf(void) {
 
         return 1;
 #else
-        return -EOPNOTSUPP;
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libelf support is not compiled in.");
 #endif
 }
 
@@ -260,7 +269,7 @@ static int frame_callback(Dwfl_Frame *frame, void *userdata) {
                 if (!symbol)
                         symbol = sym_dwfl_module_addrname(module, pc_adjusted);
 
-                fname = sym_dwfl_module_info(module, NULL, &start, NULL, NULL, NULL, NULL, NULL);
+                fname = sym_dwfl_module_info(module, /* userdata= */ NULL, &start, /* end= */ NULL, /* dwbias= */ NULL, /* symbias= */ NULL, /* mainfile= */ NULL, /* debugfile= */ NULL);
                 module_offset = pc - start;
         }
 
@@ -425,7 +434,7 @@ static int parse_metadata(const char *name, sd_json_variant *id_json, Elf *elf, 
                                 payload = payload_0suffixed;
                         }
 
-                        r = sd_json_parse(payload, 0, &v, NULL, NULL);
+                        r = sd_json_parse(payload, /* flags= */ 0, &v, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
                         if (r < 0) {
                                 _cleanup_free_ char *esc = cescape(payload);
                                 return log_error_errno(r, "json_parse on \"%s\" failed: %m", strnull(esc));
@@ -541,7 +550,7 @@ static int module_callback(Dwfl_Module *mod, void **userdata, const char *name, 
          * We proceed in a best-effort fashion - not all ELF objects might contain both or either.
          * The build-id is easy, as libdwfl parses it during the sym_dwfl_core_file_report() call and
          * stores it separately in an internal library struct. */
-        r = parse_buildid(mod, NULL, name, c, &id_json);
+        r = parse_buildid(mod, /* elf= */ NULL, name, c, &id_json);
         if (r < 0)
                 return DWARF_CB_ABORT;
 
@@ -549,7 +558,7 @@ static int module_callback(Dwfl_Module *mod, void **userdata, const char *name, 
          * to the ELF object first. We might be lucky and just get it from elfutils. */
         elf = sym_dwfl_module_getelf(mod, &bias);
         if (elf) {
-                r = parse_metadata(name, id_json, elf, NULL, c);
+                r = parse_metadata(name, id_json, elf, /* ret_interpreter_found= */ NULL, c);
                 if (r < 0)
                         return DWARF_CB_ABORT;
                 if (r > 0)
@@ -605,7 +614,7 @@ static int module_callback(Dwfl_Module *mod, void **userdata, const char *name, 
                 if (!memelf)
                         continue;
 
-                r = parse_metadata(name, id_json, memelf, NULL, c);
+                r = parse_metadata(name, id_json, memelf, /* ret_interpreter_found= */ NULL, c);
                 if (r < 0)
                         return DWARF_CB_ABORT;
                 if (r > 0)
@@ -617,6 +626,7 @@ static int module_callback(Dwfl_Module *mod, void **userdata, const char *name, 
 
 static int parse_core(
                 int fd,
+                const char *executable,
                 const char *root,
                 char **ret,
                 sd_json_variant **ret_package_metadata,
@@ -657,21 +667,21 @@ static int parse_core(
 
         if (empty_or_root(root))
                 root = NULL;
-#if HAVE_DWFL_SET_SYSROOT
-        if (root && sym_dwfl_set_sysroot(c.dwfl, root) < 0)
-                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Could not set root directory, dwfl_set_sysroot() failed: %s", sym_dwfl_errmsg(sym_dwfl_errno()));
-#else
-        if (root)
-                log_warning("Compiled without dwfl_set_sysroot() support, ignoring provided root directory.");
-#endif
+        if (root) {
+                if (sym_dwfl_set_sysroot) {
+                        if (sym_dwfl_set_sysroot(c.dwfl, root) < 0)
+                                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Could not set root directory, dwfl_set_sysroot() failed: %s", sym_dwfl_errmsg(sym_dwfl_errno()));
+                } else
+                        log_warning("Loaded libdw does not support dwfl_set_sysroot(), ignoring provided root directory.");
+        }
 
-        if (sym_dwfl_core_file_report(c.dwfl, c.elf, NULL) < 0)
+        if (sym_dwfl_core_file_report(c.dwfl, c.elf, executable) < 0)
                 return log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Could not parse core file, dwfl_core_file_report() failed: %s", sym_dwfl_errmsg(sym_dwfl_errno()));
 
-        if (sym_dwfl_report_end(c.dwfl, NULL, NULL) != 0)
+        if (sym_dwfl_report_end(c.dwfl, /* removed= */ NULL, NULL) != 0)
                 return log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Could not parse core file, dwfl_report_end() failed: %s", sym_dwfl_errmsg(sym_dwfl_errno()));
 
-        if (sym_dwfl_getmodules(c.dwfl, &module_callback, &c, 0) < 0)
+        if (sym_dwfl_getmodules(c.dwfl, &module_callback, &c, /* offset= */ 0) < 0)
                 return log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Could not parse core file, dwfl_getmodules() failed: %s", sym_dwfl_errmsg(sym_dwfl_errno()));
 
         if (sym_dwfl_core_file_attach(c.dwfl, c.elf) < 0)
@@ -681,7 +691,7 @@ static int parse_core(
                 return log_warning_errno(SYNTHETIC_ERRNO(EINVAL), "Could not parse core file, dwfl_getthreads() failed: %s", sym_dwfl_errmsg(sym_dwfl_errno()));
 
         if (ret) {
-                r = memstream_finalize(&c.m, ret, NULL);
+                r = memstream_finalize(&c.m, ret, /* ret_size= */ NULL);
                 if (r < 0)
                         return log_warning_errno(r, "Could not parse core file, flushing file buffer failed: %m");
         }
@@ -732,7 +742,7 @@ static int parse_elf(
         if (elf_header.e_type == ET_CORE) {
                 _cleanup_free_ char *out = NULL;
 
-                r = parse_core(fd, root, ret ? &out : NULL, &package_metadata, &dlopen_metadata);
+                r = parse_core(fd, executable, root, ret ? &out : NULL, &package_metadata, &dlopen_metadata);
                 if (r < 0)
                         return log_warning_errno(r, "Failed to inspect core file: %m");
 
@@ -745,7 +755,7 @@ static int parse_elf(
                 const char *e = executable ?: "(unnamed)";
                 bool interpreter_found = false;
 
-                r = parse_buildid(NULL, c.elf, e, &c, &id_json);
+                r = parse_buildid(/* mod= */ NULL, c.elf, e, &c, &id_json);
                 if (r < 0)
                         return log_warning_errno(r, "Failed to parse build-id of ELF file: %m");
 
@@ -790,7 +800,7 @@ static int parse_elf(
                 return log_warning_errno(r, "Failed to merge JSON objects: %m");
 
         if (ret) {
-                r = memstream_finalize(&c.m, ret, NULL);
+                r = memstream_finalize(&c.m, ret, /* ret_size= */ NULL);
                 if (r < 0)
                         return log_warning_errno(r, "Could not parse ELF file, flushing file buffer failed: %m");
         }
@@ -824,11 +834,11 @@ int parse_elf_object(
 
         assert(fd >= 0);
 
-        r = dlopen_dw();
+        r = dlopen_dw(LOG_DEBUG);
         if (r < 0)
                 return r;
 
-        r = dlopen_elf();
+        r = dlopen_elf(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -936,7 +946,7 @@ int parse_elf_object(
                         if (!json_out)
                                 report_errno_and_exit(error_pipe[1], -errno);
 
-                        r = sd_json_variant_dump(package_metadata, SD_JSON_FORMAT_FLUSH, json_out, NULL);
+                        r = sd_json_variant_dump(package_metadata, SD_JSON_FORMAT_FLUSH, json_out, /* prefix= */ NULL);
                         if (r < 0)
                                 log_warning_errno(r, "Failed to write JSON package metadata, ignoring: %m");
                 }
@@ -952,7 +962,7 @@ int parse_elf_object(
                         if (!json_out)
                                 report_errno_and_exit(error_pipe[1], -errno);
 
-                        r = sd_json_variant_dump(dlopen_metadata, SD_JSON_FORMAT_FLUSH, json_out, NULL);
+                        r = sd_json_variant_dump(dlopen_metadata, SD_JSON_FORMAT_FLUSH, json_out, /* prefix= */ NULL);
                         if (r < 0)
                                 log_warning_errno(r, "Failed to write JSON package metadata, ignoring: %m");
                 }
@@ -972,31 +982,31 @@ int parse_elf_object(
                 if (!in)
                         return -errno;
 
-                r = read_full_stream(in, &buf, NULL);
+                r = read_full_stream(in, &buf, /* ret_size= */ NULL);
                 if (r < 0)
                         return r;
         }
 
         if (ret_package_metadata) {
-                _cleanup_fclose_ FILE *json_in = NULL;
-
-                json_in = take_fdopen(&package_metadata_pipe[0], "r");
-                if (!json_in)
-                        return -errno;
-
-                r = sd_json_parse_file(json_in, NULL, 0, &package_metadata, NULL, NULL);
+                r = sd_json_parse_fd(
+                                /* path= */ NULL,
+                                TAKE_FD(package_metadata_pipe[0]),
+                                SD_JSON_PARSE_DONATE_FD,
+                                &package_metadata,
+                                /* reterr_line= */ NULL,
+                                /* reterr_column= */ NULL);
                 if (r < 0 && r != -ENODATA) /* ENODATA: json was empty, so we got nothing, but that's ok */
                         log_warning_errno(r, "Failed to read or parse package metadata, ignoring: %m");
         }
 
         if (ret_dlopen_metadata) {
-                _cleanup_fclose_ FILE *json_in = NULL;
-
-                json_in = take_fdopen(&dlopen_metadata_pipe[0], "r");
-                if (!json_in)
-                        return -errno;
-
-                r = sd_json_parse_file(json_in, NULL, 0, &dlopen_metadata, NULL, NULL);
+                r = sd_json_parse_fd(
+                                /* path= */ NULL,
+                                TAKE_FD(dlopen_metadata_pipe[0]),
+                                SD_JSON_PARSE_DONATE_FD,
+                                &dlopen_metadata,
+                                /* reterr_line= */ NULL,
+                                /* reterr_column= */ NULL);
                 if (r < 0 && r != -ENODATA) /* ENODATA: json was empty, so we got nothing, but that's ok */
                         log_warning_errno(r, "Failed to read or parse dlopen metadata, ignoring: %m");
         }

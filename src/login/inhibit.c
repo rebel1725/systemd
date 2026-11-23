@@ -2,11 +2,12 @@
 
 #include <fcntl.h>
 #include <fnmatch.h>
-#include <getopt.h>
 #include <stdio.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
+#include "sd-event.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
@@ -14,6 +15,7 @@
 #include "bus-locator.h"
 #include "bus-util.h"
 #include "errno-util.h"
+#include "event-util.h"
 #include "fd-util.h"
 #include "format-table.h"
 #include "log.h"
@@ -22,7 +24,6 @@
 #include "parse-argument.h"
 #include "pidref.h"
 #include "polkit-agent.h"
-#include "pretty-print.h"
 #include "process-util.h"
 #include "runtime-scope.h"
 #include "signal-util.h"
@@ -30,11 +31,13 @@
 #include "strv.h"
 #include "terminal-util.h"
 #include "user-util.h"
+#include "verbs.h"
 
 static const char *arg_what = NULL;
 static const char *arg_who = NULL;
 static const char *arg_why = NULL;
 static const char *arg_mode = NULL;
+static int arg_signal = SIGNO_INVALID;
 static bool arg_ask_password = true;
 static PagerFlags arg_pager_flags = 0;
 static bool arg_legend = true;
@@ -44,6 +47,16 @@ static enum {
         ACTION_INHIBIT,
         ACTION_LIST
 } arg_action = ACTION_INHIBIT;
+
+COMMAND(
+        "systemd-inhibit\0",
+        "Execute a process while inhibiting shutdown/sleep/idle.",
+        .argspec =
+                "COMMAND…\0"
+                "--list\0",
+        .man_page = "systemd-inhibit(1)",
+        .pager_flags = &arg_pager_flags,
+);
 
 static int inhibit(sd_bus *bus, sd_bus_error *error) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
@@ -63,6 +76,81 @@ static int inhibit(sd_bus *bus, sd_bus_error *error) {
         return RET_NERRNO(fcntl(fd, F_DUPFD_CLOEXEC, 3));
 }
 
+typedef struct Context {
+        PidRef *child;      /* The command we are wrapping... */
+        const char *name;   /* ...and how to call it in log messages */
+} Context;
+
+static int on_prepare_for(sd_bus_message *message, void *userdata, sd_bus_error *ret_error) {
+        Context *c = ASSERT_PTR(userdata);
+        int b, r;
+
+        assert(message);
+        assert(pidref_is_set(c->child));
+
+        r = sd_bus_message_read(message, "b", &b);
+        if (r < 0) {
+                bus_log_parse_error(r);
+                return 0;
+        }
+        if (!b)
+                /* We are resuming, so nothing to do */
+                return 0;
+
+        const char *operation = streq_ptr(sd_bus_message_get_member(message), "PrepareForShutdown") ?
+                "go down" : "sleep";
+
+        log_info("Sending SIG%s to '%s', because the system is about to %s.",
+                 signal_to_string(arg_signal), c->name, operation);
+
+        r = pidref_kill(c->child, arg_signal);
+        if (r < 0)
+                log_warning_errno(r, "Failed to send SIG%s to '%s', ignoring: %m",
+                                  signal_to_string(arg_signal), c->name);
+
+        return 0;
+}
+
+static int subscribe_prepare_for(sd_bus *bus, const char *member, Context *context, sd_bus_slot **ret_slot) {
+        int r;
+
+        assert(bus);
+        assert(member);
+        assert(context);
+        assert(ret_slot);
+
+        r = bus_match_signal(bus, ret_slot, bus_login_mgr, member, on_prepare_for, context);
+        if (r < 0)
+                return log_error_errno(r, "Failed to subscribe to %s signal: %m", member);
+
+        return 0;
+}
+
+static int on_child_exit(sd_event_source *s, const siginfo_t *si, void *userdata) {
+        const char *name = ASSERT_PTR(userdata);
+        int ret;
+
+        assert(s);
+        assert(si);
+
+        if (si->si_code == CLD_EXITED) {
+                if (si->si_status != EXIT_SUCCESS)
+                        log_debug("'%s' failed with exit status %i.", name, si->si_status);
+                else
+                        log_debug("'%s' succeeded.", name);
+
+                ret = si->si_status;
+
+        } else if (IN_SET(si->si_code, CLD_KILLED, CLD_DUMPED))
+                ret = log_error_errno(SYNTHETIC_ERRNO(EPROTO),
+                                      "'%s' terminated by signal %s.", name, signal_to_string(si->si_status));
+        else
+                ret = log_error_errno(SYNTHETIC_ERRNO(EPROTO),
+                                      "'%s' failed due to unknown reason.", name);
+
+        return sd_event_exit(sd_event_source_get_event(s), ret);
+}
+
 static int print_inhibitors(sd_bus *bus) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
@@ -73,7 +161,7 @@ static int print_inhibitors(sd_bus *bus) {
 
         pager_open(arg_pager_flags);
 
-        r = bus_call_method(bus, bus_login_mgr, "ListInhibitors", &error, &reply, NULL);
+        r = bus_call_method(bus, bus_login_mgr, "ListInhibitors", &error, &reply, /* types= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Could not get active inhibitors: %s", bus_error_message(&error, r));
 
@@ -168,141 +256,95 @@ static int print_inhibitors(sd_bus *bus) {
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-inhibit", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] COMMAND ...\n"
-               "\n%sExecute a process while inhibiting shutdown/sleep/idle.%s\n\n"
-               "  -h --help               Show this help\n"
-               "     --version            Show package version\n"
-               "     --no-ask-password    Do not attempt interactive authorization\n"
-               "     --no-pager           Do not pipe output into a pager\n"
-               "     --no-legend          Do not show the headers and footers\n"
-               "     --json=pretty|short|off\n"
-               "                          Generate JSON output\n"
-               "     --what=WHAT          Operations to inhibit, colon separated list of:\n"
-               "                          shutdown, sleep, idle, handle-power-key,\n"
-               "                          handle-suspend-key, handle-hibernate-key,\n"
-               "                          handle-lid-switch\n"
-               "     --who=STRING         A descriptive string who is inhibiting\n"
-               "     --why=STRING         A descriptive string why is being inhibited\n"
-               "     --mode=MODE          One of block, block-weak, or delay\n"
-               "     --list               List active inhibitors\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               link);
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_WHAT,
-                ARG_WHO,
-                ARG_WHY,
-                ARG_MODE,
-                ARG_LIST,
-                ARG_NO_ASK_PASSWORD,
-                ARG_NO_PAGER,
-                ARG_NO_LEGEND,
-                ARG_JSON,
-        };
-
-        static const struct option options[] = {
-                { "help",             no_argument,       NULL, 'h'                 },
-                { "version",          no_argument,       NULL, ARG_VERSION         },
-                { "no-ask-password",  no_argument,       NULL, ARG_NO_ASK_PASSWORD },
-                { "what",             required_argument, NULL, ARG_WHAT            },
-                { "who",              required_argument, NULL, ARG_WHO             },
-                { "why",              required_argument, NULL, ARG_WHY             },
-                { "mode",             required_argument, NULL, ARG_MODE            },
-                { "list",             no_argument,       NULL, ARG_LIST            },
-                { "no-pager",         no_argument,       NULL, ARG_NO_PAGER        },
-                { "no-legend",        no_argument,       NULL, ARG_NO_LEGEND       },
-                { "json",             required_argument, NULL, ARG_JSON            },
-                {}
-        };
-
-        int c, r;
-
+static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         assert(argc >= 0);
         assert(argv);
+        assert(remaining_args);
 
-        /* Resetting to 0 forces the invocation of an internal initialization routine of getopt_long()
-         * that checks for GNU extensions in optstring ('-' or '+' at the beginning). */
-        optind = 0;
-        while ((c = getopt_long(argc, argv, "+h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv, OPTION_PARSER_STOP_AT_FIRST_NONOPTION };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_WHAT:
-                        arg_what = optarg;
-                        break;
-
-                case ARG_WHO:
-                        arg_who = optarg;
-                        break;
-
-                case ARG_WHY:
-                        arg_why = optarg;
-                        break;
-
-                case ARG_MODE:
-                        arg_mode = optarg;
-                        break;
-
-                case ARG_LIST:
-                        arg_action = ACTION_LIST;
-                        break;
-
-                case ARG_NO_ASK_PASSWORD:
+                OPTION_COMMON_NO_ASK_PASSWORD:
                         arg_ask_password = false;
                         break;
 
-                case ARG_NO_PAGER:
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case ARG_NO_LEGEND:
+                OPTION_COMMON_NO_LEGEND:
                         arg_legend = false;
                         break;
 
-                case ARG_JSON:
-                        r = parse_json_argument(optarg, &arg_json_format_flags);
+                OPTION_COMMON_JSON:
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
                         if (r <= 0)
                                 return r;
-
                         break;
 
-                case '?':
-                        return -EINVAL;
+                OPTION_LONG("what", "WHAT",
+                            "Operations to inhibit, colon separated list "
+                            "(shutdown, sleep, idle, handle-power-key, "
+                            "handle-suspend-key, handle-hibernate-key, "
+                            "handle-lid-switch)"):
+                        arg_what = opts.arg;
+                        break;
 
-                default:
-                        assert_not_reached();
+                OPTION_LONG("who", "STRING",
+                            "A descriptive string who is inhibiting"):
+                        arg_who = opts.arg;
+                        break;
+
+                OPTION_LONG("why", "STRING",
+                            "A descriptive string why is being inhibited"):
+                        arg_why = opts.arg;
+                        break;
+
+                OPTION_LONG("mode", "MODE", "One of block, block-weak, or delay"):
+                        arg_mode = opts.arg;
+                        break;
+
+                OPTION_LONG("signal", "SIGNAL",
+                            "Signal to send to the command once the delayed operation "
+                            "is about to be executed (requires --mode=delay)"):
+                        r = parse_signal_argument(opts.arg, &arg_signal);
+                        if (r <= 0)
+                                return r;
+                        break;
+
+                OPTION_LONG("list", NULL, "List active inhibitors"):
+                        arg_action = ACTION_LIST;
+                        break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
 
-        if (arg_action == ACTION_INHIBIT && optind == argc)
+        char **args = option_parser_get_args(&opts);
+
+        if (arg_action == ACTION_INHIBIT && strv_isempty(args))
                 arg_action = ACTION_LIST;
 
-        else if (arg_action == ACTION_INHIBIT && optind >= argc)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Missing command line to execute.");
+        if (SIGNAL_VALID(arg_signal)) {
+                if (arg_action != ACTION_INHIBIT)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--signal= requires a command to execute.");
 
+                if (!streq_ptr(arg_mode, "delay"))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "--signal= is only supported with --mode=delay.");
+        }
+
+        *remaining_args = args;
         return 1;
 }
 
@@ -312,7 +354,8 @@ static int run(int argc, char *argv[]) {
 
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
@@ -326,6 +369,7 @@ static int run(int argc, char *argv[]) {
                 return print_inhibitors(bus);
         else {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
+                _cleanup_(sd_event_unrefp) sd_event *event = NULL;
                 _cleanup_strv_free_ char **arguments = NULL;
                 _cleanup_free_ char *w = NULL;
                 _cleanup_close_ int fd = -EBADF;
@@ -333,11 +377,15 @@ static int run(int argc, char *argv[]) {
                 /* Ignore SIGINT and allow the forked process to receive it */
                 (void) ignore_signals(SIGINT);
 
+                if (!arg_mode)
+                        arg_mode = "block";
+
                 if (!arg_what)
-                        arg_what = "idle:sleep:shutdown";
+                        /* logind only accepts delay locks for sleep and shutdown. */
+                        arg_what = streq(arg_mode, "delay") ? "sleep:shutdown" : "idle:sleep:shutdown";
 
                 if (!arg_who) {
-                        w = strv_join(argv + optind, " ");
+                        w = strv_join(args, " ");
                         if (!w)
                                 return log_oom();
 
@@ -347,30 +395,68 @@ static int run(int argc, char *argv[]) {
                 if (!arg_why)
                         arg_why = "Unknown reason";
 
-                if (!arg_mode)
-                        arg_mode = "block";
+                _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+                Context context = {
+                        .child = &pidref,
+                        .name = args[0],
+                };
+                _cleanup_(sd_bus_slot_unrefp) sd_bus_slot *sleep_slot = NULL, *shutdown_slot = NULL;
+
+                r = default_signals(SIGCHLD);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to reset SIGCHLD: %m");
+
+                r = sd_event_new(&event);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to allocate event loop: %m");
+
+                if (SIGNAL_VALID(arg_signal)) {
+                        /* Should be before locking so that we cannot miss a notification race */
+                        if (string_contains_word(arg_what, ":", "sleep")) {
+                                r = subscribe_prepare_for(bus, "PrepareForSleep", &context, &sleep_slot);
+                                if (r < 0)
+                                        return r;
+                        }
+
+                        if (string_contains_word(arg_what, ":", "shutdown")) {
+                                r = subscribe_prepare_for(bus, "PrepareForShutdown", &context, &shutdown_slot);
+                                if (r < 0)
+                                        return r;
+                        }
+
+                        r = sd_bus_attach_event(bus, event, SD_EVENT_PRIORITY_NORMAL);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to attach bus to event loop: %m");
+                }
 
                 fd = inhibit(bus, &error);
                 if (fd < 0)
                         return log_error_errno(fd, "Failed to inhibit: %s", bus_error_message(&error, fd));
 
-                arguments = strv_copy(argv + optind);
+                arguments = strv_copy(args);
                 if (!arguments)
                         return log_oom();
 
-                _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
                 r = pidref_safe_fork("(inhibit)", FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_CLOSE_ALL_FDS|FORK_RLIMIT_NOFILE_SAFE|FORK_LOG, &pidref);
                 if (r < 0)
                         return r;
                 if (r == 0) {
                         /* Child */
-                        execvp(arguments[0], arguments);
+                        r = execvp_safe(arguments[0], arguments);
                         log_open();
-                        log_error_errno(errno, "Failed to execute '%s': %m", arguments[0]);
+                        log_error_errno(r, "Failed to execute '%s': %m", arguments[0]);
                         _exit(EXIT_FAILURE);
                 }
 
-                return pidref_wait_for_terminate_and_check(argv[optind], &pidref, WAIT_LOG_ABNORMAL);
+                _cleanup_(sd_event_source_disable_unrefp) sd_event_source *child_source = NULL;
+                r = event_add_child_pidref(event, &child_source, &pidref, WEXITED,
+                                           on_child_exit, args[0]);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to watch '%s': %m", args[0]);
+
+                /* on_child_exit() reports the exit status via sd_event_exit(), and has already logged about
+                 * anything abnormal, so just pass on whatever it left us with. */
+                return sd_event_loop(event);
         }
 }
 

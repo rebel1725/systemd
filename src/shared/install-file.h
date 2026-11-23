@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 
 typedef enum InstallFileFlags {
         INSTALL_REPLACE    = 1 << 0, /* Replace an existing inode */
@@ -15,4 +15,5 @@ typedef enum InstallFileFlags {
 int install_file(int source_atfd, const char *source_name, int target_atfd, const char *target_name, InstallFileFlags flags);
 
 usec_t parse_source_date_epoch(void);
+int source_date_epoch_seconds(char **ret);
 usec_t source_date_epoch_or_now(void);

@@ -4,8 +4,14 @@
 
 #include "bus-error.h"
 #include "bus-locator.h"
+#include "conf-files.h"
+#include "constants.h"
 #include "log.h"
 #include "login-util.h"
+#include "path-util.h"
+#include "set.h"
+#include "string-util.h"
+#include "strv.h"
 #include "sysupdate-util.h"
 
 int reboot_now(void) {
@@ -17,10 +23,126 @@ int reboot_now(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to open bus connection: %m");
 
-        r = bus_call_method(bus, bus_login_mgr, "RebootWithFlags", &error, NULL, "t",
+        r = bus_call_method(bus, bus_login_mgr, "RebootWithFlags", &error, /* ret_reply= */ NULL, "t",
                             (uint64_t) SD_LOGIND_ROOT_CHECK_INHIBITORS);
         if (r < 0)
                 return log_error_errno(r, "Failed to issue reboot request: %s", bus_error_message(&error, r));
 
+        return 0;
+}
+
+bool feature_name_valid(const char *c) {
+
+        if (!string_is_safe(c, STRING_FILENAME_PART))
+                return false;
+
+        /* Stack allocation is safe, since STRING_FILENAME_PART includes a length check */
+        const char *j = strjoina(c, ".feature.d");
+
+        return filename_is_valid(j);
+}
+
+bool component_name_valid(const char *c) {
+        /* See if the specified string enclosed in the directory prefix+suffix would be a valid file name */
+
+        if (!string_is_safe(c, STRING_FILENAME_PART))
+                return false;
+
+        if (endswith(c, ".component")) /* don't allow ambiguity around sysupdate.<foobar>.component.d/ */
+                return false;
+
+        /* Stack allocation is safe, since STRING_FILENAME_PART includes a length check */
+        const char *j = strjoina("sysupdate.", c, ".component.d");
+
+        return filename_is_valid(j);
+}
+
+static int add_component_name(ConfFile *e, const char *suffix, Set **names) {
+        int r;
+
+        assert(e);
+        assert(suffix);
+        assert(names);
+
+        const char *s = startswith(e->filename, "sysupdate.");
+        if (!s)
+                return 0;
+
+        const char *a = endswith(s, suffix);
+        if (!a)
+                return 0;
+
+        if (a == s)
+                return 0;
+
+        _cleanup_free_ char *n = strndup(s, a - s);
+        if (!n)
+                return log_oom();
+
+        if (!component_name_valid(n))
+                return 0;
+
+        r = set_ensure_consume(names, &string_hash_ops_free, TAKE_PTR(n));
+        if (r < 0 && r != -EEXIST)
+                return r;
+
+        return 0;
+}
+
+int get_component_list(const char *root, char ***ret) {
+        int r;
+
+        assert(ret);
+
+        ConfFile **directories = NULL;
+        size_t n_directories = 0;
+        CLEANUP_ARRAY(directories, n_directories, conf_file_free_array);
+
+        r = conf_files_list_strv_full(
+                        ".d",
+                        root,
+                        CONF_FILES_DIRECTORY|CONF_FILES_WARN,
+                        (const char * const *) CONF_PATHS_STRV(""),
+                        &directories,
+                        &n_directories);
+        if (r < 0)
+                return r;
+
+        /* A component is defined by a sysupdate.<name>.d/ directory or a sysupdate.<name>.component file */
+        ConfFile **files = NULL;
+        size_t n_files = 0;
+        CLEANUP_ARRAY(files, n_files, conf_file_free_array);
+
+        r = conf_files_list_strv_full(
+                        ".component",
+                        root,
+                        CONF_FILES_REGULAR|CONF_FILES_FILTER_MASKED|CONF_FILES_WARN,
+                        (const char * const *) CONF_PATHS_STRV(""),
+                        &files,
+                        &n_files);
+        if (r < 0)
+                return r;
+
+        _cleanup_set_free_ Set *names = NULL;
+
+        FOREACH_ARRAY(i, directories, n_directories) {
+                r = add_component_name(*i, ".d", &names);
+                if (r < 0)
+                        return r;
+        }
+
+        FOREACH_ARRAY(i, files, n_files) {
+                r = add_component_name(*i, ".component", &names);
+                if (r < 0)
+                        return r;
+        }
+
+        _cleanup_strv_free_ char **z = set_to_strv(&names);
+        if (!z)
+                return -ENOMEM;
+
+        strv_sort(z);
+
+        *ret = TAKE_PTR(z);
         return 0;
 }

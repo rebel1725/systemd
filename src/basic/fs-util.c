@@ -3,17 +3,18 @@
 #include <linux/falloc.h>
 #include <stdlib.h>
 #include <sys/file.h>
+#include <sys/mount.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "btrfs.h"
+#include "btrfs-util.h"
 #include "chattr-util.h"
 #include "dirent-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
 #include "hostname-util.h"
-#include "label.h"
+#include "label-util.h"
 #include "lock-util.h"
 #include "log.h"
 #include "mkdir.h"
@@ -47,7 +48,7 @@ int rmdir_parents(const char *path, const char *stop) {
                 char *slash = NULL;
 
                 /* skip the last component. */
-                r = path_find_last_component(p, /* accept_dot_dot= */ false, (const char **) &slash, NULL);
+                r = path_find_last_component(p, /* accept_dot_dot= */ false, (const char **) &slash, /* ret= */ NULL);
                 if (r <= 0)
                         return r;
                 if (slash == p)
@@ -190,16 +191,16 @@ int chmod_and_chown_at(int dir_fd, const char *path, mode_t mode, uid_t uid, gid
 
         if (path) {
                 /* Let's acquire an O_PATH fd, as precaution to change mode/owner on the same file */
-                fd = openat(dir_fd, path, O_PATH|O_CLOEXEC|O_NOFOLLOW);
+                fd = xopenat(dir_fd, path, O_PATH|O_NOFOLLOW);
                 if (fd < 0)
-                        return -errno;
+                        return fd;
                 dir_fd = fd;
 
         } else if (dir_fd == AT_FDCWD) {
                 /* Let's acquire an O_PATH fd of the current directory */
-                fd = openat(dir_fd, ".", O_PATH|O_CLOEXEC|O_NOFOLLOW|O_DIRECTORY);
+                fd = fd_reopen(dir_fd, O_PATH|O_DIRECTORY);
                 if (fd < 0)
-                        return -errno;
+                        return fd;
                 dir_fd = fd;
         }
 
@@ -402,16 +403,17 @@ int touch_file(const char *path, bool parents, usec_t stamp, uid_t uid, gid_t gi
         /* Initially, we try to open the node with O_PATH, so that we get a reference to the node. This is useful in
          * case the path refers to an existing device or socket node, as we can open it successfully in all cases, and
          * won't trigger any driver magic or so. */
-        fd = open(path, O_PATH|O_CLOEXEC|O_NOFOLLOW);
+        fd = xopenat(AT_FDCWD, path, O_PATH|O_NOFOLLOW);
         if (fd < 0) {
-                if (errno != ENOENT)
-                        return -errno;
+                if (fd != -ENOENT)
+                        return fd;
 
                 /* if the node doesn't exist yet, we create it, but with O_EXCL, so that we only create a regular file
                  * here, and nothing else */
-                fd = open(path, O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC, IN_SET(mode, 0, MODE_INVALID) ? 0644 : mode);
+                fd = xopenat_full(AT_FDCWD, path, O_WRONLY|O_CREAT|O_EXCL, /* xopen_flags= */ 0,
+                                  IN_SET(mode, 0, MODE_INVALID) ? 0644 : mode);
                 if (fd < 0)
-                        return -errno;
+                        return fd;
         }
 
         /* Let's make a path from the fd, and operate on that. With this logic, we can adjust the access mode,
@@ -423,7 +425,7 @@ int touch_file(const char *path, bool parents, usec_t stamp, uid_t uid, gid_t gi
 }
 
 int touch(const char *path) {
-        return touch_file(path, false, USEC_INFINITY, UID_INVALID, GID_INVALID, MODE_INVALID);
+        return touch_file(path, /* parents= */ false, USEC_INFINITY, UID_INVALID, GID_INVALID, MODE_INVALID);
 }
 
 int symlinkat_idempotent(const char *target, int atfd, const char *linkpath, bool make_relative) {
@@ -460,7 +462,7 @@ int symlinkat_idempotent(const char *target, int atfd, const char *linkpath, boo
         return 0;
 }
 
-int symlinkat_atomic_full(const char *target, int atfd, const char *linkpath, SymlinkFlags flags) {
+int symlinkat_atomic_full_label(const char *target, int atfd, const char *linkpath, SymlinkFlags flags, LabelContext *label_context) {
         int r;
 
         assert(target);
@@ -476,13 +478,13 @@ int symlinkat_atomic_full(const char *target, int atfd, const char *linkpath, Sy
         }
 
         _cleanup_free_ char *t = NULL;
-        r = tempfn_random(linkpath, NULL, &t);
+        r = tempfn_random(linkpath, /* extra= */ NULL, &t);
         if (r < 0)
                 return r;
 
         bool call_label_ops_post = false;
         if (FLAGS_SET(flags, SYMLINK_LABEL)) {
-                r = label_ops_pre(atfd, linkpath, S_IFLNK);
+                r = label_ops_pre(atfd, linkpath, S_IFLNK, label_context);
                 if (r < 0)
                         return r;
 
@@ -491,7 +493,7 @@ int symlinkat_atomic_full(const char *target, int atfd, const char *linkpath, Sy
 
         r = RET_NERRNO(symlinkat(target, atfd, t));
         if (call_label_ops_post)
-                RET_GATHER(r, label_ops_post(atfd, t, /* created= */ r >= 0));
+                RET_GATHER(r, label_ops_post(atfd, t, /* created= */ r >= 0, label_context));
         if (r < 0)
                 return r;
 
@@ -510,7 +512,7 @@ int mknodat_atomic(int atfd, const char *path, mode_t mode, dev_t dev) {
 
         assert(path);
 
-        r = tempfn_random(path, NULL, &t);
+        r = tempfn_random(path, /* extra= */ NULL, &t);
         if (r < 0)
                 return r;
 
@@ -533,7 +535,7 @@ int mkfifoat_atomic(int dir_fd, const char *path, mode_t mode) {
         assert(path);
 
         /* We're only interested in the (random) filename.  */
-        r = tempfn_random(path, NULL, &t);
+        r = tempfn_random(path, /* extra= */ NULL, &t);
         if (r < 0)
                 return r;
 
@@ -610,7 +612,7 @@ static int getenv_tmp_dir(const char **ret_path) {
                         goto next;
                 }
 
-                r = is_dir(e, true);
+                r = is_dir(e, /* follow= */ true);
                 if (r < 0)
                         goto next;
                 if (r == 0) {
@@ -736,18 +738,18 @@ int unlinkat_deallocate(int fd, const char *name, UnlinkDeallocateFlags flags) {
          * primary job – to delete the file – is accomplished. */
 
         if (!FLAGS_SET(flags, UNLINK_REMOVEDIR)) {
-                truncate_fd = openat(fd, name, O_WRONLY|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW|O_NONBLOCK);
+                truncate_fd = xopenat(fd, name, O_WRONLY|O_NOCTTY|O_NOFOLLOW|O_NONBLOCK);
                 if (truncate_fd < 0) {
 
                         /* If this failed because the file doesn't exist propagate the error right-away. Also,
                          * AT_REMOVEDIR wasn't set, and we tried to open the file for writing, which means EISDIR is
                          * returned when this is a directory but we are not supposed to delete those, hence propagate
                          * the error right-away too. */
-                        if (IN_SET(errno, ENOENT, EISDIR))
-                                return -errno;
+                        if (IN_SET(truncate_fd, -ENOENT, -EISDIR))
+                                return truncate_fd;
 
-                        if (errno != ELOOP) /* don't complain if this is a symlink */
-                                log_debug_errno(errno, "Failed to open file '%s' for deallocation, ignoring: %m", name);
+                        if (truncate_fd != -ELOOP) /* don't complain if this is a symlink */
+                                log_debug_errno(truncate_fd, "Failed to open file '%s' for deallocation, ignoring: %m", name);
                 }
         }
 
@@ -846,7 +848,7 @@ int open_parent_at(int dir_fd, const char *path, int flags, mode_t mode) {
         if (!FLAGS_SET(flags, O_TMPFILE))
                 flags |= O_DIRECTORY;
 
-        return RET_NERRNO(openat(dir_fd, parent, flags, mode));
+        return xopenat_full(dir_fd, parent, flags, /* xopen_flags= */ 0, mode);
 }
 
 int conservative_renameat(
@@ -863,11 +865,11 @@ int conservative_renameat(
          * too much. I.e. whenever we are in doubt, we rather rename than fail. After all reducing inotify
          * events is an optimization only, not more. */
 
-        old_fd = openat(olddirfd, oldpath, O_CLOEXEC|O_RDONLY|O_NOCTTY|O_NOFOLLOW);
+        old_fd = xopenat(olddirfd, oldpath, O_RDONLY|O_NOCTTY|O_NOFOLLOW);
         if (old_fd < 0)
                 goto do_rename;
 
-        new_fd = openat(newdirfd, newpath, O_CLOEXEC|O_RDONLY|O_NOCTTY|O_NOFOLLOW);
+        new_fd = xopenat(newdirfd, newpath, O_RDONLY|O_NOCTTY|O_NOFOLLOW);
         if (new_fd < 0)
                 goto do_rename;
 
@@ -992,7 +994,7 @@ int parse_cifs_service(
         if (!h)
                 return -ENOMEM;
 
-        if (!hostname_is_valid(h, 0))
+        if (!hostname_is_valid(h, /* flags= */ 0))
                 return -EINVAL;
 
         e++;
@@ -1034,7 +1036,7 @@ int parse_cifs_service(
         return 0;
 }
 
-int open_mkdir_at_full(int dirfd, const char *path, int flags, XOpenFlags xopen_flags, mode_t mode) {
+int open_mkdir_at_full_label(int dirfd, const char *path, int flags, XOpenFlags xopen_flags, mode_t mode, LabelContext *label_context) {
         _cleanup_close_ int fd = -EBADF, parent_fd = -EBADF;
         _cleanup_free_ char *fname = NULL, *parent = NULL;
         int r;
@@ -1048,8 +1050,8 @@ int open_mkdir_at_full(int dirfd, const char *path, int flags, XOpenFlags xopen_
         if ((flags & O_ACCMODE_STRICT) != O_RDONLY)
                 return -EINVAL;
 
-        /* Note that O_DIRECTORY|O_NOFOLLOW is implied, but we allow specifying it anyway. The following
-         * flags actually make sense to specify: O_CLOEXEC, O_EXCL, O_NOATIME, O_PATH */
+        /* Note that O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC is implied, but we allow specifying it anyway. The
+         * following flags actually make sense to specify: O_EXCL, O_NOATIME, O_PATH */
 
         /* If this is not a valid filename, it's a path. Let's open the parent directory then, so
          * that we can pin it, and operate below it. */
@@ -1062,15 +1064,15 @@ int open_mkdir_at_full(int dirfd, const char *path, int flags, XOpenFlags xopen_
                 if (r < 0)
                         return r;
 
-                parent_fd = openat(dirfd, parent, O_PATH|O_DIRECTORY|O_CLOEXEC);
+                parent_fd = xopenat(dirfd, parent, O_PATH|O_DIRECTORY);
                 if (parent_fd < 0)
-                        return -errno;
+                        return parent_fd;
 
                 dirfd = parent_fd;
                 path = fname;
         }
 
-        fd = xopenat_full(dirfd, path, flags|O_CREAT|O_DIRECTORY|O_NOFOLLOW, xopen_flags, mode);
+        fd = xopenat_full_label(dirfd, path, flags|O_CREAT|O_DIRECTORY|O_NOFOLLOW, xopen_flags, mode, label_context);
         if (IN_SET(fd, -ELOOP, -ENOTDIR))
                 return -EEXIST;
         if (fd < 0)
@@ -1079,8 +1081,11 @@ int open_mkdir_at_full(int dirfd, const char *path, int flags, XOpenFlags xopen_
         return TAKE_FD(fd);
 }
 
+/* openat_report_new() and xopenat_full_label() call open() and openat() directly. clang-tidy reports
+ * direct calls in all other code. */
+/* NOLINTBEGIN(bugprone-unsafe-functions) */
 int openat_report_new(int dirfd, const char *pathname, int flags, mode_t mode, bool *ret_newly_created) {
-        int fd;
+        int fd, r;
 
         /* Just like openat(), but adds one thing: optionally returns whether we created the file anew or if
          * it already existed before. This is only relevant if O_CREAT is set without O_EXCL, and thus will
@@ -1089,7 +1094,11 @@ int openat_report_new(int dirfd, const char *pathname, int flags, mode_t mode, b
          * Note that this routine is a bit more strict with symlinks than regular openat() is. If O_NOFOLLOW
          * is not specified, then we'll follow the symlink when opening an existing file but we will *not*
          * follow it when creating a new one (because that's a terrible UNIX misfeature and generally a
-         * security hole). */
+         * security hole), and report -ELOOP in that case.
+         *
+         * O_CLOEXEC is always set. */
+
+        flags |= O_CLOEXEC;
 
         if (!FLAGS_SET(flags, O_CREAT) || FLAGS_SET(flags, O_EXCL)) {
                 fd = openat(dirfd, pathname, flags, mode);
@@ -1102,18 +1111,8 @@ int openat_report_new(int dirfd, const char *pathname, int flags, mode_t mode, b
         }
 
         for (unsigned attempts = 7;;) {
-                /* First, attempt to open without O_CREAT/O_EXCL, i.e. open existing file */
-                fd = openat(dirfd, pathname, flags & ~(O_CREAT | O_EXCL), mode);
-                if (fd >= 0) {
-                        if (ret_newly_created)
-                                *ret_newly_created = false;
-                        return fd;
-                }
-                if (errno != ENOENT)
-                        return -errno;
-
-                /* So the file didn't exist yet, hence create it with O_CREAT/O_EXCL/O_NOFOLLOW. */
-                fd = openat(dirfd, pathname, flags | O_CREAT | O_EXCL | O_NOFOLLOW, mode);
+                /* First, attempt to create the file with O_EXCL/O_NOFOLLOW. */
+                fd = openat(dirfd, pathname, flags | O_EXCL | O_NOFOLLOW, mode);
                 if (fd >= 0) {
                         if (ret_newly_created)
                                 *ret_newly_created = true;
@@ -1122,23 +1121,123 @@ int openat_report_new(int dirfd, const char *pathname, int flags, mode_t mode, b
                 if (errno != EEXIST)
                         return -errno;
 
-                /* Hmm, so now we got EEXIST? Then someone might have created the file between the first and
-                 * second call to openat(). Let's try again but with a limit so we don't spin forever. */
+                /* So the file exists already. Open it with O_CREAT still set, as the kernel only applies
+                 * fs.protected_regular and fs.protected_fifos to O_CREAT opens, but follow a symlink only
+                 * without O_CREAT. */
+                fd = openat(dirfd, pathname, flags | O_NOFOLLOW, mode);
+                if (fd >= 0) {
+                        if (ret_newly_created) {
+                                /* Unless it went away in the meantime and we created it after all.
+                                 * F_CREATED_QUERY tells us since Linux 6.12, older kernels refuse it with
+                                 * EINVAL and we assume it still existed. */
+                                r = RET_NERRNO(fcntl(fd, F_CREATED_QUERY));
+                                if (r == -EINVAL || ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                                        r = false;
+                                else if (r < 0) {
+                                        safe_close(fd);
+                                        return r;
+                                }
+
+                                *ret_newly_created = r;
+                        }
+                        return fd;
+                }
+                if (errno == ELOOP && !FLAGS_SET(flags, O_NOFOLLOW)) {
+                        fd = openat(dirfd, pathname, flags & ~O_CREAT, mode);
+                        if (fd >= 0) {
+                                if (ret_newly_created)
+                                        *ret_newly_created = false;
+                                return fd;
+                        }
+                }
+                if (errno != ENOENT)
+                        return -errno;
+
+                /* If this is a dangling symlink don't needlessly retry. Just report it like O_NOFOLLOW would. */
+                r = is_symlink_at(dirfd, pathname);
+                if (r > 0)
+                        return -ELOOP;
+                if (r < 0 && r != -ENOENT)
+                        return r;
+
+                /* Hmm, so now we got ENOENT? Then someone might have removed the symlink in the meantime.
+                 * Let's try again but with a limit so we don't spin forever. */
 
                 if (--attempts == 0) /* Give up eventually, somebody is playing with us */
-                        return -EEXIST;
+                        return -ENOENT;
         }
 }
 
-int xopenat_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_flags, mode_t mode) {
+static int openat_with_automount(int dir_fd, const char *path, int open_flags, mode_t mode) {
+        /* When XO_TRIGGER_AUTOMOUNT is set we want to trigger automounts on the path. open() with O_PATH
+         * does not do that, so we use open_tree() without OPEN_TREE_CLONE which is equivalent to open() with
+         * O_PATH except that it does trigger automounts. Some sandboxes reject open_tree() with EPERM or
+         * ENOSYS, in which case we fall back to plain openat(): autofs wouldn't work inside a restricted
+         * mount namespace anyway. open_tree() only ever returns O_PATH fds, so this helper is for O_PATH
+         * acquisition only. */
+
+        static bool can_open_tree = true;
+
+        assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
+        assert(path);
+        assert(FLAGS_SET(open_flags, O_PATH));
+
+        if (can_open_tree) {
+                int fd = RET_NERRNO(open_tree(dir_fd, path,
+                                              OPEN_TREE_CLOEXEC |
+                                              (FLAGS_SET(open_flags, O_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0)));
+                if (fd >= 0) {
+                        /* open_tree() doesn't honor O_DIRECTORY, so enforce it ourselves to match
+                         * the openat() fallback's behavior. */
+                        if (FLAGS_SET(open_flags, O_DIRECTORY)) {
+                                int q = fd_verify_directory(fd);
+                                if (q < 0) {
+                                        safe_close(fd);
+                                        return q;
+                                }
+                        }
+
+                        return fd;
+                }
+                if (fd != -EPERM && !ERRNO_IS_NEG_NOT_SUPPORTED(fd))
+                        return fd;
+
+                can_open_tree = false;
+        }
+
+        return RET_NERRNO(openat(dir_fd, path, open_flags, mode));
+}
+
+int xopenat_full_label(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_flags, mode_t mode, LabelContext *label_context) {
         _cleanup_close_ int fd = -EBADF;
-        bool made_dir = false, made_file = false;
+        bool made_dir = false, made_file = false, dir_exists = false;
         int r;
 
-        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(dir_fd));
 
-        /* An inode cannot be both a directory and a regular file at the same time. */
-        assert(!(FLAGS_SET(open_flags, O_DIRECTORY) && FLAGS_SET(xopen_flags, XO_REGULAR)));
+        /* O_TMPFILE carries O_DIRECTORY, but names the parent and yields a regular file */
+        bool is_tmpfile = FLAGS_SET(open_flags, O_TMPFILE);
+        bool directory = FLAGS_SET(open_flags, O_DIRECTORY) && !is_tmpfile;
+
+        /* An inode can only be one of a directory, a regular file or a socket at the same time. */
+        assert(directory + FLAGS_SET(xopen_flags, XO_REGULAR) + FLAGS_SET(xopen_flags, XO_SOCKET) <= 1);
+        /* O_TMPFILE yields a nameless, regular, writable file: nothing to pin, verify, label or retry read-only */
+        assert(!is_tmpfile || !(open_flags & (O_PATH|O_CREAT)));
+        assert(!is_tmpfile || !(xopen_flags & (XO_LABEL|XO_SUBVOLUME|XO_REGULAR|XO_SOCKET)));
+        assert(!is_tmpfile || !(xopen_flags & (XO_TRIGGER_AUTOMOUNT|XO_AUTO_RW_RO)));
+        /* Sockets cannot be open()ed, only pinned via O_PATH. */
+        assert(!FLAGS_SET(xopen_flags, XO_SOCKET) || FLAGS_SET(open_flags, O_PATH));
+        /* XO_TRIGGER_AUTOMOUNT requires O_PATH and does not support creating inodes. XO_SUBVOLUME
+         * requires O_CREAT, and XO_COW/XO_NOCOW need a writable fd for their chattr ioctl, so none are
+         * compatible with XO_TRIGGER_AUTOMOUNT. */
+        assert(!FLAGS_SET(xopen_flags, XO_TRIGGER_AUTOMOUNT) ||
+               (FLAGS_SET(open_flags, O_PATH) && !FLAGS_SET(open_flags, O_CREAT)));
+        assert(!(FLAGS_SET(xopen_flags, XO_TRIGGER_AUTOMOUNT) && FLAGS_SET(xopen_flags, XO_SUBVOLUME)));
+        assert(!(FLAGS_SET(xopen_flags, XO_TRIGGER_AUTOMOUNT) && (xopen_flags & (XO_COW|XO_NOCOW))));
+        assert((xopen_flags & (XO_COW|XO_NOCOW)) != (XO_COW|XO_NOCOW));
+
+        /* Don't specify an access mode if you want auto mode. */
+        assert(!FLAGS_SET(xopen_flags, XO_AUTO_RW_RO) || (open_flags & O_ACCMODE_STRICT) == 0);
 
         /* This is like openat(), but has a few tricks up its sleeves, extending behaviour:
          *
@@ -1147,22 +1246,53 @@ int xopenat_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_
          *
          *   • If O_CREAT is used with XO_LABEL, any created file will be immediately relabelled.
          *
-         *   • If the path is specified NULL or empty, behaves like fd_reopen().
+         *   • If XO_EMPTY_PATH is specified and the path is NULL or empty, behaves like fd_reopen(), similar to
+         *     AT_EMPTY_PATH. Without the flag an empty path fails with -ENOENT, as for open(). Creating an inode
+         *     needs a name, O_CREAT and O_TMPFILE with an empty path fail with -ENOENT either way.
          *
-         *   • If XO_NOCOW is specified will turn on the NOCOW btrfs flag on the file, if available.
+         *   • If XO_COW or XO_NOCOW is specified will turn off or on the NOCOW btrfs flag on the file, if
+         *     available.
          *
          *   • if XO_REGULAR is specified will return an error if inode is not a regular file.
+         *
+         *   • if XO_SOCKET is specified will return an error if inode is not a socket.
+         *
+         *   • if XO_TRIGGER_AUTOMOUNT is specified O_PATH fds will trigger automounts.
          *
          *   • If mode is specified as MODE_INVALID, we'll use 0755 for dirs, and 0644 for regular files.
          *
          *   • The dir fd can be passed as XAT_FDROOT, in which case any relative paths will be taken relative to the root fs.
+         *
+         *   • If XO_AUTO_RW_RO is specified and the file cannot be opened in O_RDWR mode due to EACCES/EROFS or similar, retry in O_RDONLY mode.
+         *
+         *   • O_CLOEXEC is always set, use fd_cloexec() on the result to turn it off.
+         *
+         *   • O_TMPFILE is supported, the path then refers to the directory to create the anonymous file in.
          */
 
+        open_flags |= O_CLOEXEC;
+
         if (mode == MODE_INVALID)
-                mode = (open_flags & O_DIRECTORY) ? 0755 : 0644;
+                mode = directory ? 0755 : 0644;
+
+        if (FLAGS_SET(xopen_flags, XO_AUTO_RW_RO)) {
+                if (directory) {
+                        /* Directories can only be opened in read-only mode */
+                        xopen_flags &= ~XO_AUTO_RW_RO;
+                        open_flags |= O_RDONLY;
+                } else if (open_flags & O_PATH)
+                        /* O_PATH is incompatible with O_RDONLY/O_RDWR → fail */
+                        return -EINVAL;
+        }
 
         if (isempty(path)) {
-                assert(!FLAGS_SET(open_flags, O_CREAT|O_EXCL));
+                if (!FLAGS_SET(xopen_flags, XO_EMPTY_PATH)) /* No name to open, as for open("") */
+                        return -ENOENT;
+
+                if (FLAGS_SET(open_flags, O_CREAT) || is_tmpfile) /* Creating an inode needs a name */
+                        return -ENOENT;
+
+                open_flags &= ~O_NOFOLLOW;
 
                 if (FLAGS_SET(xopen_flags, XO_REGULAR)) {
                         r = fd_verify_regular(dir_fd);
@@ -1170,7 +1300,22 @@ int xopenat_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_
                                 return r;
                 }
 
-                return fd_reopen(dir_fd, open_flags & ~O_NOFOLLOW);
+                if (FLAGS_SET(xopen_flags, XO_SOCKET)) {
+                        r = fd_verify_socket(dir_fd);
+                        if (r < 0)
+                                return r;
+                }
+
+                if (FLAGS_SET(xopen_flags, XO_AUTO_RW_RO)) {
+                        /* First try: in r/w mode */
+                        fd = fd_reopen(dir_fd, open_flags|O_RDWR);
+                        if (!ERRNO_IS_NEG_FS_WRITE_REFUSED(fd) && fd != -EISDIR)
+                                return TAKE_FD(fd);
+
+                        open_flags |= O_RDONLY;
+                }
+
+                return fd_reopen(dir_fd, open_flags);
         }
 
         _cleanup_close_ int _dir_fd = -EBADF;
@@ -1189,23 +1334,25 @@ int xopenat_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_
         bool call_label_ops_post = false;
 
         if (FLAGS_SET(open_flags, O_CREAT) && FLAGS_SET(xopen_flags, XO_LABEL)) {
-                r = label_ops_pre(dir_fd, path, FLAGS_SET(open_flags, O_DIRECTORY) ? S_IFDIR : S_IFREG);
+                r = label_ops_pre(dir_fd, path, directory ? S_IFDIR : S_IFREG, label_context);
                 if (r < 0)
                         return r;
 
                 call_label_ops_post = true;
         }
 
-        if (FLAGS_SET(open_flags, O_DIRECTORY|O_CREAT)) {
+        if (directory && FLAGS_SET(open_flags, O_CREAT)) {
                 if (FLAGS_SET(xopen_flags, XO_SUBVOLUME))
                         r = btrfs_subvol_make_fallback(dir_fd, path, mode);
                 else
                         r = RET_NERRNO(mkdirat(dir_fd, path, mode));
                 if (r == -EEXIST) {
                         if (FLAGS_SET(open_flags, O_EXCL))
-                                return -EEXIST;
+                                goto error;
+
+                        dir_exists = true;
                 } else if (r < 0)
-                        return r;
+                        goto error;
                 else
                         made_dir = true;
 
@@ -1217,9 +1364,11 @@ int xopenat_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_
                  * first */
 
                 if (FLAGS_SET(open_flags, O_PATH)) {
-                        fd = openat(dir_fd, path, open_flags, mode);
+                        fd = FLAGS_SET(xopen_flags, XO_TRIGGER_AUTOMOUNT) ?
+                                openat_with_automount(dir_fd, path, open_flags, mode) :
+                                RET_NERRNO(openat(dir_fd, path, open_flags, mode));
                         if (fd < 0) {
-                                r = -errno;
+                                r = fd;
                                 goto error;
                         }
 
@@ -1229,10 +1378,23 @@ int xopenat_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_
 
                 } else if (FLAGS_SET(open_flags, O_CREAT|O_EXCL)) {
                         /* In O_EXCL mode we can just create the thing, everything is dealt with for us */
-                        fd = openat(dir_fd, path, open_flags, mode);
+
+                        if (FLAGS_SET(xopen_flags, XO_AUTO_RW_RO)) {
+                                fd = RET_NERRNO(openat(dir_fd, path, open_flags|O_RDWR, mode));
+                                if (ERRNO_IS_NEG_FS_WRITE_REFUSED(fd))
+                                        open_flags |= O_RDONLY;
+                                else if (fd < 0) {
+                                        r = fd;
+                                        goto error;
+                                }
+                        }
+
                         if (fd < 0) {
-                                r = -errno;
-                                goto error;
+                                fd = openat(dir_fd, path, open_flags, mode);
+                                if (fd < 0) {
+                                        r = -errno;
+                                        goto error;
+                                }
                         }
 
                         made_file = true;
@@ -1245,11 +1407,34 @@ int xopenat_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_
                                         goto error;
                                 }
 
-                                /* Doesn't exist yet, then try to create it */
-                                fd = openat(dir_fd, path, open_flags|O_CREAT|O_EXCL, mode);
-                                if (fd < 0) {
-                                        r = -errno;
+                                /* Don't create through a dangling symlink, report it like openat_report_new() */
+                                r = is_symlink_at(dir_fd, path);
+                                if (r < 0 && r != -ENOENT)
                                         goto error;
+                                if (r > 0) {
+                                        r = -ELOOP;
+                                        goto error;
+                                }
+
+                                /* Doesn't exist yet, then try to create it */
+                                open_flags |= O_EXCL;
+
+                                if (FLAGS_SET(xopen_flags, XO_AUTO_RW_RO)) {
+                                        fd = RET_NERRNO(openat(dir_fd, path, open_flags|O_RDWR, mode));
+                                        if (ERRNO_IS_NEG_FS_WRITE_REFUSED(fd))
+                                                open_flags |= O_RDONLY;
+                                        else if (fd < 0) {
+                                                r = fd;
+                                                goto error;
+                                        }
+                                }
+
+                                if (fd < 0) {
+                                        fd = openat(dir_fd, path, open_flags, mode);
+                                        if (fd < 0) {
+                                                r = -errno;
+                                                goto error;
+                                        }
                                 }
 
                                 made_file = true;
@@ -1259,31 +1444,81 @@ int xopenat_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_
                                 if (r < 0)
                                         goto error;
 
-                                fd = fd_reopen(inode_fd, open_flags & ~(O_NOFOLLOW|O_CREAT));
+                                open_flags &= ~(O_NOFOLLOW|O_CREAT);
+
+                                if (FLAGS_SET(xopen_flags, XO_AUTO_RW_RO)) {
+                                        fd = fd_reopen(inode_fd, open_flags|O_RDWR);
+                                        if (ERRNO_IS_NEG_FS_WRITE_REFUSED(fd))
+                                                open_flags |= O_RDONLY;
+                                        else if (fd < 0) {
+                                                r = fd;
+                                                goto error;
+                                        }
+                                }
+
                                 if (fd < 0) {
-                                        r = fd;
-                                        goto error;
+                                        fd = fd_reopen(inode_fd, open_flags);
+                                        if (fd < 0) {
+                                                r = fd;
+                                                goto error;
+                                        }
                                 }
                         }
                 }
-        } else {
-                fd = openat_report_new(dir_fd, path, open_flags, mode, &made_file);
+        } else if (FLAGS_SET(xopen_flags, XO_TRIGGER_AUTOMOUNT)) {
+                fd = openat_with_automount(dir_fd, path, open_flags, mode);
                 if (fd < 0) {
                         r = fd;
                         goto error;
                 }
+        } else {
+                /* XO_SOCKET also lands here: it requires O_PATH (see asserts above) so openat() pins
+                 * the inode without connecting, and fd_verify_socket() below enforces the type. */
+                if (FLAGS_SET(xopen_flags, XO_AUTO_RW_RO)) {
+                        fd = openat_report_new(dir_fd, path, O_RDWR|open_flags, mode, &made_file);
+                        if (ERRNO_IS_NEG_FS_WRITE_REFUSED(fd) || fd == -EISDIR)
+                                open_flags |= O_RDONLY;
+                        else if (fd < 0) {
+                                r = fd;
+                                goto error;
+                        }
+                }
+
+                if (fd < 0) {
+                        fd = openat_report_new(dir_fd, path, open_flags, mode, &made_file);
+                        if (fd < 0) {
+                                r = fd;
+
+                                /* Report a dangling symlink in the way of mkdirat() like O_NOFOLLOW would */
+                                if (r == -ENOENT && dir_exists) {
+                                        int q = is_symlink_at(dir_fd, path);
+                                        if (q > 0)
+                                                r = -ELOOP;
+                                        else if (q < 0 && q != -ENOENT)
+                                                r = q;
+                                }
+
+                                goto error;
+                        }
+                }
+        }
+
+        if (FLAGS_SET(xopen_flags, XO_SOCKET)) {
+                r = fd_verify_socket(fd);
+                if (r < 0)
+                        goto error;
         }
 
         if (call_label_ops_post) {
                 call_label_ops_post = false;
 
-                r = label_ops_post(fd, /* path= */ NULL, made_file || made_dir);
+                r = label_ops_post(fd, /* path= */ NULL, made_file || made_dir, label_context);
                 if (r < 0)
                         goto error;
         }
 
-        if (FLAGS_SET(xopen_flags, XO_NOCOW)) {
-                r = chattr_fd(fd, FS_NOCOW_FL, FS_NOCOW_FL);
+        if (xopen_flags & (XO_COW|XO_NOCOW)) {
+                r = chattr_fd(fd, FLAGS_SET(xopen_flags, XO_NOCOW) ? FS_NOCOW_FL : 0, FS_NOCOW_FL);
                 if (r < 0 && !ERRNO_IS_IOCTL_NOT_SUPPORTED(r))
                         goto error;
         }
@@ -1292,28 +1527,32 @@ int xopenat_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_
 
 error:
         if (call_label_ops_post)
-                (void) label_ops_post(fd >= 0 ? fd : dir_fd, fd >= 0 ? NULL : path, made_dir || made_file);
+                (void) label_ops_post(fd >= 0 ? fd : dir_fd, fd >= 0 ? NULL : path, made_dir || made_file, label_context);
 
         if (made_dir || made_file)
                 (void) unlinkat(dir_fd, path, made_dir ? AT_REMOVEDIR : 0);
 
         return r;
 }
+/* NOLINTEND(bugprone-unsafe-functions) */
 
-int xopenat_lock_full(
+int xopenat_lock_full_label(
                 int dir_fd,
                 const char *path,
                 int open_flags,
                 XOpenFlags xopen_flags,
                 mode_t mode,
                 LockType locktype,
-                int operation) {
+                int operation,
+                LabelContext *label_context) {
 
         _cleanup_close_ int fd = -EBADF;
         int r;
 
         assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
         assert(IN_SET(operation & ~LOCK_NB, LOCK_EX, LOCK_SH));
+        /* An O_TMPFILE file never gets linked, the loop below would wait for that forever */
+        assert(!FLAGS_SET(open_flags, O_TMPFILE));
 
         /* POSIX/UNPOSIX locks don't work on directories (errno is set to -EBADF so let's return early with
          * the same error here). */
@@ -1323,7 +1562,7 @@ int xopenat_lock_full(
         for (;;) {
                 struct stat st;
 
-                fd = xopenat_full(dir_fd, path, open_flags, xopen_flags, mode);
+                fd = xopenat_full_label(dir_fd, path, open_flags, xopen_flags, mode, label_context);
                 if (fd < 0)
                         return fd;
 
@@ -1398,7 +1637,7 @@ int linkat_replace(int olddirfd, const char *oldpath, int newdirfd, const char *
         if (r != -EEXIST)
                 return r;
 
-        old_fd = xopenat(olddirfd, oldpath, O_PATH|O_CLOEXEC);
+        old_fd = xopenat_full(olddirfd, oldpath, O_PATH, XO_EMPTY_PATH, MODE_INVALID); /* oldpath may be NULL */
         if (old_fd < 0)
                 return old_fd;
 

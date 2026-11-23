@@ -24,10 +24,10 @@ void sync_req_varlink_reply(SyncReq *req) {
 
         /* Disconnect the SyncReq from the Varlink connection object, and free it */
         _cleanup_(sd_varlink_unrefp) sd_varlink *vl = TAKE_PTR(req->link);
-        sd_varlink_set_userdata(vl, req->manager); /* reinstall manager object */
+        sd_varlink_set_userdata(vl, /* userdata= */ NULL);
         req = sync_req_free(req);
 
-        r = sd_varlink_reply(vl, NULL);
+        r = sd_varlink_reply(vl, /* parameters= */ NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to reply to Synchronize() client, ignoring: %m");
 }
@@ -40,10 +40,15 @@ static int vl_method_synchronize(sd_varlink *link, sd_json_variant *parameters, 
                 {}
         };
 
-        Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(link);
+
+        Manager *m = ASSERT_PTR(sd_varlink_server_get_userdata(sd_varlink_get_server(link)));
+
+        /* The varlink connection already requested to sync journals. Refusing. */
+        if (sd_varlink_get_userdata(link))
+                return -EBUSY;
 
         r = sd_varlink_dispatch(link, parameters, dispatch_table, &offline);
         if (r != 0)
@@ -81,10 +86,11 @@ static int vl_method_synchronize(sd_varlink *link, sd_json_variant *parameters, 
 }
 
 static int vl_method_rotate(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
-        Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(link);
+
+        Manager *m = ASSERT_PTR(sd_varlink_server_get_userdata(sd_varlink_get_server(link)));
 
         r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
         if (r != 0)
@@ -98,14 +104,15 @@ static int vl_method_rotate(sd_varlink *link, sd_json_variant *parameters, sd_va
         manager_full_rotate(m);
         log_debug("Client request to rotate journal completed.");
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_flush_to_var(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
-        Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(link);
+
+        Manager *m = ASSERT_PTR(sd_varlink_server_get_userdata(sd_varlink_get_server(link)));
 
         r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
         if (r != 0)
@@ -116,20 +123,21 @@ static int vl_method_flush_to_var(sd_varlink *link, sd_json_variant *parameters,
                 return r;
 
         if (m->namespace)
-                return sd_varlink_error(link, "io.systemd.Journal.NotSupportedByNamespaces", NULL);
+                return sd_varlink_error(link, "io.systemd.Journal.NotSupportedByNamespaces", /* parameters= */ NULL);
 
         log_info("Received client request to flush runtime journal.");
         manager_full_flush(m);
         log_debug("Client request to flush runtime journal completed.");
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_relinquish_var(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
-        Manager *m = ASSERT_PTR(userdata);
         int r;
 
         assert(link);
+
+        Manager *m = ASSERT_PTR(sd_varlink_server_get_userdata(sd_varlink_get_server(link)));
 
         r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
         if (r != 0)
@@ -140,13 +148,13 @@ static int vl_method_relinquish_var(sd_varlink *link, sd_json_variant *parameter
                 return r;
 
         if (m->namespace)
-                return sd_varlink_error(link, "io.systemd.Journal.NotSupportedByNamespaces", NULL);
+                return sd_varlink_error(link, "io.systemd.Journal.NotSupportedByNamespaces", /* parameters= */ NULL);
 
         log_info("Received client request to relinquish %s access.", m->system_storage.path);
         manager_relinquish_var(m);
         log_debug("Client request to relinquish %s access completed.", m->system_storage.path);
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_connect(sd_varlink_server *server, sd_varlink *link, void *userdata) {
@@ -166,14 +174,7 @@ static void vl_disconnect(sd_varlink_server *server, sd_varlink *link, void *use
         assert(server);
         assert(link);
 
-        void *u = sd_varlink_get_userdata(link);
-        if (u != m) {
-                /* If this is a Varlink connection that does not have the Server object as userdata, then it has a SyncReq object instead. Let's finish it. */
-
-                SyncReq *req = u;
-                sd_varlink_set_userdata(link, m); /* reinstall server object */
-                sync_req_free(req);
-        }
+        sync_req_free(sd_varlink_set_userdata(link, /* userdata= */ NULL));
 
         (void) manager_start_or_stop_idle_timer(m); /* maybe we are idle now */
 }
@@ -185,7 +186,7 @@ int manager_open_varlink(Manager *m, const char *socket, int fd) {
 
         r = varlink_server_new(
                         &m->varlink_server,
-                        SD_VARLINK_SERVER_ACCOUNT_UID|SD_VARLINK_SERVER_INHERIT_USERDATA,
+                        SD_VARLINK_SERVER_ACCOUNT_UID,
                         m);
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate varlink server object: %m");
@@ -205,6 +206,7 @@ int manager_open_varlink(Manager *m, const char *socket, int fd) {
                         "io.systemd.Journal.RelinquishVar",  vl_method_relinquish_var,
                         "io.systemd.service.Ping",           varlink_method_ping,
                         "io.systemd.service.SetLogLevel",    varlink_method_set_log_level,
+                        "io.systemd.service.GetLogLevel",    varlink_method_get_log_level,
                         "io.systemd.service.GetEnvironment", varlink_method_get_environment);
         if (r < 0)
                 return r;

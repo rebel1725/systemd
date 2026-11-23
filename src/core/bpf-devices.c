@@ -16,6 +16,7 @@
 #include "nulstr-util.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "stat-util.h"
 #include "string-util.h"
 
 #define PASS_JUMP_OFF 4096
@@ -246,7 +247,7 @@ int bpf_devices_apply_policy(
                                        empty_to_root(cgroup_path));
 
  finish:
-        /* Unref the old BPF program (which will implicitly detach it) right before attaching the new program. */
+        /* Unref the old BPF program (which will implicitly detach it) right after attaching the new program. */
         if (prog_installed) {
                 bpf_program_free(*prog_installed);
                 *prog_installed = TAKE_PTR(*prog);
@@ -308,8 +309,9 @@ int bpf_devices_allow_list_device(
                         return log_warning_errno(errno, "Couldn't stat device %s: %m", node);
                 }
 
-                if (!S_ISCHR(st.st_mode) && !S_ISBLK(st.st_mode))
-                        return log_warning_errno(SYNTHETIC_ERRNO(ENODEV), "%s is not a device.", node);
+                r = stat_verify_device_node(&st);
+                if (r < 0)
+                        return log_warning_errno(r, "'%s' is not a device node.", node);
 
                 mode = st.st_mode;
                 rdev = (dev_t) st.st_rdev;

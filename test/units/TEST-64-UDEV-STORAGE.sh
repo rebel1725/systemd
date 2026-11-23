@@ -7,7 +7,7 @@ set -o pipefail
 
 # Check if all symlinks under /dev/disk/ are valid
 # shellcheck disable=SC2120
-helper_check_device_symlinks() {(
+helper_check_device_symlinks() (
     set +x
 
     local dev link path paths target
@@ -38,9 +38,9 @@ helper_check_device_symlinks() {(
             return 1
         fi
     done < <(find "${paths[@]}" -type l)
-)}
+)
 
-helper_check_udev_watch() {(
+helper_check_udev_watch() (
     set +x
 
     local link target id dev
@@ -78,9 +78,9 @@ helper_check_udev_watch() {(
             return 1
         fi
     done < <(find /run/udev/watch -type l)
-)}
+)
 
-check_device_unit() {(
+check_device_unit() (
     set +x
 
     local log_level link links path syspath unit
@@ -126,9 +126,9 @@ check_device_unit() {(
 
     [[ "$log_level" == 1 ]] && echo >&2 "ERROR: $unit exists for $syspath but it does not have the corresponding DEVLINKS or SYSTEMD_ALIAS."
     return 1
-)}
+)
 
-check_device_units() {(
+check_device_units() (
     set +x
 
     local log_level path paths unit units
@@ -152,9 +152,9 @@ check_device_units() {(
     done
 
     return 0
-)}
+)
 
-helper_check_device_units() {(
+helper_check_device_units() (
     set +x
 
     local i
@@ -167,18 +167,86 @@ helper_check_device_units() {(
     done
 
     check_device_units 1 "$@"
-)}
+)
 
 testcase_virtio_scsi_basic() {
     lsblk -S
     [[ "$(lsblk --scsi --noheadings | wc -l)" -ge 128 ]]
 }
 
+diskhealth_available() {
+    # systemd-report is optional
+    systemctl cat systemd-report-diskhealth.socket >/dev/null
+}
+
+diskhealth_list() {
+    # Called in command substitution ("$(diskhealth_list)"), where errexit is not inherited
+    # (no inherit_errexit), so re-enable it to make a failing socket start abort instead of
+    # falling through to varlinkctl.
+    set -e
+
+    systemctl start systemd-report-diskhealth.socket
+    varlinkctl call --more --graceful=io.systemd.Metrics.NoSuchMetric /run/systemd/report/io.systemd.DiskHealth io.systemd.Metrics.List {}
+}
+
+diskhealth_value() {
+    local metrics="${1:?}" metric="${2:?}" object="${3:?}"
+
+    echo "$metrics" | jq --seq -r --arg n "io.systemd.DiskHealth.$metric" --arg o "$object" 'select(.name == $n and .object == $o) | .value | tostring'
+}
+
+write_block_hwdb() {
+    mkdir -p /etc/udev/hwdb.d
+    printf 'block::name:QEMU NVMe Ctrl:*\n %s\n' "$@" >/etc/udev/hwdb.d/99-test-block.hwdb
+    systemd-hwdb update
+    # udevd checks for a new hwdb.bin at most every 3 seconds. Without a reload, the next event can still use
+    # the old hwdb.
+    udevadm control --reload
+}
+
+check_block_io_timeout() {
+    local disk original timeout
+
+    disk="$(readlink -f /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_deadbeef0)"
+    timeout="/sys/class/block/${disk##*/}/queue/io_timeout"
+    original="$(<"$timeout")"
+
+    # The kernel stores the timeout in jiffies and converts it back to milliseconds when io_timeout is read.
+    # 60000 ms and 45000 ms are a whole number of jiffies for every HZ value, so io_timeout reads back 60000
+    # and 45000 exactly.
+    write_block_hwdb ID_BLOCK_IO_TIMEOUT_MS=60000
+    udevadm trigger --settle --action=add "$disk"
+    [[ "$(<"$timeout")" == 60000 ]]
+
+    # 61-block-hwdb.rules only writes the timeout on add events, so a change event keeps the value that was
+    # set at runtime.
+    echo 45000 >"$timeout"
+    udevadm trigger --settle --action=change "$disk"
+    [[ "$(<"$timeout")" == 45000 ]]
+
+    # The kernel converts 4294967295 ms to its largest timeout. The value that io_timeout reads back depends
+    # on HZ, but it is always larger than 60000.
+    write_block_hwdb ID_BLOCK_IO_TIMEOUT_MS=max
+    udevadm trigger --settle --action=add "$disk"
+    (( $(<"$timeout") > 60000 ))
+
+    # 90-iocost.rules uses the IOCOST_SOLUTIONS property that 61-block-hwdb.rules imports from the hwdb.
+    # udevadm test doesn't run "iocost apply", which would fail for a solution that doesn't exist.
+    write_block_hwdb IOCOST_SOLUTIONS=test
+    udevadm test --action=add --json=short "/sys/class/block/${disk##*/}" 2>/dev/null |
+        jq -r '.queuedCommands[].command' | grep "^iocost apply $disk\$" >/dev/null
+
+    rm /etc/udev/hwdb.d/99-test-block.hwdb
+    systemd-hwdb update
+    udevadm control --reload
+    echo "$original" >"$timeout"
+}
+
 testcase_nvme_basic() {
     local expected_symlinks=()
-    local i
+    local i metrics name metric
 
-    for i in {0..4}; do
+    for i in {0..2}; do
         expected_symlinks+=(
             # both replace mode provides the same devlink
             /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_deadbeef"$i"
@@ -186,7 +254,7 @@ testcase_nvme_basic() {
             /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_deadbeef"$i"_1
         )
     done
-    for i in {5..9}; do
+    for i in {3..5}; do
         expected_symlinks+=(
             # old replace mode
             /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl__deadbeef_"$i"
@@ -196,7 +264,7 @@ testcase_nvme_basic() {
             /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_____deadbeef__"$i"_1
         )
     done
-    for i in {10..14}; do
+    for i in {6..8}; do
         expected_symlinks+=(
             # old replace mode does not provide devlink, as serial contains "/"
             # newer replace mode
@@ -205,7 +273,7 @@ testcase_nvme_basic() {
             /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_____dead_beef_"$i"_1
         )
     done
-    for i in {15..19}; do
+    for i in {9..11}; do
         expected_symlinks+=(
             # old replace mode does not provide devlink, as serial contains "/"
             # newer replace mode
@@ -222,7 +290,33 @@ testcase_nvme_basic() {
     test ! -e /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_deadbeef
 
     lsblk --noheadings | grep "^nvme"
-    [[ "$(lsblk --noheadings | grep -c "^nvme")" -ge 20 ]]
+    [[ "$(lsblk --noheadings | grep -c "^nvme")" -ge 12 ]]
+
+    # systemd-hwdb update is very slow with sanitizers in a VM without acceleration, so we skip the hwdb
+    # checks there.
+    if ! [[ -v ASAN_OPTIONS && "$(systemd-detect-virt -v)" == "qemu" ]]; then
+        check_block_io_timeout
+    fi
+
+    # The disk health report must cover the NVMe disks, including the SMART data of the (healthy) emulated
+    # controllers.
+    if ! diskhealth_available; then
+        echo "systemd-report-diskhealth not available, skipping disk health checks."
+        return 0
+    fi
+
+    metrics="$(diskhealth_list)"
+    for i in {0..2}; do
+        name="$(readlink -f /dev/disk/by-id/nvme-QEMU_NVMe_Ctrl_deadbeef"$i"_1)"
+        [[ "$(diskhealth_value "$metrics" DiskSerial "$name")" == "deadbeef$i" ]]
+        [[ "$(diskhealth_value "$metrics" DiskModel "$name")" == "QEMU NVMe Ctrl" ]]
+        [[ "$(diskhealth_value "$metrics" DiskSizeBytes "$name")" == "$((1024 * 1024))" ]]
+        [[ "$(diskhealth_value "$metrics" NVMeCriticalWarning "$name")" == 0 ]]
+        [[ "$(diskhealth_value "$metrics" NVMeMediaErrors "$name")" == 0 ]]
+        for metric in NVMeAvailableSparePercent NVMePercentageUsed DiskPowerCycles DiskPowerOnHours; do
+            [[ "$(diskhealth_value "$metrics" "$metric" "$name")" =~ ^[0-9]+$ ]]
+        done
+    done
 }
 
 testcase_nvme_subsystem() {
@@ -236,6 +330,29 @@ testcase_nvme_subsystem() {
     )
 
     udevadm wait --settle --timeout=30 "${expected_symlinks[@]}"
+
+    # If the kernel supports native NVMe multipath, the shared namespaces are exposed as block devices below
+    # the (virtual) NVMe subsystem device, which must be reported by the disk health report nonetheless,
+    # including the vendor of the PCI device of the controller, as NVMe disks carry no vendor information.
+    # The latter is only available if the hwdb carries PCI data, which is not the case on all distributions.
+    if ! diskhealth_available; then
+        echo "systemd-report-diskhealth not available, skipping disk health checks."
+        return 0
+    fi
+
+    local i metrics name vendor
+    metrics="$(diskhealth_list)"
+    for i in /dev/disk/by-path/*pci*-nvme-16 /dev/disk/by-path/*pci*-nvme-17; do
+        name="$(readlink -f "$i")"
+        [[ "$(diskhealth_value "$metrics" DiskSizeBytes "$name")" == "$((1024 * 1024))" ]]
+        [[ "$(diskhealth_value "$metrics" NVMeCriticalWarning "$name")" == 0 ]]
+
+        [[ "$i" =~ .*pci-([^/]+)-nvme-[0-9]+$ ]]
+        vendor="$(udevadm info --query=property --value --property=ID_VENDOR_FROM_DATABASE "/sys/bus/pci/devices/${BASH_REMATCH[1]}")"
+        if [[ -n "$vendor" ]]; then
+            [[ "$(diskhealth_value "$metrics" DiskVendor "$name")" == "$vendor" ]]
+        fi
+    done
 }
 
 testcase_virtio_scsi_identically_named_partitions() {
@@ -266,9 +383,8 @@ EOF
 testcase_multipath_basic_failover() {
     local dmpath i path wwid
 
-    . /etc/os-release
-    if [[ "${ID_LIKE:-}" == "alpine" ]]; then
-        echo "multipath on alpine/postmarketos is broken, skipping the test" | tee --append /skipped
+    if ! systemctl list-unit-files multipathd.service >/dev/null; then
+        echo "This test requires multipathd.service but it is not installed, skipping ..." | tee --append /skipped
         exit 77
     fi
 
@@ -387,10 +503,12 @@ EOF
 }
 
 testcase_simultaneous_events_1() {
-    local disk expected i iterations link num_part part partscript rule target timeout
+    local disk expected i iterations link num_disks num_part part partscript prio_disk_index0 prio_disk_index1 rule reduce_num_disks target timeout
     local -a devices symlinks running
 
-    if [[ -v ASAN_OPTIONS || "$(systemd-detect-virt -v)" == "qemu" ]]; then
+    reduce_num_disks="${1:-0}"
+
+    if [[ -v ASAN_OPTIONS || "$(systemd-detect-virt -v)" == "qemu" || "$reduce_num_disks" -eq 1 ]]; then
         num_part=2
         iterations=10
         timeout=240
@@ -400,7 +518,18 @@ testcase_simultaneous_events_1() {
         timeout=60
     fi
 
-    for disk in {0..9}; do
+    # NOTE: num_disks must be even for the later test logic to remain correct.
+    if [[ "$reduce_num_disks" -eq 1 ]]; then
+        num_disks=4
+        prio_disk_index0=3
+        prio_disk_index1=2
+    else
+        num_disks=10
+        prio_disk_index0=5
+        prio_disk_index1=4
+    fi
+
+    for ((disk = 0; disk < num_disks; disk++)); do
         link="/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_deadbeeftest${disk}"
         target="$(readlink -f "$link")"
         if [[ ! -b "$target" ]]; then
@@ -426,13 +555,13 @@ EOF
     rule=/run/udev/rules.d/50-test.rules
     mkdir -p "${rule%/*}"
     cat >"$rule" <<EOF
-SUBSYSTEM=="block", KERNEL=="${devices[4]##*/}*|${devices[5]##*/}*", OPTIONS="link_priority=10"
+SUBSYSTEM=="block", KERNEL=="${devices[$prio_disk_index1]##*/}*|${devices[$prio_disk_index0]##*/}*", OPTIONS="link_priority=10"
 EOF
 
     udevadm control --reload
 
     # initialize partition table
-    for disk in {0..9}; do
+    for ((disk = 0; disk < num_disks; disk++)); do
         echo 'label: gpt' | udevadm lock --timeout=30 --device="${devices[$disk]}" sfdisk -q "${devices[$disk]}"
     done
 
@@ -444,7 +573,7 @@ EOF
     # leading to dead symlinks in /dev/disk/
     for ((i = 1; i <= iterations; i++)); do
         running=()
-        for disk in {0..9}; do
+        for ((disk = 0; disk < num_disks; disk++)); do
             if ((disk % 2 == i % 2)); then
                 udevadm lock --timeout=30 --device="${devices[$disk]}" sfdisk -q --delete "${devices[$disk]}" &
             else
@@ -467,9 +596,9 @@ EOF
                 link="/dev/disk/by-partlabel/test${part}"
                 target="$(readlink -f "$link")"
                 if ((i % 2 == 0)); then
-                    expected="${devices[5]}$part"
+                    expected="${devices[$prio_disk_index0]}$part"
                 else
-                    expected="${devices[4]}$part"
+                    expected="${devices[$prio_disk_index1]}$part"
                 fi
                 if [[ "$target" != "$expected" ]]; then
                     echo >&2 "ERROR: symlink '/dev/disk/by-partlabel/test${part}' points to '$target' but '$expected' was expected"
@@ -482,7 +611,7 @@ EOF
     helper_check_device_units
 
     # Cleanup and check if unnecessary devlinks are removed.
-    for disk in {0..9}; do
+    for ((disk = 0; disk < num_disks; disk++)); do
         udevadm lock --timeout="$timeout" --device="${devices[$disk]}" sfdisk -q --delete "${devices[$disk]}" || :
     done
     udevadm settle --timeout="$timeout"
@@ -495,14 +624,16 @@ EOF
 }
 
 testcase_simultaneous_events_2() {
-    local disk i iterations link num_part part script_dir target timeout
+    local disk i iterations link num_disks num_part part script_dir reduce_num_disks target timeout
     local -a devices running
+
+    reduce_num_disks="${1:-0}"
 
     script_dir="$(mktemp --directory "/tmp/test-udev-storage.script.XXXXXXXXXX")"
     # shellcheck disable=SC2064
     trap "rm -rf '$script_dir'" RETURN
 
-    if [[ -v ASAN_OPTIONS || "$(systemd-detect-virt -v)" == "qemu" ]]; then
+    if [[ -v ASAN_OPTIONS || "$(systemd-detect-virt -v)" == "qemu" || "$reduce_num_disks" -eq 1 ]]; then
         num_part=10
         iterations=2
         timeout=300
@@ -512,7 +643,13 @@ testcase_simultaneous_events_2() {
         timeout=200
     fi
 
-    for disk in {0..9}; do
+    if [[ "$reduce_num_disks" -eq 1 ]]; then
+        num_disks=4
+    else
+        num_disks=10
+    fi
+
+    for ((disk = 0; disk < num_disks; disk++)); do
         link="/dev/disk/by-id/scsi-0QEMU_QEMU_HARDDISK_deadbeeftest${disk}"
         target="$(readlink -f "$link")"
         if [[ ! -b "$target" ]]; then
@@ -617,15 +754,16 @@ EOF
 }
 
 testcase_simultaneous_events() {
+    local reduce_num_disks
+
     . /etc/os-release
-    if [[ "$ID" == "debian" ]]; then
-        # See https://github.com/systemd/systemd/issues/39552
-        echo "Simultaneous events test cases are not working on Debian, skipping the test" | tee --append /skipped
-        exit 77
+    reduce_num_disks=0
+    if [[ "$ID" == "ubuntu" || "$ID" == "debian" ]]; then
+        reduce_num_disks=1
     fi
 
-    testcase_simultaneous_events_1
-    testcase_simultaneous_events_2
+    testcase_simultaneous_events_1 "$reduce_num_disks"
+    testcase_simultaneous_events_2 "$reduce_num_disks"
     testcase_simultaneous_events_3
 }
 
@@ -638,7 +776,7 @@ testcase_lvm_basic() {
 
     . /etc/os-release
     if [[ "$ID" == "ubuntu" || "${ID_LIKE:-}" == "alpine" ]]; then
-        echo "LVM on Ubuntu/alpine/postmarketos is broken, skipping the test" | tee --append /skipped
+        echo "LVM on Ubuntu/Alpine/Nura is broken, skipping the test" | tee --append /skipped
         exit 77
     fi
 
@@ -849,6 +987,10 @@ EOF
     btrfs filesystem show
     helper_check_device_symlinks
     helper_check_device_units
+    # Wipe the btrfs signature from each partition first, otherwise the superblocks remain inside
+    # the disk's data area and would be discovered again as duplicate UUIDs after re-partitioning,
+    # which breaks subsequent runs of this test (e.g. after a VM reboot).
+    udevadm lock --timeout=30 --device="${devices[0]}" wipefs -a /dev/disk/by-partlabel/diskpart{1..4}
     udevadm lock --timeout=30 --device="${devices[0]}" wipefs -a "${devices[0]}"
     udevadm wait --settle --timeout=30 --removed /dev/disk/by-partlabel/diskpart{1..4}
 
@@ -866,6 +1008,12 @@ EOF
     btrfs filesystem show
     helper_check_device_symlinks
     helper_check_device_units
+    # Wipe the btrfs signatures so that subsequent sections (and runs of the test, e.g. after a VM
+    # reboot) don't see the stale UUID.
+    for ((i = 0; i < ${#devices[@]}; i++)); do
+        udevadm lock --timeout=30 --device="${devices[$i]}" wipefs -a "${devices[$i]}"
+    done
+    udevadm settle --timeout=30
 
     echo "Multiple devices: using LUKS encrypted disks, data: raid1, metadata: raid1, mixed mode"
     uuid="deadbeef-dead-dead-beef-000000000003"
@@ -941,7 +1089,13 @@ EOF
     sed -i "/${mpoint##*/}/d" /etc/fstab
     : >/etc/crypttab
     rm -fr "$mpoint"
+    rm -f /etc/btrfs_keyfile
     systemctl daemon-reload
+    # Wipe LUKS headers from the underlying devices, so that if the VM is rebooted the disks don't retain
+    # stale LUKS signatures that would interfere with a re-run of the test.
+    for ((i = 0; i < ${#devices[@]}; i++)); do
+        udevadm lock --timeout=30 --device="${devices[$i]}" wipefs -a "${devices[$i]}"
+    done
     udevadm settle --timeout=30
 }
 
@@ -1333,6 +1487,12 @@ testcase_mdadm_lvm() {
     helper_check_device_units
     # Cleanup
     lvm vgchange -an "$vgroup"
+    # Wipe the LVM signature off the MD device, otherwise the underlying disks
+    # still hold the PV header at the same offset. If the VM is restarted (e.g.
+    # the test gets re-run because of a reboot), mdadm --create with the same
+    # UUID would expose the same data and udev would auto-trigger
+    # lvm-activate-${vgroup}.service, racing with the test's pvcreate.
+    wipefs --all "$raid_dev"
     mdadm -v --stop "$raid_dev"
 
     # Clear superblocks to make the MD device will not be restarted even if the VM is restarted.
@@ -1340,6 +1500,10 @@ testcase_mdadm_lvm() {
     udevadm settle --timeout=30
     # shellcheck disable=SC2046
     mdadm -v --zero-superblock --force $(readlink -f "${devices[@]}")
+    # Also wipe any leftover signatures from the underlying disks for the same
+    # reason as above.
+    # shellcheck disable=SC2046
+    wipefs --all $(readlink -f "${devices[@]}")
     udevadm settle --timeout=30
 
     # Check if all expected symlinks were removed after the cleanup
@@ -1349,6 +1513,32 @@ testcase_mdadm_lvm() {
 
 udevadm settle
 lsblk -a
+
+# This test often fails because the VM reboots (eg: kernel panic) and the previous state is left unclean.
+# Do the cleanups at the beginning too, to try and reduce flakiness.
+mdadm --stop --scan || :
+for _dm in /dev/mapper/encbtrfs[0-3] /dev/mapper/encdisk[0-3] /dev/mapper/lvmluksmap; do
+    [[ -e "$_dm" ]] || continue
+    cryptsetup close "$_dm" || :
+done
+unset _dm
+for _vg in $(lvm vgs --noheadings -o vg_name 2>/dev/null \
+                 | awk '$1 ~ /^(MyTestGroup|iscsi_lvm|mdmirpar_vg)/ {print $1}'); do
+    lvm vgchange -an "$_vg" || :
+done
+unset _vg
+udevadm settle --timeout=30
+_stale_devs=()
+for _d in /dev/disk/by-id/scsi-0systemd_foobar_deadbeef*; do
+    [[ -e "$_d" ]] && _stale_devs+=("$_d")
+done
+if (( ${#_stale_devs[@]} > 0 )); then
+    # shellcheck disable=SC2046
+    mdadm -v --zero-superblock --force $(readlink -f "${_stale_devs[@]}") || :
+    wipefs --all "${_stale_devs[@]}" || :
+fi
+unset _d _stale_devs
+udevadm settle --timeout=30
 
 echo "Check if all symlinks under /dev/disk/ are valid (pre-test)"
 helper_check_device_symlinks

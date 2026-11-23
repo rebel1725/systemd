@@ -27,15 +27,11 @@ int verb_timespan(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 if (!table)
                         return log_oom();
 
-                assert_se(cell = table_get_cell(table, 0, 0));
-                r = table_set_ellipsize_percent(table, cell, 100);
-                if (r < 0)
-                        return r;
+                assert_se(cell = table_get_cell(table, /* row= */ 0, /* column= */ 0));
+                (void) table_set_ellipsize_percent(table, cell, 100);
 
-                assert_se(cell = table_get_cell(table, 0, 1));
-                r = table_set_ellipsize_percent(table, cell, 100);
-                if (r < 0)
-                        return r;
+                assert_se(cell = table_get_cell(table, /* row= */ 0, 1));
+                (void) table_set_ellipsize_percent(table, cell, 100);
 
                 r = table_add_many(table,
                                    TABLE_FIELD, "Original",
@@ -43,7 +39,7 @@ int verb_timespan(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 if (r < 0)
                         return table_log_add_error(r);
 
-                r = table_add_cell_stringf_full(table, NULL, TABLE_FIELD, "%ss", glyph(GLYPH_MU));
+                r = table_add_cell_stringf_full(table, /* ret_cell= */ NULL, TABLE_FIELD, "%ss", glyph(GLYPH_MU));
                 if (r < 0)
                         return table_log_add_error(r);
 
@@ -55,7 +51,7 @@ int verb_timespan(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 if (r < 0)
                         return table_log_add_error(r);
 
-                r = table_print(table, NULL);
+                r = table_print_or_warn(table);
                 if (r < 0)
                         return r;
 

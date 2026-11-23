@@ -1,43 +1,70 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
+#include <linux/unix_diag.h>
+#include <netinet/tcp.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "sd-daemon.h"
+#include "sd-json.h"
+#include "sd-netlink.h"
 #include "sd-varlink.h"
 
+#include "ansi-color.h"
+#include "bpf-link.h"
+#include "bpf-util.h"
 #include "build.h"
+#include "bus-polkit.h"
 #include "bus-util.h"
 #include "chase.h"
+#include "devnum-util.h"
 #include "env-util.h"
+#include "errno-list.h"
+#include "errno-util.h"
+#include "escape.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "format-table.h"
 #include "format-util.h"
+#include "fs-util.h"
+#include "glyph-util.h"
+#include "hashmap.h"
+#include "iovec-util.h"
+#include "json-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "memfd-util.h"
+#include "netlink-sock-diag.h"
+#include "options.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "path-lookup.h"
 #include "path-util.h"
 #include "pidfd-util.h"
+#include "pidref.h"
 #include "polkit-agent.h"
 #include "pretty-print.h"
 #include "process-util.h"
 #include "recurse-dir.h"
 #include "runtime-scope.h"
+#include "socket-forward.h"
+#include "socket-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
 #include "time-util.h"
+#include "user-util.h"
 #include "varlink-idl-util.h"
 #include "varlink-util.h"
 #include "verbs.h"
 #include "version.h"
+#include "xattr-util.h"
+
+#if HAVE_LIBBPF
+#include "monitor-varlink-api.bpf.h"
+#endif
 
 typedef struct PushFds {
         int *fds;
@@ -52,10 +79,16 @@ static bool arg_quiet = false;
 static char **arg_graceful = NULL;
 static usec_t arg_timeout = 0;
 static bool arg_exec = false;
+static bool arg_upgrade = false;
 static PushFds arg_push_fds = {};
 static bool arg_ask_password = true;
 static bool arg_legend = true;
 static RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+static uid_t arg_uid = UID_INVALID;
+static pid_t arg_pid = 0;
+static char *arg_socket_path = NULL;
+static bool arg_socket_path_anonymous = false;
+static char *arg_polkit_action = NULL;
 
 static void push_fds_done(PushFds *p) {
         assert(p);
@@ -66,201 +99,124 @@ static void push_fds_done(PushFds *p) {
 
 STATIC_DESTRUCTOR_REGISTER(arg_graceful, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_push_fds, push_fds_done);
+STATIC_DESTRUCTOR_REGISTER(arg_socket_path, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_polkit_action, freep);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
         int r;
-
-        r = terminal_urlify_man("varlinkctl", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        pager_open(arg_pager_flags);
-
-        printf("%1$s [OPTIONS...] COMMAND ...\n\n"
-               "%5$sIntrospect Varlink Services.%6$s\n"
-               "\n%3$sCommands:%4$s\n"
-               "  info ADDRESS           Show service information\n"
-               "  list-interfaces ADDRESS\n"
-               "                         List interfaces implemented by service\n"
-               "  list-methods ADDRESS [INTERFACE…]\n"
-               "                         List methods implemented by services or specific\n"
-               "                         interfaces\n"
-               "  introspect ADDRESS [INTERFACE…]\n"
-               "                         Show interface definition\n"
-               "  call ADDRESS METHOD [PARAMS]\n"
-               "                         Invoke method\n"
-               "  --exec call ADDRESS METHOD PARAMS -- CMDLINE…\n"
-               "                         Invoke method and pass response and fds to command\n"
-               "  list-registry          Show list of services in the service registry\n"
-               "  validate-idl [FILE]    Validate interface description\n"
-               "  help                   Show this help\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help              Show this help\n"
-               "     --version           Show package version\n"
-               "     --no-ask-password   Do not prompt for password\n"
-               "     --no-pager          Do not pipe output into a pager\n"
-               "     --system            Enumerate system registry\n"
-               "     --user              Enumerate user registry\n"
-               "     --more              Request multiple responses\n"
-               "     --collect           Collect multiple responses in a JSON array\n"
-               "     --oneway            Do not request response\n"
-               "     --json=MODE         Output as JSON\n"
-               "  -j                     Same as --json=pretty on tty, --json=short otherwise\n"
-               "  -q --quiet             Do not output method reply\n"
-               "     --graceful=ERROR    Treat specified Varlink error as success\n"
-               "     --timeout=SECS      Maximum time to wait for method call completion\n"
-               "  -E                     Short for --more --timeout=infinity\n"
-               "     --push-fd=FD        Pass the specified fd along with method call\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
-
-        return 0;
-}
-
-static int verb_help(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        return help();
-}
-
-static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_NO_PAGER,
-                ARG_MORE,
-                ARG_ONEWAY,
-                ARG_JSON,
-                ARG_COLLECT,
-                ARG_GRACEFUL,
-                ARG_TIMEOUT,
-                ARG_EXEC,
-                ARG_PUSH_FD,
-                ARG_NO_ASK_PASSWORD,
-                ARG_USER,
-                ARG_SYSTEM,
-        };
-
-        static const struct option options[] = {
-                { "help",            no_argument,       NULL, 'h'                },
-                { "version",         no_argument,       NULL, ARG_VERSION         },
-                { "no-pager",        no_argument,       NULL, ARG_NO_PAGER        },
-                { "more",            no_argument,       NULL, ARG_MORE            },
-                { "oneway",          no_argument,       NULL, ARG_ONEWAY          },
-                { "json",            required_argument, NULL, ARG_JSON            },
-                { "collect",         no_argument,       NULL, ARG_COLLECT         },
-                { "quiet",           no_argument,       NULL, 'q'                 },
-                { "graceful",        required_argument, NULL, ARG_GRACEFUL        },
-                { "timeout",         required_argument, NULL, ARG_TIMEOUT         },
-                { "exec",            no_argument,       NULL, ARG_EXEC            },
-                { "push-fd",         required_argument, NULL, ARG_PUSH_FD         },
-                { "no-ask-password", no_argument,       NULL, ARG_NO_ASK_PASSWORD },
-                { "user",            no_argument,       NULL, ARG_USER            },
-                { "system",          no_argument,       NULL, ARG_SYSTEM          },
-                {},
-        };
-
-        int c, r;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hjqE", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_NO_PAGER:
+                OPTION_COMMON_NO_ASK_PASSWORD:
+                        arg_ask_password = false;
+                        break;
+
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case 'E':
-                        arg_timeout = USEC_INFINITY;
-                        _fallthrough_;
+                OPTION_LONG("system", NULL, "Enumerate system registry"):
+                        arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+                        break;
 
-                case ARG_MORE:
+                OPTION_LONG("user", NULL, "Enumerate user registry"):
+                        arg_runtime_scope = RUNTIME_SCOPE_USER;
+                        break;
+
+                OPTION_LONG("more", NULL, "Request multiple responses"):
                         arg_method_flags = (arg_method_flags & ~SD_VARLINK_METHOD_ONEWAY) | SD_VARLINK_METHOD_MORE;
                         break;
 
-                case ARG_ONEWAY:
-                        arg_method_flags = (arg_method_flags & ~SD_VARLINK_METHOD_MORE) | SD_VARLINK_METHOD_ONEWAY;
-                        break;
-
-                case ARG_COLLECT:
+                OPTION_LONG("collect", NULL, "Collect multiple responses in a JSON array"):
                         arg_collect = true;
                         break;
 
-                case ARG_JSON:
-                        r = parse_json_argument(optarg, &arg_json_format_flags);
-                        if (r <= 0)
-                                return r;
-
+                OPTION_LONG("oneway", NULL, "Do not request response"):
+                        arg_method_flags = (arg_method_flags & ~SD_VARLINK_METHOD_MORE) | SD_VARLINK_METHOD_ONEWAY;
                         break;
 
-                case 'j':
+                OPTION_COMMON_JSON:
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
+                        if (r <= 0)
+                                return r;
+                        break;
+
+                OPTION_COMMON_LOWERCASE_J:
                         arg_json_format_flags = SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO;
                         break;
 
-                case 'q':
+                OPTION('q', "quiet", NULL, "Do not output method reply"):
                         arg_quiet = true;
                         break;
 
-                case ARG_GRACEFUL:
-                        r = varlink_idl_qualified_symbol_name_is_valid(optarg);
+                OPTION_LONG("graceful", "ERROR", "Treat specified Varlink error as success"):
+                        r = varlink_idl_qualified_symbol_name_is_valid(opts.arg);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to validate Varlink error name '%s': %m", optarg);
+                                return log_error_errno(r, "Failed to validate Varlink error name '%s': %m", opts.arg);
                         if (r == 0)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Not a valid Varlink error name: %s", optarg);
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Not a valid Varlink error name: %s", opts.arg);
 
-                        if (strv_extend(&arg_graceful, optarg) < 0)
+                        if (strv_extend(&arg_graceful, opts.arg) < 0)
                                 return log_oom();
-
                         break;
 
-                case ARG_TIMEOUT:
-                        if (isempty(optarg)) {
+                OPTION_LONG("timeout", "SECS", "Maximum time to wait for method call completion"):
+                        if (isempty(opts.arg)) {
                                 arg_timeout = USEC_INFINITY;
                                 break;
                         }
 
-                        r = parse_sec(optarg, &arg_timeout);
+                        r = parse_sec(opts.arg, &arg_timeout);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --timeout= parameter '%s': %m", optarg);
+                                return log_error_errno(r, "Failed to parse --timeout= parameter '%s': %m", opts.arg);
 
                         if (arg_timeout == 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Timeout cannot be zero.");
-
                         break;
 
-                case ARG_EXEC:
+                OPTION_SHORT('E', NULL, "Short for --more --timeout=infinity"):
+                        arg_timeout = USEC_INFINITY;
+                        arg_method_flags = (arg_method_flags & ~SD_VARLINK_METHOD_ONEWAY) | SD_VARLINK_METHOD_MORE;
+                        break;
+
+                OPTION_LONG("upgrade", NULL,
+                            "Request protocol upgrade (connection becomes raw"
+                            " bidirectional pipe on stdin/stdout after reply)"):
+                        arg_upgrade = true;
+                        break;
+
+                OPTION_LONG("exec", NULL, "Invoke method and pass response and fds to command"):
                         arg_exec = true;
                         break;
 
-                case ARG_PUSH_FD: {
+                OPTION_LONG("push-fd", "FD", "Pass the specified fd along with method call"): {
                         if (!GREEDY_REALLOC(arg_push_fds.fds, arg_push_fds.n_fds + 1))
                                 return log_oom();
 
                         _cleanup_close_ int add_fd = -EBADF;
-                        if (STARTSWITH_SET(optarg, "/", "./")) {
+                        if (STARTSWITH_SET(opts.arg, "/", "./")) {
                                 /* We usually expect a numeric fd spec, but as an extension let's treat this
                                  * as a path to open in read-only mode in case this is clearly an absolute or
                                  * relative path */
-                                add_fd = open(optarg, O_CLOEXEC|O_RDONLY|O_NOCTTY);
+                                add_fd = xopenat(AT_FDCWD, opts.arg, O_RDONLY|O_NOCTTY);
                                 if (add_fd < 0)
-                                        return log_error_errno(errno, "Failed to open '%s': %m", optarg);
+                                        return log_error_errno(add_fd, "Failed to open '%s': %m", opts.arg);
                         } else {
-                                int parsed_fd = parse_fd(optarg);
+                                int parsed_fd = parse_fd(opts.arg);
                                 if (parsed_fd < 0)
-                                        return log_error_errno(parsed_fd, "Failed to parse --push-fd= parameter: %s", optarg);
+                                        return log_error_errno(parsed_fd, "Failed to parse --push-fd= parameter: %s", opts.arg);
 
                                 /* Make a copy, so that the same fd could be used multiple times in a reasonable
                                  * way. This also validates the fd early */
@@ -273,23 +229,43 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case ARG_NO_ASK_PASSWORD:
-                        arg_ask_password = false;
+                OPTION('u', "uid", "UID", "Monitor only connections of specified UID"):
+                        r = parse_uid(opts.arg, &arg_uid);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse UID '%s': %m", opts.arg);
                         break;
 
-                case ARG_USER:
-                        arg_runtime_scope = RUNTIME_SCOPE_USER;
+                OPTION('p', "pid", "PID", "Filter monitored traffic by PID"):
+                        r = parse_pid(opts.arg, &arg_pid);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse PID '%s': %m", opts.arg);
                         break;
 
-                case ARG_SYSTEM:
-                        arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+                OPTION_LONG("path", "PATH", "Filter monitored traffic by socket path"):
+                        arg_socket_path = mfree(arg_socket_path);
+                        if (streq(opts.arg, "anonymous"))
+                                arg_socket_path_anonymous = true;
+                        else {
+                                arg_socket_path_anonymous = false;
+                                r = path_simplify_alloc(opts.arg, &arg_socket_path);
+                                if (r < 0)
+                                        return log_oom();
+                        }
                         break;
 
-                case '?':
-                        return -EINVAL;
+                OPTION_LONG("polkit-action", "ACTION", "Authorize clients via the specified polkit action before upgrading"):
+                        if (isempty(opts.arg)) {
+                                arg_polkit_action = mfree(arg_polkit_action);
+                                break;
+                        }
 
-                default:
-                        assert_not_reached();
+                        r = free_and_strdup_warn(&arg_polkit_action, opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
 
         /* If more than one reply is expected, imply JSON-SEQ output, and set SD_JSON_FORMAT_FLUSH */
@@ -298,6 +274,7 @@ static int parse_argv(int argc, char *argv[]) {
 
         strv_sort_uniq(arg_graceful);
 
+        *ret_args = option_parser_get_args(&opts);
         return 1;
 }
 
@@ -313,9 +290,9 @@ static int varlink_connect_auto(sd_varlink **ret, const char *where) {
                 _cleanup_close_ int fd = -EBADF;
                 struct stat st;
 
-                fd = open(where, O_PATH|O_CLOEXEC);
+                fd = xopenat(AT_FDCWD, where, O_PATH);
                 if (fd < 0)
-                        return log_error_errno(errno, "Failed to open '%s': %m", where);
+                        return log_error_errno(fd, "Failed to open '%s': %m", where);
 
                 if (fstat(fd, &st) < 0)
                         return log_error_errno(errno, "Failed to stat '%s': %m", where);
@@ -366,6 +343,17 @@ static void get_info_data_done(GetInfoData *d) {
         d->interfaces = strv_free(d->interfaces);
 }
 
+COMMAND(
+        "varlinkctl\0",
+        "Introspect Varlink Services.",
+        .man_page = "varlinkctl(1)",
+        .footer = "With --exec, specify the command to invoke:\n"
+                  "  varlinkctl --exec call ADDRESS METHOD PARAMS -- CMDLINE…",
+        .pager_flags = &arg_pager_flags,
+);
+
+VERB(verb_info, "info", "ADDRESS\0", 2, 2, 0, "Show service information");
+VERB(verb_info, "list-interfaces", "ADDRESS\0", 2, 2, 0, "List interfaces implemented by service");
 static int verb_info(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
         const char *url;
@@ -405,6 +393,8 @@ static int verb_info(int argc, char *argv[], uintptr_t _data, void *userdata) {
                 if (streq_ptr(argv[0], "list-interfaces")) {
                         STRV_FOREACH(i, data.interfaces)
                                 puts(*i);
+
+                        return 0;
                 } else {
                         _cleanup_(table_unrefp) Table *t = NULL;
 
@@ -428,20 +418,14 @@ static int verb_info(int argc, char *argv[], uintptr_t _data, void *userdata) {
                         if (r < 0)
                                 return table_log_add_error(r);
 
-                        r = table_print(t, NULL);
-                        if (r < 0)
-                                return table_log_print_error(r);
+                        return table_print_or_warn(t);
                 }
         } else {
-                sd_json_variant *v;
-
-                v = streq_ptr(argv[0], "list-interfaces") ?
+                sd_json_variant *v = streq_ptr(argv[0], "list-interfaces") ?
                         sd_json_variant_by_key(reply, "interfaces") : reply;
 
-                sd_json_variant_dump(v, arg_json_format_flags, stdout, NULL);
+                return sd_json_variant_dump(v, arg_json_format_flags, stdout, /* prefix= */ NULL);
         }
-
-        return 0;
 }
 
 static size_t break_columns(void) {
@@ -463,6 +447,9 @@ typedef struct GetInterfaceDescriptionData {
         const char *description;
 } GetInterfaceDescriptionData;
 
+VERB(verb_introspect, "introspect", "ADDRESS [INTERFACE…]\0", 2, VERB_ANY, 0, "Show interface definition");
+VERB(verb_introspect, "list-methods", "ADDRESS [INTERFACE…]\0", 2, VERB_ANY, 0,
+     "List methods implemented by services or specific interfaces");
 static int verb_introspect(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
         _cleanup_strv_free_ char **auto_interfaces = NULL;
@@ -512,80 +499,113 @@ static int verb_introspect(int argc, char *argv[], uintptr_t _data, void *userda
         if (!list_methods && strv_length(interfaces) > 1)
                 arg_json_format_flags |= SD_JSON_FORMAT_SEQ;
 
-        _cleanup_strv_free_ char **methods = NULL;
+        _cleanup_strv_free_ char **methods = NULL, **experimental_methods = NULL;
 
         STRV_FOREACH(i, interfaces) {
+                _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *vi = NULL;
+                static const sd_json_dispatch_field description_table[] = {
+                        { "description", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, 0, SD_JSON_MANDATORY },
+                        {}
+                };
                 sd_json_variant *reply = NULL;
-                r = varlink_callbo_and_log(
-                                vl,
-                                "org.varlink.service.GetInterfaceDescription",
-                                &reply,
-                                SD_JSON_BUILD_PAIR_STRING("interface", *i));
+                const char *description = NULL;
+                unsigned line = 0, column = 0;
+
+                /* Keep the helper: it logs the error id a service returns, which sd_varlink_call()
+                 * would fold into -EBADR. */
+                r = varlink_callbo_and_log(vl, "org.varlink.service.GetInterfaceDescription", &reply,
+                                           SD_JSON_BUILD_PAIR_STRING("interface", *i));
                 if (r < 0)
                         return r;
 
-                if (!sd_json_format_enabled(arg_json_format_flags) || list_methods) {
-                        static const sd_json_dispatch_field dispatch_table[] = {
-                                { "description", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, 0, SD_JSON_MANDATORY },
-                                {}
-                        };
-                        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *vi = NULL;
-                        const char *description = NULL;
-                        unsigned line = 0, column = 0;
+                r = sd_json_dispatch(reply, description_table, SD_JSON_LOG|SD_JSON_ALLOW_EXTENSIONS, &description);
+                if (r < 0)
+                        return r;
 
-                        r = sd_json_dispatch(reply, dispatch_table, SD_JSON_LOG|SD_JSON_ALLOW_EXTENSIONS, &description);
-                        if (r < 0)
-                                return r;
+                /* Parse the textual IDL, so that we can colorize it or render it as JSON */
+                r = sd_varlink_idl_parse(ASSERT_PTR(description), &line, &column, &vi);
+                if (r < 0) {
+                        /* The JSON rendering is the result of this parse, so there is nothing to show
+                         * on failure. The raw text is only useful in text mode. */
+                        if (list_methods || sd_json_format_enabled(arg_json_format_flags))
+                                return log_error_errno(r, "Failed to parse returned interface description at %u:%u: %m", line, column);
 
-                        if (!list_methods && i > interfaces)
+                        log_warning_errno(r, "Failed to parse returned interface description at %u:%u, showing raw interface description: %m", line, column);
+
+                        if (i > interfaces)
                                 print_separator();
 
-                        /* Try to parse the returned description, so that we can add syntax highlighting */
-                        r = sd_varlink_idl_parse(ASSERT_PTR(description), &line, &column, &vi);
-                        if (r < 0) {
-                                if (list_methods)
-                                        return log_error_errno(r, "Failed to parse returned interface description at %u:%u: %m", line, column);
+                        pager_open(arg_pager_flags);
+                        fputs_with_newline(stdout, description);
+                        continue;
+                }
 
-                                log_warning_errno(r, "Failed to parse returned interface description at %u:%u, showing raw interface description: %m", line, column);
+                if (list_methods) {
+                        for (const sd_varlink_symbol *const *y = vi->symbols, *symbol; (symbol = *y); y++) {
+                                if (symbol->symbol_type != SD_VARLINK_METHOD)
+                                        continue;
 
-                                pager_open(arg_pager_flags);
-                                fputs_with_newline(stdout, description);
-                        } else if (list_methods) {
-                                for (const sd_varlink_symbol *const *y = vi->symbols, *symbol; (symbol = *y); y++) {
-                                        if (symbol->symbol_type != SD_VARLINK_METHOD)
-                                                continue;
+                                r = strv_extendf(&methods, "%s.%s", vi->name, symbol->name);
+                                if (r < 0)
+                                        return log_oom();
 
-                                        r = strv_extendf(&methods, "%s.%s", vi->name, symbol->name);
+                                if (FLAGS_SET(vi->interface_flags, SD_VARLINK_EXPERIMENTAL) ||
+                                    FLAGS_SET(symbol->symbol_flags, SD_VARLINK_EXPERIMENTAL)) {
+                                        r = strv_extendf(&experimental_methods, "%s.%s", vi->name, symbol->name);
                                         if (r < 0)
                                                 return log_oom();
                                 }
-                        } else {
-                                pager_open(arg_pager_flags);
-                                r = sd_varlink_idl_dump(stdout, vi, SD_VARLINK_IDL_FORMAT_COLOR_AUTO, break_columns());
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to format parsed interface description: %m");
                         }
+
+                        continue;
+                }
+
+                /* Keep the JSON stream free of separators: a consumer reads it value by value. */
+                if (!sd_json_format_enabled(arg_json_format_flags) && i > interfaces)
+                        print_separator();
+
+                pager_open(arg_pager_flags);
+
+                if (sd_json_format_enabled(arg_json_format_flags)) {
+                        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+                        r = sd_varlink_idl_format_json(vi, &v);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to convert interface description to JSON: %m");
+
+                        r = sd_json_variant_dump(v, arg_json_format_flags, stdout, /* prefix= */ NULL);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to print JSON interface description: %m");
                 } else {
-                        pager_open(arg_pager_flags);
-                        sd_json_variant_dump(reply, arg_json_format_flags, stdout, NULL);
+                        r = sd_varlink_idl_dump(stdout, vi, SD_VARLINK_IDL_FORMAT_COLOR_AUTO, break_columns());
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to format parsed interface description: %m");
                 }
         }
 
         if (list_methods) {
+                /* Only mark experimental methods if connected to a TTY, so that the output stays parsable,
+                 * e.g. for shell completion. Check this before spawning the pager. */
+                bool mark = on_tty();
+
                 pager_open(arg_pager_flags);
 
                 strv_sort_uniq(methods);
 
-                if (!sd_json_format_enabled(arg_json_format_flags))
-                        strv_print(methods);
-                else {
+                if (!sd_json_format_enabled(arg_json_format_flags)) {
+                        STRV_FOREACH(m, methods)
+                                if (mark && strv_contains(experimental_methods, *m))
+                                        printf("%s%s (experimental)%s\n", ansi_bright_yellow(), *m, ansi_normal());
+                                else
+                                        puts(*m);
+                } else {
                         _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
 
                         r = sd_json_build(&j, SD_JSON_BUILD_STRV(methods));
                         if (r < 0)
                                 return log_error_errno(r, "Failed to build JSON array: %m");
 
-                        sd_json_variant_dump(j, arg_json_format_flags, stdout, NULL);
+                        sd_json_variant_dump(j, arg_json_format_flags, stdout, /* prefix= */ NULL);
                 }
         }
 
@@ -629,16 +649,283 @@ static int reply_callback(
         }
 
         if (!arg_quiet)
-                sd_json_variant_dump(parameters, arg_json_format_flags, stdout, NULL);
+                sd_json_variant_dump(parameters, arg_json_format_flags, stdout, /* prefix= */ NULL);
 
         return r;
 }
 
+static int upgrade_forward_done(SocketForward *sf, int error, void *userdata) {
+        sd_event *event = ASSERT_PTR(userdata);
+
+        return sd_event_exit(event, error < 0 ? error : 0);
+}
+
+static int dup_stdio_fd(int fd, int flags, int *ret_nonblock_reset) {
+        int r;
+
+        assert(fd >= 0);
+        assert(ret_nonblock_reset);
+
+        /* SPLICE_F_NONBLOCK only covers the forwarder's internal pipe, hence stdin/stdout must be
+         * O_NONBLOCK themselves. Reopen (as ptyfwd does) so that the invoking shell's open file description
+         * is not switched to non-blocking too. Sockets cannot be reopened, hence the fallback. */
+        r = fd_dup_or_reopen_stdio_nonblock(fd, flags);
+        if (r >= 0) {
+                *ret_nonblock_reset = -EBADF;
+                return r;
+        }
+
+        log_debug_errno(r, "Failed to reopen fd %i, using a dup instead: %m", fd);
+
+        _cleanup_close_ int dup_fd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+        if (dup_fd < 0)
+                return -errno;
+
+        /* The dup shares the open file description, whoever uses it after us expects it blocking again. */
+        r = fd_nonblock(dup_fd, /* nonblock= */ true);
+        if (r < 0)
+                return r;
+        *ret_nonblock_reset = r > 0 ? fd : -EBADF;
+
+        return TAKE_FD(dup_fd);
+}
+
+/* This will only return if something goes wrong, otherwise the exec_cmdline
+ * is run and replaces our code. */
+static int exec_with_listen_fds(char **exec_cmdline, int *fds, size_t n_fds) {
+        _cleanup_free_ char *j = quote_command_line(exec_cmdline, SHELL_ESCAPE_EMPTY);
+        if (!j)
+                return log_oom();
+
+        log_close();
+        log_set_open_when_needed(true);
+
+        int r = close_all_fds(fds, n_fds);
+        if (r < 0)
+                return log_error_errno(r, "Failed to close all remaining file descriptors: %m");
+
+        r = pack_fds(fds, n_fds);
+        if (r < 0)
+                return log_error_errno(r, "Failed to rearrange file descriptors: %m");
+
+        r = fd_cloexec_many(fds, n_fds, /* cloexec= */ false);
+        if (r < 0)
+                return log_error_errno(r, "Failed to disable O_CLOEXEC for file descriptors: %m");
+
+        if (n_fds > 0) {
+                r = setenvf("LISTEN_FDS", /* overwrite= */ true, "%zu", n_fds);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set $LISTEN_FDS environment variable: %m");
+
+                r = setenvf("LISTEN_PID", /* overwrite= */ true, PID_FMT, getpid_cached());
+                if (r < 0)
+                        return log_error_errno(r, "Failed to set $LISTEN_PID environment variable: %m");
+
+                uint64_t pidfdid;
+                if (pidfd_get_inode_id_self_cached(&pidfdid) >= 0) {
+                        r = setenvf("LISTEN_PIDFDID", /* overwrite= */ true, "%" PRIu64, pidfdid);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to set $LISTEN_PIDFDID environment variable: %m");
+                }
+        } else {
+                (void) unsetenv("LISTEN_FDS");
+                (void) unsetenv("LISTEN_PID");
+                (void) unsetenv("LISTEN_PIDFDID");
+        }
+        (void) unsetenv("LISTEN_FDNAMES");
+
+        log_debug("Executing: %s", j);
+
+        r = execvp_safe(exec_cmdline[0], exec_cmdline);
+        return log_error_errno(r, "Failed to execute '%s': %m", j);
+}
+
+static int notice_if_method_experimental(sd_varlink **vl, const char *url, const char *method) {
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "description", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, 0, SD_JSON_MANDATORY },
+                {}
+        };
+        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *vi = NULL;
+        _cleanup_free_ char *interface = NULL;
+        const char *error_id = NULL, *description = NULL, *name;
+        const sd_varlink_symbol *symbol;
+        sd_json_variant *reply = NULL;
+        int r;
+
+        assert(vl);
+        assert(*vl);
+        assert(url);
+        assert(method);
+
+        /* Let the user know if they are calling an experimental method. This requires an additional
+         * roundtrip, hence only do it if somebody is watching. Failures are not fatal, after all this is
+         * purely informational, but the connection might be unusable after a failed call (e.g. after a
+         * disconnect), hence reconnect in that case. Timeouts are fatal however, as otherwise we'd wait
+         * twice as long for a hung service. Note that this must be called before any fds are pushed, as
+         * these would otherwise be sent along with the introspection call. */
+
+        if (arg_quiet || !isatty_safe(STDERR_FILENO))
+                return 0;
+
+        r = varlink_idl_split_qualified_symbol_name(method, &interface, &name);
+        if (r < 0)
+                return log_error_errno(r, "Failed to split method name '%s': %m", method);
+
+        if (streq(interface, "org.varlink.service"))
+                return 0;
+
+        r = sd_varlink_callbo(
+                        *vl,
+                        "org.varlink.service.GetInterfaceDescription",
+                        &reply,
+                        &error_id,
+                        SD_JSON_BUILD_PAIR_STRING("interface", interface));
+        if (r == -ETIME)
+                return log_error_errno(r, "Timed out while introspecting interface '%s': %m", interface);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to introspect interface '%s', reconnecting: %m", interface);
+
+                *vl = sd_varlink_unref(*vl);
+                return varlink_connect_auto(vl, url);
+        }
+        if (error_id) {
+                log_debug("Failed to introspect interface '%s', ignoring: %s", interface, error_id);
+                return 0;
+        }
+
+        r = sd_json_dispatch(reply, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &description);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to dispatch interface description, ignoring: %m");
+                return 0;
+        }
+
+        r = sd_varlink_idl_parse(description, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &vi);
+        if (r < 0) {
+                log_debug_errno(r, "Failed to parse interface description, ignoring: %m");
+                return 0;
+        }
+
+        symbol = varlink_idl_find_symbol(vi, SD_VARLINK_METHOD, name);
+        if (!symbol)
+                return 0;
+
+        if (FLAGS_SET(vi->interface_flags, SD_VARLINK_EXPERIMENTAL) ||
+            FLAGS_SET(symbol->symbol_flags, SD_VARLINK_EXPERIMENTAL))
+                log_notice("Method %s() is experimental, it may change incompatibly or be removed in future versions.", method);
+
+        return 0;
+}
+
+static int varlink_call_and_upgrade(const char *url, const char *method, sd_json_variant *parameters, char **exec_cmdline) {
+        _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_(socket_forward_freep) SocketForward *sf = NULL;
+        _cleanup_close_ int input_fd = -EBADF, output_fd = -EBADF;
+        const char *error_id = NULL;
+        int r;
+
+        r = varlink_connect_auto(&vl, url);
+        if (r < 0)
+                return r;
+
+        r = notice_if_method_experimental(&vl, url, method);
+        if (r < 0)
+                return r;
+
+        r = sd_varlink_call_and_upgrade(
+                        vl,
+                        method,
+                        parameters,
+                        /* ret_parameters= */ NULL,
+                        &error_id,
+                        &input_fd,
+                        &output_fd);
+        if (r < 0)
+                return log_error_errno(r, "Failed to upgrade connection via %s(): %m", method);
+        if (!isempty(error_id))
+                return log_error_errno(SYNTHETIC_ERRNO(EBADE), "Upgrade via %s() failed with error: %s", method, error_id);
+
+        if (!strv_isempty(exec_cmdline)) {
+                /* --exec mode: place the upgraded connection on stdin/stdout so that the child
+                 * process can just read/write naturally. */
+                (void) sd_notify(/* unset_environment= */ false, "READY=1");
+
+                log_close();
+                log_set_open_when_needed(true);
+
+                int keep_fds[] = { TAKE_FD(input_fd), TAKE_FD(output_fd) };
+
+                r = close_all_fds(keep_fds, 2);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to close remaining file descriptors: %m");
+                        _exit(EXIT_FAILURE);
+                }
+
+                r = move_fd(keep_fds[0], STDIN_FILENO, /* cloexec= */ false);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to move upgraded connection to stdin: %m");
+                        _exit(EXIT_FAILURE);
+                }
+
+                r = move_fd(keep_fds[1], STDOUT_FILENO, /* cloexec= */ false);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to move upgraded connection to stdout: %m");
+                        _exit(EXIT_FAILURE);
+                }
+
+                (void) exec_with_listen_fds(exec_cmdline, /* fds= */ NULL, /* n_fds= */ 0);
+                /* This is only reached on failure, otherwise we continue with exec_cmdline). */
+                _exit(EXIT_FAILURE);
+        }
+
+        /* No --exec: bidirectional proxy between stdin/stdout and the upgraded socket */
+
+        /* splice() into a socket honours the socket's O_NONBLOCK, not SPLICE_F_NONBLOCK. */
+        r = fd_nonblock(input_fd, /* nonblock= */ true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set upgraded input fd to non-blocking mode: %m");
+
+        r = fd_nonblock(output_fd, /* nonblock= */ true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set upgraded output fd to non-blocking mode: %m");
+
+        /* Use a clean event loop just for the forwarding to avoid any interference. */
+        r = sd_event_new(&event);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate event loop: %m");
+
+        _cleanup_(nonblock_resetp) int stdin_nonblock_reset = -EBADF, stdout_nonblock_reset = -EBADF;
+
+        _cleanup_close_ int stdin_fd = dup_stdio_fd(STDIN_FILENO, O_RDONLY, &stdin_nonblock_reset);
+        if (stdin_fd < 0)
+                return log_error_errno(stdin_fd, "Failed to dup stdin: %m");
+
+        _cleanup_close_ int stdout_fd = dup_stdio_fd(STDOUT_FILENO, O_WRONLY, &stdout_nonblock_reset);
+        if (stdout_fd < 0)
+                return log_error_errno(stdout_fd, "Failed to dup stdout: %m");
+
+        r = socket_forward_new_pair(
+                        event,
+                        TAKE_FD(stdin_fd), TAKE_FD(stdout_fd),
+                        TAKE_FD(input_fd), TAKE_FD(output_fd),
+                        upgrade_forward_done, event,
+                        &sf);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set up socket forwarding for varlink: %m");
+
+        r = sd_event_loop(event);
+        if (r < 0)
+                return log_error_errno(r, "Failed to run socket forward for varlink: %m");
+
+        return 0;
+}
+
+VERB(verb_call, "call", "ADDRESS METHOD [PARAMS]\0", 3, VERB_ANY, 0, "Invoke method");
 static int verb_call(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *jp = NULL;
         _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
         const char *url, *method, *parameter, *source;
-        char **cmdline;
+        char **exec_cmdline;
         int r;
 
         assert(argc >= 3);
@@ -651,12 +938,31 @@ static int verb_call(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (arg_exec && (arg_collect || (arg_method_flags & (SD_VARLINK_METHOD_ONEWAY|SD_VARLINK_METHOD_MORE))) != 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--exec and --collect/--more/--oneway may not be combined.");
 
+        if (arg_upgrade) {
+                if (arg_collect || arg_method_flags != 0 || arg_push_fds.n_fds > 0 || !strv_isempty(arg_graceful))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--upgrade may not be combined with --collect/--more/--oneway/--push-fd=/--graceful.");
+        }
+
         (void) polkit_agent_open_if_enabled(BUS_TRANSPORT_LOCAL, arg_ask_password);
 
         url = argv[1];
         method = argv[2];
         parameter = argc > 3 && !streq(argv[3], "-") ? argv[3] : NULL;
-        cmdline = strv_skip(argv, 4);
+        exec_cmdline = strv_skip(argv, 4);
+
+        if (!varlink_idl_qualified_symbol_name_is_valid(method))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Not a valid qualified method name: '%s' (Expected valid Varlink interface name, followed by a dot, followed by a valid Varlink symbol name.)", method);
+
+        if (arg_upgrade) {
+                /* For --upgrade, parse parameters from argv only (stdin is used for the upgraded connection) */
+                if (parameter) {
+                        r = sd_json_parse(parameter, SD_JSON_PARSE_MUST_BE_OBJECT, &jp, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse parameters: %m");
+                }
+
+                return varlink_call_and_upgrade(url, method, jp, exec_cmdline);
+        }
 
         /* No JSON mode explicitly configured? Then default to the same as -j (except if --exec is used, in
          * which case generate shortest possible JSON since we are going to pass it to a program rather than
@@ -673,9 +979,6 @@ static int verb_call(int argc, char *argv[], uintptr_t _data, void *userdata) {
         /* For pipeable text tools it's kinda customary to finish output off in a newline character, and not
          * leave incomplete lines hanging around. */
         arg_json_format_flags |= SD_JSON_FORMAT_NEWLINE;
-
-        if (!varlink_idl_qualified_symbol_name_is_valid(method))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Not a valid qualified method name: '%s' (Expected valid Varlink interface name, followed by a dot, followed by a valid Varlink symbol name.)", method);
 
         unsigned line = 0, column = 0;
         if (parameter) {
@@ -700,6 +1003,10 @@ static int verb_call(int argc, char *argv[], uintptr_t _data, void *userdata) {
          * JsonVariant object for method calls. */
 
         r = varlink_connect_auto(&vl, url);
+        if (r < 0)
+                return r;
+
+        r = notice_if_method_experimental(&vl, url, method);
         if (r < 0)
                 return r;
 
@@ -747,7 +1054,7 @@ static int verb_call(int argc, char *argv[], uintptr_t _data, void *userdata) {
                         return r;
 
                 pager_open(arg_pager_flags);
-                sd_json_variant_dump(reply, arg_json_format_flags, stdout, NULL);
+                sd_json_variant_dump(reply, arg_json_format_flags, stdout, /* prefix= */ NULL);
                 return r;
 
         } else if (arg_method_flags & SD_VARLINK_METHOD_ONEWAY) {
@@ -842,10 +1149,6 @@ static int verb_call(int argc, char *argv[], uintptr_t _data, void *userdata) {
                         if (mfd < 0)
                                 return log_error_errno(mfd, "Failed to allocate memfd for reply: %m");
 
-                        _cleanup_free_ char *j = strv_join(cmdline, " ");
-                        if (!j)
-                                return log_oom();
-
                         int *fd_array = NULL, n = 0;
                         size_t m = 0;
                         CLEANUP_ARRAY(fd_array, m, close_many_and_free);
@@ -872,65 +1175,14 @@ static int verb_call(int argc, char *argv[], uintptr_t _data, void *userdata) {
                          * lives in our process their fds. Hence we will now no longer bubble up any
                          * errors. */
 
-                        log_close();
-                        log_set_open_when_needed(true);
-
                         r = move_fd(mfd, STDIN_FILENO, /* cloexec= */ false);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to move reply to STDIN_FILENO: %m");
                                 _exit(EXIT_FAILURE);
                         }
 
-                        r = close_all_fds(fd_array, m);
-                        if (r < 0) {
-                                log_error_errno(r, "Failed to close all remaining file descriptors: %m");
-                                _exit(EXIT_FAILURE);
-                        }
-
-                        r = pack_fds(fd_array, m);
-                        if (r < 0) {
-                                log_error_errno(r, "Failed to rearrange file descriptors: %m");
-                                _exit(EXIT_FAILURE);
-                        }
-
-                        r = fd_cloexec_many(fd_array, m, false);
-                        if (r < 0) {
-                                log_error_errno(r, "Failed to disable O_CLOEXEC for file descriptors: %m");
-                                _exit(EXIT_FAILURE);
-                        }
-
-                        if (m > 0) {
-                                r = setenvf("LISTEN_FDS", /* overwrite= */ true, "%zu", m);
-                                if (r < 0) {
-                                        log_error_errno(r, "Failed to set $LISTEN_FDS environment variable: %m");
-                                        _exit(EXIT_FAILURE);
-                                }
-
-                                r = setenvf("LISTEN_PID", /* overwrite= */ true, PID_FMT, getpid_cached());
-                                if (r < 0) {
-                                        log_error_errno(r, "Failed to set $LISTEN_PID environment variable: %m");
-                                        _exit(EXIT_FAILURE);
-                                }
-
-                                uint64_t pidfdid;
-                                if (pidfd_get_inode_id_self_cached(&pidfdid) >= 0) {
-                                        r = setenvf("LISTEN_PIDFDID", /* overwrite= */ true, "%" PRIu64, pidfdid);
-                                        if (r < 0) {
-                                                log_error_errno(r, "Failed to set $LISTEN_PIDFDID environment variable: %m");
-                                                _exit(EXIT_FAILURE);
-                                        }
-                                }
-                        } else {
-                                (void) unsetenv("LISTEN_FDS");
-                                (void) unsetenv("LISTEN_PID");
-                                (void) unsetenv("LISTEN_PIDFDID");
-                        }
-                        (void) unsetenv("LISTEN_FDNAMES");
-
-                        log_debug("Executing: %s", j);
-
-                        execvp(cmdline[0], cmdline);
-                        log_error_errno(errno, "Failed to execute '%s': %m", j);
+                        (void) exec_with_listen_fds(exec_cmdline, fd_array, m);
+                        /* This is only reached on failure, otherwise we continue with exec_cmdline. */
                         _exit(EXIT_FAILURE);
                 }
 
@@ -939,13 +1191,14 @@ static int verb_call(int argc, char *argv[], uintptr_t _data, void *userdata) {
 
                 pager_open(arg_pager_flags);
 
-                sd_json_variant_dump(reply, arg_json_format_flags, stdout, NULL);
+                sd_json_variant_dump(reply, arg_json_format_flags, stdout, /* prefix= */ NULL);
                 return r;
         }
 
         return 0;
 }
 
+VERB(verb_validate_idl, "validate-idl", "[FILE]\0", 1, 2, 0, "Validate interface description");
 static int verb_validate_idl(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *vi = NULL;
         _cleanup_free_ char *text = NULL;
@@ -956,11 +1209,11 @@ static int verb_validate_idl(int argc, char *argv[], uintptr_t _data, void *user
         fname = argc > 1 ? argv[1] : NULL;
 
         if (fname) {
-                r = read_full_file(fname, &text, NULL);
+                r = read_full_file(fname, &text, /* ret_size= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read interface description file '%s': %m", fname);
         } else {
-                r = read_full_stream(stdin, &text, NULL);
+                r = read_full_stream(stdin, &text, /* ret_size= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read interface description from stdin: %m");
 
@@ -995,6 +1248,7 @@ static int verb_validate_idl(int argc, char *argv[], uintptr_t _data, void *user
         return 0;
 }
 
+VERB_NOARG(verb_list_registry, "list-registry", "Show list of services in the service registry");
 static int verb_list_registry(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
@@ -1011,10 +1265,10 @@ static int verb_list_registry(int argc, char *argv[], uintptr_t _data, void *use
 
         (void) table_set_sort(table, (size_t) 0);
 
-        _cleanup_close_ int regfd = open(reg_path, O_DIRECTORY|O_CLOEXEC);
+        _cleanup_close_ int regfd = xopenat(AT_FDCWD, reg_path, O_DIRECTORY);
         if (regfd < 0)  {
-                if (errno != ENOENT)
-                        return log_error_errno(errno, "Failed to open '%s': %m", reg_path);
+                if (regfd != -ENOENT)
+                        return log_error_errno(regfd, "Failed to open '%s': %m", reg_path);
         } else {
                 _cleanup_free_ DirectoryEntries *des = NULL;
                 r = readdir_all(regfd, RECURSE_DIR_IGNORE_DOT|RECURSE_DIR_ENSURE_TYPE, &des);
@@ -1073,7 +1327,7 @@ static int verb_list_registry(int argc, char *argv[], uintptr_t _data, void *use
                         }
 
                         default:
-                                log_debug("Ignoring inode '%s' of unexpected type: %m", de->d_name);
+                                log_debug("Ignoring inode '%s' of unexpected type.", de->d_name);
                         }
                 }
         }
@@ -1094,32 +1348,735 @@ static int verb_list_registry(int argc, char *argv[], uintptr_t _data, void *use
         return 0;
 }
 
-static int varlinkctl_main(int argc, char *argv[]) {
-        static const Verb verbs[] = {
-                { "info",            2,        2,        0, verb_info          },
-                { "list-interfaces", 2,        2,        0, verb_info          },
-                { "introspect",      2,        VERB_ANY, 0, verb_introspect    },
-                { "list-methods",    2,        VERB_ANY, 0, verb_introspect    },
-                { "call",            3,        VERB_ANY, 0, verb_call          },
-                { "list-registry",   VERB_ANY, 1,        0, verb_list_registry },
-                { "validate-idl",    1,        2,        0, verb_validate_idl  },
-                { "help",            VERB_ANY, VERB_ANY, 0, verb_help          },
+VERB_NOARG(verb_list_sockets, "list-sockets", "List listening Varlink entrypoint sockets");
+static int verb_list_sockets(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        int r;
+
+        assert(argc <= 1);
+
+        /* Enumerates listening, file-system bound AF_UNIX SOCK_STREAM sockets via the sock_diag netlink API,
+         * and lists those that are marked as Varlink entrypoints (i.e. carry the "user.varlink" xattr set to
+         * "entrypoint").  */
+
+        r = socket_xattr_supported();
+        if (r < 0)
+                return log_error_errno(r, "Failed to check if S_IFSOCK inodes support xattrs: %m");
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "This kernel does not support extended attributes on socket inodes, cannot enumerate Varlink sockets.");
+
+        _cleanup_(sd_netlink_unrefp) sd_netlink *nl = NULL;
+        r = sd_sock_diag_socket_open(&nl);
+        if (r < 0)
+                return log_error_errno(r, "Failed to open sock_diag netlink socket: %m");
+
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *req = NULL;
+        r = sd_sock_diag_message_new_unix_dump(nl, &req, 1U << TCP_LISTEN, UDIAG_SHOW_NAME|UDIAG_SHOW_VFS);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate AF_UNIX socket dump request: %m");
+
+        _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *reply = NULL;
+        r = sd_netlink_call(nl, req, /* timeout= */ 0, &reply);
+        if (r < 0)
+                return log_error_errno(r, "Failed to issue AF_UNIX socket dump: %m");
+
+        _cleanup_(table_unrefp) Table *table = table_new("path", "access");
+        if (!table)
+                return log_oom();
+
+        (void) table_set_sort(table, (size_t) 0);
+
+        for (sd_netlink_message *m = reply; m; m = sd_netlink_message_next(m)) {
+
+                r = sd_netlink_message_get_errno(m);
+                if (r < 0) {
+                        log_warning_errno(r, "Error in AF_UNIX socket dump entry, ignoring: %m");
+                        continue;
+                }
+
+                struct unix_diag_msg udm;
+                r = sd_sock_diag_message_get_unix(m, &udm);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to read AF_UNIX socket dump header, ignoring: %m");
+                        continue;
+                }
+
+                /* We only care about listening stream sockets. The kernel already filtered by state, but
+                 * there's no way to filter by type in the request, so we do that here (and double check the
+                 * state for good measure). */
+                if (udm.udiag_type != SOCK_STREAM)
+                        continue;
+                if (udm.udiag_state != TCP_LISTEN)
+                        continue;
+
+                /* Read the bound name. This is not NUL terminated on the wire, hence read it as raw data. */
+                _cleanup_free_ void *name = NULL;
+                size_t name_size = 0;
+                r = sd_netlink_message_read_data(m, UNIX_DIAG_NAME, &name_size, &name);
+                if (r == -ENODATA) /* unnamed socket */
+                        continue;
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read AF_UNIX socket name: %m");
+
+                /* Safely turn the raw, not necessarily NUL-terminated, name into a C string. This also
+                 * rejects any name with embedded NUL bytes. */
+                _cleanup_free_ char *path = NULL;
+                r = make_cstring(name, name_size, MAKE_CSTRING_ALLOW_TRAILING_NUL, &path);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to convert AF_UNIX socket name to string, skipping: %m");
+                        continue;
+                }
+                if (!path_is_absolute(path)) {
+                        log_debug("Got non-absolute AF_UNIX socket path '%s', skipping.", path);
+                        continue;
+                }
+
+                /* The kernel also reports the backing VFS inode/device, but only for file-system bound
+                 * sockets. We require it, both as a filter and to validate the path below. */
+                _cleanup_free_ void *vfs = NULL;
+                size_t vfs_size = 0;
+                r = sd_netlink_message_read_data(m, UNIX_DIAG_VFS, &vfs_size, &vfs);
+                if (r == -ENODATA)
+                        continue; /* not fs bound */
+                if (r < 0)
+                        return log_error_errno(r, "Failed to read AF_UNIX socket VFS data: %m");
+                if (vfs_size != sizeof(struct unix_diag_vfs)) {
+                        log_warning("Got AF_UNIX socket VFS data of unexpected size, skipping.");
+                        continue;
+                }
+                const struct unix_diag_vfs *uv = vfs;
+
+                /* Validate the path the kernel reported: open it (without following a final-component
+                 * symlink), and verify it really is a socket whose inode and backing device match what
+                 * netlink told us. This guards against the path having been unlinked/replaced in the
+                 * meantime, so that we only ever read xattrs off the right inode. */
+                _cleanup_close_ int fd = xopenat(AT_FDCWD, path, O_PATH|O_NOFOLLOW);
+                if (fd < 0) {
+                        log_debug_errno(fd, "Failed to open reported AF_UNIX socket path '%s', skipping: %m", path);
+                        continue;
+                }
+
+                struct stat st;
+                if (fstat(fd, &st) < 0) {
+                        log_debug_errno(errno, "Failed to stat reported AF_UNIX socket path '%s', skipping: %m", path);
+                        continue;
+                }
+
+                if (!S_ISSOCK(st.st_mode)) {
+                        log_debug("Reported AF_UNIX socket path '%s' is not a socket, skipping.", path);
+                        continue;
+                }
+
+                /* the unix_diag_vfs structure only gives us 32bit inode numbers, which it truncates. hence lets truncate the value before comparison */
+                if (((st.st_ino ^ uv->udiag_vfs_ino) & UINT32_MAX) != 0) {
+                        log_debug("Inode of reported AF_UNIX socket path '%s' does not match netlink data, skipping.", path);
+                        continue;
+                }
+
+                /* udiag_vfs_dev carries the kernel-internal dev_t encoding, which differs from the userspace
+                 * dev_t in st_dev — hence translate before comparing. */
+                if (STAT_DEV_TO_KERNEL(st.st_dev) != uv->udiag_vfs_dev) {
+                        log_debug("Backing device of reported AF_UNIX socket path '%s' does not match netlink data, skipping.", path);
+                        continue;
+                }
+
+                /* The path is validated now, hence we may safely read the Varlink role xattr off the fd. We
+                 * only list sockets that are marked as Varlink entrypoints. */
+                _cleanup_free_ char *role = NULL;
+                r = fgetxattr_malloc(fd, "user.varlink", &role, /* ret_size= */ NULL);
+                if (r < 0) {
+                        if (!ERRNO_IS_NEG_XATTR_ABSENT(r))
+                                log_debug_errno(r, "Failed to read 'user.varlink' xattr of '%s', skipping: %m", path);
+                        continue;
+                }
+                if (!streq(role, "entrypoint"))
+                        continue;
+
+                _cleanup_free_ char *no = NULL;
+                r = access_fd(fd, W_OK);
+                if (r < 0) {
+                        no = strjoin("no (", ERRNO_NAME(r), ")");
+                        if (!no)
+                                return log_oom();
+                }
+
+                r = table_add_many(
+                                table,
+                                TABLE_PATH, path,
+                                TABLE_STRING, no ?: "yes",
+                                TABLE_SET_COLOR, ansi_highlight_green_red(!no));
+                if (r < 0)
+                        return r;
+        }
+
+        if (!table_isempty(table) || sd_json_format_enabled(arg_json_format_flags)) {
+                r = table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, /* show_header= */ true);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to output table: %m");
+        }
+
+        if (arg_legend && !sd_json_format_enabled(arg_json_format_flags)) {
+                if (table_isempty(table))
+                        printf("No sockets found.\n");
+                else
+                        printf("\n%zu entrypoint sockets listed.\n", table_get_rows(table) - 1);
+        }
+
+        return 0;
+}
+
+/* Build a minimal IDL from a qualified method name so that introspection works. The parsed interface is
+ * returned to the caller who must keep it alive for the lifetime of the server
+ * (sd_varlink_server_add_interface() borrows the pointer). */
+static int varlink_server_add_interface_from_method(sd_varlink_server *s, const char *method, sd_varlink_interface **ret_interface) {
+        assert(s);
+        assert(method);
+        assert(ret_interface);
+
+        _cleanup_free_ char *interface_name = NULL;
+        const char *name;
+        int r;
+
+        r = varlink_idl_split_qualified_symbol_name(method, &interface_name, &name);
+        if (r < 0)
+                return log_error_errno(r, "Failed to split method name '%s': %m", method);
+
+        /* Note that we do not need to put the upgrade flag comment here, it is added automatically
+         * by varlink_idl_format_symbol() because of the SD_VARLINK_REQUIRES_UPGRADE flag. */
+        _cleanup_free_ char *idl_text = strjoin(
+                        "interface ", interface_name, "\n"
+                        "\n"
+                        "method ", name, " () -> ()\n");
+        if (!idl_text)
+                return log_oom();
+
+        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *iface = NULL;
+        r = sd_varlink_idl_parse(idl_text, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &iface);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse IDL for method '%s': %m", method);
+
+        /* Mark the method as requiring the upgrade flag so introspection shows the annotation */
+        assert(iface->symbols[0] && iface->symbols[0]->symbol_type == SD_VARLINK_METHOD);
+        ((sd_varlink_symbol*) iface->symbols[0])->symbol_flags |= SD_VARLINK_REQUIRES_UPGRADE;
+
+        r = sd_varlink_server_add_interface(s, iface);
+        if (r < 0)
+                return r;
+
+        *ret_interface = TAKE_PTR(iface);
+
+        return 0;
+}
+
+typedef struct ServeContext {
+        char **exec_cmdline;
+        Hashmap *polkit_registry;
+} ServeContext;
+
+static void serve_context_done(ServeContext *c) {
+        assert(c);
+
+        c->polkit_registry = hashmap_free(c->polkit_registry);
+}
+
+static int method_serve_upgrade(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        ServeContext *c = ASSERT_PTR(userdata);
+        _cleanup_close_ int input_fd = -EBADF, output_fd = -EBADF;
+        int r;
+
+        if (!FLAGS_SET(flags, SD_VARLINK_METHOD_UPGRADE))
+                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_UPGRADE, /* parameters= */ NULL);
+
+        if (arg_polkit_action) {
+                /* Pass POLKIT_DONT_REPLY so that the helper never answers the client itself: it only does
+                 * so on some denial paths, hence always reply on our own instead. Any error, privilege
+                 * related or not, looks like a denial to the client to avoid leaking information. */
+                r = varlink_verify_polkit_async_full(
+                                link,
+                                /* bus= */ NULL,
+                                arg_polkit_action,
+                                /* details= */ NULL,
+                                /* good_user= */ UID_INVALID,
+                                POLKIT_DONT_REPLY,
+                                &c->polkit_registry,
+                                /* ret_admin= */ NULL);
+                if (r < 0) {
+                        if (!ERRNO_IS_NEG_PRIVILEGE(r))
+                                log_warning_errno(r, "Failed to check polkit authorization, denying: %m");
+                        return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, /* parameters= */ NULL);
+                }
+                if (r == 0) /* polkit query in flight, we are dispatched again once it is answered */
+                        return 0;
+        }
+
+        r = sd_varlink_reply_and_upgrade(link, /* parameters= */ NULL, &input_fd, &output_fd);
+        if (r < 0)
+                return log_error_errno(r, "Failed to upgrade connection: %m");
+
+        /* Copy exec_cmdline before forking: pidref_safe_fork() calls rename_process() which
+         * overwrites the argv area that exec_cmdline points into. */
+        _cleanup_strv_free_ char **cmdline_copy = strv_copy(c->exec_cmdline);
+        if (!cmdline_copy)
+                return log_oom();
+
+        r = pidref_safe_fork_full(
+                        "(serve)",
+                        (int[]) { input_fd, output_fd, STDERR_FILENO },
+                        /* except_fds= */ NULL, /* n_except_fds= */ 0,
+                        FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_REARRANGE_STDIO|FORK_DETACH|FORK_LOG,
+                        /* ret= */ NULL);
+        if (r < 0)
+                return r;
+        if (r == 0) {
+                r = execvp_safe(cmdline_copy[0], cmdline_copy);
+                log_error_errno(r, "Failed to execute '%s': %m", cmdline_copy[0]);
+                _exit(EXIT_FAILURE);
+        }
+
+        return 0;
+}
+
+VERB(verb_serve, "serve", "METHOD CMDLINE…\0", 3, VERB_ANY, 0, "Serve a command via varlink protocol upgrade");
+static int verb_serve(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_(serve_context_done) ServeContext context = {};
+        const char *method;
+        int r, n;
+
+        assert(argc >= 3); /* Guaranteed by verb dispatch table */
+
+        method = argv[1];
+        context.exec_cmdline = argv + 2;
+
+        r = varlink_idl_qualified_symbol_name_is_valid(method);
+        if (r < 0)
+                return log_error_errno(r, "Failed to validate method name '%s': %m", method);
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Not a valid qualified method name: '%s'", method);
+
+        /* Require socket activation */
+        n = sd_listen_fds(/* unset_environment= */ true);
+        if (n < 0)
+                return log_error_errno(n, "Failed to determine passed file descriptors: %m");
+        if (n == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No file descriptors passed via socket activation.");
+        if (n > 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Expected exactly one socket activation fd, got %d.", n);
+
+        r = sd_event_default(&event);
+        if (r < 0)
+                return log_error_errno(r, "Failed to get event loop: %m");
+
+        r = sd_varlink_server_new(&s,
+                                  (arg_polkit_action ? SD_VARLINK_SERVER_ACCOUNT_UID : 0)|
+                                  SD_VARLINK_SERVER_INHERIT_USERDATA|SD_VARLINK_SERVER_UPGRADABLE);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate varlink server: %m");
+
+        _cleanup_free_ char *description = strjoin("serve:", method);
+        if (!description)
+                return log_oom();
+
+        r = sd_varlink_server_set_description(s, description);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set server description: %m");
+
+        r = sd_varlink_server_bind_method(s, method, method_serve_upgrade);
+        if (r < 0)
+                return log_error_errno(r, "Failed to bind method '%s': %m", method);
+
+        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *iface = NULL;
+        r = varlink_server_add_interface_from_method(s, method, &iface);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add interface for method '%s': %m", method);
+
+        sd_varlink_server_set_userdata(s, &context);
+
+        r = sd_varlink_server_listen_fd(s, SD_LISTEN_FDS_START);
+        if (r < 0)
+                return log_error_errno(r, "Failed to listen on socket activation fd: %m");
+
+        r = sd_varlink_server_attach_event(s, event, SD_EVENT_PRIORITY_NORMAL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to attach varlink server to event loop: %m");
+
+        (void) sd_notify(/* unset_environment= */ false, "READY=1");
+
+        r = sd_event_loop(event);
+        if (r < 0)
+                return log_error_errno(r, "Failed to run event loop: %m");
+
+        return 0;
+}
+
+#if HAVE_LIBBPF
+typedef struct MonitorJsonBuffer {
+        struct iovec data;
+        struct monitor_varlink_packet packet;
+        bool truncated;
+} MonitorJsonBuffer;
+
+static MonitorJsonBuffer* monitor_json_buffer_free(MonitorJsonBuffer *buf) {
+        if (!buf)
+                return NULL;
+        iovec_done(&buf->data);
+        return mfree(buf);
+}
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(MonitorJsonBuffer *, monitor_json_buffer_free);
+
+static Hashmap* monitor_json_buffers_free(Hashmap *h) {
+        MonitorJsonBuffer *buf;
+        while ((buf = hashmap_steal_first(h)))
+                monitor_json_buffer_free(buf);
+        return hashmap_free(h);
+}
+
+static void monitor_json_buffer_display_json(const MonitorJsonBuffer *buf, sd_json_variant *data, bool truncated) {
+        assert(buf);
+
+        const struct monitor_varlink_packet *p = &buf->packet;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        _cleanup_free_ char *path_str = NULL;
+
+        if (p->path_len > 0) {
+                path_str = cescape_length(p->path, p->path_len);
+                if (!path_str)
+                        return (void) log_oom();
+        }
+
+        usec_t realtime = map_clock_usec(p->timestamp_ns / 1000, CLOCK_BOOTTIME, CLOCK_REALTIME);
+
+        _cleanup_(pidref_done) PidRef sender = { .pid = p->pid, .fd = -EBADF, .fd_id = p->pidfd_id },
+                                      peer = { .pid = p->peer_pid, .fd = -EBADF, .fd_id = p->peer_pidfd_id };
+
+        (void) sd_json_buildo(
+                        &v,
+                        SD_JSON_BUILD_PAIR_UNSIGNED("timestamp", realtime),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("sockCookie", p->sock_cookie),
+                        JSON_BUILD_PAIR_PIDREF("pid", &sender),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("uid", p->uid),
+                        JSON_BUILD_PAIR_PIDREF("peerPid", &peer),
+                        SD_JSON_BUILD_PAIR_CONDITION(p->peer_uid != UID_INVALID, "peerUid", SD_JSON_BUILD_UNSIGNED(p->peer_uid)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("path", path_str),
+                        SD_JSON_BUILD_PAIR_CONDITION(!!data, "data", SD_JSON_BUILD_VARIANT(data)),
+                        SD_JSON_BUILD_PAIR_CONDITION(truncated, "truncated", SD_JSON_BUILD_BOOLEAN(true)));
+
+        (void) sd_json_variant_dump(v, arg_json_format_flags, stdout, /* prefix= */ NULL);
+}
+
+static void monitor_json_buffer_display_pretty(const MonitorJsonBuffer *buf, sd_json_variant *data, const char *msg, size_t msg_len, bool truncated) {
+        assert(buf);
+
+        const struct monitor_varlink_packet *p = &buf->packet;
+        usec_t realtime = map_clock_usec(p->timestamp_ns / 1000, CLOCK_BOOTTIME, CLOCK_REALTIME);
+
+        printf("%s%s%s %s%s%s\n",
+               ansi_highlight_cyan(),
+               glyph(GLYPH_TRIANGULAR_BULLET),
+               ansi_normal(),
+               ansi_grey(),
+               FORMAT_TIMESTAMP_STYLE(realtime, TIMESTAMP_US),
+               ansi_normal());
+
+        if (p->path_len > 0) {
+                _cleanup_free_ char *escaped = cescape_length(p->path, p->path_len);
+                printf("  %s%s%s\n",
+                       ansi_highlight_cyan(),
+                       strna(escaped),
+                       ansi_normal());
+        } else
+                printf("  %s(anonymous)%s\n",
+                       ansi_highlight_cyan(),
+                       ansi_normal());
+
+        printf("  %sPID=%s%"PRIu32"%s %sUID=%s%"PRIu32"%s %s %sPID=%s%"PRIu32"%s %sUID=%s%"PRIu32"%s %scookie=%s%"PRIu64"%s\n",
+               ansi_grey(), ansi_highlight(), p->pid, ansi_normal(),
+               ansi_grey(), ansi_highlight(), p->uid, ansi_normal(),
+               glyph(GLYPH_ARROW_RIGHT),
+               ansi_grey(), ansi_highlight(), p->peer_pid, ansi_normal(),
+               ansi_grey(), ansi_highlight(), p->peer_uid, ansi_normal(),
+               ansi_grey(), ansi_highlight(), p->sock_cookie, ansi_normal());
+
+        if (truncated)
+                printf("  %s(truncated)%s\n", ansi_highlight_red(), ansi_normal());
+
+        if (data)
+                (void) sd_json_variant_dump(data,
+                                            SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO|SD_JSON_FORMAT_NEWLINE,
+                                            stdout, /* prefix= */ NULL);
+        else if (msg && msg_len > 0)
+                printf("  (invalid JSON, %zu bytes)\n", msg_len);
+
+        printf("\n");
+}
+
+/* Cap reassembly buffers so a malformed stream (no NUL terminator) cannot grow unbounded. */
+#define MONITOR_BUFFER_MAX (16U * 1024U * 1024U)
+
+static void monitor_process_packet(
+                Hashmap **buffers,
+                const struct monitor_varlink_packet *p) {
+
+        assert(buffers);
+        assert(p);
+
+        void *key = UINT64_TO_PTR(p->sock_cookie);
+        MonitorJsonBuffer *buf = hashmap_get(*buffers, key);
+
+        if (!buf) {
+                _cleanup_(monitor_json_buffer_freep) MonitorJsonBuffer *new_buf = NULL;
+
+                buf = new_buf = new(MonitorJsonBuffer, 1);
+                if (!new_buf)
+                        return;
+
+                *new_buf = (MonitorJsonBuffer) {};
+
+                if (hashmap_ensure_put(buffers, &trivial_hash_ops, key, new_buf) < 0)
+                        return;
+                TAKE_PTR(new_buf);
+        }
+
+        if (p->truncated) {
+                buf->truncated = true;
+                if (buf->data.iov_len > 0) {
+                        if (!iovec_append(&buf->data, &iovec_nul_byte))
+                                return;
+                }
+        }
+
+        buf->packet = *p;
+
+        if (p->data_len > 0 && !iovec_append(&buf->data, &IOVEC_MAKE(p->data, p->data_len)))
+                return;
+
+        /* Cap buffers so a malformed stream (no NUL terminator) cannot grow unbounded. */
+        if (buf->data.iov_len > MONITOR_BUFFER_MAX) {
+                buf->truncated = true;
+                if (!iovec_append(&buf->data, &iovec_nul_byte))
+                        return;
+        }
+
+        for (;;) {
+                const char *nul = memchr(buf->data.iov_base, '\0', buf->data.iov_len);
+                if (!nul)
+                        break;
+
+                size_t msg_len = (size_t)(nul - (const char*) buf->data.iov_base);
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *data = NULL;
+                (void) sd_json_parse(buf->data.iov_base, /* flags= */ 0, &data, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
+
+                if (sd_json_format_enabled(arg_json_format_flags))
+                        monitor_json_buffer_display_json(buf, data, buf->truncated);
+                else
+                        monitor_json_buffer_display_pretty(buf, data, buf->data.iov_base, msg_len, buf->truncated);
+
+                fflush(stdout);
+
+                buf->truncated = false;
+                assert_se(iovec_consume(&buf->data, msg_len + 1));
+        }
+
+        if (buf->data.iov_len == 0)
+                monitor_json_buffer_free(hashmap_remove(*buffers, key));
+}
+
+static int on_bpf_ringbuf_sample(void *ctx, void *data, size_t size) {
+        Hashmap **buffers = ctx;
+
+        if (size < sizeof(struct monitor_varlink_packet))
+                return 0;
+
+        monitor_process_packet(buffers, data);
+
+        return 0;
+}
+
+static int on_monitor_ringbuf_io(sd_event_source *s, int fd, uint32_t events, void *userdata) {
+        struct ring_buffer *rb = ASSERT_PTR(userdata);
+        int r;
+
+        r = sym_ring_buffer__poll(rb, /* timeout_ms= */ 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to consume BPF ring buffer: %m");
+
+        return 0;
+}
+
+typedef struct MonitorContext {
+        sd_event *event;
+        struct ring_buffer *rb;
+        Hashmap *json_buffers;
+        int ringbuf_fd;
+} MonitorContext;
+
+static void monitor_context_done(MonitorContext *c) {
+        assert(c);
+
+        c->rb = bpf_ring_buffer_free(c->rb);
+        c->json_buffers = monitor_json_buffers_free(c->json_buffers);
+        c->ringbuf_fd = safe_close(c->ringbuf_fd);
+}
+
+static int on_monitor_reply(
+                sd_varlink *link,
+                sd_json_variant *parameters,
+                const char *error,
+                sd_varlink_reply_flags_t flags,
+                void *userdata) {
+
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "ringbufFileDescriptor", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint, 0, SD_JSON_MANDATORY },
                 {}
         };
 
-        return dispatch_verb(argc, argv, verbs, NULL);
+        MonitorContext *c = ASSERT_PTR(userdata);
+        int r;
+
+        if (error) {
+                int err = sd_varlink_error_to_errno(error, parameters);
+                if (err == -EOPNOTSUPP)
+                        log_error("Kernel does not support required BPF features for varlink monitoring.");
+                else
+                        log_error("Monitor call failed: %s", error);
+                return sd_event_exit(c->event, err);
+        }
+
+        if (!(flags & SD_VARLINK_REPLY_CONTINUES))
+                return sd_event_exit(c->event, /* code= */ 0);
+
+        if (c->ringbuf_fd >= 0)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Received unexpected additional reply from monitor.");
+
+        unsigned ringbuf_fd_idx = UINT_MAX;
+        r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_LOG|SD_JSON_ALLOW_EXTENSIONS, &ringbuf_fd_idx);
+        if (r < 0)
+                return r;
+
+        c->ringbuf_fd = sd_varlink_peek_dup_fd(link, ringbuf_fd_idx);
+        if (c->ringbuf_fd < 0)
+                return log_error_errno(c->ringbuf_fd, "Failed to take ring buffer fd from varlink connection: %m");
+
+        c->rb = sym_ring_buffer__new(c->ringbuf_fd, on_bpf_ringbuf_sample, &c->json_buffers, /* opts= */ NULL);
+        if (!c->rb)
+                return log_error_errno(errno, "Failed to create BPF ring buffer consumer: %m");
+
+        int poll_fd = sym_ring_buffer__epoll_fd(c->rb);
+        if (poll_fd < 0)
+                return log_error_errno(poll_fd, "Failed to get poll fd of ring buffer: %m");
+
+        r = sd_event_add_io(c->event, /* ret= */ NULL, poll_fd, EPOLLIN, on_monitor_ringbuf_io, c->rb);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add ring buffer poll fd to event loop: %m");
+
+        (void) sd_notify(/* unset_environment= */ false, "READY=1");
+
+        return 0;
 }
+
+VERB_NOARG(verb_monitor, "monitor", "Monitor varlink traffic");
+static int verb_monitor(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(monitor_context_done) MonitorContext c = {
+                .ringbuf_fd = -EBADF,
+        };
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
+        int r;
+
+        LIBBPF_NOTE(recommended);
+        r = dlopen_bpf(LOG_ERR);
+        if (r < 0)
+                return log_error_errno(r, "Failed to load libbpf: %m");
+
+        if (sd_json_format_enabled(arg_json_format_flags))
+                arg_json_format_flags |= SD_JSON_FORMAT_SEQ|SD_JSON_FORMAT_FLUSH;
+
+        r = sd_event_default(&event);
+        if (r < 0)
+                return log_error_errno(r, "Failed to allocate event loop: %m");
+
+        c.event = event;
+
+        (void) sd_event_add_signal(event, /* ret= */ NULL, SIGTERM|SD_EVENT_SIGNAL_PROCMASK, /* callback= */ NULL, /* userdata= */ NULL);
+        (void) sd_event_add_signal(event, /* ret= */ NULL, SIGINT|SD_EVENT_SIGNAL_PROCMASK, /* callback= */ NULL, /* userdata= */ NULL);
+
+        r = sd_varlink_connect_address(&link, "/run/systemd/io.systemd.VarlinkMonitor");
+        if (r < 0)
+                return log_error_errno(r, "Failed to connect to varlink monitoring service: %m");
+
+        r = sd_varlink_set_allow_fd_passing_input(link, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to enable file descriptor passing: %m");
+
+        r = sd_varlink_set_relative_timeout(link, USEC_INFINITY);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set varlink timeout: %m");
+
+        sd_varlink_set_userdata(link, &c);
+
+        r = sd_varlink_bind_reply(link, on_monitor_reply);
+        if (r < 0)
+                return log_error_errno(r, "Failed to bind reply callback: %m");
+
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        if (arg_pid > 0) {
+                r = pidref_set_pid(&pidref, arg_pid);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to open reference to PID " PID_FMT ": %m", arg_pid);
+        }
+
+        bool has_filters = arg_uid != UID_INVALID || arg_pid > 0 || arg_socket_path || arg_socket_path_anonymous;
+
+        (void) polkit_agent_open_if_enabled(BUS_TRANSPORT_LOCAL, arg_ask_password);
+
+        r = sd_varlink_observebo(
+                        link,
+                        "io.systemd.VarlinkMonitor.Acquire",
+                        SD_JSON_BUILD_PAIR_BOOLEAN("allowInteractiveAuthentication", arg_ask_password),
+                        SD_JSON_BUILD_PAIR_CONDITION(has_filters, "filters",
+                                SD_JSON_BUILD_ARRAY(
+                                        SD_JSON_BUILD_OBJECT(
+                                                SD_JSON_BUILD_PAIR_CONDITION(arg_uid != UID_INVALID, "uid", SD_JSON_BUILD_UNSIGNED(arg_uid)),
+                                                SD_JSON_BUILD_PAIR_CONDITION(arg_pid > 0, "pid", JSON_BUILD_PIDREF(&pidref)),
+                                                SD_JSON_BUILD_PAIR_CONDITION(!!arg_socket_path, "path", SD_JSON_BUILD_STRING(arg_socket_path)),
+                                                SD_JSON_BUILD_PAIR_CONDITION(arg_socket_path_anonymous, "path", JSON_BUILD_CONST_STRING(""))))));
+        if (r < 0)
+                return log_error_errno(r, "Failed to observe monitor: %m");
+
+        r = sd_varlink_attach_event(link, event, SD_EVENT_PRIORITY_NORMAL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to attach varlink to event loop: %m");
+
+        r = sd_event_loop(event);
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+#else
+VERB_NOARG(verb_monitor, "monitor", "Monitor varlink traffic");
+static int verb_monitor(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Not compiled with libbpf support.");
+}
+#endif
+
+VERB_COMMON_HELP_AUTO();
 
 static int run(int argc, char *argv[]) {
         int r;
 
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;  /* unnecessary initialization to appease gcc <= 13 */
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
-        return varlinkctl_main(argc, argv);
+        if (arg_polkit_action && !streq_ptr(args[0], "serve"))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "--polkit-action= is only supported with the 'serve' verb.");
+
+        return dispatch_verb(args, NULL);
 }
 
 DEFINE_MAIN_FUNCTION(run);

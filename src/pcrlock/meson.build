@@ -12,9 +12,8 @@ executables += [
                         'pcrlock-firmware.c',
                 ),
                 'dependencies' : [
-                        libm,
-                        libopenssl,
-                        tpm2,
+                        libopenssl_cflags,
+                        tpm2_cflags,
                 ],
         },
 ]
@@ -27,6 +26,7 @@ install_data('pcrlock.d/500-separator.pcrlock.d/600-0xffffffff.pcrlock', install
 install_data('pcrlock.d/700-action-efi-exit-boot-services.pcrlock.d/300-present.pcrlock', install_dir : pcrlockdir / '700-action-efi-exit-boot-services.pcrlock.d')
 install_data('pcrlock.d/700-action-efi-exit-boot-services.pcrlock.d/600-absent.pcrlock', install_dir : pcrlockdir / '700-action-efi-exit-boot-services.pcrlock.d')
 install_data('pcrlock.d/750-enter-initrd.pcrlock', install_dir : pcrlockdir)
+install_data('pcrlock.d/750-os-separator.pcrlock', install_dir : pcrlockdir)
 install_data('pcrlock.d/770-nvpcr-separator.pcrlock', install_dir : pcrlockdir)
 install_data('pcrlock.d/800-leave-initrd.pcrlock', install_dir : pcrlockdir)
 install_data('pcrlock.d/850-sysinit.pcrlock', install_dir : pcrlockdir)

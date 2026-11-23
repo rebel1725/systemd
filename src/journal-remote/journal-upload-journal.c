@@ -1,7 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <curl/curl.h>
-
 #include "sd-daemon.h"
 #include "sd-event.h"
 #include "sd-journal.h"
@@ -170,7 +168,7 @@ static ssize_t write_entry(char *buf, size_t size, Uploader *u) {
                         if (memory_startswith(u->field_data, u->field_length, "_BOOT_ID="))
                                 continue;
 
-                        if (!utf8_is_printable_newline(u->field_data, u->field_length, false)) {
+                        if (!utf8_is_printable_newline(u->field_data, u->field_length, /* allow_newline= */ false)) {
                                 u->entry_state = ENTRY_BINARY_FIELD_START;
                                 continue;
                         }
@@ -274,7 +272,7 @@ static void check_update_watchdog(Uploader *u) {
         elapsed_time = usec_sub_unsigned(after, u->watchdog_timestamp);
         if (elapsed_time > u->watchdog_usec / 2) {
                 log_debug("Update watchdog timer");
-                sd_notify(false, "WATCHDOG=1");
+                sd_notify(/* unset_environment= */ false, "WATCHDOG=1");
                 u->watchdog_timestamp = after;
         }
 }
@@ -354,7 +352,7 @@ static size_t journal_input_callback(void *buf, size_t size, size_t nmemb, void 
                 r = compress_blob(u->compression->algorithm, compression_buffer, filled, buf, size * nmemb, &compressed_size, u->compression->level);
                 if (r < 0) {
                         log_error_errno(r, "Failed to compress %zu bytes by %s with level %i: %m",
-                                        filled, compression_lowercase_to_string(u->compression->algorithm), u->compression->level);
+                                        filled, compression_to_string(u->compression->algorithm), u->compression->level);
                         return CURL_READFUNC_ABORT;
                 }
 
@@ -433,8 +431,6 @@ int open_journal_for_upload(Uploader *u,
         int fd, r, events;
 
         u->journal = j;
-
-        sd_journal_set_data_threshold(j, 0);
 
         if (follow) {
                 fd = sd_journal_get_fd(j);

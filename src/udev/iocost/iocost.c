@@ -1,12 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <stdio.h>
 
 #include "sd-device.h"
 
 #include "alloc-util.h"
-#include "build.h"
 #include "cgroup-util.h"
 #include "conf-parser.h"
 #include "device-util.h"
@@ -20,6 +18,13 @@
 static char *arg_target_solution = NULL;
 STATIC_DESTRUCTOR_REGISTER(arg_target_solution, freep);
 
+COMMAND(
+        "iocost\0",
+        "Set up iocost model and qos solutions for block devices.",
+        .man_page = "iocost.conf(5)",
+        .option_namespace = "common",
+);
+
 static int parse_config(void) {
         static const ConfigTableItem items[] = {
                 { "IOCost", "TargetSolution", config_parse_string, 0, &arg_target_solution },
@@ -27,15 +32,15 @@ static int parse_config(void) {
         int r;
 
         r = config_parse(
-                        NULL,
+                        /* unit= */ NULL,
                         "/etc/udev/iocost.conf",
                         NULL,
                         "IOCost\0",
                         config_item_table_lookup,
                         items,
                         CONFIG_PARSE_WARN,
-                        NULL,
-                        NULL);
+                        /* userdata= */ NULL,
+                        /* ret_stat= */ NULL);
         if (r < 0)
                 return r;
 
@@ -49,56 +54,7 @@ static int parse_config(void) {
         return 0;
 }
 
-static int help(void) {
-        printf("%s [OPTIONS...]\n\n"
-               "Set up iocost model and qos solutions for block devices\n"
-               "\nCommands:\n"
-               "  apply <path> [SOLUTION]    Apply solution for the device if\n"
-               "                             found, do nothing otherwise\n"
-               "  query <path>               Query the known solution for\n"
-               "                             the device\n"
-               "\nOptions:\n"
-               "  -h --help                  Show this help\n"
-               "     --version               Show package version\n",
-               program_invocation_short_name);
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-        };
-
-        static const struct option options[] = {
-                { "help",      no_argument,       NULL, 'h'           },
-                { "version",   no_argument,       NULL, ARG_VERSION   },
-                {}
-        };
-
-        int c;
-
-        assert(argc >= 1);
-        assert(argv);
-
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
-                switch (c) {
-
-                case 'h':
-                        return help();
-
-                case ARG_VERSION:
-                        return version();
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
-                }
-
-        return 1;
-}
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
 static int get_known_solutions(sd_device *device, int log_level, char ***ret_solutions, const char **ret_selected) {
         _cleanup_free_ char **s = NULL;
@@ -280,32 +236,27 @@ static int query_solutions_for_path(const char *path) {
         return 0;
 }
 
+VERB(verb_query, "query", "PATH\0", 2, 2, 0,
+     "Query the known solution for the device");
 static int verb_query(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return query_solutions_for_path(ASSERT_PTR(argv[1]));
 }
 
+VERB(verb_apply, "apply", "PATH [SOLUTION]\0", 2, 3, 0,
+     "Apply solution for the device if found, do nothing otherwise");
 static int verb_apply(int argc, char *argv[], uintptr_t _data, void *userdata) {
         return apply_solution_for_path(
                         ASSERT_PTR(argv[1]),
                         argc > 2 ? ASSERT_PTR(argv[2]) : NULL);
 }
 
-static int iocost_main(int argc, char *argv[]) {
-        static const Verb verbs[] = {
-                { "query", 2, 2, 0, verb_query },
-                { "apply", 2, 3, 0, verb_apply },
-                {},
-        };
-
-        return dispatch_verb(argc, argv, verbs, NULL);
-}
-
 static int run(int argc, char *argv[]) {
+        char **args = NULL;
         int r;
 
         log_setup();
 
-        r = parse_argv(argc, argv);
+        r = common_parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
@@ -313,7 +264,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
-        return iocost_main(argc, argv);
+        return dispatch_verb(args, NULL);
 }
 
 DEFINE_MAIN_FUNCTION(run);

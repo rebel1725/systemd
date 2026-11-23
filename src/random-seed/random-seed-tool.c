@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <getopt.h>
 #include <stdlib.h>
 #include <sys/random.h>
 #include <sys/stat.h>
@@ -11,21 +10,20 @@
 #include "sd-id128.h"
 
 #include "alloc-util.h"
-#include "build.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
+#include "initrd-util.h"
 #include "io-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "mkdir.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "random-util.h"
 #include "sha256.h"
-#include "string-table.h"
 #include "string-util.h"
 #include "sync-util.h"
+#include "verbs.h"
 #include "xattr-util.h"
 
 typedef enum SeedAction {
@@ -42,6 +40,13 @@ typedef enum CreditEntropy {
 } CreditEntropy;
 
 static SeedAction arg_action = _ACTION_INVALID;
+
+COMMAND(
+        "systemd-random-seed\0",
+        "Load and save the system random seed at boot and shutdown.",
+        .man_page = "systemd-random-seed(8)",
+        .option_namespace = "common",
+);
 
 static CreditEntropy may_credit(int seed_fd) {
         const char *e;
@@ -87,8 +92,8 @@ static CreditEntropy may_credit(int seed_fd) {
         /* Don't credit the random seed if we are in first-boot mode, because we are supposed to start from
          * scratch. This is a safety precaution for cases where people ship "golden" images with empty
          * /etc but populated /var that contains a random seed. */
-        r = RET_NERRNO(access("/run/systemd/first-boot", F_OK));
-        if (r == -ENOENT)
+        r = in_first_boot();
+        if (r == 0)
                 /* All is good, we are not in first-boot mode. */
                 return CREDIT_ENTROPY_YES_PLEASE;
         if (r < 0) {
@@ -157,7 +162,7 @@ static int load_seed_file(
         if (!buf)
                 return log_oom();
 
-        k = loop_read(seed_fd, buf, seed_size, false);
+        k = loop_read(seed_fd, buf, seed_size, /* do_poll= */ false);
         if (k < 0) {
                 log_warning_errno(k, "Failed to read seed from %s: %m", RANDOM_SEED);
                 return 0;
@@ -232,7 +237,7 @@ static int save_seed_file(
 
         /* This is just a safety measure. Given that we are root and most likely created the file ourselves
          * the mode and owner should be correct anyway. */
-        r = fchmod_and_chown(seed_fd, 0600, 0, 0);
+        r = fchmod_and_chown(seed_fd, 0600, /* uid= */ 0, /* gid= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to adjust seed file ownership and access mode: %m");
 
@@ -257,7 +262,7 @@ static int save_seed_file(
 
         if (!getrandom_worked) {
                 /* Retry with classic /dev/urandom */
-                k = loop_read(urandom_fd, buf, seed_size, false);
+                k = loop_read(urandom_fd, buf, seed_size, /* do_poll= */ false);
                 if (k < 0)
                         return log_error_errno(k, "Failed to read new seed from /dev/urandom: %m");
                 if (k == 0)
@@ -281,7 +286,7 @@ static int save_seed_file(
                 return log_error_errno(r, "Failed to write new random seed file: %m");
 
         if (ftruncate(seed_fd, k) < 0)
-                return log_error_errno(r, "Failed to truncate random seed file: %m");
+                return log_error_errno(errno, "Failed to truncate random seed file: %m");
 
         r = fsync_full(seed_fd);
         if (r < 0)
@@ -296,77 +301,13 @@ static int save_seed_file(
         return 0;
 }
 
-static int help(int argc, char *argv[], void *userdata) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-random-seed", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...] COMMAND\n"
-               "\n%5$sLoad and save the system random seed at boot and shutdown.%6$s\n"
-               "\n%3$sCommands:%4$s\n"
-               "  load                Load a random seed saved on disk into the kernel entropy pool\n"
-               "  save                Save a new random seed on disk\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help           Show this help\n"
-               "     --version        Show package version\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
-
+VERB_FULL(verb_set_action, "load", NULL, VERB_ANY, 1, 0, ACTION_LOAD,
+          "Load a random seed saved on disk into the kernel entropy pool");
+VERB_FULL(verb_set_action, "save", NULL, VERB_ANY, 1, 0, ACTION_SAVE,
+          "Save a new random seed on disk");
+static int verb_set_action(int argc, char *argv[], uintptr_t data, void *userdata) {
+        arg_action = data;
         return 0;
-}
-
-static const char* const seed_action_table[_ACTION_MAX] = {
-        [ACTION_LOAD] = "load",
-        [ACTION_SAVE] = "save",
-};
-
-DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(seed_action, SeedAction);
-
-static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-        };
-
-        static const struct option options[] = {
-                { "help",    no_argument, NULL, 'h'         },
-                { "version", no_argument, NULL, ARG_VERSION },
-                {}
-        };
-
-        int c;
-
-        assert(argc >= 0);
-        assert(argv);
-
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
-                switch (c) {
-                case 'h':
-                        return help(0, NULL, NULL);
-                case ARG_VERSION:
-                        return version();
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
-                }
-
-        if (optind + 1 != argc)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program requires one argument.");
-
-        arg_action = seed_action_from_string(argv[optind]);
-        if (arg_action < 0)
-                return log_error_errno(arg_action, "Unknown action '%s'", argv[optind]);
-
-        return 1;
 }
 
 static int run(int argc, char *argv[]) {
@@ -378,8 +319,13 @@ static int run(int argc, char *argv[]) {
 
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = common_parse_argv(argc, argv, &args);
         if (r <= 0)
+                return r;
+
+        r = dispatch_verb(args, /* userdata= */ NULL);
+        if (r < 0)
                 return r;
 
         umask(0022);
@@ -388,9 +334,9 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to create directory %s: %m", RANDOM_SEED);
 
-        random_fd = open("/dev/urandom", O_RDWR|O_CLOEXEC|O_NOCTTY);
+        random_fd = xopenat(AT_FDCWD, "/dev/urandom", O_RDWR|O_NOCTTY);
         if (random_fd < 0)
-                return log_error_errno(errno, "Failed to open %s: %m", "/dev/urandom");
+                return log_error_errno(random_fd, "Failed to open %s: %m", "/dev/urandom");
 
         /* When we load the seed we read it and write it to the device and then immediately update the saved
          * seed with new data, to make sure the next boot gets seeded differently. */
@@ -401,15 +347,16 @@ static int run(int argc, char *argv[]) {
                  * load_machine_id() for an explanation why. */
                 load_machine_id(random_fd);
 
-                seed_fd = RET_NERRNO(open(RANDOM_SEED, O_RDWR|O_CLOEXEC|O_NOCTTY|O_CREAT, 0600));
+                seed_fd = xopenat_full(AT_FDCWD, RANDOM_SEED, O_RDWR|O_NOCTTY|O_CREAT, /* xopen_flags= */ 0, 0600);
                 if (seed_fd < 0) {
                         int open_rw_error = seed_fd;
 
                         write_seed_file = false;
 
-                        seed_fd = RET_NERRNO(open(RANDOM_SEED, O_RDONLY|O_CLOEXEC|O_NOCTTY));
+                        seed_fd = xopenat(AT_FDCWD, RANDOM_SEED, O_RDONLY|O_NOCTTY);
                         if (seed_fd < 0) {
-                                bool missing = seed_fd == -ENOENT;
+                                /* A dangling symlink fails with -ELOOP above, it isn't just missing */
+                                bool missing = seed_fd == -ENOENT && open_rw_error != -ELOOP;
                                 int level = missing ? LOG_DEBUG : LOG_ERR;
 
                                 log_full_errno(level, open_rw_error, "Failed to open %s for writing: %m", RANDOM_SEED);
@@ -424,7 +371,7 @@ static int run(int argc, char *argv[]) {
                 break;
 
         case ACTION_SAVE:
-                seed_fd = RET_NERRNO(open(RANDOM_SEED, O_WRONLY|O_CLOEXEC|O_NOCTTY|O_CREAT, 0600));
+                seed_fd = xopenat_full(AT_FDCWD, RANDOM_SEED, O_WRONLY|O_NOCTTY|O_CREAT, /* xopen_flags= */ 0, 0600);
                 if (seed_fd < 0)
                         return log_error_errno(seed_fd, "Failed to open %s: %m", RANDOM_SEED);
 

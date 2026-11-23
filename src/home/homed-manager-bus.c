@@ -12,6 +12,8 @@
 #include "bus-message-util.h"
 #include "bus-object.h"
 #include "bus-polkit.h"
+#include "crypto-util.h"
+#include "errno-util.h"
 #include "fileio.h"
 #include "format-util.h"
 #include "home-util.h"
@@ -22,7 +24,6 @@
 #include "homed-manager-bus.h"
 #include "homed-operation.h"
 #include "log.h"
-#include "openssl-util.h"
 #include "path-util.h"
 #include "set.h"
 #include "string-util.h"
@@ -482,7 +483,7 @@ static int validate_and_allocate_home(Manager *m, UserRecord *hr, Hashmap *blobs
                         return sd_bus_error_set_errnof(error, r, "Failed to acquire UID for '%s': %m", hr->user_name);
         }
 
-        r = home_new(m, hr, NULL, ret);
+        r = home_new(m, hr, /* sysfs= */ NULL, ret);
         if (r < 0)
                 return r;
 
@@ -517,7 +518,7 @@ static int method_register_home(
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = validate_and_allocate_home(m, hr, NULL, &h, error);
+        r = validate_and_allocate_home(m, hr, /* blobs= */ NULL, &h, error);
         if (r < 0)
                 return r;
 
@@ -527,7 +528,7 @@ static int method_register_home(
 
         TAKE_PTR(h);
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_adopt_home(
@@ -568,7 +569,7 @@ static int method_adopt_home(
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_unregister_home(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -740,8 +741,12 @@ static int method_lock_all_homes(sd_bus_message *message, void *userdata, sd_bus
                 log_info("Automatically locking home of user %s.", h->user_name);
 
                 r = home_schedule_operation(h, o, error);
-                if (r < 0)
+                if (r < 0) {
+                        /* We'll reply with an error right away, make sure the operations already
+                         * enqueued for other homes won't reply a second time. */
+                        o->message = sd_bus_message_unref(o->message);
                         return r;
+                }
 
                 waiting = true;
         }
@@ -750,7 +755,7 @@ static int method_lock_all_homes(sd_bus_message *message, void *userdata, sd_bus
                       * be sent as soon as the last of the lock operations completed. */
                 return 1;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_deactivate_all_homes(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -776,8 +781,12 @@ static int method_deactivate_all_homes(sd_bus_message *message, void *userdata, 
                 log_info("Automatically deactivating home of user %s.", h->user_name);
 
                 r = home_schedule_operation(h, o, error);
-                if (r < 0)
+                if (r < 0) {
+                        /* We'll reply with an error right away, make sure the operations already
+                         * enqueued for other homes won't reply a second time. */
+                        o->message = sd_bus_message_unref(o->message);
                         return r;
+                }
 
                 waiting = true;
         }
@@ -786,7 +795,7 @@ static int method_deactivate_all_homes(sd_bus_message *message, void *userdata, 
                       * sent as soon as the last of the deactivation operations completed. */
                 return 1;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_rebalance(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -936,14 +945,14 @@ static bool manager_has_public_key(Manager *m, EVP_PKEY *needle) {
 
         EVP_PKEY *pkey;
         HASHMAP_FOREACH(pkey, m->public_keys) {
-                r = EVP_PKEY_eq(pkey, needle);
+                r = sym_EVP_PKEY_eq(pkey, needle);
                 if (r > 0)
                         return true;
 
                 /* EVP_PKEY_eq() returns -1 and -2 too under some conditions, which we'll all treat as "not the same" */
         }
 
-        r = EVP_PKEY_eq(m->private_key, needle);
+        r = sym_EVP_PKEY_eq(m->private_key, needle);
         if (r > 0)
                 return true;
 
@@ -983,12 +992,23 @@ static int method_add_signing_key(sd_bus_message *message, void *userdata, sd_bu
         if (r == 0)
                 return 1; /* Will call us back */
 
-        _cleanup_(EVP_PKEY_freep) EVP_PKEY *pkey = NULL;
-        r = openssl_pubkey_from_pem(pem, /* pem_size= */ SIZE_MAX, &pkey);
-        if (r == -EIO)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Public key invalid: %s", fn);
+        /* Load libcrypto up front so that its unavailability (e.g. -EOPNOTSUPP) is propagated as the real
+         * error instead of being misattributed to the user-supplied key below. */
+        r = dlopen_libcrypto(LOG_DEBUG);
         if (r < 0)
                 return r;
+
+        _cleanup_(EVP_PKEY_freep) EVP_PKEY *pkey = NULL;
+        r = openssl_pubkey_from_pem(pem, /* pem_size= */ SIZE_MAX, &pkey);
+        if (r < 0) {
+                /* libcrypto is loaded at this point, so any failure here is a failure to parse or load the
+                 * user-supplied key (the translated OpenSSL errno varies: -EBADMSG, -EINVAL, -EOPNOTSUPP,
+                 * -EIO, …) — treat it as an invalid public key, except resource exhaustion which we
+                 * propagate as-is. */
+                if (ERRNO_IS_NEG_RESOURCE(r))
+                        return r;
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Public key invalid: %s", fn);
+        }
 
         /* Make sure the local key is loaded before can detect conflicts */
         r = manager_acquire_key_pair(m);
@@ -1024,7 +1044,7 @@ static int method_add_signing_key(sd_bus_message *message, void *userdata, sd_bu
         TAKE_PTR(fn_copy);
         TAKE_PTR(pkey);
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_remove_signing_key(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -1073,7 +1093,7 @@ static int method_remove_signing_key(sd_bus_message *message, void *userdata, sd
         _cleanup_free_ char *fn_free = NULL;
         pkey = ASSERT_PTR(hashmap_remove2(m->public_keys, fn, (void**) &fn_free));
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static const sd_bus_vtable manager_vtable[] = {

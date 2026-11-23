@@ -15,6 +15,8 @@ typedef enum SessionState {
         _SESSION_STATE_INVALID = -EINVAL,
 } SessionState;
 
+/* Used as index into LoginCounters.n_sessions_started[], hence changing this changes the layout of the
+ * counters file: add new classes at the end only, and bump LOGIN_COUNTERS_VERSION when doing so. */
 typedef enum SessionClass {
         SESSION_USER,               /* A regular user session */
         SESSION_USER_EARLY,         /* A user session, that is not ordered after systemd-user-sessions.service (i.e. for root) */
@@ -179,7 +181,7 @@ bool session_may_gc(Session *s, bool drop_not_started);
 void session_add_to_gc_queue(Session *s);
 int session_activate(Session *s);
 bool session_is_active(Session *s);
-int session_get_idle_hint(Session *s, dual_timestamp *t);
+bool session_get_idle_hint(Session *s, dual_timestamp *ret_timestamp);
 int session_set_idle_hint(Session *s, bool b);
 int session_get_locked_hint(Session *s);
 int session_set_locked_hint(Session *s, bool b);
@@ -219,3 +221,5 @@ int session_send_create_reply(Session *s, const sd_bus_error *error);
 
 bool session_is_self(const char *name);
 bool session_is_auto(const char *name);
+
+int session_build_json(Session *s, sd_json_variant **ret);

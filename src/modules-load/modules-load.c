@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
@@ -9,9 +8,10 @@
 
 #include "alloc-util.h"
 #include "assert.h"
-#include "build.h"
 #include "conf-files.h"
 #include "constants.h"
+#include "cpu-set-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -21,10 +21,10 @@
 #include "module-util.h"
 #include "ordered-set.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "proc-cmdline.h"
 #include "string-util.h"
 #include "strv.h"
+#include "verbs.h"
 
 #define MODULE_NAME_MAX_LEN (4096UL)
 
@@ -32,6 +32,14 @@ static char **arg_proc_cmdline_modules = NULL;
 static const char conf_file_dirs[] = CONF_PATHS_NULSTR("modules-load.d");
 
 STATIC_DESTRUCTOR_REGISTER(arg_proc_cmdline_modules, strv_freep);
+
+COMMAND(
+        "systemd-modules-load\0",
+        "Load statically configured kernel modules.",
+        .argspec = "[CONFIGURATION FILE…]\0",
+        .man_page = "systemd-modules-load.service(8)",
+        .option_namespace = "common",
+);
 
 static int modules_list_append_suffix(OrderedSet **module_set, char *modp) {
         /* take possession of string no matter what */
@@ -120,7 +128,7 @@ static int apply_file_from_path(const char *path, OrderedSet **module_set) {
 
         assert(path);
 
-        r = search_and_fopen_nulstr(path, "re", NULL, conf_file_dirs, &f, &pp);
+        r = search_and_fopen_nulstr(path, "re", /* root= */ NULL, conf_file_dirs, &f, &pp);
         if (r < 0)
                 return log_error_errno(r, "Failed to open %s: %m", path);
 
@@ -313,13 +321,13 @@ static unsigned determine_num_worker_threads(unsigned n_modules) {
         if (n_threads == UINT_MAX) {
                 /* By default, use a number of worker threads equal the number of online CPUs,
                  * but clamp it to avoid a probing storm on machines with many CPUs. */
-                long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
-                if (ncpus < 0) {
-                        log_warning_errno(errno, "Failed to get number of online CPUs, ignoring: %m");
-                        ncpus = 1;
-                }
-
-                n_threads = CLAMP((unsigned)ncpus, 1U, 16U);
+                unsigned n_cpus;
+                r = cpus_online(&n_cpus);
+                if (r < 0) {
+                        log_warning_errno(r, "Failed to get number of online CPUs, ignoring: %m");
+                        n_threads = 1;
+                } else
+                        n_threads = CLAMP(n_cpus, 1U, 16U);
         }
 
         /* There's no reason to spawn more threads than the modules that need to be loaded */
@@ -327,58 +335,6 @@ static unsigned determine_num_worker_threads(unsigned n_modules) {
 
         /* One of the probe threads is the main process */
         return n_threads - 1U;
-}
-
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-
-        if (terminal_urlify_man("systemd-modules-load.service", "8", &link) < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] [CONFIGURATION FILE...]\n\n"
-               "Loads statically configured kernel modules.\n\n"
-               "  -h --help             Show this help\n"
-               "     --version          Show package version\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               link);
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-        };
-
-        static const struct option options[] = {
-                { "help",      no_argument,       NULL, 'h'           },
-                { "version",   no_argument,       NULL, ARG_VERSION   },
-                {}
-        };
-
-        int c;
-
-        assert(argc >= 0);
-        assert(argv);
-
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
-                switch (c) {
-
-                case 'h':
-                        return help();
-
-                case ARG_VERSION:
-                        return version();
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
-                }
-
-        return 1;
 }
 
 static int run(int argc, char *argv[]) {
@@ -395,7 +351,10 @@ static int run(int argc, char *argv[]) {
         char *module;
         int ret = 0, r;
 
-        r = parse_argv(argc, argv);
+        LIBKMOD_NOTE(required);
+
+        char **args = NULL;
+        r = common_parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
@@ -407,9 +366,9 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
 
-        if (argc > optind) {
-                for (int i = optind; i < argc; i++) {
-                        r = apply_file_from_path(argv[i], &module_set);
+        if (!strv_isempty(args)) {
+                STRV_FOREACH(i, args) {
+                        r = apply_file_from_path(*i, &module_set);
                         if (r < 0)
                                 RET_GATHER(ret, r);
                 }
@@ -417,7 +376,7 @@ static int run(int argc, char *argv[]) {
                 ConfFile **files = NULL;
                 size_t n_files = 0;
 
-                CLEANUP_ARRAY(files, n_files, conf_file_free_many);
+                CLEANUP_ARRAY(files, n_files, conf_file_free_array);
 
                 STRV_FOREACH(i, arg_proc_cmdline_modules)
                         RET_GATHER(ret, modules_list_append_dup(&module_set, *i));

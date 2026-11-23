@@ -40,15 +40,17 @@
 #include "logind-session.h"
 #include "logind.h"
 #include "logind-action.h"
+#include "logind-counters.h"
 #include "logind-dbus.h"
 #include "logind-polkit.h"
 #include "logind-seat.h"
 #include "logind-seat-dbus.h"
 #include "logind-session-dbus.h"
+#include "logind-shutdown.h"
 #include "logind-user.h"
 #include "logind-user-dbus.h"
 #include "logind-utmp.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "os-util.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -58,6 +60,7 @@
 #include "signal-util.h"
 #include "sleep-config.h"
 #include "stdio-util.h"
+#include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
 #include "tmpfile-util.h"
@@ -76,10 +79,6 @@
  */
 #define WALL_MESSAGE_MAX 4096U
 
-#define SHUTDOWN_SCHEDULE_FILE "/run/systemd/shutdown/scheduled"
-
-static void reset_scheduled_shutdown(Manager *m);
-
 static int get_sender_session(
                 Manager *m,
                 sd_bus_message *message,
@@ -93,6 +92,7 @@ static int get_sender_session(
         int r;
 
         assert(m);
+        assert(ret);
 
         /* Acquire the sender's session. This first checks if the sending process is inside a session itself,
          * and returns that. If not and 'consult_display' is true, this returns the display session of the
@@ -150,9 +150,9 @@ int manager_get_session_from_creds(
         assert(ret);
 
         if (session_is_self(name)) /* the caller's own session */
-                return get_sender_session(m, message, false, error, ret);
+                return get_sender_session(m, message, /* consult_display= */ false, error, ret);
         if (session_is_auto(name)) /* The caller's own session if they have one, otherwise their user's display session */
-                return get_sender_session(m, message, true, error, ret);
+                return get_sender_session(m, message, /* consult_display= */ true, error, ret);
 
         session = hashmap_get(m->sessions, name);
         if (!session)
@@ -167,6 +167,8 @@ static int get_sender_user(Manager *m, sd_bus_message *message, sd_bus_error *er
         uid_t uid;
         User *user;
         int r;
+
+        assert(ret);
 
         /* Note that we get the owner UID of the session, not the actual client UID here! */
         r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_OWNER_UID|SD_BUS_CREDS_AUGMENT, &creds);
@@ -281,7 +283,7 @@ static int property_get_idle_hint(
         assert(bus);
         assert(reply);
 
-        return sd_bus_message_append(reply, "b", manager_get_idle_hint(m, NULL) > 0);
+        return sd_bus_message_append(reply, "b", manager_get_idle_hint(m, /* ret_timestamp= */ NULL));
 }
 
 static int property_get_idle_since_hint(
@@ -294,7 +296,7 @@ static int property_get_idle_since_hint(
                 sd_bus_error *error) {
 
         Manager *m = ASSERT_PTR(userdata);
-        dual_timestamp t = DUAL_TIMESTAMP_NULL;
+        dual_timestamp t;
 
         assert(bus);
         assert(reply);
@@ -476,7 +478,7 @@ static int property_get_maintenance_time(
 }
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_handle_action, handle_action, HandleAction);
-static BUS_DEFINE_PROPERTY_GET(property_get_docked, "b", Manager, manager_is_docked_or_external_displays);
+static BUS_DEFINE_PROPERTY_GET(property_get_docked, "b", Manager, manager_is_docked);
 static BUS_DEFINE_PROPERTY_GET(property_get_lid_closed, "b", Manager, manager_is_lid_closed);
 static BUS_DEFINE_PROPERTY_GET_GLOBAL(property_get_on_external_power, "b", manager_is_on_external_power());
 static BUS_DEFINE_PROPERTY_GET_GLOBAL(property_get_compat_user_tasks_max, "t", CGROUP_LIMIT_MAX);
@@ -527,7 +529,7 @@ static int method_get_session_by_pid(sd_bus_message *message, void *userdata, sd
                 return -EINVAL;
 
         if (pid == 0) {
-                r = manager_get_session_from_creds(m, message, NULL, error, &session);
+                r = manager_get_session_from_creds(m, message, /* name= */ NULL, error, &session);
                 if (r < 0)
                         return r;
         } else {
@@ -700,10 +702,7 @@ static int method_list_sessions_ex(sd_bus_message *message, void *userdata, sd_b
                 if (!path)
                         return -ENOMEM;
 
-                r = session_get_idle_hint(s, &idle_ts);
-                if (r < 0)
-                        return r;
-                idle = r > 0;
+                idle = session_get_idle_hint(s, &idle_ts);
 
                 r = sd_bus_message_append(reply, "(sussussbto)",
                                           s->id,
@@ -1154,7 +1153,7 @@ static int manager_create_session_by_bus(
         if (isempty(desktop))
                 desktop = NULL;
         else {
-                if (!string_is_safe(desktop))
+                if (!string_is_safe(desktop, STRING_ALLOW_GLOBS))
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
                                                  "Invalid desktop string %s", desktop);
         }
@@ -1249,6 +1248,9 @@ static int manager_create_session_by_bus(
         r = session_start(session, message, error);
         if (r < 0)
                 goto fail;
+
+        session_count_started(session);
+
         r = sd_bus_message_exit_container(message);
         if (r < 0)
                 goto fail;
@@ -1401,7 +1403,7 @@ static int method_release_session(sd_bus_message *message, void *userdata, sd_bu
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_activate_session(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -1462,7 +1464,7 @@ static int method_activate_session_on_seat(sd_bus_message *message, void *userda
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_lock_session(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -1505,7 +1507,7 @@ static int method_lock_sessions(sd_bus_message *message, void *userdata, sd_bus_
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_kill_session(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -1647,6 +1649,7 @@ static int method_set_user_linger(sd_bus_message *message, void *userdata, sd_bu
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &m->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -1654,7 +1657,7 @@ static int method_set_user_linger(sd_bus_message *message, void *userdata, sd_bu
                 return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
         (void) mkdir_p_label("/var/lib/systemd", 0755);
-        r = mkdir_safe_label("/var/lib/systemd/linger", 0755, 0, 0, MKDIR_WARN_MODE);
+        r = mkdir_safe_label("/var/lib/systemd/linger", 0755, /* uid= */ 0, /* gid= */ 0, MKDIR_WARN_MODE);
         if (r < 0)
                 return r;
 
@@ -1696,7 +1699,7 @@ static int method_set_user_linger(sd_bus_message *message, void *userdata, sd_bu
                 }
         }
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int trigger_device(Manager *m, sd_device *parent) {
@@ -1720,7 +1723,7 @@ static int trigger_device(Manager *m, sd_device *parent) {
         }
 
         FOREACH_DEVICE(e, d) {
-                r = sd_device_trigger(d, SD_DEVICE_CHANGE);
+                r = device_trigger_with_timestamp(d, SD_DEVICE_CHANGE, m->device_trigger_args, /* ret_uuid= */ NULL);
                 if (r < 0)
                         log_device_debug_errno(d, r, "Failed to trigger device, ignoring: %m");
         }
@@ -1785,7 +1788,7 @@ static int flush_devices(Manager *m) {
                                 log_warning_errno(errno, "Failed to unlink %s: %m", de->d_name);
                 }
 
-        return trigger_device(m, NULL);
+        return trigger_device(m, /* parent= */ NULL);
 }
 
 static int method_attach_device(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -1823,6 +1826,7 @@ static int method_attach_device(sd_bus_message *message, void *userdata, sd_bus_
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &m->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -1833,7 +1837,7 @@ static int method_attach_device(sd_bus_message *message, void *userdata, sd_bus_
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_flush_devices(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -1853,6 +1857,7 @@ static int method_flush_devices(sd_bus_message *message, void *userdata, sd_bus_
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &m->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -1863,25 +1868,7 @@ static int method_flush_devices(sd_bus_message *message, void *userdata, sd_bus_
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
-}
-
-static int have_multiple_sessions(
-                Manager *m,
-                uid_t uid) {
-
-        Session *session;
-
-        assert(m);
-
-        /* Check for other users' sessions. Greeter sessions do not
-         * count, and non-login sessions do not count either. */
-        HASHMAP_FOREACH(session, m->sessions)
-                if (SESSION_CLASS_IS_INHIBITOR_LIKE(session->class) &&
-                    session->user->user_record->uid != uid)
-                        return true;
-
-        return false;
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int bus_manager_log_shutdown(
@@ -1941,7 +1928,7 @@ int manager_set_lid_switch_ignore(Manager *m, usec_t until) {
                                 m->event,
                                 &m->lid_switch_ignore_event_source,
                                 CLOCK_MONOTONIC,
-                                until, 0,
+                                until, /* accuracy= */ 0,
                                 lid_switch_ignore_handler, m);
 
         return r;
@@ -2052,7 +2039,7 @@ static int execute_shutdown_or_sleep(
 
 fail:
         /* Tell people that they now may take a lock again. */
-        (void) send_prepare_for(m, a, false);
+        (void) send_prepare_for(m, a, /* _active= */ false);
 
         return r;
 }
@@ -2107,7 +2094,7 @@ static int manager_inhibit_timeout_handler(
 
         assert(manager->inhibit_timeout_source == s);
 
-        return manager_dispatch_delayed(manager, true);
+        return manager_dispatch_delayed(manager, /* timeout= */ true);
 }
 
 static int delay_shutdown_or_sleep(
@@ -2170,12 +2157,12 @@ int bus_manager_shutdown_or_sleep_now_or_later(
                                         a->target, load_state);
 
         /* Tell everybody to prepare for shutdown/sleep */
-        (void) send_prepare_for(m, a, true);
+        (void) send_prepare_for(m, a, /* _active= */ true);
 
         delayed =
                 m->inhibit_delay_max > 0 &&
                 a->inhibit_what >= 0 &&
-                manager_is_inhibited(m, a->inhibit_what, NULL, MANAGER_IS_INHIBITED_CHECK_DELAY, UID_INVALID, NULL);
+                manager_is_inhibited(m, a->inhibit_what, /* since= */ NULL, MANAGER_IS_INHIBITED_CHECK_DELAY, UID_INVALID, /* ret_offending= */ NULL);
 
         if (delayed)
                 /* Shutdown is delayed, keep in mind what we
@@ -2187,121 +2174,6 @@ int bus_manager_shutdown_or_sleep_now_or_later(
                 r = execute_shutdown_or_sleep(m, a, error);
 
         return r;
-}
-
-static int verify_shutdown_creds(
-                Manager *m,
-                sd_bus_message *message,
-                const HandleActionData *a,
-                uint64_t flags,
-                sd_bus_error *error) {
-
-        _cleanup_(sd_bus_creds_unrefp) sd_bus_creds *creds = NULL;
-        bool multiple_sessions, blocked, interactive;
-        _unused_ bool error_or_denial = false;
-        Inhibitor *offending = NULL;
-        uid_t uid;
-        int r;
-
-        assert(m);
-        assert(a);
-        assert(message);
-
-        r = sd_bus_query_sender_creds(message, SD_BUS_CREDS_EUID, &creds);
-        if (r < 0)
-                return r;
-
-        r = sd_bus_creds_get_euid(creds, &uid);
-        if (r < 0)
-                return r;
-
-        r = have_multiple_sessions(m, uid);
-        if (r < 0)
-                return r;
-
-        multiple_sessions = r > 0;
-        blocked = manager_is_inhibited(m, a->inhibit_what, NULL, /* flags= */ 0, uid, &offending);
-        interactive = flags & SD_LOGIND_INTERACTIVE;
-
-        if (multiple_sessions) {
-                r = bus_verify_polkit_async_full(
-                                message,
-                                a->polkit_action_multiple_sessions,
-                                /* details= */ NULL,
-                                /* good_user= */ UID_INVALID,
-                                interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
-                                &m->polkit_registry,
-                                error);
-                if (r < 0) {
-                        /* If we get -EBUSY, it means a polkit decision was made, but not for
-                         * this action in particular. Assuming we are blocked on inhibitors,
-                         * ignore that error and allow the decision to be revealed below. */
-                        if (blocked && r == -EBUSY)
-                                error_or_denial = true;
-                        else
-                                return r;
-                }
-                if (r == 0)
-                        return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
-        }
-
-        if (blocked) {
-                PolkitFlags polkit_flags = 0;
-
-                /* With a strong inhibitor, if the skip flag is not set, reject outright.
-                 * With a weak inhibitor, if root is asking and the root flag is set, reject outright.
-                 * All else, check polkit first. */
-                if (!FLAGS_SET(flags, SD_LOGIND_SKIP_INHIBITORS) &&
-                    (offending->mode != INHIBIT_BLOCK_WEAK ||
-                     (uid == 0 && FLAGS_SET(flags, SD_LOGIND_ROOT_CHECK_INHIBITORS))))
-                        return sd_bus_error_set(error, BUS_ERROR_BLOCKED_BY_INHIBITOR_LOCK,
-                                                "Operation denied due to active block inhibitor");
-
-                /* We want to always ask here, even for root, to only allow bypassing if explicitly allowed
-                 * by polkit, unless a weak blocker is used, in which case it will be authorized. */
-                if (offending->mode != INHIBIT_BLOCK_WEAK)
-                        polkit_flags |= POLKIT_ALWAYS_QUERY;
-
-                if (interactive)
-                        polkit_flags |= POLKIT_ALLOW_INTERACTIVE;
-
-                r = bus_verify_polkit_async_full(
-                                message,
-                                a->polkit_action_ignore_inhibit,
-                                /* details= */ NULL,
-                                /* good_user= */ UID_INVALID,
-                                polkit_flags,
-                                &m->polkit_registry,
-                                error);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
-        }
-
-        if (!multiple_sessions && !blocked) {
-                r = bus_verify_polkit_async_full(
-                                message,
-                                a->polkit_action,
-                                /* details= */ NULL,
-                                /* good_user= */ UID_INVALID,
-                                interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
-                                &m->polkit_registry,
-                                error);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
-        }
-
-        /* If error_or_denial was set above, it means that a polkit denial or
-         * error was deferred for a future call to bus_verify_polkit_async_full()
-         * to catch. In any case, it also means that the payload guarded by
-         * these polkit calls should never be executed, and hence we should
-         * never reach this point. */
-        assert(!error_or_denial);
-
-        return 0;
 }
 
 static int setup_wall_message_timer(Manager *m, sd_bus_message* message) {
@@ -2442,9 +2314,16 @@ static int method_do_shutdown_or_sleep(
         } else if (!a)
                 assert_se(a = handle_action_lookup(action));
 
-        r = verify_shutdown_creds(m, message, a, flags, error);
+        r = manager_verify_shutdown_creds(m, message, /* link= */ NULL, a, flags, error);
         if (r != 0)
                 return r;
+
+        {
+                _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+
+                (void) bus_query_sender_pidref(message, &pidref);
+                log_shutdown_caller(&pidref, handle_action_to_string(a->handle));
+        }
 
         if (m->delayed_action)
                 return sd_bus_error_setf(error, BUS_ERROR_OPERATION_IN_PROGRESS,
@@ -2452,20 +2331,20 @@ static int method_do_shutdown_or_sleep(
                                          handle_action_to_string(m->delayed_action->handle),
                                          handle_action_to_string(a->handle));
 
-        /* reset case we're shorting a scheduled shutdown */
+        r = bus_manager_shutdown_or_sleep_now_or_later(m, a, error);
+        if (r < 0)
+                return r;
+
+        /* Reset in case we're short-circuiting a scheduled shutdown. */
         m->unlink_nologin = false;
-        reset_scheduled_shutdown(m);
+        manager_reset_scheduled_shutdown(m);
 
         m->scheduled_shutdown_timeout = 0;
         m->scheduled_shutdown_action = action;
 
         (void) setup_wall_message_timer(m, message);
 
-        r = bus_manager_shutdown_or_sleep_now_or_later(m, a, error);
-        if (r < 0)
-                return r;
-
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_poweroff(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -2474,7 +2353,7 @@ static int method_poweroff(sd_bus_message *message, void *userdata, sd_bus_error
         return method_do_shutdown_or_sleep(
                         m, message,
                         HANDLE_POWEROFF,
-                        sd_bus_message_is_method_call(message, NULL, "PowerOffWithFlags"),
+                        sd_bus_message_is_method_call(message, /* interface= */ NULL, "PowerOffWithFlags"),
                         error);
 }
 
@@ -2484,7 +2363,7 @@ static int method_reboot(sd_bus_message *message, void *userdata, sd_bus_error *
         return method_do_shutdown_or_sleep(
                         m, message,
                         HANDLE_REBOOT,
-                        sd_bus_message_is_method_call(message, NULL, "RebootWithFlags"),
+                        sd_bus_message_is_method_call(message, /* interface= */ NULL, "RebootWithFlags"),
                         error);
 }
 
@@ -2494,7 +2373,7 @@ static int method_halt(sd_bus_message *message, void *userdata, sd_bus_error *er
         return method_do_shutdown_or_sleep(
                         m, message,
                         HANDLE_HALT,
-                        sd_bus_message_is_method_call(message, NULL, "HaltWithFlags"),
+                        sd_bus_message_is_method_call(message, /* interface= */ NULL, "HaltWithFlags"),
                         error);
 }
 
@@ -2504,7 +2383,7 @@ static int method_suspend(sd_bus_message *message, void *userdata, sd_bus_error 
         return method_do_shutdown_or_sleep(
                         m, message,
                         HANDLE_SUSPEND,
-                        sd_bus_message_is_method_call(message, NULL, "SuspendWithFlags"),
+                        sd_bus_message_is_method_call(message, /* interface= */ NULL, "SuspendWithFlags"),
                         error);
 }
 
@@ -2514,7 +2393,7 @@ static int method_hibernate(sd_bus_message *message, void *userdata, sd_bus_erro
         return method_do_shutdown_or_sleep(
                         m, message,
                         HANDLE_HIBERNATE,
-                        sd_bus_message_is_method_call(message, NULL, "HibernateWithFlags"),
+                        sd_bus_message_is_method_call(message, /* interface= */ NULL, "HibernateWithFlags"),
                         error);
 }
 
@@ -2524,7 +2403,7 @@ static int method_hybrid_sleep(sd_bus_message *message, void *userdata, sd_bus_e
         return method_do_shutdown_or_sleep(
                         m, message,
                         HANDLE_HYBRID_SLEEP,
-                        sd_bus_message_is_method_call(message, NULL, "HybridSleepWithFlags"),
+                        sd_bus_message_is_method_call(message, /* interface= */ NULL, "HybridSleepWithFlags"),
                         error);
 }
 
@@ -2534,7 +2413,7 @@ static int method_suspend_then_hibernate(sd_bus_message *message, void *userdata
         return method_do_shutdown_or_sleep(
                         m, message,
                         HANDLE_SUSPEND_THEN_HIBERNATE,
-                        sd_bus_message_is_method_call(message, NULL, "SuspendThenHibernateWithFlags"),
+                        sd_bus_message_is_method_call(message, /* interface= */ NULL, "SuspendThenHibernateWithFlags"),
                         error);
 }
 
@@ -2566,29 +2445,6 @@ static int nologin_timeout_handler(
 static usec_t nologin_timeout_usec(usec_t elapse) {
         /* Issue /run/nologin five minutes before shutdown */
         return LESS_BY(elapse, 5 * USEC_PER_MINUTE);
-}
-
-static void reset_scheduled_shutdown(Manager *m) {
-        assert(m);
-
-        m->scheduled_shutdown_timeout_source = sd_event_source_disable_unref(m->scheduled_shutdown_timeout_source);
-        m->wall_message_timeout_source = sd_event_source_disable_unref(m->wall_message_timeout_source);
-        m->nologin_timeout_source = sd_event_source_disable_unref(m->nologin_timeout_source);
-
-        m->scheduled_shutdown_action = _HANDLE_ACTION_INVALID;
-        m->scheduled_shutdown_timeout = USEC_INFINITY;
-        m->scheduled_shutdown_uid = UID_INVALID;
-        m->scheduled_shutdown_tty = mfree(m->scheduled_shutdown_tty);
-        m->shutdown_dry_run = false;
-
-        if (m->unlink_nologin) {
-                (void) unlink_or_warn("/run/nologin");
-                m->unlink_nologin = false;
-        }
-
-        (void) unlink(SHUTDOWN_SCHEDULE_FILE);
-
-        manager_send_changed(m, "ScheduledShutdown");
 }
 
 static int update_schedule_file(Manager *m) {
@@ -2669,7 +2525,7 @@ static int manager_scheduled_shutdown_handler(
 
                 bus_manager_log_shutdown(m, a);
                 log_info("Running in dry run, suppressing action.");
-                reset_scheduled_shutdown(m);
+                manager_reset_scheduled_shutdown(m);
 
                 return 0;
         }
@@ -2683,7 +2539,7 @@ static int manager_scheduled_shutdown_handler(
         return 0;
 
 error:
-        reset_scheduled_shutdown(m);
+        manager_reset_scheduled_shutdown(m);
         return r;
 }
 
@@ -2694,17 +2550,17 @@ static int manager_setup_shutdown_timers(Manager* m) {
 
         r = event_reset_time(m->event, &m->scheduled_shutdown_timeout_source,
                              CLOCK_REALTIME,
-                             m->scheduled_shutdown_timeout, 0,
+                             m->scheduled_shutdown_timeout, /* accuracy= */ 0,
                              manager_scheduled_shutdown_handler, m,
-                             0, "scheduled-shutdown-timeout", true);
+                             /* priority= */ 0, "scheduled-shutdown-timeout", /* force_reset= */ true);
         if (r < 0)
                 goto fail;
 
         r = event_reset_time(m->event, &m->nologin_timeout_source,
                              CLOCK_REALTIME,
-                             nologin_timeout_usec(m->scheduled_shutdown_timeout), 0,
+                             nologin_timeout_usec(m->scheduled_shutdown_timeout), /* accuracy= */ 0,
                              nologin_timeout_handler, m,
-                             0, "nologin-timeout", true);
+                             /* priority= */ 0, "nologin-timeout", /* force_reset= */ true);
         if (r < 0)
                 goto fail;
 
@@ -2738,7 +2594,7 @@ void manager_load_scheduled_shutdown(Manager *m) {
                            "TTY", &tty);
 
         /* reset will delete the file */
-        reset_scheduled_shutdown(m);
+        manager_reset_scheduled_shutdown(m);
 
         if (r == -ENOENT)
                 return;
@@ -2767,7 +2623,7 @@ void manager_load_scheduled_shutdown(Manager *m) {
 
         if (wall_message) {
                 _cleanup_free_ char *unescaped = NULL;
-                r = cunescape(wall_message, 0, &unescaped);
+                r = cunescape(wall_message, /* flags= */ 0, &unescaped);
                 if (r < 0)
                         log_debug_errno(r, "Failed to parse wall message: %s", wall_message);
                 else
@@ -2784,7 +2640,7 @@ void manager_load_scheduled_shutdown(Manager *m) {
 
         r = manager_setup_shutdown_timers(m);
         if (r < 0)
-                return reset_scheduled_shutdown(m);
+                return manager_reset_scheduled_shutdown(m);
 
         (void) manager_setup_wall_message_timer(m);
         (void) update_schedule_file(m);
@@ -2819,7 +2675,7 @@ static int method_schedule_shutdown(sd_bus_message *message, void *userdata, sd_
         assert_se(a = handle_action_lookup(handle));
         assert(a->polkit_action);
 
-        r = verify_shutdown_creds(m, message, a, 0, error);
+        r = manager_verify_shutdown_creds(m, message, /* link= */ NULL, a, /* flags= */ 0, error);
         if (r != 0)
                 return r;
 
@@ -2853,13 +2709,13 @@ static int method_schedule_shutdown(sd_bus_message *message, void *userdata, sd_
                 r = update_schedule_file(m);
 
         if (r < 0) {
-                reset_scheduled_shutdown(m);
+                manager_reset_scheduled_shutdown(m);
                 return r;
         }
 
         manager_send_changed(m, "ScheduledShutdown");
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_cancel_scheduled_shutdown(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -2913,7 +2769,7 @@ static int method_cancel_scheduled_shutdown(sd_bus_message *message, void *userd
         }
 
         cancel_delayed_action(m);
-        reset_scheduled_shutdown(m);
+        manager_reset_scheduled_shutdown(m);
 
         return sd_bus_reply_method_return(message, "b", true);
 }
@@ -2969,12 +2825,12 @@ static int method_can_shutdown_or_sleep(
         if (r < 0)
                 return r;
 
-        r = have_multiple_sessions(m, uid);
+        r = manager_have_multiple_sessions(m, uid);
         if (r < 0)
                 return r;
 
         multiple_sessions = r > 0;
-        blocked = manager_is_inhibited(m, a->inhibit_what, NULL, /* flags= */ 0, uid, NULL);
+        blocked = manager_is_inhibited(m, a->inhibit_what, /* since= */ NULL, /* flags= */ 0, uid, /* ret_offending= */ NULL);
 
         if (check_unit_state && a->target) {
                 _cleanup_free_ char *load_state = NULL;
@@ -3159,11 +3015,11 @@ static int method_set_reboot_parameter(
         if (r == 0)
                 return 1; /* No authorization for now, but the async polkit stuff will call us again when it has it */
 
-        r = update_reboot_parameter_and_warn(arg, false);
+        r = update_reboot_parameter_and_warn(arg, /* keep= */ false);
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_can_reboot_parameter(
@@ -3290,7 +3146,7 @@ static int method_set_reboot_to_firmware_setup(
                 }
         }
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_can_reboot_to_firmware_setup(
@@ -3438,7 +3294,7 @@ static int method_set_reboot_to_boot_loader_menu(
 
         if (use_efi) {
                 if (x == UINT64_MAX)
-                        r = efi_set_variable(EFI_LOADER_VARIABLE_STR("LoaderConfigTimeoutOneShot"), NULL, 0);
+                        r = efi_set_variable(EFI_LOADER_VARIABLE_STR("LoaderConfigTimeoutOneShot"), /* value= */ NULL, /* size= */ 0);
                 else {
                         char buf[DECIMAL_STR_MAX(uint64_t) + 1];
                         xsprintf(buf, "%" PRIu64, DIV_ROUND_UP(x, USEC_PER_SEC)); /* second granularity */
@@ -3460,7 +3316,7 @@ static int method_set_reboot_to_boot_loader_menu(
                 }
         }
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_can_reboot_to_boot_loader_menu(
@@ -3549,6 +3405,32 @@ static int property_get_reboot_to_boot_loader_entry(
         return sd_bus_message_append(reply, "s", x);
 }
 
+static int manager_load_boot_config(Manager *m, BootConfig *config) {
+        bool auto_only = true;
+        int r;
+
+        assert(m);
+        assert(config);
+
+        r = boot_config_load_auto(config, /* override_esp_path= */ NULL, /* override_xbootldr_path= */ NULL);
+        if (ERRNO_IS_NEG_RESOURCE(r))
+                return r;
+        if (r < 0 && r != -ENOKEY) { /* don't complain if there's no GPT found */
+                /* Don't fail on unsupported setups, e.g. a symlinked /boot/loader/ on ostree (see #44636).
+                 * Drop the partially loaded config and use all entries the boot loader reports instead. */
+                log_debug_errno(r, "Failed to load boot loader entries, ignoring: %m");
+                boot_config_free(config);
+                *config = (BootConfig) BOOT_CONFIG_NULL;
+                auto_only = false;
+        }
+
+        r = manager_read_efi_boot_loader_entries(m);
+        if (r >= 0)
+                (void) boot_config_augment_from_loader(config, m->efi_boot_loader_entries, auto_only);
+
+        return 0;
+}
+
 static int boot_loader_entry_exists(Manager *m, const char *id) {
         _cleanup_(boot_config_free) BootConfig config = BOOT_CONFIG_NULL;
         int r;
@@ -3556,13 +3438,9 @@ static int boot_loader_entry_exists(Manager *m, const char *id) {
         assert(m);
         assert(id);
 
-        r = boot_config_load_auto(&config, NULL, NULL);
-        if (r < 0 && r != -ENOKEY) /* don't complain if no GPT is found, hence skip ENOKEY */
+        r = manager_load_boot_config(m, &config);
+        if (r < 0)
                 return r;
-
-        r = manager_read_efi_boot_loader_entries(m);
-        if (r >= 0)
-                (void) boot_config_augment_from_loader(&config, m->efi_boot_loader_entries, /* auto_only= */ true);
 
         return !!boot_config_find_entry(&config, id);
 }
@@ -3633,7 +3511,7 @@ static int method_set_reboot_to_boot_loader_entry(
         if (use_efi) {
                 if (isempty(v))
                         /* Delete item */
-                        r = efi_set_variable(EFI_LOADER_VARIABLE_STR("LoaderEntryOneShot"), NULL, 0);
+                        r = efi_set_variable(EFI_LOADER_VARIABLE_STR("LoaderEntryOneShot"), /* value= */ NULL, /* size= */ 0);
                 else
                         r = efi_set_variable_string(EFI_LOADER_VARIABLE_STR("LoaderEntryOneShot"), v);
                 if (r < 0)
@@ -3643,13 +3521,13 @@ static int method_set_reboot_to_boot_loader_entry(
                         if (unlink("/run/systemd/reboot-to-boot-loader-entry") < 0 && errno != ENOENT)
                                 return -errno;
                 } else {
-                        r = write_string_file("/run/systemd/reboot-boot-to-loader-entry", v, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL);
+                        r = write_string_file("/run/systemd/reboot-to-boot-loader-entry", v, WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL);
                         if (r < 0)
                                 return r;
                 }
         }
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_can_reboot_to_boot_loader_entry(
@@ -3708,13 +3586,9 @@ static int property_get_boot_loader_entries(
         assert(bus);
         assert(reply);
 
-        r = boot_config_load_auto(&config, NULL, NULL);
-        if (r < 0 && r != -ENOKEY) /* don't complain if there's no GPT found */
+        r = manager_load_boot_config(m, &config);
+        if (r < 0)
                 return r;
-
-        r = manager_read_efi_boot_loader_entries(m);
-        if (r >= 0)
-                (void) boot_config_augment_from_loader(&config, m->efi_boot_loader_entries, /* auto_only= */ true);
 
         r = sd_bus_message_open_container(reply, 'a', "s");
         if (r < 0)
@@ -3729,6 +3603,46 @@ static int property_get_boot_loader_entries(
         }
 
         return sd_bus_message_close_container(reply);
+}
+
+static int wall_message_validate(const char *wall_message, sd_bus_error *error) {
+        if (strlen(wall_message) > WALL_MESSAGE_MAX)
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
+                                         "Wall message too long, maximum permitted length is %u characters.",
+                                         WALL_MESSAGE_MAX);
+
+        if (string_has_cc(wall_message, /* ok= */ "\n\t"))
+                return sd_bus_error_set(error,
+                                        SD_BUS_ERROR_INVALID_ARGS,
+                                        "Wall message contains control characters, refusing.");
+
+        return 0;
+}
+
+static int property_set_wall_message(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *value,
+                void *userdata,
+                sd_bus_error *error) {
+
+        char **p = ASSERT_PTR(userdata);
+        const char *s;
+        int r;
+
+        assert(value);
+
+        r = sd_bus_message_read(value, "s", &s);
+        if (r < 0)
+                return r;
+
+        r = wall_message_validate(s, error);
+        if (r < 0)
+                return r;
+
+        return free_and_strdup_warn(p, empty_to_null(s));
 }
 
 static int method_set_wall_message(
@@ -3747,10 +3661,9 @@ static int method_set_wall_message(
         if (r < 0)
                 return r;
 
-        if (strlen(wall_message) > WALL_MESSAGE_MAX)
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
-                        "Wall message too long, maximum permitted length is %u characters.",
-                        WALL_MESSAGE_MAX);
+        r = wall_message_validate(wall_message, error);
+        if (r < 0)
+                return r;
 
         /* Short-circuit the operation if the desired state is already in place, to
          * avoid an unnecessary polkit permission check. */
@@ -3776,7 +3689,7 @@ static int method_set_wall_message(
         m->wall_messages = enable_wall_messages;
 
  done:
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_inhibit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -3909,15 +3822,30 @@ static int method_inhibit(sd_bus_message *message, void *userdata, sd_bus_error 
         return sd_bus_reply_method_return(message, "h", fifo_fd);
 }
 
+static int bus_property_get_kill_exclude_users(
+                sd_bus *bus,
+                const char *path,
+                const char *interface,
+                const char *property,
+                sd_bus_message *reply,
+                void *userdata,
+                sd_bus_error *reterr_error) {
+
+        Manager *m = ASSERT_PTR(userdata);
+
+        /* NULL represents the default, i.e. only root is excluded. */
+        return sd_bus_message_append_strv(reply, m->kill_exclude_users ?: STRV_MAKE("root"));
+}
+
 static const sd_bus_vtable manager_vtable[] = {
         SD_BUS_VTABLE_START(0),
 
         SD_BUS_WRITABLE_PROPERTY("EnableWallMessages", "b", bus_property_get_bool, bus_property_set_bool, offsetof(Manager, wall_messages), 0),
-        SD_BUS_WRITABLE_PROPERTY("WallMessage", "s", NULL, NULL, offsetof(Manager, wall_message), 0),
+        SD_BUS_WRITABLE_PROPERTY("WallMessage", "s", NULL, property_set_wall_message, offsetof(Manager, wall_message), 0),
 
         SD_BUS_PROPERTY("NAutoVTs", "u", NULL, offsetof(Manager, n_autovts), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("KillOnlyUsers", "as", NULL, offsetof(Manager, kill_only_users), SD_BUS_VTABLE_PROPERTY_CONST),
-        SD_BUS_PROPERTY("KillExcludeUsers", "as", NULL, offsetof(Manager, kill_exclude_users), SD_BUS_VTABLE_PROPERTY_CONST),
+        SD_BUS_PROPERTY("KillExcludeUsers", "as", bus_property_get_kill_exclude_users, 0, SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("KillUserProcesses", "b", bus_property_get_bool, offsetof(Manager, kill_user_processes), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("RebootParameter", "s", property_get_reboot_parameter, 0, 0),
         SD_BUS_PROPERTY("RebootToFirmwareSetup", "b", property_get_reboot_to_firmware_setup, 0, 0),
@@ -4402,7 +4330,7 @@ int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *err
                 log_info("Operation '%s' finished.", handle_action_to_string(m->delayed_action->handle));
 
                 /* Tell people that they now may take a lock again */
-                (void) send_prepare_for(m, m->delayed_action, false);
+                (void) send_prepare_for(m, m->delayed_action, /* _active= */ false);
 
                 m->action_job = mfree(m->action_job);
                 m->delayed_action = NULL;
@@ -4430,7 +4358,7 @@ int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *err
                 /* If the user is stopping, we're tracking stop jobs here. So don't send reply. */
                 if (!user->stopping) {
                         char **user_job;
-                        FOREACH_ARGUMENT(user_job, &user->runtime_dir_job, &user->service_manager_job)
+                        FOREACH_ARGUMENT(user_job, &user->runtime_dir_job, &user->service_manager_job, &user->measure_job)
                                 if (streq_ptr(path, *user_job)) {
                                         *user_job = mfree(*user_job);
 
@@ -4646,7 +4574,7 @@ int manager_start_scope(
 
         if (more_properties) {
                 /* If TasksMax also appears here, it will overwrite the default value set above */
-                r = sd_bus_message_copy(m, more_properties, true);
+                r = sd_bus_message_copy(m, more_properties, /* all= */ true);
                 if (r < 0)
                         return r;
         }
@@ -4659,7 +4587,7 @@ int manager_start_scope(
         if (r < 0)
                 return r;
 
-        r = sd_bus_call(manager->bus, m, 0, &e, &reply);
+        r = sd_bus_call(manager->bus, m, /* usec= */ 0, &e, &reply);
         if (r < 0) {
                 /* If this failed with a property we couldn't write, this is quite likely because the server
                  * doesn't support PIDFDs yet, let's try without. */
@@ -4765,8 +4693,8 @@ int manager_abandon_scope(Manager *manager, const char *scope, sd_bus_error *ret
                         "org.freedesktop.systemd1.Scope",
                         "Abandon",
                         &error,
-                        NULL,
-                        NULL);
+                        /* ret_reply= */ NULL,
+                        /* types= */ NULL);
         if (r < 0) {
                 if (sd_bus_error_has_names(&error, BUS_ERROR_NO_SUCH_UNIT,
                                                    BUS_ERROR_LOAD_FAILED,
@@ -4790,7 +4718,7 @@ int manager_kill_unit(Manager *manager, const char *unit, KillWhom whom, int sig
                         bus_systemd_mgr,
                         "KillUnit",
                         error,
-                        NULL,
+                        /* ret_reply= */ NULL,
                         "ssi",
                         unit,
                         whom == KILL_LEADER ? "main" : "all",

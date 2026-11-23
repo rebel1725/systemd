@@ -1,26 +1,28 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "sd-daemon.h"
 #include "sd-event.h"
 
 #include "alloc-util.h"
+#include "compress.h"
 #include "copy.h"
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
 #include "import-common.h"
-#include "import-compress.h"
 #include "import-raw.h"
 #include "import-util.h"
 #include "install-file.h"
 #include "io-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "pretty-print.h"
 #include "qcow2-util.h"
 #include "ratelimit.h"
+#include "stat-util.h"
 #include "string-util.h"
 #include "terminal-util.h"
 #include "time-util.h"
@@ -43,11 +45,14 @@ typedef struct RawImport {
         int input_fd;
         int output_fd;
 
-        ImportCompress compress;
+        Compression compression;
+        Compressor *compress;
+
+        ImportDigest decoded_digest;
 
         sd_event_source *input_event_source;
 
-        uint8_t buffer[IMPORT_BUFFER_SIZE];
+        uint8_t buffer[COMPRESS_PIPE_BUFFER_SIZE];
         size_t buffer_size;
 
         uint64_t written_compressed;
@@ -71,7 +76,7 @@ RawImport* raw_import_unref(RawImport *i) {
 
         unlink_and_free(i->temp_path);
 
-        import_compress_free(&i->compress);
+        i->compress = compressor_free(i->compress);
 
         sd_event_unref(i->event);
 
@@ -114,6 +119,7 @@ int raw_import_new(
                 .image_root = TAKE_PTR(root),
                 .progress_ratelimit = { 100 * USEC_PER_MSEC, 1 },
                 .offset = UINT64_MAX,
+                .compression = _COMPRESSION_INVALID,
                 .size_max = UINT64_MAX,
         };
 
@@ -148,7 +154,7 @@ static void raw_import_report_progress(RawImport *i) {
         if (!ratelimit_below(&i->progress_ratelimit))
                 return;
 
-        sd_notifyf(false, "X_IMPORT_PROGRESS=%u%%", percent);
+        sd_notifyf(/* unset_environment= */ false, "X_IMPORT_PROGRESS=%u%%", percent);
 
         if (isatty_safe(STDERR_FILENO))
                 (void) draw_progress_barf(
@@ -184,13 +190,13 @@ static int raw_import_maybe_convert_qcow2(RawImport *i) {
                 return 0;
 
         /* This is a QCOW2 image, let's convert it */
-        r = tempfn_random(i->final_path, NULL, &f);
+        r = tempfn_random(i->final_path, /* extra= */ NULL, &f);
         if (r < 0)
                 return log_oom();
 
-        converted_fd = open(f, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0664);
+        converted_fd = xopenat_full(AT_FDCWD, f, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY, /* xopen_flags= */ 0, 0664);
         if (converted_fd < 0)
-                return log_error_errno(errno, "Failed to create %s: %m", f);
+                return log_error_errno(converted_fd, "Failed to create %s: %m", f);
 
         t = TAKE_PTR(f);
 
@@ -214,6 +220,16 @@ static int raw_import_finish(RawImport *i) {
 
         assert(i);
         assert(i->output_fd >= 0);
+
+        r = import_digest_verify(&i->decoded_digest);
+        if (r < 0)
+                return r;
+
+        if (FLAGS_SET(i->flags, IMPORT_ZERO_FILL)) {
+                r = import_zero_fill(i->output_fd, i->offset, i->size_max, i->written_uncompressed);
+                if (r < 0)
+                        return r;
+        }
 
         /* Nothing of what is below applies to block devices */
         if (S_ISBLK(i->output_stat.st_mode)) {
@@ -244,7 +260,7 @@ static int raw_import_finish(RawImport *i) {
 
                 if (S_ISREG(i->input_stat.st_mode)) {
                         (void) copy_times(i->input_fd, i->output_fd, COPY_CRTIME);
-                        (void) copy_xattr(i->input_fd, NULL, i->output_fd, NULL, 0);
+                        (void) copy_xattr(i->input_fd, /* from= */ NULL, i->output_fd, /* to= */ NULL, /* copy_flags= */ 0);
                 }
         }
 
@@ -279,11 +295,12 @@ static int raw_import_open_disk(RawImport *i) {
                  * redirection would do it) — except if an offset was passed, in which case we are supposed
                  * to operate on a section of the file only, in which case we apparently work on an some
                  * existing thing (i.e. are not the sole thing stored in the file), in which case we will
-                 * neither truncate nor create. */
+                 * neither truncate nor create. Unlike the shell we never create through a dangling
+                 * symlink. */
 
-                i->output_fd = open(i->local, O_RDWR|O_NOCTTY|O_CLOEXEC|(i->offset == UINT64_MAX ? O_TRUNC|O_CREAT : 0), 0664);
+                i->output_fd = xopenat_full(AT_FDCWD, i->local, O_RDWR|O_NOCTTY|(i->offset == UINT64_MAX ? O_TRUNC|O_CREAT : 0), /* xopen_flags= */ 0, 0664);
                 if (i->output_fd < 0)
-                        return log_error_errno(errno, "Failed to open destination '%s': %m", i->local);
+                        return log_error_errno(i->output_fd, "Failed to open destination '%s': %m", i->local);
 
                 if (i->offset == UINT64_MAX)
                         (void) import_set_nocow_and_log(i->output_fd, i->local);
@@ -292,15 +309,15 @@ static int raw_import_open_disk(RawImport *i) {
                 if (!i->final_path)
                         return log_oom();
 
-                r = tempfn_random(i->final_path, NULL, &i->temp_path);
+                r = tempfn_random(i->final_path, /* extra= */ NULL, &i->temp_path);
                 if (r < 0)
                         return log_oom();
 
                 (void) mkdir_parents_label(i->temp_path, 0700);
 
-                i->output_fd = open(i->temp_path, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0664);
+                i->output_fd = xopenat_full(AT_FDCWD, i->temp_path, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY, /* xopen_flags= */ 0, 0664);
                 if (i->output_fd < 0)
-                        return log_error_errno(errno, "Failed to open destination '%s': %m", i->temp_path);
+                        return log_error_errno(i->output_fd, "Failed to open destination '%s': %m", i->temp_path);
 
                 (void) import_set_nocow_and_log(i->output_fd, i->temp_path);
         }
@@ -308,9 +325,9 @@ static int raw_import_open_disk(RawImport *i) {
         if (fstat(i->output_fd, &i->output_stat) < 0)
                 return log_error_errno(errno, "Failed to stat() output file: %m");
 
-        if (!S_ISREG(i->output_stat.st_mode) && !S_ISBLK(i->output_stat.st_mode))
-                return log_error_errno(SYNTHETIC_ERRNO(EBADFD),
-                                       "Target file is not a regular file or block device");
+        r = stat_verify_regular_or_block(&i->output_stat);
+        if (r < 0)
+                return log_error_errno(r, "Target file is not a regular file or block device.");
 
         if (i->offset != UINT64_MAX) {
                 if (lseek(i->output_fd, i->offset, SEEK_SET) < 0)
@@ -328,7 +345,11 @@ static int raw_import_try_reflink(RawImport *i) {
         assert(i->input_fd >= 0);
         assert(i->output_fd >= 0);
 
-        if (i->compress.type != IMPORT_COMPRESS_UNCOMPRESSED)
+        if (compressor_type(i->compress) != COMPRESSION_NONE)
+                return 0;
+
+        /* We need to see the data to verify it */
+        if (i->decoded_digest.enabled)
                 return 0;
 
         if (i->offset != UINT64_MAX || i->size_max != UINT64_MAX)
@@ -378,6 +399,8 @@ static int raw_import_write(const void *p, size_t sz, void *userdata) {
                 }
         }
 
+        import_digest_update(&i->decoded_digest, p, sz);
+
         /* Generate sparse file if we created/truncated the file */
         if (S_ISREG(i->output_stat.st_mode) && i->offset == UINT64_MAX) {
                 ssize_t n;
@@ -425,13 +448,20 @@ static int raw_import_process(RawImport *i) {
 
         i->buffer_size += l;
 
-        if (i->compress.type == IMPORT_COMPRESS_UNKNOWN) {
+        if (!i->compress) {
 
-                if (l == 0) { /* EOF */
+                if (i->compression >= 0) {
+                        /* We were told which algorithm to expect, hence don't guess from the data */
+                        r = decompressor_force(&i->compress, i->compression);
+                        if (r < 0) {
+                                log_error_errno(r, "Failed to initialize decompressor: %m");
+                                goto finish;
+                        }
+                } else if (l == 0) { /* EOF */
                         log_debug("File too short to be compressed, as no compression signature fits in, thus assuming uncompressed.");
-                        import_uncompress_force_off(&i->compress);
+                        decompressor_force_off(&i->compress);
                 } else {
-                        r = import_uncompress_detect(&i->compress, i->buffer, i->buffer_size);
+                        r = decompressor_detect(&i->compress, i->buffer, i->buffer_size);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to detect file compression: %m");
                                 goto finish;
@@ -451,7 +481,7 @@ static int raw_import_process(RawImport *i) {
                         goto complete;
         }
 
-        r = import_uncompress(&i->compress, i->buffer, i->buffer_size, raw_import_write, i);
+        r = decompressor_push(i->compress, i->buffer, i->buffer_size, raw_import_write, i);
         if (r < 0) {
                 log_error_errno(r, "Failed to decode and write: %m");
                 goto finish;
@@ -500,14 +530,18 @@ int raw_import_start(
                 const char *local,
                 uint64_t offset,
                 uint64_t size_max,
+                Compression compression,
+                const struct iovec *decoded_checksum,
                 ImportFlags flags) {
         int r;
 
         assert(i);
         assert(fd >= 0);
         assert(local);
+        assert(compression < _COMPRESSION_MAX);
         assert(!(flags & ~IMPORT_FLAGS_MASK_RAW));
         assert(offset == UINT64_MAX || FLAGS_SET(flags, IMPORT_DIRECT));
+        assert(!FLAGS_SET(flags, IMPORT_ZERO_FILL) || (offset != UINT64_MAX && size_max != UINT64_MAX));
 
         if (!import_validate_local(local, flags))
                 return -EINVAL;
@@ -515,7 +549,7 @@ int raw_import_start(
         if (i->input_fd >= 0)
                 return -EBUSY;
 
-        r = fd_nonblock(fd, true);
+        r = fd_nonblock(fd, /* nonblock= */ true);
         if (r < 0)
                 return r;
 
@@ -526,6 +560,8 @@ int raw_import_start(
         i->flags = flags;
         i->offset = offset;
         i->size_max = size_max;
+        i->compression = compression;
+        import_digest_init(&i->decoded_digest, decoded_checksum);
 
         if (fstat(fd, &i->input_stat) < 0)
                 return -errno;

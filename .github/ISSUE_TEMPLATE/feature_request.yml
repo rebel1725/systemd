@@ -21,6 +21,7 @@ body:
         - 'homectl'
         - 'hostnamectl'
         - 'hardware database files'
+        - 'importctl'
         - 'journalctl'
         - 'kernel-install'
         - 'loginctl'
@@ -41,6 +42,8 @@ body:
         - 'systemd-boot'
         - 'systemd-cgtop'
         - 'systemd-coredump'
+        - 'systemd-creds'
+        - 'systemd-cryptenroll'
         - 'systemd-cryptsetup'
         - 'systemd-delta'
         - 'systemd-dissect'
@@ -51,7 +54,7 @@ body:
         - 'systemd-homed'
         - 'systemd-hostnamed'
         - 'systemd-hwdb'
-        - 'systemd-import'
+        - 'systemd-importd'
         - 'systemd-journal-gatewayd'
         - 'systemd-journal-remote'
         - 'systemd-journal-upload'
@@ -120,6 +123,6 @@ body:
     attributes:
       label: The systemd version you checked that didn't have the feature you are asking for
       description: If this is not the most recently released upstream version, then please check first if it has that feature already.
-      placeholder: '257.x'
+      placeholder: '261.x'
     validations:
       required: false

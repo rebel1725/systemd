@@ -7,12 +7,11 @@ endif
 executables += [
         executable_template + {
                 'name' : 'systemd-creds',
-                'public' : true,
                 'sources' : files('creds.c'),
                 'dependencies' : [
                         libmount_cflags,
-                        libopenssl,
-                        threads,
+                        libopenssl_cflags,
+                        tpm2_cflags,
                 ],
         },
 ]

@@ -8,7 +8,10 @@
 #include <linux/seccomp.h>
 #include <sched.h>
 #include <sys/mman.h>
-#include <sys/prctl.h>
+#include <sys/mount.h>
+#include <sys/personality.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
+#include <sys/ptrace.h>
 #include <sys/shm.h>
 #include <sys/stat.h>
 
@@ -16,10 +19,9 @@
 #include <asm/sgidefs.h>
 #endif
 
-#include "sd-dlopen.h"
-
 #include "af-list.h"
 #include "alloc-util.h"
+#include "bitfield.h"
 #include "env-util.h"
 #include "errno-list.h"
 #include "log.h"
@@ -34,8 +36,6 @@
 #include "strv.h"
 
 #if HAVE_SECCOMP
-static void *libseccomp_dl = NULL;
-
 DLSYM_PROTOTYPE(seccomp_api_get) = NULL;
 DLSYM_PROTOTYPE(seccomp_arch_add) = NULL;
 DLSYM_PROTOTYPE(seccomp_arch_exist) = NULL;
@@ -49,32 +49,6 @@ DLSYM_PROTOTYPE(seccomp_rule_add_array) = NULL;
 DLSYM_PROTOTYPE(seccomp_rule_add_exact) = NULL;
 DLSYM_PROTOTYPE(seccomp_syscall_resolve_name) = NULL;
 DLSYM_PROTOTYPE(seccomp_syscall_resolve_num_arch) = NULL;
-
-int dlopen_libseccomp(void) {
-        SD_ELF_NOTE_DLOPEN(
-                        "seccomp",
-                        "Support for Seccomp Sandboxes",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED,
-                        "libseccomp.so.2");
-
-        return dlopen_many_sym_or_warn(
-                        &libseccomp_dl,
-                        "libseccomp.so.2",
-                        LOG_DEBUG,
-                        DLSYM_ARG(seccomp_api_get),
-                        DLSYM_ARG(seccomp_arch_add),
-                        DLSYM_ARG(seccomp_arch_exist),
-                        DLSYM_ARG(seccomp_arch_native),
-                        DLSYM_ARG(seccomp_arch_remove),
-                        DLSYM_ARG(seccomp_attr_set),
-                        DLSYM_ARG(seccomp_init),
-                        DLSYM_ARG(seccomp_load),
-                        DLSYM_ARG(seccomp_release),
-                        DLSYM_ARG(seccomp_rule_add_array),
-                        DLSYM_ARG(seccomp_rule_add_exact),
-                        DLSYM_ARG(seccomp_syscall_resolve_name),
-                        DLSYM_ARG(seccomp_syscall_resolve_num_arch));
-}
 
 /* This array will be modified at runtime as seccomp_restrict_archs is called. */
 uint32_t seccomp_local_archs[] = {
@@ -278,10 +252,12 @@ int seccomp_init_for_arch(scmp_filter_ctx *ret, uint32_t arch, uint32_t default_
         _cleanup_(seccomp_releasep) scmp_filter_ctx seccomp = NULL;
         int r;
 
+        assert(ret);
+
         /* Much like seccomp_init(), but initializes the filter for one specific architecture only, without affecting
          * any others. Also, turns off the NNP fiddling. */
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -312,7 +288,7 @@ int seccomp_init_for_arch(scmp_filter_ctx *ret, uint32_t arch, uint32_t default_
         if (r < 0)
                 return r;
 
-        r = sym_seccomp_attr_set(seccomp, SCMP_FLTATR_CTL_NNP, 0);
+        r = sym_seccomp_attr_set(seccomp, SCMP_FLTATR_CTL_NNP, /* value= */ 0);
         if (r < 0)
                 return r;
 
@@ -329,19 +305,18 @@ int seccomp_init_for_arch(scmp_filter_ctx *ret, uint32_t arch, uint32_t default_
 }
 
 static bool is_basic_seccomp_available(void) {
-        return prctl(PR_GET_SECCOMP, 0, 0, 0, 0) >= 0;
+        return prctl_safe(PR_GET_SECCOMP, 0, 0, 0, 0) >= 0;
 }
 
 static bool is_seccomp_filter_available(void) {
-        return prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, NULL, 0, 0) < 0 &&
-                errno == EFAULT;
+        return prctl_safe(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, 0, 0, 0) == -EFAULT;
 }
 
 bool is_seccomp_available(void) {
         static int cached_enabled = -1;
 
         if (cached_enabled < 0) {
-                if (dlopen_libseccomp() < 0)
+                if (dlopen_libseccomp(LOG_DEBUG) < 0)
                         return (cached_enabled = false);
 
                 int b = secure_getenv_bool("SYSTEMD_SECCOMP");
@@ -1091,7 +1066,7 @@ int seccomp_add_syscall_filter_item(
         } else {
                 int id, r;
 
-                r = dlopen_libseccomp();
+                r = dlopen_libseccomp(LOG_DEBUG);
                 if (r < 0)
                         return r;
 
@@ -1102,7 +1077,7 @@ int seccomp_add_syscall_filter_item(
                         return 0;
                 }
 
-                r = sym_seccomp_rule_add_exact(seccomp, action, id, 0);
+                r = sym_seccomp_rule_add_exact(seccomp, action, id, /* arg_cnt= */ 0);
                 if (r < 0) {
                         /* If the system call is not known on this architecture, then that's fine, let's ignore it */
                         bool ignore = r == -EDOM;
@@ -1171,7 +1146,7 @@ int seccomp_load_syscall_filter_set(uint32_t default_action, const SyscallFilter
         /* The one-stop solution: allocate a seccomp object, add the specified filter to it, and apply it. Once for
          * each local arch. */
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1187,7 +1162,7 @@ int seccomp_load_syscall_filter_set(uint32_t default_action, const SyscallFilter
                 if (r < 0)
                         return r;
 
-                r = add_syscall_filter_set(seccomp, set, action, NULL, log_missing, &added);
+                r = add_syscall_filter_set(seccomp, set, action, /* exclude= */ NULL, log_missing, &added);
                 if (r < 0)
                         return log_debug_errno(r, "Failed to add filter set: %m");
 
@@ -1203,7 +1178,7 @@ int seccomp_load_syscall_filter_set(uint32_t default_action, const SyscallFilter
                                 if (strv_contains(added, name))
                                         continue;
 
-                                r = sym_seccomp_rule_add_exact(seccomp, default_action, id, 0);
+                                r = sym_seccomp_rule_add_exact(seccomp, default_action, id, /* arg_cnt= */ 0);
                                 if (r < 0 && r != -EDOM)  /* EDOM means that the syscall is not available for arch */
                                         return log_debug_errno(r, "Failed to add rule for system call %s() / %d: %m",
                                                                name, id);
@@ -1237,7 +1212,7 @@ int seccomp_load_syscall_filter_set_raw(uint32_t default_action, Hashmap* filter
         if (hashmap_isempty(filter) && default_action == SCMP_ACT_ALLOW)
                 return 0;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1265,7 +1240,7 @@ int seccomp_load_syscall_filter_set_raw(uint32_t default_action, Hashmap* filter
                         else if (error >= 0)
                                 a = SCMP_ACT_ERRNO(error);
 
-                        r = sym_seccomp_rule_add_exact(seccomp, a, id, 0);
+                        r = sym_seccomp_rule_add_exact(seccomp, a, id, /* arg_cnt= */ 0);
                         if (r < 0) {
                                 /* If the system call is not known on this architecture, then that's
                                  * fine, let's ignore it */
@@ -1294,7 +1269,7 @@ int seccomp_load_syscall_filter_set_raw(uint32_t default_action, Hashmap* filter
                                 if (hashmap_contains(filter, INT_TO_PTR(id + 1)))
                                         continue;
 
-                                r = sym_seccomp_rule_add_exact(seccomp, default_action, id, 0);
+                                r = sym_seccomp_rule_add_exact(seccomp, default_action, id, /* arg_cnt= */ 0);
                                 if (r < 0 && r != -EDOM)  /* EDOM means that the syscall is not available for arch */
                                         return log_debug_errno(r, "Failed to add rule for system call %s() / %d: %m",
                                                                name, id);
@@ -1360,12 +1335,12 @@ int seccomp_parse_syscall_filter(
         } else {
                 int id;
 
-                r = dlopen_libseccomp();
+                r = dlopen_libseccomp(LOG_DEBUG);
                 if (r < 0) {
                         if (!FLAGS_SET(flags, SECCOMP_PARSE_PERMISSIVE))
                                 return r;
 
-                        log_syntax(unit, FLAGS_SET(flags, SECCOMP_PARSE_LOG) ? LOG_WARNING : LOG_DEBUG, filename, line, r,
+                        log_syntax(unit, FLAGS_SET(flags, SECCOMP_PARSE_LOG) ? LOG_INFO : LOG_DEBUG, filename, line, r,
                                    "System call %s cannot be resolved as libseccomp is not available, ignoring: %m", name);
                         return 0;
                 }
@@ -1403,6 +1378,74 @@ int seccomp_parse_syscall_filter(
         return 0;
 }
 
+static int seccomp_add_mount_namespace_rules(scmp_filter_ctx seccomp, uint32_t arch) {
+        unsigned flag;
+        int id, r;
+
+        assert(seccomp);
+
+        /* Besides via unshare(), clone() and setns() with CLONE_NEWNS, mount namespaces are created by:
+         *
+         * - unshare() with UNSHARE_EMPTY_MNTNS, which implies CLONE_NEWNS without it being set,
+         * - open_tree() and open_tree_attr() with OPEN_TREE_CLONE (an anonymous mount namespace) or
+         *   OPEN_TREE_NAMESPACE (a regular one),
+         * - every fsmount() call (an anonymous mount namespace, or with FSMOUNT_NAMESPACE a regular one).
+         *
+         * The kernel treats all of these as creating a mount namespace (e.g. Landlock's namespace
+         * restrictions deny all of them), hence block all of them. Plain open_tree() and fspick() only
+         * refer to existing mounts, and remain permitted. */
+
+        r = sym_seccomp_rule_add_exact(
+                        seccomp,
+                        SCMP_ACT_ERRNO(EPERM),
+                        SCMP_SYS(unshare),
+                        1,
+                        SCMP_A0(SCMP_CMP_MASKED_EQ, UNSHARE_EMPTY_MNTNS, UNSHARE_EMPTY_MNTNS));
+        if (r < 0)
+                return r;
+
+        FOREACH_STRING(name, "open_tree", "open_tree_attr") {
+                id = sym_seccomp_syscall_resolve_name(name);
+
+                /* Older libseccomp versions do not know open_tree_attr() yet. On the native architecture we
+                 * can still filter it by its system call number, like we do for fchmodat2().
+                 * FIXME: remove this once we know libseccomp supports open_tree_attr */
+                if (id == __NR_SCMP_ERROR && streq(name, "open_tree_attr") &&
+                    arch == sym_seccomp_arch_native())
+                        id = __NR_open_tree_attr;
+
+                if (id == __NR_SCMP_ERROR) {
+                        log_debug("System call %s() is not known, not blocking it.", name);
+                        continue;
+                }
+
+                FOREACH_ARGUMENT(flag, OPEN_TREE_CLONE, OPEN_TREE_NAMESPACE) {
+                        r = sym_seccomp_rule_add_exact(
+                                        seccomp,
+                                        SCMP_ACT_ERRNO(EPERM),
+                                        id,
+                                        1,
+                                        SCMP_A2(SCMP_CMP_MASKED_EQ, flag, flag));
+                        if (r == -EDOM) /* Not available on this architecture */
+                                break;
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        id = sym_seccomp_syscall_resolve_name("fsmount");
+        if (id == __NR_SCMP_ERROR) {
+                log_debug("System call fsmount() is not known, not blocking it.");
+                return 0;
+        }
+
+        r = sym_seccomp_rule_add_exact(seccomp, SCMP_ACT_ERRNO(EPERM), id, /* arg_cnt= */ 0);
+        if (r < 0 && r != -EDOM)
+                return r;
+
+        return 0;
+}
+
 int seccomp_restrict_namespaces(unsigned long retain) {
         uint32_t arch;
         int r;
@@ -1418,7 +1461,7 @@ int seccomp_restrict_namespaces(unsigned long retain) {
         if (FLAGS_SET(retain, NAMESPACE_FLAGS_ALL))
                 return 0;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1442,7 +1485,7 @@ int seccomp_restrict_namespaces(unsigned long retain) {
                                 seccomp,
                                 SCMP_ACT_ERRNO(ENOSYS),
                                 SCMP_SYS(clone3),
-                                0);
+                                /* arg_cnt= */ 0);
                 if (r < 0)
                         log_debug_errno(r, "Failed to add clone3() rule for architecture %s, ignoring: %m",
                                         seccomp_arch_to_string(arch));
@@ -1454,16 +1497,17 @@ int seccomp_restrict_namespaces(unsigned long retain) {
                                         seccomp,
                                         SCMP_ACT_ERRNO(EPERM),
                                         SCMP_SYS(setns),
-                                        0);
+                                        /* arg_cnt= */ 0);
                 else
                         /* Otherwise, block only the invocations with the appropriate flags in the loop
-                         * below, but also the special invocation with a zero flags argument, right here. */
+                         * below, but also the special invocation with a zero flags argument, right here. The
+                         * kernel takes nstype as an int and truncates it to 32 bits, hence only compare those. */
                         r = sym_seccomp_rule_add_exact(
                                         seccomp,
                                         SCMP_ACT_ERRNO(EPERM),
                                         SCMP_SYS(setns),
                                         1,
-                                        SCMP_A1(SCMP_CMP_EQ, 0));
+                                        SCMP_A1(SCMP_CMP_MASKED_EQ, UINT32_MAX, 0));
                 if (r < 0) {
                         log_debug_errno(r, "Failed to add setns() rule for architecture %s, skipping: %m",
                                         seccomp_arch_to_string(arch));
@@ -1531,6 +1575,15 @@ int seccomp_restrict_namespaces(unsigned long retain) {
                 if (r < 0)
                         continue;
 
+                if (!FLAGS_SET(retain, CLONE_NEWNS)) {
+                        r = seccomp_add_mount_namespace_rules(seccomp, arch);
+                        if (r < 0) {
+                                log_debug_errno(r, "Failed to add mount namespace rules for architecture %s, skipping: %m",
+                                                seccomp_arch_to_string(arch));
+                                continue;
+                        }
+                }
+
                 r = sym_seccomp_load(seccomp);
                 if (ERRNO_IS_NEG_SECCOMP_FATAL(r))
                         return r;
@@ -1546,7 +1599,7 @@ int seccomp_protect_sysctl(void) {
         uint32_t arch;
         int r;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1576,7 +1629,7 @@ int seccomp_protect_sysctl(void) {
                                 seccomp,
                                 SCMP_ACT_ERRNO(EPERM),
                                 SCMP_SYS(_sysctl),
-                                0);
+                                /* arg_cnt= */ 0);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to add _sysctl() rule for architecture %s, skipping: %m",
                                         seccomp_arch_to_string(arch));
@@ -1598,7 +1651,7 @@ int seccomp_protect_syslog(void) {
         uint32_t arch;
         int r;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1613,7 +1666,7 @@ int seccomp_protect_syslog(void) {
                                 seccomp,
                                 SCMP_ACT_ERRNO(EPERM),
                                 SCMP_SYS(syslog),
-                                0);
+                                /* arg_cnt= */ 0);
 
                 if (r < 0) {
                         log_debug_errno(r, "Failed to add syslog() rule for architecture %s, skipping: %m", seccomp_arch_to_string(arch));
@@ -1635,7 +1688,7 @@ int seccomp_restrict_address_families(Set *address_families, bool allow_list) {
         uint32_t arch;
         int r;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1718,7 +1771,7 @@ int seccomp_restrict_address_families(Set *address_families, bool allow_list) {
                                                 seccomp,
                                                 SCMP_ACT_ERRNO(EAFNOSUPPORT),
                                                 SCMP_SYS(socket),
-                                                0);
+                                                /* arg_cnt= */ 0);
                                 if (r < 0) {
                                         log_debug_errno(r, "Failed to add socket() rule for architecture %s, skipping: %m",
                                                         seccomp_arch_to_string(arch));
@@ -1779,7 +1832,9 @@ int seccomp_restrict_address_families(Set *address_families, bool allow_list) {
                         void *af;
 
                         /* If this is a deny list, then generate one rule for each address family that are
-                         * then combined in OR checks. */
+                         * then combined in OR checks. The kernel takes the domain as an int, i.e. it
+                         * truncates the 64-bit register to its low 32 bits, hence only compare those. A plain
+                         * equality check could be bypassed by setting any of the upper bits. */
 
                         SET_FOREACH(af, address_families) {
                                 r = sym_seccomp_rule_add_exact(
@@ -1787,7 +1842,7 @@ int seccomp_restrict_address_families(Set *address_families, bool allow_list) {
                                                 SCMP_ACT_ERRNO(EAFNOSUPPORT),
                                                 SCMP_SYS(socket),
                                                 1,
-                                                SCMP_A0(SCMP_CMP_EQ, PTR_TO_INT(af)));
+                                                SCMP_A0(SCMP_CMP_MASKED_EQ, UINT32_MAX, (uint32_t) PTR_TO_INT(af)));
                                 if (r < 0)
                                         break;
                         }
@@ -1821,7 +1876,7 @@ int seccomp_restrict_realtime_full(int error_code) {
 
         assert(error_code > 0);
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1883,6 +1938,18 @@ int seccomp_restrict_realtime_full(int error_code) {
                         continue;
                 }
 
+                /* sched_setattr() can switch to SCHED_FIFO/SCHED_RR and is the only way to get
+                 * SCHED_DEADLINE, but the policy is in a struct passed by pointer, which seccomp cannot
+                 * inspect. Hence refuse the call altogether. */
+                r = sym_seccomp_rule_add_exact(
+                                seccomp,
+                                SCMP_ACT_ERRNO(error_code),
+                                SCMP_SYS(sched_setattr),
+                                /* arg_cnt= */ 0);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to add sched_setattr() rule for %s, ignoring: %m",
+                                        seccomp_arch_to_string(arch));
+
                 r = sym_seccomp_load(seccomp);
                 if (ERRNO_IS_NEG_SECCOMP_FATAL(r))
                         return r;
@@ -1926,7 +1993,7 @@ int seccomp_memory_deny_write_execute(void) {
         unsigned loaded = 0;
         int r;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2001,7 +2068,7 @@ int seccomp_memory_deny_write_execute(void) {
                         continue;
 
                 if (block_syscall != 0) {
-                        r = add_seccomp_syscall_filter(seccomp, arch, block_syscall, 0, (const struct scmp_arg_cmp){} );
+                        r = add_seccomp_syscall_filter(seccomp, arch, block_syscall, /* arg_cnt= */ 0, (const struct scmp_arg_cmp){} );
                         if (r < 0)
                                 continue;
                 }
@@ -2046,7 +2113,7 @@ int seccomp_restrict_archs(Set *archs) {
         int r;
         bool blocked_new = false;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2099,7 +2166,7 @@ int seccomp_restrict_archs(Set *archs) {
         if (!blocked_new)
                 return 0;
 
-        r = sym_seccomp_attr_set(seccomp, SCMP_FLTATR_CTL_NNP, 0);
+        r = sym_seccomp_attr_set(seccomp, SCMP_FLTATR_CTL_NNP, /* value= */ 0);
         if (r < 0)
                 return r;
 
@@ -2125,7 +2192,7 @@ int parse_syscall_archs(char **l, Set **archs) {
                 if (r < 0)
                         return -EINVAL;
 
-                r = set_ensure_put(archs, NULL, UINT32_TO_PTR(a + 1));
+                r = set_ensure_put(archs, /* hash_ops= */ NULL, UINT32_TO_PTR(a + 1));
                 if (r < 0)
                         return -ENOMEM;
         }
@@ -2139,7 +2206,7 @@ int seccomp_filter_set_add_by_name(Hashmap *filter, bool add, const char *name) 
         assert(filter);
         assert(name);
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2181,14 +2248,14 @@ int seccomp_filter_set_add(Hashmap *filter, bool add, const SyscallFilterSet *se
         return 0;
 }
 
-int seccomp_lock_personality(unsigned long personality) {
+/* Block PTRACE_POKE{TEXT,DATA} FOLL_FORCE writes. A missing filter is a bypass, so unlike the other helpers
+ * this fails when the native architecture cannot be filtered. A secondary architecture the kernel refuses a
+ * filter for is skipped as everywhere else: it cannot run binaries either. */
+int seccomp_restrict_ptrace(void) {
         uint32_t arch;
         int r;
 
-        if (personality >= PERSONALITY_INVALID)
-                return -EINVAL;
-
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2199,17 +2266,137 @@ int seccomp_lock_personality(unsigned long personality) {
                 if (r < 0)
                         return r;
 
-                r = sym_seccomp_rule_add_exact(
-                                seccomp,
-                                SCMP_ACT_ERRNO(EPERM),
-                                SCMP_SYS(personality),
-                                1,
-                                SCMP_A0(SCMP_CMP_NE, personality));
+                r = add_seccomp_syscall_filter(seccomp, arch, SCMP_SYS(ptrace),
+                                               1, SCMP_A0(SCMP_CMP_EQ, PTRACE_POKETEXT));
+                if (r < 0)
+                        return r;
+
+                r = add_seccomp_syscall_filter(seccomp, arch, SCMP_SYS(ptrace),
+                                               1, SCMP_A0(SCMP_CMP_EQ, PTRACE_POKEDATA));
+                if (r < 0)
+                        return r;
+
+                r = sym_seccomp_load(seccomp);
                 if (r < 0) {
-                        log_debug_errno(r, "Failed to add scheduler rule for architecture %s, skipping: %m",
+                        if (ERRNO_IS_NEG_SECCOMP_FATAL(r) || arch == sym_seccomp_arch_native())
+                                return log_debug_errno(r, "Failed to apply ptrace restrictions for architecture %s: %m",
+                                                       seccomp_arch_to_string(arch));
+                        log_debug_errno(r, "Failed to apply ptrace restrictions for architecture %s, skipping: %m",
                                         seccomp_arch_to_string(arch));
-                        continue;
                 }
+        }
+
+        return 0;
+}
+
+static int add_personality_rule(scmp_filter_ctx seccomp, uint32_t arch, uint32_t mask, uint32_t value) {
+        return add_seccomp_syscall_filter(seccomp, arch, SCMP_SYS(personality), 1,
+                                          SCMP_A0(SCMP_CMP_MASKED_EQ, mask, value));
+}
+
+/* Refuse every personality() argument but those matching value under mask, and the 0xffffffff query. The
+ * kernel only looks at the lower 32 bits and a rule may compare an argument only once, so this takes masked
+ * compares: each bit set in value must be set, and the other bits of mask must either all be clear, or all
+ * be set along with every bit outside of mask. If they are mixed, one of them is set while the next one,
+ * wrapping around, is clear. */
+static int add_personality_rules(scmp_filter_ctx seccomp, uint32_t arch, uint32_t mask, uint32_t value) {
+        uint32_t clear = mask & ~value;
+        int first, r;
+
+        assert((value & ~mask) == 0);
+
+        BIT_FOREACH(bit, value) {
+                r = add_personality_rule(seccomp, arch, INDEX_TO_MASK(uint32_t, bit), /* value= */ 0);
+                if (r < 0)
+                        return r;
+        }
+
+        first = BIT_FIRST_SET(clear);
+        if (first < 0)
+                return 0;
+
+        BIT_FOREACH(bit, clear) {
+                int next = BIT_NEXT_SET(clear, bit);
+
+                if (next < 0)
+                        next = first;
+                if (next == bit)
+                        break;
+
+                r = add_personality_rule(seccomp, arch,
+                                         INDEX_TO_MASK(uint32_t, bit) | INDEX_TO_MASK(uint32_t, next),
+                                         INDEX_TO_MASK(uint32_t, bit));
+                if (r < 0)
+                        return r;
+        }
+
+        BIT_FOREACH(bit, ~mask) {
+                r = add_personality_rule(seccomp, arch,
+                                         INDEX_TO_MASK(uint32_t, first) | INDEX_TO_MASK(uint32_t, bit),
+                                         INDEX_TO_MASK(uint32_t, first));
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+/* Refuse to set READ_IMPLIES_EXEC, under which brk() maps the heap executable without passing through the
+ * mmap_file or file_mprotect hooks. Like seccomp_restrict_ptrace(), only fail for the native architecture or
+ * if no filter can be installed at all. */
+int seccomp_restrict_read_implies_exec(void) {
+        uint32_t arch;
+        int r;
+
+        r = dlopen_libseccomp(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
+        SECCOMP_FOREACH_LOCAL_ARCH(arch) {
+                _cleanup_(seccomp_releasep) scmp_filter_ctx seccomp = NULL;
+
+                r = seccomp_init_for_arch(&seccomp, arch, SCMP_ACT_ALLOW);
+                if (r < 0)
+                        return r;
+
+                r = add_personality_rules(seccomp, arch, READ_IMPLIES_EXEC, /* value= */ 0);
+                if (r < 0)
+                        return r;
+
+                r = sym_seccomp_load(seccomp);
+                if (r < 0) {
+                        if (ERRNO_IS_NEG_SECCOMP_FATAL(r) || arch == sym_seccomp_arch_native())
+                                return log_debug_errno(r, "Failed to restrict personality() for architecture %s: %m",
+                                                       seccomp_arch_to_string(arch));
+                        log_debug_errno(r, "Failed to restrict personality() for architecture %s, skipping: %m",
+                                        seccomp_arch_to_string(arch));
+                }
+        }
+
+        return 0;
+}
+
+int seccomp_lock_personality(unsigned long personality) {
+        uint32_t arch;
+        int r;
+
+        if (personality >= PERSONALITY_INVALID)
+                return -EINVAL;
+
+        r = dlopen_libseccomp(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
+        SECCOMP_FOREACH_LOCAL_ARCH(arch) {
+                _cleanup_(seccomp_releasep) scmp_filter_ctx seccomp = NULL;
+
+                r = seccomp_init_for_arch(&seccomp, arch, SCMP_ACT_ALLOW);
+                if (r < 0)
+                        return r;
+
+                r = add_personality_rules(seccomp, arch, UINT32_MAX, (uint32_t) personality);
+                if (r < 0)
+                        continue;
 
                 r = sym_seccomp_load(seccomp);
                 if (ERRNO_IS_NEG_SECCOMP_FATAL(r))
@@ -2226,7 +2413,7 @@ int seccomp_protect_hostname(void) {
         uint32_t arch;
         int r;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2241,7 +2428,7 @@ int seccomp_protect_hostname(void) {
                                 seccomp,
                                 SCMP_ACT_ERRNO(EPERM),
                                 SCMP_SYS(sethostname),
-                                0);
+                                /* arg_cnt= */ 0);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to add sethostname() rule for architecture %s, skipping: %m",
                                         seccomp_arch_to_string(arch));
@@ -2252,7 +2439,7 @@ int seccomp_protect_hostname(void) {
                                 seccomp,
                                 SCMP_ACT_ERRNO(EPERM),
                                 SCMP_SYS(setdomainname),
-                                0);
+                                /* arg_cnt= */ 0);
                 if (r < 0) {
                         log_debug_errno(r, "Failed to add setdomainname() rule for architecture %s, skipping: %m",
                                         seccomp_arch_to_string(arch));
@@ -2417,7 +2604,7 @@ static int seccomp_restrict_sxid(scmp_filter_ctx seccomp, mode_t m) {
                         seccomp,
                         SCMP_ACT_ERRNO(ENOSYS),
                         SCMP_SYS(openat2),
-                        0);
+                        /* arg_cnt= */ 0);
         if (r < 0)
                 log_debug_errno(r, "Failed to add filter for openat2: %m");
         else
@@ -2442,7 +2629,7 @@ int seccomp_restrict_suid_sgid(void) {
         uint32_t arch;
         int r, k;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2544,18 +2731,16 @@ static int block_open_flag(scmp_filter_ctx seccomp, int flag) {
         else
                 any = true;
 
-#if defined(__SNR_openat2)
-        /* The new openat2() system call can't be filtered sensibly, see above. */
-        r = sym_seccomp_rule_add_exact(
-                        seccomp,
-                        SCMP_ACT_ERRNO(ENOSYS),
-                        SCMP_SYS(openat2),
-                        0);
-        if (r < 0)
-                log_debug_errno(r, "Failed to add filter for openat2: %m");
-        else
-                any = true;
-#endif
+        /* We can't reasonably filter openat2() here, because the flags are in an indirect struct instead of
+         * a regular scalar argument, see also the comment in seccomp_restrict_sxid() above. However,
+         * blocking it here causes an increasing number of issues as more software moves to openat2() without
+         * any fallback to open()/openat().
+         *
+         * Given that calling openat2() with O_SYNC is rather rare, and most of the heavy-lifting is done by
+         * filtering out the sync-family syscalls in seccomp_suppress_sync() below, let's just blanket-allow
+         * openat2() to avoid unnecessarily breaking stuff left and right when nspawn is running with
+         * --suppress-sync=yes. This means that we might issue a synchronous write when something calls
+         * openat2() with O_SYNC, but it is the best we can do at least until a better solution pops up. */
 
         return any ? 0 : r;
 }
@@ -2567,9 +2752,9 @@ int seccomp_suppress_sync(void) {
         /* This behaves slightly differently from SystemCallFilter=~@sync:0, in that negative fds (which
          * we can determine to be invalid) are still refused with EBADF. See #34478.
          *
-         * Additionally, O_SYNC/O_DSYNC are masked. */
+         * Additionally, O_SYNC/O_DSYNC are masked (except for openat2(), see above). */
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -2603,7 +2788,7 @@ int seccomp_suppress_sync(void) {
                                                 seccomp,
                                                 SCMP_ACT_ERRNO(0), /* success → we want this to be a NOP after all */
                                                 id,
-                                                0);
+                                                /* arg_cnt= */ 0);
                         if (r < 0)
                                 log_debug_errno(r, "Failed to add filter for system call %s, ignoring: %m", c);
                 }
@@ -2625,6 +2810,35 @@ int seccomp_suppress_sync(void) {
 }
 
 #endif
+
+int dlopen_libseccomp(int log_level) {
+#if HAVE_SECCOMP
+        static void *libseccomp_dl = NULL;
+
+        LIBSECCOMP_NOTE(suggested);
+
+        return dlopen_many_sym_or_warn(
+                        &libseccomp_dl,
+                        "libseccomp.so.2",
+                        log_level,
+                        DLSYM_ARG(seccomp_api_get),
+                        DLSYM_ARG(seccomp_arch_add),
+                        DLSYM_ARG(seccomp_arch_exist),
+                        DLSYM_ARG(seccomp_arch_native),
+                        DLSYM_ARG(seccomp_arch_remove),
+                        DLSYM_ARG(seccomp_attr_set),
+                        DLSYM_ARG(seccomp_init),
+                        DLSYM_ARG(seccomp_load),
+                        DLSYM_ARG(seccomp_release),
+                        DLSYM_ARG(seccomp_rule_add_array),
+                        DLSYM_ARG(seccomp_rule_add_exact),
+                        DLSYM_ARG(seccomp_syscall_resolve_name),
+                        DLSYM_ARG(seccomp_syscall_resolve_num_arch));
+#else
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libseccomp support is not compiled in.");
+#endif
+}
 
 bool seccomp_errno_or_action_is_valid(int n) {
         return n == SECCOMP_ERROR_NUMBER_KILL || errno_is_valid(n);

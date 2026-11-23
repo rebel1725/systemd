@@ -13,6 +13,7 @@
 #include "base-filesystem.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "log.h"
 #include "nulstr-util.h"
 #include "path-util.h"
@@ -76,6 +77,9 @@ static const BaseFilesystem table[] = {
 #elif defined(__arm__)
         /* No /lib64 on arm. The linker is /lib/ld-linux-armhf.so.3. */
 #  define KNOW_LIB64_DIRS 1
+#elif defined(__hppa__)
+        /* No /lib32 or /lib64 on hppa. The linker is /usr/lib/hppa-linux-gnu/ld.so.1. */
+#  define KNOW_LIB64_DIRS 1
 #elif defined(__i386__) || defined(__x86_64__)
         { "lib64",    0, "usr/lib64\0"
                          "usr/lib\0",                "ld-linux-x86-64.so.2" },
@@ -114,6 +118,8 @@ static const BaseFilesystem table[] = {
         /* powerpc64-linux-gnu */
 #  else
         /* powerpc-linux-gnu */
+        /* No /lib32 or /lib64 on powerpc. The linker is /usr/lib/powerpc-linux-gnu/ld.so.1. */
+#       define KNOW_LIB64_DIRS 1
 #  endif
 #elif defined(__riscv)
 #  if __riscv_xlen == 32
@@ -214,9 +220,9 @@ int base_filesystem_create_fd(int fd, const char *root, uid_t uid, gid_t gid) {
 int base_filesystem_create(const char *root, uid_t uid, gid_t gid) {
         _cleanup_close_ int fd = -EBADF;
 
-        fd = open(ASSERT_PTR(root), O_DIRECTORY|O_CLOEXEC);
+        fd = xopenat(AT_FDCWD, ASSERT_PTR(root), O_DIRECTORY);
         if (fd < 0)
-                return log_error_errno(errno, "Failed to open root file system: %m");
+                return log_error_errno(fd, "Failed to open root file system: %m");
 
         return base_filesystem_create_fd(fd, root, uid, gid);
 }

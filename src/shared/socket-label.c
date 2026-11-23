@@ -7,14 +7,16 @@
 #include "fd-util.h"
 #include "fs-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "parse-util.h"
 #include "selinux-util.h"
 #include "smack-util.h"
 #include "socket-label.h"
 #include "socket-util.h"
 #include "string-table.h"
+#include "strv.h"
 #include "umask-util.h"
+#include "xattr-util.h"
 
 static const char* const socket_address_bind_ipv6_only_table[_SOCKET_ADDRESS_BIND_IPV6_ONLY_MAX] = {
         [SOCKET_ADDRESS_DEFAULT]   = "default",
@@ -36,6 +38,32 @@ SocketAddressBindIPv6Only socket_address_bind_ipv6_only_or_bool_from_string(cons
         return socket_address_bind_ipv6_only_from_string(s);
 }
 
+int socket_set_xattrs(int fd, const char *path, char **xattrs) {
+        int r;
+
+        assert(wildcard_fd_is_valid(fd));
+
+        if (strv_isempty(xattrs))
+                return 0;
+
+        r = socket_xattr_supported();
+        if (r <= 0)
+                return r;
+
+        int c = 0;
+        STRV_FOREACH_PAIR(name, value, xattrs) {
+                r = xsetxattr(fd, path, AT_EMPTY_PATH, *name, *value);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to set extended attribute '%s' on socket, ignoring: %m", *name);
+                        continue;
+                }
+
+                c++;
+        }
+
+        return c;
+}
+
 int socket_address_listen(
                 const SocketAddress *a,
                 int flags,
@@ -48,7 +76,9 @@ int socket_address_listen(
                 mode_t directory_mode,
                 mode_t socket_mode,
                 const char *selinux_label,
-                const char *smack_label) {
+                const char *smack_label,
+                char **xattr_entrypoint,
+                char **xattr_listen) {
 
         _cleanup_close_ int fd = -EBADF;
         const char *p;
@@ -56,7 +86,7 @@ int socket_address_listen(
 
         assert(a);
 
-        r = socket_address_verify(a, true);
+        r = socket_address_verify(a, /* strict= */ true);
         if (r < 0)
                 return r;
 
@@ -69,7 +99,7 @@ int socket_address_listen(
                         return r;
         }
 
-        fd = RET_NERRNO(socket(socket_address_family(a), a->type | flags, a->protocol));
+        fd = RET_NERRNO(socket(socket_address_family(a), a->type | flags | SOCK_CLOEXEC, a->protocol));
 
         if (selinux_label)
                 mac_selinux_create_socket_clear();
@@ -97,7 +127,7 @@ int socket_address_listen(
                 }
 
                 if (reuse_port) {
-                        r = setsockopt_int(fd, SOL_SOCKET, SO_REUSEPORT, true);
+                        r = setsockopt_int(fd, SOL_SOCKET, SO_REUSEPORT, /* value= */ true);
                         if (r < 0)
                                 log_warning_errno(r, "SO_REUSEPORT failed: %m");
                 }
@@ -115,9 +145,11 @@ int socket_address_listen(
                 }
         }
 
-        r = setsockopt_int(fd, SOL_SOCKET, SO_REUSEADDR, true);
+        r = setsockopt_int(fd, SOL_SOCKET, SO_REUSEADDR, /* value= */ true);
         if (r < 0)
                 return r;
+
+        (void) socket_set_xattrs(fd, /* path= */ NULL, xattr_listen);
 
         p = socket_address_get_path(a);
         if (p) {
@@ -138,11 +170,14 @@ int socket_address_listen(
                         if (r < 0)
                                 return r;
                 }
+
                 if (smack_label) {
                         r = mac_smack_apply(p, SMACK_ATTR_ACCESS, smack_label);
                         if (r < 0)
                                 log_warning_errno(r, "Failed to apply SMACK label for socket path, ignoring: %m");
                 }
+
+                (void) socket_set_xattrs(AT_FDCWD, p, xattr_entrypoint);
         } else {
                 if (bind(fd, &a->sockaddr.sa, a->size) < 0)
                         return -errno;

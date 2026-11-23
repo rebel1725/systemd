@@ -1,9 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "alloc-util.h"
 #include "gpt.h"
+#include "stdio-util.h"
 #include "string-table.h"
 #include "string-util.h"
+#include "strv.h"
 #include "utf8.h"
 
 /* Gently push people towards defining GPT type UUIDs for all architectures we know */
@@ -95,6 +99,60 @@ PartitionDesignator partition_verity_to_data(PartitionDesignator d) {
         return partition_verity_sig_to_data(d);
 }
 
+/* GPT limits partition labels to 36 characters, and labels often start with the name of the partition type.
+ * Names of partition types and partition designators may therefore use shorthands: "-vty" for "-verity",
+ * "-vsig" for "-verity-sig", and a "2" suffix for "-secondary" after "root" or "usr". For example, "usr-vty2"
+ * stands for "usr-secondary-verity". */
+static const struct {
+        const char *shorthand;
+        const char *suffix;
+} partition_verity_shorthand_table[] = {
+        { "-vty",  "-verity"     },
+        { "-vsig", "-verity-sig" },
+};
+
+#define PARTITION_NAME_MAX 64
+
+static bool partition_name_expand(const char *s, char ret[static PARTITION_NAME_MAX]) {
+        char stem[PARTITION_NAME_MAX];
+        const char *suffix = "";
+        bool secondary, shorthand = false;
+        char *e;
+
+        assert(s);
+        assert(ret);
+
+        if (strlen(s) >= sizeof(stem))
+                return false;
+        strcpy(stem, s);
+
+        e = endswith(stem, "2");
+        secondary = e;
+        if (e)
+                *e = 0;
+
+        FOREACH_ELEMENT(i, partition_verity_shorthand_table) {
+                e = endswith(stem, i->shorthand);
+                if (e)
+                        shorthand = true;
+                else
+                        e = endswith(stem, i->suffix);
+                if (e) {
+                        *e = 0;
+                        suffix = i->suffix;
+                        break;
+                }
+        }
+
+        if (!secondary && !shorthand)
+                return false;
+
+        if (secondary && !STR_IN_SET(stem, "root", "usr"))
+                return false;
+
+        return snprintf_ok(ret, PARTITION_NAME_MAX, "%s%s%s", stem, secondary ? "-secondary" : "", suffix);
+}
+
 static const char *const partition_designator_table[_PARTITION_DESIGNATOR_MAX] = {
         [PARTITION_ROOT]                      = "root",
         [PARTITION_USR]                       = "usr",
@@ -111,7 +169,18 @@ static const char *const partition_designator_table[_PARTITION_DESIGNATOR_MAX] =
         [PARTITION_VAR]                       = "var",
 };
 
-DEFINE_STRING_TABLE_LOOKUP(partition_designator, PartitionDesignator);
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(partition_designator, PartitionDesignator);
+
+PartitionDesignator partition_designator_from_string(const char *s) {
+        char expanded[PARTITION_NAME_MAX];
+        PartitionDesignator d;
+
+        d = string_table_lookup_from_string(partition_designator_table, ELEMENTSOF(partition_designator_table), s);
+        if (d >= 0 || !s || !partition_name_expand(s, expanded))
+                return d;
+
+        return string_table_lookup_from_string(partition_designator_table, ELEMENTSOF(partition_designator_table), expanded);
+}
 
 static const char *const partition_mountpoint_table[_PARTITION_DESIGNATOR_MAX] = {
         [PARTITION_ROOT]                      = "/\0",
@@ -242,21 +311,38 @@ const char* gpt_partition_type_uuid_to_string_harder(
         return sd_id128_to_uuid_string(id, buffer);
 }
 
+static const GptPartitionType* gpt_partition_type_find_by_name(const char *s) {
+        assert(s);
+
+        FOREACH_ARRAY(t, gpt_partition_type_table, ELEMENTSOF(gpt_partition_type_table) - 1)
+                if (streq(s, t->name))
+                        return t;
+
+        return NULL;
+}
+
 int gpt_partition_type_from_string(const char *s, GptPartitionType *ret) {
-        sd_id128_t id = SD_ID128_NULL;
+        const GptPartitionType *t;
+        sd_id128_t id;
         int r;
 
         assert(s);
 
-        FOREACH_ARRAY(t, gpt_partition_type_table, ELEMENTSOF(gpt_partition_type_table) - 1)
-                if (streq(s, t->name)) {
-                        /* Don't return immediately, instead re-resolve by UUID so that we can support
-                        * aliases like aarch64 -> arm64 transparently. */
-                        id = t->uuid;
-                        break;
-                }
+        /* Look up the name as typed before expanding the shorthands. Otherwise a type whose name ends in "2",
+         * such as "root-riscv32", could not be found by its own name. */
+        t = gpt_partition_type_find_by_name(s);
+        if (!t) {
+                char expanded[PARTITION_NAME_MAX];
 
-        if (sd_id128_is_null(id)) {
+                if (partition_name_expand(s, expanded))
+                        t = gpt_partition_type_find_by_name(expanded);
+        }
+
+        if (t)
+                /* Don't return the table entry directly, instead re-resolve by UUID so that we can support
+                 * aliases like aarch64 -> arm64 transparently. */
+                id = t->uuid;
+        else {
                 r = sd_id128_from_string(s, &id);
                 if (r < 0)
                         return r;
@@ -290,14 +376,36 @@ Architecture gpt_partition_type_uuid_to_arch(sd_id128_t id) {
         return pt->arch;
 }
 
-int gpt_partition_label_valid(const char *s) {
-        _cleanup_free_ char16_t *recoded = NULL;
+bool gpt_label_is_valid(const char *s) {
+        size_t n = 0;
 
-        recoded = utf8_to_utf16(s, SIZE_MAX);
-        if (!recoded)
-                return -ENOMEM;
+        /* Checks whether the specified string is suitable as GPT partition label. GPT stores labels as
+         * UTF-16, hence the length limit applies to UTF-16 code units, not characters or bytes. UEFI leaves
+         * it unspecified which characters are permitted, but let's insist on valid UTF-8 and refuse control
+         * characters. */
 
-        return char16_strlen(recoded) <= GPT_LABEL_MAX;
+        if (!s)
+                return false;
+
+        for (const char *p = s; *p;) {
+                char32_t c;
+                int l;
+
+                l = utf8_encoded_valid_unichar_full(p, SIZE_MAX, &c);
+                if (l < 0)
+                        return false;
+
+                if (c < ' ' || (c >= 0x7F && c <= 0x9F)) /* C0 control characters, DEL, C1 control characters */
+                        return false;
+
+                n += c >= 0x10000 ? 2 : 1; /* Characters outside of the BMP require a surrogate pair */
+                if (n > GPT_LABEL_MAX)
+                        return false;
+
+                p += l;
+        }
+
+        return true;
 }
 
 GptPartitionType gpt_partition_type_from_uuid(sd_id128_t id) {
@@ -390,4 +498,87 @@ bool gpt_header_has_signature(const GptHeader *p) {
                 return false;
 
         return true;
+}
+
+ssize_t gpt_probe(
+                int fd,
+                GptHeader *ret_header,
+                void **ret_entries,
+                uint32_t *ret_n_entries,
+                uint32_t *ret_entry_size) {
+
+        assert(fd >= 0);
+
+        /* Disk images might be for 512B or for 4096 sector sizes, let's try to auto-detect that by searching
+         * for the GPT headers at the relevant byte offsets. */
+
+        assert_cc(sizeof(GptHeader) == 92);
+
+        /* We expect a sector size in the range 512…4096. The GPT header is located in the second
+         * sector. Hence it could be at byte 512 at the earliest, and at byte 4096 at the latest. And we must
+         * read with granularity of the largest sector size we care about. Which means 8K. */
+        uint8_t sectors[2 * 4096];
+
+        ssize_t n = pread(fd, sectors, sizeof(sectors), 0);
+        if (n < 0)
+                return -errno;
+        if ((size_t) n < sizeof(sectors))
+                return 0; /* too short */
+
+        /* Let's see if we find the GPT partition header with various expected sector sizes */
+        uint32_t found = 0;
+        for (uint32_t sz = 512; sz <= 4096; sz <<= 1) {
+                const GptHeader *p = (const GptHeader *) (sectors + sz);
+
+                if (!gpt_header_has_signature(p))
+                        continue;
+
+                if (found != 0)
+                        return -ENOTUNIQ;
+
+                found = sz;
+        }
+
+        if (found == 0)
+                return 0;
+
+        const GptHeader *h = (const GptHeader *) (sectors + found);
+
+        uint32_t entry_sz = le32toh(h->size_of_partition_entry);
+        uint32_t entry_count = le32toh(h->number_of_partition_entries);
+
+        if (ret_entries) {
+                uint64_t entry_lba = le64toh(h->partition_entry_lba);
+                if (entry_lba > (uint64_t) INT64_MAX / found)
+                        return -EBADMSG;
+
+                uint64_t entry_offset = entry_lba * found;
+
+                if (entry_sz < sizeof(GptPartitionEntry) || entry_count == 0 || entry_count > 1024)
+                        return -EBADMSG;
+                if (entry_sz > SIZE_MAX / entry_count)
+                        return -EBADMSG;
+
+                size_t entries_size = (size_t) entry_sz * entry_count;
+                _cleanup_free_ void *entries = malloc(entries_size);
+                if (!entries)
+                        return -ENOMEM;
+
+                n = pread(fd, entries, entries_size, entry_offset);
+                if (n < 0)
+                        return -errno;
+                if ((size_t) n < entries_size)
+                        return -EBADMSG;
+
+                *ret_entries = TAKE_PTR(entries);
+        }
+
+        if (ret_header)
+                *ret_header = *h;
+        if (ret_n_entries)
+                *ret_n_entries = entry_count;
+        if (ret_entry_size)
+                *ret_entry_size = entry_sz;
+
+        return found; /* sector size */
 }

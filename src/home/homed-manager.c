@@ -3,8 +3,6 @@
 #include <grp.h>
 #include <linux/fscrypt.h>
 #include <linux/magic.h>
-#include <math.h>
-#include <openssl/pem.h>
 #include <pwd.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
@@ -25,6 +23,7 @@
 #include "clean-ipc.h"
 #include "common-signal.h"
 #include "conf-files.h"
+#include "crypto-util.h"
 #include "device-util.h"
 #include "dirent-util.h"
 #include "errno-util.h"
@@ -41,9 +40,9 @@
 #include "homed-manager-bus.h"
 #include "homed-operation.h"
 #include "homed-varlink.h"
+#include "logarithm.h"
 #include "mkdir.h"
 #include "notify-recv.h"
-#include "openssl-util.h"
 #include "ordered-set.h"
 #include "quota-util.h"
 #include "random-util.h"
@@ -66,6 +65,7 @@
 #include "varlink-io.systemd.UserDatabase.h"
 #include "varlink-io.systemd.service.h"
 #include "varlink-util.h"
+#include "xattr-util.h"
 
 /* Where to look for private/public keys that are used to sign the user records. We are not using
  * CONF_PATHS_NULSTR() here since we want to insert /var/lib/systemd/home/ in the middle. And we insert that
@@ -104,21 +104,17 @@ static void manager_watch_home(Manager *m) {
         m->inotify_event_source = sd_event_source_disable_unref(m->inotify_event_source);
         m->scan_slash_home = false;
 
-        if (statfs(get_home_root(), &sfs) < 0) {
-                log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_WARNING, errno,
-                               "Failed to statfs() %s directory, disabling automatic scanning.", get_home_root());
-                return;
-        }
+        if (statfs(get_home_root(), &sfs) < 0)
+                return (void) log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_WARNING, errno,
+                                             "Failed to statfs() %s directory, disabling automatic scanning.",
+                                             get_home_root());
 
-        if (is_network_fs(&sfs)) {
-                log_info("%s is a network file system, disabling automatic scanning.", get_home_root());
-                return;
-        }
+        if (is_network_fs(&sfs))
+                return (void) log_info("%s is a network file system, disabling automatic scanning.",
+                                       get_home_root());
 
-        if (is_fs_type(&sfs, AUTOFS_SUPER_MAGIC)) {
-                log_info("%s is on autofs, disabling automatic scanning.", get_home_root());
-                return;
-        }
+        if (is_fs_type(&sfs, AUTOFS_SUPER_MAGIC))
+                return (void) log_info("%s is on autofs, disabling automatic scanning.", get_home_root());
 
         m->scan_slash_home = true;
 
@@ -304,6 +300,8 @@ Manager* manager_free(Manager *m) {
         m->deferred_gc_event_source = sd_event_source_unref(m->deferred_gc_event_source);
         m->deferred_auto_login_event_source = sd_event_source_unref(m->deferred_auto_login_event_source);
         m->rebalance_event_source = sd_event_source_unref(m->rebalance_event_source);
+        m->rebalance_pending_method_calls = set_free(m->rebalance_pending_method_calls);
+        m->rebalance_queued_method_calls = set_free(m->rebalance_queued_method_calls);
 
         m->event = sd_event_unref(m->event);
 
@@ -313,7 +311,7 @@ Manager* manager_free(Manager *m) {
         m->homes_by_sysfs = hashmap_free(m->homes_by_sysfs);
 
         if (m->private_key)
-                EVP_PKEY_free(m->private_key);
+                sym_EVP_PKEY_free(m->private_key);
 
         hashmap_free(m->public_keys);
 
@@ -459,7 +457,7 @@ static int manager_add_home_by_record(
                 if (h->state == HOME_UNFIXATED)
                         h->state = _HOME_STATE_INVALID;
         } else {
-                r = home_new(m, hr, NULL, &h);
+                r = home_new(m, hr, /* sysfs= */ NULL, &h);
                 if (r < 0)
                         return log_error_errno(r, "Failed to allocate new home object: %m");
 
@@ -541,9 +539,9 @@ static int search_quota(uid_t uid, const char *exclude_quota_path) {
                 struct dqblk req;
                 struct stat st;
 
-                _cleanup_close_ int fd = open(where, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+                _cleanup_close_ int fd = xopenat(AT_FDCWD, where, O_RDONLY|O_DIRECTORY);
                 if (fd < 0) {
-                        log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_ERR, errno,
+                        log_full_errno(fd == -ENOENT ? LOG_DEBUG : LOG_ERR, fd,
                                        "Failed to open '%s', ignoring: %m", where);
                         continue;
                 }
@@ -687,8 +685,7 @@ static int manager_acquire_uid(
                 if (r < 0)
                         continue;
                 if (r > 0) {
-                        log_debug_errno(r, "Candidate UID " UID_FMT " already owns IPC objects, let's try another: %m",
-                                        candidate);
+                        log_debug("Candidate UID " UID_FMT " already owns IPC objects, let's try another.", candidate);
                         continue;
                 }
 
@@ -838,15 +835,15 @@ int manager_augment_record_with_uid(
         r = user_record_add_binding(
                         hr,
                         _USER_STORAGE_INVALID,
-                        NULL,
+                        /* image_path= */ NULL,
                         SD_ID128_NULL,
                         SD_ID128_NULL,
                         SD_ID128_NULL,
-                        NULL,
-                        NULL,
+                        /* luks_cipher= */ NULL,
+                        /* luks_cipher_mode= */ NULL,
                         UINT64_MAX,
-                        NULL,
-                        NULL,
+                        /* file_system_type= */ NULL,
+                        /* home_directory= */ NULL,
                         uid,
                         (gid_t) uid);
         if (r < 0)
@@ -913,7 +910,7 @@ static int manager_assess_image(
                 if (r < 0)
                         return log_error_errno(r, "Failed to split image name into user name/realm: %m");
 
-                return manager_add_home_by_image(m, user_name, realm, path, NULL, USER_LUKS, UID_INVALID);
+                return manager_add_home_by_image(m, user_name, realm, path, /* sysfs= */ NULL, USER_LUKS, UID_INVALID);
         }
 
         if (S_ISDIR(st.st_mode)) {
@@ -935,11 +932,11 @@ static int manager_assess_image(
                         return log_error_errno(r, "Failed to split image name into user name/realm: %m");
 
                 if (dir_fd >= 0)
-                        fd = openat(dir_fd, dentry_name, O_DIRECTORY|O_RDONLY|O_CLOEXEC);
+                        fd = xopenat(dir_fd, dentry_name, O_DIRECTORY|O_RDONLY);
                 else
-                        fd = open(path, O_DIRECTORY|O_RDONLY|O_CLOEXEC);
+                        fd = xopenat(AT_FDCWD, path, O_DIRECTORY|O_RDONLY);
                 if (fd < 0)
-                        return log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_WARNING, errno,
+                        return log_full_errno(fd == -ENOENT ? LOG_DEBUG : LOG_WARNING, fd,
                                               "Failed to open directory '%s', ignoring: %m", path);
 
                 if (fstat(fd, &st) < 0)
@@ -969,7 +966,7 @@ static int manager_assess_image(
                                 storage = USER_FSCRYPT;
                 }
 
-                return manager_add_home_by_image(m, user_name, realm, path, NULL, storage, st.st_uid);
+                return manager_add_home_by_image(m, user_name, realm, path, /* sysfs= */ NULL, storage, st.st_uid);
         }
 
         return -EMEDIUMTYPE;
@@ -1042,7 +1039,7 @@ static int manager_connect_bus(Manager *m) {
         } else
                 busname = "org.freedesktop.home1";
 
-        r = sd_bus_request_name_async(m->bus, NULL, busname, 0, NULL, NULL);
+        r = sd_bus_request_name_async(m->bus, /* ret_slot= */ NULL, busname, /* flags= */ 0, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request name: %m");
 
@@ -1084,6 +1081,7 @@ static int manager_bind_varlink(Manager *m) {
                         "io.systemd.UserDatabase.GetMemberships", vl_method_get_memberships,
                         "io.systemd.service.Ping",                varlink_method_ping,
                         "io.systemd.service.SetLogLevel",         varlink_method_set_log_level,
+                        "io.systemd.service.GetLogLevel",         varlink_method_get_log_level,
                         "io.systemd.service.GetEnvironment",      varlink_method_get_environment);
         if (r < 0)
                 return log_error_errno(r, "Failed to register varlink methods: %m");
@@ -1102,6 +1100,13 @@ static int manager_bind_varlink(Manager *m) {
         r = sd_varlink_server_listen_address(m->varlink_server, socket_path, 0666 | SD_VARLINK_SERVER_MODE_MKDIR_0755);
         if (r < 0)
                 return log_error_errno(r, "Failed to bind to varlink socket '%s': %m", socket_path);
+
+        /* Reduce the noise routed to us: advertise that only look-ups for non-system users in the 16bit
+         * range are routed to us (excluding 'nobody', i.e. 0xfffe) */
+        char text[DECIMAL_STR_MAX(uid_t) + 1 + DECIMAL_STR_MAX(gid_t) + 1];
+        xsprintf(text, UID_FMT "-" UID_FMT, (uid_t) (SYSTEM_UID_MAX + 1), UID_NOBODY - 1);
+        FOREACH_STRING(xattr, "user.userdb.uid", "user.userdb.gid")
+                (void) xsetxattr(AT_FDCWD, socket_path, /* at_flags= */ 0, xattr, text);
 
         r = sd_varlink_server_attach_event(m->varlink_server, m->event, SD_EVENT_PRIORITY_NORMAL);
         if (r < 0)
@@ -1253,7 +1258,7 @@ static int manager_on_device(sd_device_monitor *monitor, sd_device *d, void *use
                 if (h)
                         manager_revalidate_image(m, h);
                 else
-                        manager_enqueue_gc(m, NULL);
+                        manager_enqueue_gc(m, /* focus= */ NULL);
         } else
                 (void) manager_add_device(m, d);
 
@@ -1271,7 +1276,7 @@ static int manager_watch_devices(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate device monitor: %m");
 
-        r = sd_device_monitor_filter_add_match_subsystem_devtype(m->device_monitor, "block", NULL);
+        r = sd_device_monitor_filter_add_match_subsystem_devtype(m->device_monitor, "block", /* devtype= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to configure device monitor match: %m");
 
@@ -1296,7 +1301,7 @@ static int manager_enumerate_devices(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_device_enumerator_add_match_subsystem(e, "block", true);
+        r = sd_device_enumerator_add_match_subsystem(e, "block", /* match= */ true);
         if (r < 0)
                 return r;
 
@@ -1317,11 +1322,11 @@ static int manager_load_key_pair(Manager *m) {
         assert(m);
 
         if (m->private_key) {
-                EVP_PKEY_free(m->private_key);
+                sym_EVP_PKEY_free(m->private_key);
                 m->private_key = NULL;
         }
 
-        r = search_and_fopen_nulstr("local.private", "re", NULL, KEY_PATHS_NULSTR, &f, NULL);
+        r = search_and_fopen_nulstr("local.private", "re", /* root= */ NULL, KEY_PATHS_NULSTR, &f, /* ret_path= */ NULL);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
@@ -1337,9 +1342,9 @@ static int manager_load_key_pair(Manager *m) {
         if (st.st_uid != 0 || (st.st_mode & 0077) != 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EPERM), "Private key file is readable by more than the root user");
 
-        m->private_key = PEM_read_PrivateKey(f, NULL, NULL, NULL);
+        m->private_key = sym_PEM_read_PrivateKey(f, NULL, /* cb= */ NULL, NULL);
         if (!m->private_key)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to load private key pair");
+                return log_openssl_errors(LOG_ERR, "Failed to load private key pair");
 
         log_info("Successfully loaded private key pair.");
 
@@ -1348,26 +1353,27 @@ static int manager_load_key_pair(Manager *m) {
 
 static int manager_generate_key_pair(Manager *m) {
         _cleanup_(EVP_PKEY_CTX_freep) EVP_PKEY_CTX *ctx = NULL;
+        _cleanup_(EVP_PKEY_freep) EVP_PKEY *pkey = NULL;
         _cleanup_(unlink_and_freep) char *temp_public = NULL, *temp_private = NULL;
         _cleanup_fclose_ FILE *fpublic = NULL, *fprivate = NULL;
         int r;
 
         if (m->private_key) {
-                EVP_PKEY_free(m->private_key);
+                sym_EVP_PKEY_free(m->private_key);
                 m->private_key = NULL;
         }
 
-        ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+        ctx = sym_EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
         if (!ctx)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to allocate Ed25519 key generation context.");
+                return log_openssl_errors(LOG_ERR, "Failed to allocate Ed25519 key generation context.");
 
-        if (EVP_PKEY_keygen_init(ctx) <= 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to initialize Ed25519 key generation context.");
+        if (sym_EVP_PKEY_keygen_init(ctx) <= 0)
+                return log_openssl_errors(LOG_ERR, "Failed to initialize Ed25519 key generation context.");
 
         log_info("Generating key pair for signing local user identity records.");
 
-        if (EVP_PKEY_keygen(ctx, &m->private_key) <= 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to generate Ed25519 key pair");
+        if (sym_EVP_PKEY_keygen(ctx, &pkey) <= 0)
+                return log_openssl_errors(LOG_ERR, "Failed to generate Ed25519 key pair");
 
         log_info("Successfully created Ed25519 key pair.");
 
@@ -1378,14 +1384,14 @@ static int manager_generate_key_pair(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to open key file for writing: %m");
 
-        if (PEM_write_PUBKEY(fpublic, m->private_key) <= 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write public key.");
+        if (sym_PEM_write_PUBKEY(fpublic, pkey) <= 0)
+                return log_openssl_errors(LOG_ERR, "Failed to write public key.");
 
         (void) fchmod(fileno(fpublic), 0444); /* Make public key world readable */
 
         r = fflush_sync_and_check(fpublic);
         if (r < 0)
-                return log_error_errno(r, "Failed to write private key: %m");
+                return log_error_errno(r, "Failed to write public key: %m");
 
         fpublic = safe_fclose(fpublic);
 
@@ -1394,8 +1400,8 @@ static int manager_generate_key_pair(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to open key file for writing: %m");
 
-        if (PEM_write_PrivateKey(fprivate, m->private_key, NULL, NULL, 0, NULL, NULL) <= 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to write private key pair.");
+        if (sym_PEM_write_PrivateKey(fprivate, pkey, /* enc= */ NULL, /* kstr= */ NULL, /* klen= */ 0, /* cb= */ NULL, NULL) <= 0)
+                return log_openssl_errors(LOG_ERR, "Failed to write private key pair.");
 
         (void) fchmod(fileno(fprivate), 0400); /* Make private key root readable */
 
@@ -1422,6 +1428,8 @@ static int manager_generate_key_pair(Manager *m) {
         if (r < 0)
                 log_warning_errno(r, "Failed to sync /var/lib/systemd/home/, ignoring: %m");
 
+        /* Only start using the key once it has been written to disk */
+        m->private_key = TAKE_PTR(pkey);
         return 1;
 }
 
@@ -1459,7 +1467,8 @@ int manager_sign_user_record(Manager *m, UserRecord *u, UserRecord **ret, sd_bus
         return user_record_sign(u, m->private_key, ret);
 }
 
-DEFINE_HASH_OPS_FULL(public_key_hash_ops, char, string_hash_func, string_compare_func, free, EVP_PKEY, EVP_PKEY_free);
+/* dlopen_libcrypto() must have been called before populating this hashmap. */
+DEFINE_HASH_OPS_FULL(public_key_hash_ops, char, string_hash_func, string_compare_func, free, EVP_PKEY, sym_EVP_PKEY_free);
 
 static int manager_load_public_key_one(Manager *m, const char *path) {
         _cleanup_(EVP_PKEY_freep) EVP_PKEY *pkey = NULL;
@@ -1495,9 +1504,9 @@ static int manager_load_public_key_one(Manager *m, const char *path) {
         if (st.st_uid != 0 || (st.st_mode & 0022) != 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EPERM), "Public key file %s is writable by more than the root user, refusing.", path);
 
-        pkey = PEM_read_PUBKEY(f, &pkey, NULL, NULL);
+        pkey = sym_PEM_read_PUBKEY(f, &pkey, /* cb= */ NULL, NULL);
         if (!pkey)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to parse public key file %s.", path);
+                return log_openssl_errors(LOG_ERR, "Failed to parse public key file %s.", path);
 
         r = hashmap_ensure_put(&m->public_keys, &public_key_hash_ops, fn, pkey);
         if (r < 0)
@@ -1520,7 +1529,7 @@ static int manager_load_public_keys(Manager *m) {
         r = conf_files_list_nulstr(
                         &files,
                         ".public",
-                        NULL,
+                        /* root= */ NULL,
                         CONF_FILES_REGULAR|CONF_FILES_FILTER_MASKED|CONF_FILES_WARN,
                         KEY_PATHS_NULSTR);
         if (r < 0)
@@ -1536,6 +1545,10 @@ int manager_startup(Manager *m) {
         int r;
 
         assert(m);
+
+        r = dlopen_libcrypto(LOG_ERR);
+        if (r < 0)
+                return r;
 
         r = manager_listen_notify(m);
         if (r < 0)
@@ -1565,7 +1578,7 @@ int manager_startup(Manager *m) {
         (void) manager_enumerate_devices(m);
 
         /* Let's clean up home directories whose devices got removed while we were not running */
-        (void) manager_enqueue_gc(m, NULL);
+        (void) manager_enqueue_gc(m, /* focus= */ NULL);
 
         /* Let's clean up blob directories for home dirs that no longer exist */
         (void) manager_gc_blob(m);
@@ -1599,17 +1612,13 @@ void manager_revalidate_image(Manager *m, Home *h) {
         } else if (h->state < 0) {
 
                 r = user_record_test_home_directory(h->record);
-                if (r < 0) {
-                        log_warning_errno(r, "Unable to determine state of home directory, ignoring: %m");
-                        return;
-                }
+                if (r < 0)
+                        return (void) log_warning_errno(r, "Unable to determine state of home directory, ignoring: %m");
 
                 if (r == USER_TEST_MOUNTED) {
                         r = user_record_test_image_path(h->record);
-                        if (r < 0) {
-                                log_warning_errno(r, "Unable to determine state of image path, ignoring: %m");
-                                return;
-                        }
+                        if (r < 0)
+                                return (void) log_warning_errno(r, "Unable to determine state of image path, ignoring: %m");
 
                         if (r == USER_TEST_ABSENT) {
                                 _cleanup_(operation_unrefp) Operation *o = NULL;
@@ -1625,12 +1634,10 @@ void manager_revalidate_image(Manager *m, Home *h) {
                                  * currently already run some operation, and we can deactivate it only after
                                  * that's complete. */
                                 o = operation_new(OPERATION_DEACTIVATE_FORCE, NULL);
-                                if (!o) {
-                                        log_oom();
-                                        return;
-                                }
+                                if (!o)
+                                        return (void) log_oom();
 
-                                r = home_schedule_operation(h, o, NULL);
+                                r = home_schedule_operation(h, o, /* error= */ NULL);
                                 if (r < 0)
                                         log_warning_errno(r, "Failed to enqueue forced home directory %s deactivation, ignoring: %m", h->user_name);
                         }
@@ -1835,10 +1842,10 @@ static int manager_rebalance_calculate(Manager *m) {
                                 &h->rebalance_size,
                                 &h->rebalance_usage,
                                 &h->rebalance_free,
-                                NULL,
-                                NULL,
+                                /* ret_disk_ceiling= */ NULL,
+                                /* ret_disk_floor= */ NULL,
                                 &fstype,
-                                NULL);
+                                /* ret_access_mode= */ NULL);
                 if (r < 0) {
                         log_warning_errno(r, "Failed to get free space of home '%s', ignoring.", h->user_name);
                         continue;
@@ -1885,14 +1892,13 @@ static int manager_rebalance_calculate(Manager *m) {
 
                 h = array[i];
 
-                assert(h->rebalance_free <= free_sum);
                 assert(h->rebalance_usage <= usage_sum);
                 assert(h->rebalance_weight <= weight_sum);
 
-                d = ((double) (free_sum / 4096.0) * (double) h->rebalance_weight) / (double) weight_sum; /* Calculate new space for this home in units of 4K */
+                d = free_sum / 4096.0 * h->rebalance_weight / weight_sum; /* Calculate new space for this home in units of 4K */
 
                 /* Convert from units of 4K back to bytes */
-                if (d >= (double) (UINT64_MAX/4096))
+                if (d >= UINT64_MAX / 4096)
                         new_free = UINT64_MAX;
                 else
                         new_free = (uint64_t) d * 4096;
@@ -1905,7 +1911,7 @@ static int manager_rebalance_calculate(Manager *m) {
                 /* Keep track of home directory with the least amount of space left: we want to schedule the
                  * next rebalance more quickly if this is low */
                 if (new_free < min_free)
-                        min_free = h->rebalance_size;
+                        min_free = new_free;
 
                 if (new_free > UINT64_MAX - h->rebalance_usage)
                         h->rebalance_goal = UINT64_MAX-1; /* maximum size */
@@ -1928,14 +1934,14 @@ static int manager_rebalance_calculate(Manager *m) {
                         h->rebalance_pending = true;
                 }
 
-                if ((fabs((double) h->rebalance_size - (double) h->rebalance_goal) * 100 / (double) h->rebalance_size) >= 5.0)
+                if (ABS_DIFF(h->rebalance_size, h->rebalance_goal) * 100.0 / h->rebalance_size >= 5.0)
                         relevant = true;
         }
 
         /* Scale next rebalancing interval based on the least amount of space of any of the home
-         * directories. We pick a time in the range 1min … 15min, scaled by log2(min_free), so that:
-         * 10M → ~0.7min, 100M → ~2.7min, 1G → ~4.6min, 10G → ~6.5min, 100G ~8.4 */
-        m->rebalance_interval_usec = (usec_t) CLAMP((LESS_BY(log2(min_free), 22)*15*USEC_PER_MINUTE)/26,
+         * directories. We pick a time in the range 1min … 15min, scaled by floor(log2(min_free)),
+         * so that: 10M → ~0.6min, 100M → ~2.3min, 1G → ~4.0min, 10G → ~6.3min, 100G → ~8.1min */
+        m->rebalance_interval_usec = (usec_t) CLAMP((LESS_BY(log2u64(min_free), 22u)*15*USEC_PER_MINUTE)/26,
                                                     1 * USEC_PER_MINUTE,
                                                     15 * USEC_PER_MINUTE);
 
@@ -1964,7 +1970,7 @@ static int manager_rebalance_apply(Manager *m) {
 
                 h->rebalance_pending = false;
 
-                r = home_resize(h, h->rebalance_goal, /* secret= */ NULL, &error);
+                r = home_resize(h, h->rebalance_goal, /* secret= */ NULL, /* automatic= */ true, &error);
                 if (r < 0)
                         log_warning_errno(r, "Failed to resize home '%s' for rebalancing, ignoring: %s",
                                           h->user_name, bus_error_message(&error, r));
@@ -1975,19 +1981,19 @@ static int manager_rebalance_apply(Manager *m) {
         return c;
 }
 
-static void manager_rebalance_reply_messages(Manager *m) {
+static void manager_rebalance_reply_messages(Set *method_calls, int result, const sd_bus_error *error) {
         int r;
 
-        assert(m);
-
         for (;;) {
-                _cleanup_(sd_bus_message_unrefp) sd_bus_message *msg =
-                        set_steal_first(m->rebalance_pending_method_calls);
+                _cleanup_(sd_bus_message_unrefp) sd_bus_message *msg = set_steal_first(method_calls);
 
                 if (!msg)
                         break;
 
-                r = sd_bus_reply_method_return(msg, NULL);
+                if (result < 0)
+                        r = sd_bus_reply_method_errno(msg, result, error);
+                else
+                        r = sd_bus_reply_method_return(msg, /* types= */ NULL);
                 if (r < 0)
                         log_debug_errno(r, "Failed to reply to rebalance method call, ignoring: %m");
         }
@@ -2049,6 +2055,13 @@ static int manager_rebalance_now(Manager *m) {
                          * tells us what to do next. */
                         log_debug("Can't enter phase, busy.");
                         m->rebalance_state = busy_state;
+
+                        /* If we didn't manage to start the cycle, move the method calls back into the queue,
+                         * so that they are processed (and replied to) by the next attempt. */
+                        if (busy_state == REBALANCE_PENDING)
+                                SWAP_TWO(m->rebalance_pending_method_calls,
+                                         m->rebalance_queued_method_calls);
+
                         return r;
                 }
                 if (r < 0)
@@ -2068,10 +2081,12 @@ static int manager_rebalance_now(Manager *m) {
         return 0;
 
 finish:
-        /* Reset state and schedule next rebalance */
+        /* Reset state and schedule next rebalance. If method calls got queued while we were running, they
+         * want a new cycle, hence schedule that right-away. */
         m->rebalance_state = REBALANCE_IDLE;
-        manager_rebalance_reply_messages(m);
-        (void) manager_schedule_rebalance(m, /* immediately= */ false);
+        manager_rebalance_reply_messages(m->rebalance_pending_method_calls, r, /* error= */ NULL);
+        (void) manager_schedule_rebalance(m,
+                                          /* immediately= */ !set_isempty(m->rebalance_queued_method_calls));
         return r;
 }
 
@@ -2102,7 +2117,7 @@ int manager_schedule_rebalance(Manager *m, bool immediately) {
                  * already running one) */
 
                 if (m->rebalance_event_source) {
-                        r = sd_event_source_set_time(m->rebalance_event_source, 0);
+                        r = sd_event_source_set_time(m->rebalance_event_source, /* usec= */ 0);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to schedule immediate rebalancing: %m");
                                 goto turn_off;
@@ -2114,7 +2129,7 @@ int manager_schedule_rebalance(Manager *m, bool immediately) {
                                 goto turn_off;
                         }
                 } else {
-                        r = sd_event_add_time(m->event, &m->rebalance_event_source, CLOCK_MONOTONIC, 0, USEC_PER_SEC, on_rebalance_timer, m);
+                        r = sd_event_add_time(m->event, &m->rebalance_event_source, CLOCK_MONOTONIC, /* usec= */ 0, USEC_PER_SEC, on_rebalance_timer, m);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to allocate rebalance event source: %m");
                                 goto turn_off;
@@ -2177,7 +2192,19 @@ int manager_schedule_rebalance(Manager *m, bool immediately) {
 turn_off:
         m->rebalance_event_source = sd_event_source_disable_unref(m->rebalance_event_source);
         m->rebalance_state = REBALANCE_OFF;
-        manager_rebalance_reply_messages(m);
+        manager_rebalance_reply_messages(m->rebalance_pending_method_calls, r, /* error= */ NULL);
+
+        /* No further run will pick up the queued calls, hence reply to them too. If no rebalancing is needed
+         * anymore, tell them so, the same way method_rebalance() does. */
+        if (r == 0)
+                manager_rebalance_reply_messages(
+                                m->rebalance_queued_method_calls,
+                                -EALREADY,
+                                &SD_BUS_ERROR_MAKE_CONST(BUS_ERROR_REBALANCE_NOT_NEEDED,
+                                                         "No home directories need rebalancing."));
+        else
+                manager_rebalance_reply_messages(m->rebalance_queued_method_calls, r, /* error= */ NULL);
+
         return r;
 }
 

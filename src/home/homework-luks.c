@@ -21,6 +21,7 @@
 #include "blockdev-util.h"
 #include "btrfs-util.h"
 #include "chattr-util.h"
+#include "crypto-util.h"
 #include "cryptsetup-util.h"
 #include "device-util.h"
 #include "devnum-util.h"
@@ -35,6 +36,7 @@
 #include "fs-util.h"
 #include "fsck-util.h"
 #include "glyph-util.h"
+#include "gpt.h"
 #include "home-util.h"
 #include "homework.h"
 #include "homework-blob.h"
@@ -48,7 +50,6 @@
 #include "memory-util.h"
 #include "mkdir.h"
 #include "mkfs-util.h"
-#include "openssl-util.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "pidref.h"
@@ -124,9 +125,9 @@ int run_mark_dirty_by_path(const char *path, bool b) {
 
         assert(path);
 
-        fd = open(path, O_RDWR|O_CLOEXEC|O_NOCTTY);
+        fd = xopenat(AT_FDCWD, path, O_RDWR|O_NOCTTY);
         if (fd < 0)
-                return log_debug_errno(errno, "Failed to open %s to mark dirty or clean: %m", path);
+                return log_debug_errno(fd, "Failed to open %s to mark dirty or clean: %m", path);
 
         return run_mark_dirty(fd, b);
 }
@@ -146,7 +147,7 @@ static int probe_file_system_by_fd(
         assert(ret_fstype);
         assert(ret_uuid);
 
-        r = dlopen_libblkid();
+        r = dlopen_libblkid(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -155,7 +156,7 @@ static int probe_file_system_by_fd(
                 return -ENOMEM;
 
         errno = 0;
-        r = sym_blkid_probe_set_device(b, fd, 0, 0);
+        r = sym_blkid_probe_set_device(b, fd, /* off= */ 0, /* size= */ 0);
         if (r != 0)
                 return errno_or_else(ENOMEM);
 
@@ -171,7 +172,7 @@ static int probe_file_system_by_fd(
 
         assert(r == _BLKID_SAFEPROBE_FOUND);
 
-        (void) sym_blkid_probe_lookup_value(b, "TYPE", &fstype, NULL);
+        (void) sym_blkid_probe_lookup_value(b, "TYPE", &fstype, /* len= */ NULL);
         if (!fstype)
                 return -ENOPKG;
 
@@ -194,24 +195,22 @@ static int probe_file_system_by_fd(
 static int probe_file_system_by_path(const char *path, char **ret_fstype, sd_id128_t *ret_uuid) {
         _cleanup_close_ int fd = -EBADF;
 
-        fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+        fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NOCTTY|O_NONBLOCK);
         if (fd < 0)
-                return negative_errno();
+                return fd;
 
         return probe_file_system_by_fd(fd, ret_fstype, ret_uuid);
 }
 
 static int block_get_size_by_fd(int fd, uint64_t *ret) {
-        struct stat st;
+        int r;
 
         assert(fd >= 0);
         assert(ret);
 
-        if (fstat(fd, &st) < 0)
-                return -errno;
-
-        if (!S_ISBLK(st.st_mode))
-                return -ENOTBLK;
+        r = fd_verify_block(fd);
+        if (r < 0)
+                return r;
 
         return blockdev_get_device_size(fd, ret);
 }
@@ -219,9 +218,9 @@ static int block_get_size_by_fd(int fd, uint64_t *ret) {
 static int block_get_size_by_path(const char *path, uint64_t *ret) {
         _cleanup_close_ int fd = -EBADF;
 
-        fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+        fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NOCTTY|O_NONBLOCK);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return block_get_size_by_fd(fd, ret);
 }
@@ -249,9 +248,9 @@ static int run_fsck(const char *node, const char *fstype) {
                 return r;
         if (r == 0) {
                 /* Child */
-                execlp("fsck", "fsck", "-aTl", node, NULL);
+                r = execvp_safe("fsck", STRV_MAKE("fsck", "-aTl", node));
                 log_open();
-                log_error_errno(errno, "Failed to execute fsck: %m");
+                log_error_errno(r, "Failed to execute fsck: %m");
                 _exit(FSCK_OPERATIONAL_ERROR);
         }
 
@@ -413,7 +412,7 @@ static int luks_setup(
                 key_serial_t *ret_key_serial) {
 
         _cleanup_(keyring_unlinkp) key_serial_t key_serial = -1;
-        _cleanup_(sym_crypt_freep) struct crypt_device *cd = NULL;
+        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         _cleanup_(erase_and_freep) void *vk = NULL;
         sd_id128_t p;
         size_t vks;
@@ -430,7 +429,7 @@ static int luks_setup(
 
         cryptsetup_enable_logging(cd);
 
-        r = sym_crypt_load(cd, CRYPT_LUKS2, NULL);
+        r = sym_crypt_load(cd, CRYPT_LUKS2, /* params= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to load LUKS superblock: %m");
 
@@ -524,14 +523,14 @@ static int acquire_open_luks_device(
                 HomeSetup *setup,
                 bool graceful) {
 
-        _cleanup_(sym_crypt_freep) struct crypt_device *cd = NULL;
+        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         int r;
 
         assert(h);
         assert(setup);
         assert(!setup->crypt_device);
 
-        r = dlopen_cryptsetup();
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -575,7 +574,7 @@ static int luks_open(
         if (r < 0)
                 return r;
 
-        r = sym_crypt_load(setup->crypt_device, CRYPT_LUKS2, NULL);
+        r = sym_crypt_load(setup->crypt_device, CRYPT_LUKS2, /* params= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to load LUKS superblock: %m");
 
@@ -600,7 +599,7 @@ static int luks_open(
         if (!vk)
                 return log_oom();
 
-        r = luks_get_volume_key(h, setup->crypt_device, cache, vk, &vks, NULL);
+        r = luks_get_volume_key(h, setup->crypt_device, cache, vk, &vks, /* ret_key_serial= */ NULL);
         if (r == -ENOKEY)
                 return log_error_errno(r, "No valid password for LUKS superblock.");
         if (r < 0)
@@ -610,7 +609,7 @@ static int luks_open(
 
         /* This is needed so that crypt_resize() can operate correctly for pre-existing LUKS devices. We need
          * to tell libcryptsetup the volume key explicitly, so that it is in the kernel keyring. */
-        r = sym_crypt_activate_by_volume_key(setup->crypt_device, NULL, vk, vks, CRYPT_ACTIVATE_KEYRING_KEY);
+        r = sym_crypt_activate_by_volume_key(setup->crypt_device, /* name= */ NULL, vk, vks, CRYPT_ACTIVATE_KEYRING_KEY);
         if (r < 0)
                 return log_error_errno(r, "Failed to upload volume key again: %m");
 
@@ -633,7 +632,7 @@ static int fs_validate(
                 sd_id128_t *ret_found_uuid) {
 
         _cleanup_free_ char *fstype = NULL;
-        sd_id128_t u = SD_ID128_NULL; /* avoid false maybe-unitialized warning */
+        sd_id128_t u = SD_ID128_NULL; /* avoid false maybe-uninitialized warning */
         int r;
 
         assert(dm_node);
@@ -686,7 +685,7 @@ static int luks_validate(
         assert(ret_size);
         assert(sector_size > 0);
 
-        r = dlopen_libblkid();
+        r = dlopen_libblkid(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -695,7 +694,7 @@ static int luks_validate(
                 return -ENOMEM;
 
         errno = 0;
-        r = sym_blkid_probe_set_device(b, fd, 0, 0);
+        r = sym_blkid_probe_set_device(b, fd, /* off= */ 0, /* size= */ 0);
         if (r != 0)
                 return errno_or_else(ENOMEM);
 
@@ -719,7 +718,7 @@ static int luks_validate(
 
         assert(r == _BLKID_SAFEPROBE_FOUND);
 
-        (void) sym_blkid_probe_lookup_value(b, "TYPE", &fstype, NULL);
+        (void) sym_blkid_probe_lookup_value(b, "TYPE", &fstype, /* len= */ NULL);
         if (streq_ptr(fstype, "crypto_LUKS")) {
                 /* Directly a LUKS image */
                 *ret_offset = 0;
@@ -729,7 +728,7 @@ static int luks_validate(
         } else if (fstype)
                 return -ENOPKG;
 
-        (void) sym_blkid_probe_lookup_value(b, "PTTYPE", &pttype, NULL);
+        (void) sym_blkid_probe_lookup_value(b, "PTTYPE", &pttype, /* len= */ NULL);
         if (!streq_ptr(pttype, "gpt"))
                 return -ENOPKG;
 
@@ -805,6 +804,11 @@ static int crypt_device_to_evp_cipher(struct crypt_device *cd, const EVP_CIPHER 
         int r;
 
         assert(cd);
+        assert(ret);
+
+        r = dlopen_libcrypto(LOG_ERR);
+        if (r < 0)
+                return r;
 
         /* Let's find the right OpenSSL EVP_CIPHER object that matches the encryption settings of the LUKS
          * device */
@@ -833,12 +837,12 @@ static int crypt_device_to_evp_cipher(struct crypt_device *cd, const EVP_CIPHER 
         if (asprintf(&cipher_name, "%s-%zu-%s", cipher, key_bits, cipher_mode) < 0)
                 return log_oom();
 
-        cc = EVP_get_cipherbyname(cipher_name);
+        cc = sym_EVP_get_cipherbyname(cipher_name);
         if (!cc)
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Selected cipher mode '%s' not supported, can't encrypt JSON record.", cipher_name);
 
         /* Verify that our key length calculations match what OpenSSL thinks */
-        r = EVP_CIPHER_key_length(cc);
+        r = sym_EVP_CIPHER_get_key_length(cc);
         if (r < 0 || (uint64_t) r != key_size)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Key size of selected cipher doesn't meet our expectations.");
 
@@ -857,6 +861,7 @@ static int luks_validate_home_record(
 
         assert(cd);
         assert(h);
+        assert(ret_luks_home_record);
 
         for (int token = 0; token < sym_crypt_token_max(CRYPT_LUKS2); token++) {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL, *rr = NULL;
@@ -909,27 +914,27 @@ static int luks_validate_home_record(
                 r = crypt_device_to_evp_cipher(cd, &cc);
                 if (r < 0)
                         return r;
-                if (iv_size > INT_MAX || EVP_CIPHER_iv_length(cc) != (int) iv_size)
+                if (iv_size > INT_MAX || sym_EVP_CIPHER_get_iv_length(cc) != (int) iv_size)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "IV size doesn't match.");
 
-                context = EVP_CIPHER_CTX_new();
+                context = sym_EVP_CIPHER_CTX_new();
                 if (!context)
                         return log_oom();
 
-                if (EVP_DecryptInit_ex(context, cc, NULL, volume_key, iv) != 1)
+                if (sym_EVP_DecryptInit_ex(context, cc, /* impl= */ NULL, volume_key, iv) != 1)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initialize decryption context.");
 
-                decrypted_size = encrypted_size + EVP_CIPHER_key_length(cc) * 2;
+                decrypted_size = encrypted_size + sym_EVP_CIPHER_get_key_length(cc) * 2;
                 decrypted = new(char, decrypted_size);
                 if (!decrypted)
                         return log_oom();
 
-                if (EVP_DecryptUpdate(context, (uint8_t*) decrypted, &decrypted_size_out1, encrypted, encrypted_size) != 1)
+                if (sym_EVP_DecryptUpdate(context, (uint8_t*) decrypted, &decrypted_size_out1, encrypted, encrypted_size) != 1)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to decrypt JSON record.");
 
                 assert((size_t) decrypted_size_out1 <= decrypted_size);
 
-                if (EVP_DecryptFinal_ex(context, (uint8_t*) decrypted + decrypted_size_out1, &decrypted_size_out2) != 1)
+                if (sym_EVP_DecryptFinal_ex(context, (uint8_t*) decrypted + decrypted_size_out1, &decrypted_size_out2) != 1)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to finish decryption of JSON record.");
 
                 assert((size_t) decrypted_size_out1 + (size_t) decrypted_size_out2 < decrypted_size);
@@ -940,7 +945,7 @@ static int luks_validate_home_record(
 
                 decrypted[decrypted_size] = 0;
 
-                r = sd_json_parse(decrypted, SD_JSON_PARSE_MUST_BE_OBJECT|SD_JSON_PARSE_SENSITIVE, &rr, NULL, NULL);
+                r = sd_json_parse(decrypted, SD_JSON_PARSE_MUST_BE_OBJECT|SD_JSON_PARSE_SENSITIVE, &rr, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse decrypted JSON record, refusing.");
 
@@ -990,8 +995,8 @@ static int format_luks_token_text(
         if (r < 0)
                 return r;
 
-        key_size = EVP_CIPHER_key_length(cc);
-        iv_size = EVP_CIPHER_iv_length(cc);
+        key_size = sym_EVP_CIPHER_get_key_length(cc);
+        iv_size = sym_EVP_CIPHER_get_iv_length(cc);
 
         if (iv_size > 0) {
                 iv = malloc(iv_size);
@@ -1003,14 +1008,14 @@ static int format_luks_token_text(
                         return log_error_errno(r, "Failed to generate IV: %m");
         }
 
-        context = EVP_CIPHER_CTX_new();
+        context = sym_EVP_CIPHER_CTX_new();
         if (!context)
                 return log_oom();
 
-        if (EVP_EncryptInit_ex(context, cc, NULL, volume_key, iv) != 1)
+        if (sym_EVP_EncryptInit_ex(context, cc, /* impl= */ NULL, volume_key, iv) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to initialize encryption context.");
 
-        r = sd_json_variant_format(hr->json, 0, &text);
+        r = sd_json_variant_format(hr->json, /* flags= */ 0, &text);
         if (r < 0)
                 return log_error_errno(r, "Failed to format user record for LUKS: %m");
 
@@ -1021,12 +1026,12 @@ static int format_luks_token_text(
         if (!encrypted)
                 return log_oom();
 
-        if (EVP_EncryptUpdate(context, encrypted, &encrypted_size_out1, (uint8_t*) text, text_length) != 1)
+        if (sym_EVP_EncryptUpdate(context, encrypted, &encrypted_size_out1, (uint8_t*) text, text_length) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to encrypt JSON record.");
 
         assert((size_t) encrypted_size_out1 <= encrypted_size);
 
-        if (EVP_EncryptFinal_ex(context, (uint8_t*) encrypted + encrypted_size_out1, &encrypted_size_out2) != 1)
+        if (sym_EVP_EncryptFinal_ex(context, (uint8_t*) encrypted + encrypted_size_out1, &encrypted_size_out2) != 1)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to finish encryption of JSON record.");
 
         assert((size_t) encrypted_size_out1 + (size_t) encrypted_size_out2 <= encrypted_size);
@@ -1040,7 +1045,7 @@ static int format_luks_token_text(
         if (r < 0)
                 return log_error_errno(r, "Failed to prepare LUKS JSON token object: %m");
 
-        r = sd_json_variant_format(v, 0, ret);
+        r = sd_json_variant_format(v, /* flags= */ 0, ret);
         if (r < 0)
                 return log_error_errno(r, "Failed to format encrypted user record for LUKS: %m");
 
@@ -1132,7 +1137,8 @@ int run_fitrim(int root_fd) {
                         return 0;
                 }
 
-                return log_warning_errno(errno, "Failed to invoke FITRIM, ignoring: %m");
+                log_warning_errno(errno, "Failed to invoke FITRIM, ignoring: %m");
+                return 0;
         }
 
         log_info("Discarded unused %s.", FORMAT_BYTES(range.len));
@@ -1185,11 +1191,11 @@ int run_fallocate(int backing_fd, const struct stat *st) {
 int run_fallocate_by_path(const char *backing_path) {
         _cleanup_close_ int backing_fd = -EBADF;
 
-        backing_fd = open(backing_path, O_RDWR|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+        backing_fd = xopenat(AT_FDCWD, backing_path, O_RDWR|O_NOCTTY|O_NONBLOCK);
         if (backing_fd < 0)
-                return log_error_errno(errno, "Failed to open '%s' for fallocate(): %m", backing_path);
+                return log_error_errno(backing_fd, "Failed to open '%s' for fallocate(): %m", backing_path);
 
-        return run_fallocate(backing_fd, NULL);
+        return run_fallocate(backing_fd, /* st= */ NULL);
 }
 
 static int lock_image_fd(int image_fd, const char *ip) {
@@ -1223,7 +1229,7 @@ static int lock_image_fd(int image_fd, const char *ip) {
         log_info("Successfully locked image file '%s'.", ip);
 
         /* Now send it to our parent to keep safe while the home dir is active */
-        r = sd_pid_notify_with_fds(0, false, "SYSTEMD_LUKS_LOCK_FD=1", &image_fd, 1);
+        r = sd_pid_notify_with_fds(/* pid= */ 0, /* unset_environment= */ false, "SYSTEMD_LUKS_LOCK_FD=1", &image_fd, 1);
         if (r < 0)
                 log_warning_errno(r, "Failed to send LUKS lock fd to parent, ignoring: %m");
 
@@ -1244,16 +1250,15 @@ static int open_image_file(
 
         ip = force_image_path ?: user_record_image_path(h);
 
-        image_fd = open(ip, O_RDWR|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+        image_fd = xopenat(AT_FDCWD, ip, O_RDWR|O_NOCTTY|O_NONBLOCK);
         if (image_fd < 0)
-                return log_error_errno(errno, "Failed to open image file %s: %m", ip);
+                return log_error_errno(image_fd, "Failed to open image file %s: %m", ip);
 
         if (fstat(image_fd, &st) < 0)
                 return log_error_errno(errno, "Failed to fstat() image file: %m");
-        if (!S_ISREG(st.st_mode) && !S_ISBLK(st.st_mode))
-                return log_error_errno(
-                                S_ISDIR(st.st_mode) ? SYNTHETIC_ERRNO(EISDIR) : SYNTHETIC_ERRNO(EBADFD),
-                                "Image file %s is not a regular file or block device.", ip);
+        r = stat_verify_regular_or_block(&st);
+        if (r < 0)
+                return log_error_errno(r, "Image file '%s' is not a regular file or block device.", ip);
 
         /* Locking block devices doesn't really make sense, as this might interfere with
          * udev's workings, and these locks aren't network propagated anyway, hence not what
@@ -1290,7 +1295,7 @@ int home_setup_luks(
         assert(setup);
         assert(user_record_storage(h) == USER_LUKS);
 
-        r = dlopen_cryptsetup();
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1344,7 +1349,7 @@ int home_setup_luks(
                                 return log_error_errno(errno, "Failed to get block device metrics of %s: %m", n);
 
                         if (fstat(setup->loop->fd, &st) < 0)
-                                return log_error_errno(r, "Failed to stat block device %s: %m", n);
+                                return log_error_errno(errno, "Failed to stat block device %s: %m", n);
                         assert(S_ISBLK(st.st_mode));
 
                         if (asprintf(&sysfs, "/sys/dev/block/" DEVNUM_FORMAT_STR "/partition", DEVNUM_FORMAT_VAL(st.st_rdev)) < 0)
@@ -1358,6 +1363,7 @@ int home_setup_luks(
                         } else {
                                 _cleanup_free_ char *buffer = NULL;
 
+                                sysfs = mfree(sysfs);
                                 if (asprintf(&sysfs, "/sys/dev/block/" DEVNUM_FORMAT_STR "/start", DEVNUM_FORMAT_VAL(st.st_rdev)) < 0)
                                         return log_oom();
 
@@ -1390,9 +1396,9 @@ int home_setup_luks(
                 log_info("Discovered used loopback device %s.", setup->loop->node);
 
                 if (setup->root_fd < 0) {
-                        setup->root_fd = open(user_record_home_directory(h), O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW);
+                        setup->root_fd = xopenat(AT_FDCWD, user_record_home_directory(h), O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
                         if (setup->root_fd < 0)
-                                return log_error_errno(errno, "Failed to open home directory: %m");
+                                return log_error_errno(setup->root_fd, "Failed to open home directory: %m");
                 }
         } else {
                 _cleanup_free_ char *fstype = NULL, *subdir = NULL;
@@ -1422,21 +1428,23 @@ int home_setup_luks(
                 if (r < 0)
                         return log_error_errno(r, "Failed to validate disk label: %m");
 
+                /* If the home partition was found within a partition table on the block device, the image
+                 * path refers to the whole device rather than to the partition itself, and we'd have to
+                 * stack a loop device on top of the block device. Refuse that. */
+                if (S_ISBLK(st.st_mode) && (offset != 0 || size != UINT64_MAX))
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "Block device '%s' has a partition table, refusing.", ip);
+
                 /* Everything before this point left the image untouched. We are now starting to make
                  * changes, hence mark the image dirty */
                 if (run_mark_dirty(setup->image_fd, true) > 0)
                         setup->do_mark_clean = true;
 
-                if (!user_record_luks_discard(h)) {
+                if (!FLAGS_SET(flags, HOME_SETUP_LUKS_DONT_FALLOCATE) && !user_record_luks_discard(h)) {
                         r = run_fallocate(setup->image_fd, &st);
                         if (r < 0)
                                 return r;
                 }
-
-                /* Before we make the loop device, make sure offset is zero & we are using the full partition
-                 * If our offset is not zero, loop_device_make will create a loop device on top of the block device */
-                if (S_ISBLK(st.st_mode))
-                        assert(offset == 0 && size == UINT64_MAX);
 
                 r = loop_device_make(
                                 setup->image_fd,
@@ -1495,14 +1503,16 @@ int home_setup_luks(
 
                 setup->undo_mount = true;
 
-                setup->root_fd = open(subdir, O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW);
+                setup->root_fd = xopenat(AT_FDCWD, subdir, O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
                 if (setup->root_fd < 0)
-                        return log_error_errno(errno, "Failed to open home directory: %m");
+                        return log_error_errno(setup->root_fd, "Failed to open home directory: %m");
 
                 if (user_record_luks_discard(h))
                         (void) run_fitrim(setup->root_fd);
 
-                setup->do_offline_fallocate = !(setup->do_offline_fitrim = user_record_luks_offline_discard(h));
+                setup->do_offline_fitrim = user_record_luks_offline_discard(h);
+                setup->do_offline_fallocate = !setup->do_offline_fitrim;
+                setup->tolerate_offline_fallocate_enospc = FLAGS_SET(flags, HOME_SETUP_LUKS_DONT_FALLOCATE);
         }
 
         if (!sd_id128_is_null(found_partition_uuid))
@@ -1570,7 +1580,7 @@ static int home_auto_grow_luks(
                         HOME_SETUP_RESIZE_DONT_UNDO,
                         setup,
                         cache,
-                        NULL);
+                        /* ret_home= */ NULL);
 }
 
 int home_activate_luks(
@@ -1591,7 +1601,7 @@ int home_activate_luks(
         assert(setup);
         assert(ret_home);
 
-        r = dlopen_cryptsetup();
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -1606,8 +1616,8 @@ int home_activate_luks(
 
         r = home_setup_luks(
                         h,
-                        0,
-                        NULL,
+                        flags,
+                        /* force_image_path= */ NULL,
                         setup,
                         cache,
                         &luks_home_record);
@@ -1652,7 +1662,7 @@ int home_activate_luks(
 
         loop_device_relinquish(setup->loop);
 
-        r = sym_crypt_deactivate_by_name(NULL, setup->dm_name, CRYPT_DEACTIVATE_DEFERRED);
+        r = sym_crypt_deactivate_by_name(/* cd= */ NULL, setup->dm_name, CRYPT_DEACTIVATE_DEFERRED);
         if (r < 0)
                 log_warning_errno(r, "Failed to relinquish DM device, ignoring: %m");
 
@@ -1696,7 +1706,7 @@ int home_deactivate_luks(UserRecord *h, HomeSetup *setup) {
 
                 cryptsetup_enable_logging(setup->crypt_device);
 
-                r = sym_crypt_deactivate_by_name(setup->crypt_device, setup->dm_name, 0);
+                r = sym_crypt_deactivate_by_name(setup->crypt_device, setup->dm_name, /* flags= */ 0);
                 if (ERRNO_IS_NEG_DEVICE_ABSENT(r) || r == -EINVAL)
                         log_debug_errno(r, "LUKS device %s is already detached.", setup->dm_node);
                 else if (r < 0)
@@ -1782,7 +1792,7 @@ static int luks_format(
                 struct crypt_device **ret) {
 
         _cleanup_(user_record_unrefp) UserRecord *reduced = NULL;
-        _cleanup_(sym_crypt_freep) struct crypt_device *cd = NULL;
+        _cleanup_(crypt_freep) struct crypt_device *cd = NULL;
         _cleanup_(erase_and_freep) void *volume_key = NULL;
         struct crypt_pbkdf_type good_pbkdf, minimal_pbkdf;
         _cleanup_free_ char *text = NULL;
@@ -1814,7 +1824,7 @@ static int luks_format(
                 return log_error_errno(r, "Failed to generate volume key: %m");
 
         /* Increase the metadata space to 4M, the largest LUKS2 supports */
-        r = sym_crypt_set_metadata_size(cd, 4096U*1024U, 0);
+        r = sym_crypt_set_metadata_size(cd, 4096U*1024U, /* keyslots_size= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to change LUKS2 metadata size: %m");
 
@@ -1866,17 +1876,6 @@ static int luks_format(
                 slot++;
         }
 
-        r = sym_crypt_activate_by_volume_key(
-                        cd,
-                        dm_name,
-                        volume_key,
-                        volume_key_size,
-                        discard ? CRYPT_ACTIVATE_ALLOW_DISCARDS : 0);
-        if (r < 0)
-                return log_error_errno(r, "Failed to activate LUKS superblock: %m");
-
-        log_info("LUKS activation by volume key succeeded.");
-
         r = user_record_clone(hr, USER_RECORD_EXTRACT_EMBEDDED|USER_RECORD_PERMISSIVE, &reduced);
         if (r < 0)
                 return log_error_errno(r, "Failed to prepare home record for LUKS: %m");
@@ -1890,6 +1889,19 @@ static int luks_format(
                 return log_error_errno(r, "Failed to set LUKS JSON token: %m");
 
         log_info("Writing user record as LUKS token completed.");
+
+        /* Activate last, so that nothing can fail after the device is activated, as our caller only takes
+         * care of deactivating it once we returned successfully. */
+        r = sym_crypt_activate_by_volume_key(
+                        cd,
+                        dm_name,
+                        volume_key,
+                        volume_key_size,
+                        discard ? CRYPT_ACTIVATE_ALLOW_DISCARDS : 0);
+        if (r < 0)
+                return log_error_errno(r, "Failed to activate LUKS superblock: %m");
+
+        log_info("LUKS activation by volume key succeeded.");
 
         if (ret)
                 *ret = TAKE_PTR(cd);
@@ -1909,7 +1921,6 @@ static int make_partition_table(
         _cleanup_(fdisk_unref_partitionp) struct fdisk_partition *p = NULL, *q = NULL;
         _cleanup_(fdisk_unref_parttypep) struct fdisk_parttype *t = NULL;
         _cleanup_(fdisk_unref_contextp) struct fdisk_context *c = NULL;
-        _cleanup_free_ char *disk_uuid_as_string = NULL;
         uint64_t offset, size, first_lba, start, last_lba, end, fdisk_sector_size;
         sd_id128_t disk_uuid;
         int r;
@@ -1918,12 +1929,13 @@ static int make_partition_table(
         assert(label);
         assert(ret_offset);
         assert(ret_size);
+        assert(ret_disk_uuid);
 
-        t = fdisk_new_parttype();
+        t = sym_fdisk_new_parttype();
         if (!t)
                 return log_oom();
 
-        r = fdisk_parttype_set_typestr(t, SD_GPT_USER_HOME_STR);
+        r = sym_fdisk_parttype_set_typestr(t, SD_GPT_USER_HOME_STR);
         if (r < 0)
                 return log_error_errno(r, "Failed to initialize partition type: %m");
 
@@ -1931,27 +1943,27 @@ static int make_partition_table(
         if (r < 0)
                 return log_error_errno(r, "Failed to open device: %m");
 
-        r = fdisk_create_disklabel(c, "gpt");
+        r = sym_fdisk_create_disklabel(c, "gpt");
         if (r < 0)
                 return log_error_errno(r, "Failed to create GPT disk label: %m");
 
-        p = fdisk_new_partition();
+        p = sym_fdisk_new_partition();
         if (!p)
                 return log_oom();
 
-        r = fdisk_partition_set_type(p, t);
+        r = sym_fdisk_partition_set_type(p, t);
         if (r < 0)
                 return log_error_errno(r, "Failed to set partition type: %m");
 
-        r = fdisk_partition_partno_follow_default(p, 1);
+        r = sym_fdisk_partition_partno_follow_default(p, 1);
         if (r < 0)
                 return log_error_errno(r, "Failed to place partition at first free partition index: %m");
 
         /* Use same sector size as the fdisk context when converting to bytes */
-        fdisk_sector_size = fdisk_get_sector_size(c);
+        fdisk_sector_size = sym_fdisk_get_sector_size(c);
         assert(fdisk_sector_size > 0);
 
-        first_lba = fdisk_get_first_lba(c); /* Boundary where usable space starts */
+        first_lba = sym_fdisk_get_first_lba(c); /* Boundary where usable space starts */
         assert(first_lba <= UINT64_MAX / fdisk_sector_size);
         start = DISK_SIZE_ROUND_UP(first_lba * fdisk_sector_size);
 
@@ -1960,56 +1972,52 @@ static int make_partition_table(
         if (start == UINT64_MAX)
                 return log_error_errno(SYNTHETIC_ERRNO(ERANGE), "Overflow while rounding up start LBA.");
 
-        last_lba = fdisk_get_last_lba(c); /* One sector before boundary where usable space ends */
+        last_lba = sym_fdisk_get_last_lba(c); /* One sector before boundary where usable space ends */
         assert(last_lba < UINT64_MAX / fdisk_sector_size);
         end = DISK_SIZE_ROUND_DOWN((last_lba + 1) * fdisk_sector_size);
 
         if (end <= start)
                 return log_error_errno(SYNTHETIC_ERRNO(ERANGE), "Resulting partition size zero or negative.");
 
-        r = fdisk_partition_set_start(p, start / fdisk_sector_size);
+        r = sym_fdisk_partition_set_start(p, start / fdisk_sector_size);
         if (r < 0)
                 return log_error_errno(r, "Failed to place partition at offset %" PRIu64 ": %m", start);
 
-        r = fdisk_partition_set_size(p, (end - start) / fdisk_sector_size);
+        r = sym_fdisk_partition_set_size(p, (end - start) / fdisk_sector_size);
         if (r < 0)
                 return log_error_errno(r, "Failed to end partition at offset %" PRIu64 ": %m", end);
 
-        r = fdisk_partition_set_name(p, label);
+        r = sym_fdisk_partition_set_name(p, label);
         if (r < 0)
                 return log_error_errno(r, "Failed to set partition name: %m");
 
-        r = fdisk_partition_set_uuid(p, SD_ID128_TO_UUID_STRING(uuid));
+        r = sym_fdisk_partition_set_uuid(p, SD_ID128_TO_UUID_STRING(uuid));
         if (r < 0)
                 return log_error_errno(r, "Failed to set partition UUID: %m");
 
-        r = fdisk_add_partition(c, p, NULL);
+        r = sym_fdisk_add_partition(c, p, /* partno= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to add partition: %m");
 
-        r = fdisk_write_disklabel(c);
+        r = sym_fdisk_write_disklabel(c);
         if (r < 0)
                 return log_error_errno(r, "Failed to write disk label: %m");
 
-        r = fdisk_get_disklabel_id(c, &disk_uuid_as_string);
+        r = fdisk_get_disklabel_id_as_id128(c, &disk_uuid);
         if (r < 0)
                 return log_error_errno(r, "Failed to determine disk label UUID: %m");
 
-        r = sd_id128_from_string(disk_uuid_as_string, &disk_uuid);
-        if (r < 0)
-                return log_error_errno(r, "Failed to parse disk label UUID: %m");
-
-        r = fdisk_get_partition(c, 0, &q);
+        r = sym_fdisk_get_partition(c, /* partno= */ 0, &q);
         if (r < 0)
                 return log_error_errno(r, "Failed to read created partition metadata: %m");
 
-        assert(fdisk_partition_has_start(q));
-        offset = fdisk_partition_get_start(q);
+        assert(sym_fdisk_partition_has_start(q));
+        offset = sym_fdisk_partition_get_start(q);
         if (offset > UINT64_MAX / fdisk_sector_size)
                 return log_error_errno(SYNTHETIC_ERRNO(ERANGE), "Partition offset too large.");
 
-        assert(fdisk_partition_has_size(q));
-        size = fdisk_partition_get_size(q);
+        assert(sym_fdisk_partition_has_size(q));
+        size = sym_fdisk_partition_get_size(q);
         if (size > UINT64_MAX / fdisk_sector_size)
                 return log_error_errno(SYNTHETIC_ERRNO(ERANGE), "Partition size too large.");
 
@@ -2207,11 +2215,21 @@ int home_create_luks(
         assert(setup->image_fd < 0);
         assert(ret_home);
 
-        r = dlopen_cryptsetup();
+        r = dlopen_fdisk(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
         assert_se(ip = user_record_image_path(h));
+
+        /* The partition is looked up by its label on activation, hence refuse if it would be truncated */
+        if (!gpt_label_is_valid(user_record_user_name_and_realm(h)))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "User name '%s' not valid as GPT partition label, refusing.",
+                                       user_record_user_name_and_realm(h));
 
         fstype = user_record_file_system_type(h);
         if (!supported_fstype(fstype))
@@ -2276,8 +2294,9 @@ int home_create_luks(
                 if (setup->image_fd < 0)
                         return setup->image_fd;
 
-                if (!S_ISBLK(st.st_mode))
-                        return log_error_errno(SYNTHETIC_ERRNO(ENOTBLK), "Device is not a block device, refusing.");
+                r = stat_verify_block(&st);
+                if (r < 0)
+                        return log_error_errno(r, "Device is not a block device, refusing.");
 
                 if (asprintf(&sysfs, "/sys/dev/block/" DEVNUM_FORMAT_STR "/partition", DEVNUM_FORMAT_VAL(st.st_rdev)) < 0)
                         return log_oom();
@@ -2297,10 +2316,12 @@ int home_create_luks(
                 if (h->disk_size == UINT64_MAX) {
 
                         /* If a relative disk size is requested, apply it relative to the block device size */
-                        if (h->disk_size_relative < UINT32_MAX)
-                                host_size = CLAMP(DISK_SIZE_ROUND_DOWN(block_device_size * h->disk_size_relative / UINT32_MAX),
+                        if (h->disk_size_relative < UINT32_MAX) {
+                                double f = (double) h->disk_size_relative / UINT32_MAX;
+
+                                host_size = CLAMP(DISK_SIZE_ROUND_DOWN((uint64_t) (block_device_size * f)),
                                                   USER_DISK_SIZE_MIN, USER_DISK_SIZE_MAX);
-                        else
+                        } else
                                 host_size = block_device_size; /* Otherwise, take the full device */
 
                 } else if (h->disk_size > block_device_size)
@@ -2338,13 +2359,13 @@ int home_create_luks(
                 if (r < 0)
                         return log_error_errno(r, "Failed to derive temporary file name for %s: %m", ip);
 
-                setup->image_fd = open(t, O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC|O_NOCTTY|O_NOFOLLOW, 0600);
+                setup->image_fd = xopenat_full(AT_FDCWD, t, O_RDWR|O_CREAT|O_EXCL|O_NOCTTY|O_NOFOLLOW, /* xopen_flags= */ 0, 0600);
                 if (setup->image_fd < 0)
-                        return log_error_errno(errno, "Failed to create home image %s: %m", t);
+                        return log_error_errno(setup->image_fd, "Failed to create home image %s: %m", t);
 
                 setup->temporary_image_path = TAKE_PTR(t);
 
-                r = chattr_full(setup->image_fd, NULL, FS_NOCOW_FL|FS_NOCOMP_FL, FS_NOCOW_FL|FS_NOCOMP_FL, NULL, NULL, CHATTR_FALLBACK_BITWISE);
+                r = chattr_full(setup->image_fd, /* path= */ NULL, FS_NOCOW_FL|FS_NOCOMP_FL, FS_NOCOW_FL|FS_NOCOMP_FL, /* ret_previous= */ NULL, /* ret_final= */ NULL, CHATTR_FALLBACK_BITWISE);
                 if (r < 0 && r != -ENOANO) /* ENOANO → some bits didn't work; which we skip logging about because chattr_full() already debug logs about those flags */
                         log_full_errno(ERRNO_IS_IOCTL_NOT_SUPPORTED(r) ? LOG_DEBUG : LOG_WARNING, r,
                                        "Failed to set file attributes on %s, ignoring: %m", setup->temporary_image_path);
@@ -2353,12 +2374,20 @@ int home_create_luks(
                 if (r < 0)
                         return r;
 
-                r = resize_image_loop(h, setup, 0, host_size, &host_size);
+                r = resize_image_loop(h, setup, /* old_image_size= */ 0, host_size, &host_size);
                 if (r < 0)
                         return r;
 
+                /* resize_image_loop() might have picked a smaller size if disk space is short, recheck */
+                if (!supported_fs_size(fstype, LESS_BY(host_size, GPT_LUKS2_OVERHEAD)))
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOSPC),
+                                               "Not enough disk space for minimal %s file system.", fstype);
+
                 log_info("Allocating image file completed.");
         }
+
+        if (fstat(setup->image_fd, &st) < 0)
+                return log_error_errno(errno, "Failed to fstat home image: %m");
 
         if (h->luks_sector_size == UINT64_MAX) {
                 /* If sector size is not specified, select UINT32_MAX, i.e. auto-probe */
@@ -2386,9 +2415,6 @@ int home_create_luks(
                 return r;
 
         log_info("Writing of partition table completed.");
-
-        if (fstat(setup->image_fd, &st) < 0)
-                return log_error_errno(errno, "Failed to fstat home image: %m");
 
         /* Ensure we don't create a loop device over block device as it leads to huge overhead for discard operations
          * if the device does not support discard_zeroes_data */
@@ -2419,7 +2445,7 @@ int home_create_luks(
                                 partition_offset,
                                 partition_size,
                                 image_sector_size,
-                                0,
+                                /* loop_flags= */ 0,
                                 LOCK_EX,
                                 &setup->loop);
                 if (r == -ENOENT) /* this means /dev/loop-control doesn't exist, i.e. we are in a container
@@ -2487,17 +2513,17 @@ int home_create_luks(
         if (r < 0)
                 return log_error_errno(r, "Failed to create user directory in mounted image file: %m");
 
-        setup->root_fd = open(subdir, O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW);
+        setup->root_fd = xopenat(AT_FDCWD, subdir, O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
         if (setup->root_fd < 0)
-                return log_error_errno(errno, "Failed to open user directory in mounted image file: %m");
+                return log_error_errno(setup->root_fd, "Failed to open user directory in mounted image file: %m");
 
-        (void) home_shift_uid(setup->root_fd, NULL, UID_NOBODY, h->uid, &mount_fd);
+        (void) home_shift_uid(setup->root_fd, /* target= */ NULL, UID_NOBODY, h->uid, &mount_fd);
 
         if (mount_fd >= 0) {
                 /* If we have established a new mount, then we can use that as new root fd to our home directory. */
                 safe_close(setup->root_fd);
 
-                setup->root_fd = fd_reopen(mount_fd, O_RDONLY|O_CLOEXEC|O_DIRECTORY);
+                setup->root_fd = fd_reopen(mount_fd, O_RDONLY|O_DIRECTORY);
                 if (setup->root_fd < 0)
                         return log_error_errno(setup->root_fd, "Unable to convert mount fd into proper directory fd: %m");
 
@@ -2527,7 +2553,7 @@ int home_create_luks(
                         sym_crypt_get_cipher_mode(setup->crypt_device),
                         luks_volume_key_size_convert(setup->crypt_device),
                         fstype,
-                        NULL,
+                        /* home_directory= */ NULL,
                         h->uid,
                         (gid_t) h->uid);
         if (r < 0)
@@ -2552,18 +2578,18 @@ int home_create_luks(
         setup->loop = loop_device_unref(setup->loop);
 
         if (!user_record_luks_offline_discard(h)) {
-                r= run_fallocate(setup->image_fd, NULL /* refresh stat() data */);
+                r = run_fallocate(setup->image_fd, /* st= */ NULL /* refresh stat() data */);
                 if (r < 0)
                         return r;
         }
 
         /* Sync everything to disk before we move things into place under the final name. */
         if (fsync(setup->image_fd) < 0)
-                return log_error_errno(r, "Failed to synchronize image to disk: %m");
+                return log_error_errno(errno, "Failed to synchronize image to disk: %m");
 
         if (disk_uuid_path)
                 /* Reread partition table if this is a block device */
-                (void) reread_partition_table_fd(setup->image_fd, /* flags= */ 0);
+                (void) reread_partition_table_fd(setup->image_fd, /* flags= */ 0, /* args= */ NULL);
         else {
                 assert(setup->temporary_image_path);
 
@@ -2706,10 +2732,10 @@ static int ext4_offline_resize_fs(
                 return r;
         if (r == 0) {
                 /* Child */
-                execlp("e2fsck", "e2fsck", "-fp", setup->dm_node, NULL);
+                r = execvp_safe("e2fsck", STRV_MAKE("e2fsck", "-fp", setup->dm_node));
                 log_open();
-                log_error_errno(errno, "Failed to execute e2fsck: %m");
-                _exit(EXIT_FAILURE);
+                log_error_errno(r, "Failed to execute e2fsck: %m");
+                _exit(FSCK_OPERATIONAL_ERROR);
         }
 
         exit_status = pidref_wait_for_terminate_and_check("e2fsck", &fsck_pidref, WAIT_LOG_ABNORMAL);
@@ -2739,9 +2765,9 @@ static int ext4_offline_resize_fs(
                 return r;
         if (r == 0) {
                 /* Child */
-                execlp("resize2fs", "resize2fs", setup->dm_node, size_str, NULL);
+                r = execvp_safe("resize2fs", STRV_MAKE("resize2fs", setup->dm_node, size_str));
                 log_open();
-                log_error_errno(errno, "Failed to execute resize2fs: %m");
+                log_error_errno(r, "Failed to execute resize2fs: %m");
                 _exit(EXIT_FAILURE);
         }
 
@@ -2757,9 +2783,9 @@ static int ext4_offline_resize_fs(
         }
 
         if (re_open) {
-                setup->root_fd = open(HOME_RUNTIME_WORK_DIR, O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW);
+                setup->root_fd = xopenat(AT_FDCWD, HOME_RUNTIME_WORK_DIR, O_RDONLY|O_DIRECTORY|O_NOFOLLOW);
                 if (setup->root_fd < 0)
-                        return log_error_errno(errno, "Failed to reopen file system: %m");
+                        return log_error_errno(setup->root_fd, "Failed to reopen file system: %m");
         }
 
         log_info("File system mounted again.");
@@ -2777,7 +2803,6 @@ static int prepare_resize_partition(
 
         _cleanup_(fdisk_unref_contextp) struct fdisk_context *c = NULL;
         _cleanup_(fdisk_unref_tablep) struct fdisk_table *t = NULL;
-        _cleanup_free_ char *disk_uuid_as_string = NULL;
         struct fdisk_partition *found = NULL;
         sd_id128_t disk_uuid;
         size_t n_partitions;
@@ -2786,6 +2811,7 @@ static int prepare_resize_partition(
         assert(fd >= 0);
         assert(ret_disk_uuid);
         assert(ret_table);
+        assert(ret_partition);
 
         assert((partition_offset & 511) == 0);
         assert((old_partition_size & 511) == 0);
@@ -2804,45 +2830,43 @@ static int prepare_resize_partition(
         if (r < 0)
                 return log_error_errno(r, "Failed to open device: %m");
 
-        if (!fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
+        if (!sym_fdisk_is_labeltype(c, FDISK_DISKLABEL_GPT))
                 return log_error_errno(SYNTHETIC_ERRNO(ENOMEDIUM), "Disk has no GPT partition table.");
 
-        r = fdisk_get_disklabel_id(c, &disk_uuid_as_string);
+        r = fdisk_get_disklabel_id_as_id128(c, &disk_uuid);
         if (r < 0)
                 return log_error_errno(r, "Failed to acquire disk UUID: %m");
 
-        r = sd_id128_from_string(disk_uuid_as_string, &disk_uuid);
-        if (r < 0)
-                return log_error_errno(r, "Failed to parse disk UUID: %m");
-
-        r = fdisk_get_partitions(c, &t);
+        r = sym_fdisk_get_partitions(c, &t);
         if (r < 0)
                 return log_error_errno(r, "Failed to acquire partition table: %m");
 
-        n_partitions = fdisk_table_get_nents(t);
+        n_partitions = sym_fdisk_table_get_nents(t);
         for (size_t i = 0; i < n_partitions; i++)  {
                 struct fdisk_partition *p;
                 uint64_t fdisk_sector_size;
 
-                p = fdisk_table_get_partition(t, i);
+                p = sym_fdisk_table_get_partition(t, i);
                 if (!p)
                         return log_error_errno(SYNTHETIC_ERRNO(EIO), "Failed to read partition metadata.");
 
-                if (fdisk_partition_is_used(p) <= 0)
+                if (sym_fdisk_partition_is_used(p) <= 0)
                         continue;
-                if (fdisk_partition_has_start(p) <= 0 || fdisk_partition_has_size(p) <= 0 || fdisk_partition_has_end(p) <= 0)
+                if (sym_fdisk_partition_has_start(p) <= 0 ||
+                        sym_fdisk_partition_has_size(p) <= 0 ||
+                        sym_fdisk_partition_has_end(p) <= 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Found partition without a size.");
 
-                fdisk_sector_size = fdisk_get_sector_size(c);
+                fdisk_sector_size = sym_fdisk_get_sector_size(c);
                 assert(fdisk_sector_size > 0);
-                if (fdisk_partition_get_start(p) == partition_offset / fdisk_sector_size &&
-                    fdisk_partition_get_size(p) == old_partition_size / fdisk_sector_size) {
+                if (sym_fdisk_partition_get_start(p) == partition_offset / fdisk_sector_size &&
+                    sym_fdisk_partition_get_size(p) == old_partition_size / fdisk_sector_size) {
 
                         if (found)
                                 return log_error_errno(SYNTHETIC_ERRNO(ENOTUNIQ), "Partition found twice, refusing.");
 
                         found = p;
-                } else if (fdisk_partition_get_end(p) > partition_offset / fdisk_sector_size)
+                } else if (sym_fdisk_partition_get_end(p) > partition_offset / fdisk_sector_size)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Can't extend, not last partition in image.");
         }
 
@@ -2874,12 +2898,12 @@ static int get_maximum_partition_size(
                 return log_error_errno(r, "Failed to create fdisk context: %m");
 
         /* Get the probed sector size by fdisk */
-        fdisk_sector_size = fdisk_get_sector_size(c);
-        start_lba = fdisk_partition_get_start(p);
+        fdisk_sector_size = sym_fdisk_get_sector_size(c);
+        start_lba = sym_fdisk_partition_get_start(p);
         assert(start_lba <= UINT64_MAX / fdisk_sector_size);
         start = start_lba * fdisk_sector_size;
 
-        last_lba = fdisk_get_last_lba(c); /* One sector before boundary where usable space ends */
+        last_lba = sym_fdisk_get_last_lba(c); /* One sector before boundary where usable space ends */
         assert(last_lba < UINT64_MAX / fdisk_sector_size);
         end = DISK_SIZE_ROUND_DOWN((last_lba + 1) * fdisk_sector_size);
 
@@ -2891,34 +2915,12 @@ static int get_maximum_partition_size(
         return 1;
 }
 
-static int ask_cb(struct fdisk_context *c, struct fdisk_ask *ask, void *userdata) {
-        char *result;
-
-        assert(c);
-
-        switch (fdisk_ask_get_type(ask)) {
-
-        case FDISK_ASKTYPE_STRING:
-                result = new(char, 37);
-                if (!result)
-                        return log_oom();
-
-                fdisk_ask_string_set_result(ask, sd_id128_to_uuid_string(*(sd_id128_t*) userdata, result));
-                break;
-
-        default:
-                log_debug("Unexpected question from libfdisk, ignoring.");
-        }
-
-        return 0;
-}
-
 static int apply_resize_partition(
                 int fd,
                 sd_id128_t disk_uuids,
                 struct fdisk_table *t,
                 struct fdisk_partition *p,
-                size_t new_partition_size) {
+                uint64_t new_partition_size) {
 
         _cleanup_(fdisk_unref_contextp) struct fdisk_context *c = NULL;
         uint32_t ssz;
@@ -2941,31 +2943,27 @@ static int apply_resize_partition(
                 return log_error_errno(r, "Failed to open device: %m");
 
         /* Before writing our partition patch the final size in */
-        r = fdisk_partition_size_explicit(p, 1);
+        r = sym_fdisk_partition_size_explicit(p, 1);
         if (r < 0)
                 return log_error_errno(r, "Failed to enable explicit partition size: %m");
 
-        r = fdisk_partition_set_size(p, new_partition_size / ssz);
+        r = sym_fdisk_partition_set_size(p, new_partition_size / ssz);
         if (r < 0)
                 return log_error_errno(r, "Failed to change partition size: %m");
 
-        r = fdisk_create_disklabel(c, "gpt");
+        r = sym_fdisk_create_disklabel(c, "gpt");
         if (r < 0)
                 return log_error_errno(r, "Failed to create GPT disk label: %m");
 
-        r = fdisk_apply_table(c, t);
+        r = sym_fdisk_apply_table(c, t);
         if (r < 0)
                 return log_error_errno(r, "Failed to apply partition table: %m");
 
-        r = fdisk_set_ask(c, ask_cb, &disk_uuids);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set libfdisk query function: %m");
-
-        r = fdisk_set_disklabel_id(c);
+        r = fdisk_set_disklabel_id_as_id128(c, disk_uuids);
         if (r < 0)
                 return log_error_errno(r, "Failed to change disklabel ID: %m");
 
-        r = fdisk_write_disklabel(c);
+        r = sym_fdisk_write_disklabel(c);
         if (r < 0)
                 return log_error_errno(r, "Failed to write disk label: %m");
 
@@ -3078,7 +3076,7 @@ static int resize_fs_loop(
 
                 /* Now resize the file system */
                 if (resize_type == CAN_RESIZE_ONLINE) {
-                        r = resize_fs(setup->root_fd, try_fs_size, NULL);
+                        r = resize_fs(setup->root_fd, try_fs_size, /* ret_size= */ NULL);
                         if (r < 0) {
                                 if (!ERRNO_IS_DISK_SPACE(r) || new_fs_size > old_fs_size) /* Not a disk space issue? Not trying to shrink? */
                                         return log_error_errno(r, "Failed to resize file system: %m");
@@ -3238,7 +3236,11 @@ int home_resize_luks(
         assert(user_record_storage(h) == USER_LUKS);
         assert(setup);
 
-        r = dlopen_cryptsetup();
+        r = dlopen_fdisk(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -3246,7 +3248,7 @@ int home_resize_luks(
         ip = strdupa_safe(ipo); /* copy out since original might change later in home record object */
 
         if (setup->image_fd < 0) {
-                setup->image_fd = open_image_file(h, NULL, &st);
+                setup->image_fd = open_image_file(h, /* force_image_path= */ NULL, &st);
                 if (setup->image_fd < 0)
                         return setup->image_fd;
         } else {
@@ -3269,7 +3271,7 @@ int home_resize_luks(
 
                         log_info("Operating on partition device %s, using parent device.", ip);
 
-                        opened_image_fd = r = device_open_from_devnum(S_IFBLK, parent, O_RDWR|O_CLOEXEC|O_NOCTTY|O_NONBLOCK, &whole_disk);
+                        opened_image_fd = r = device_open_from_devnum(S_IFBLK, parent, O_RDWR|O_NOCTTY|O_NONBLOCK, &whole_disk);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to open whole block device for %s: %m", ip);
 
@@ -3530,7 +3532,7 @@ int home_resize_luks(
                         log_info("Growing of partition completed.");
 
                 if (S_ISBLK(st.st_mode))
-                        (void) reread_partition_table_fd(image_fd, /* flags= */ 0);
+                        (void) reread_partition_table_fd(image_fd, /* flags= */ 0, /* args= */ NULL);
 
                 /* Tell LUKS about the new bigger size too */
                 /* libcrypsetup uses units of 512B sectors for size */
@@ -3591,7 +3593,7 @@ int home_resize_luks(
         new_fs_size = resized_fs_size;
 
         /* Immediately sync afterwards */
-        r = home_sync_and_statfs(setup->root_fd, NULL);
+        r = home_sync_and_statfs(setup->root_fd, /* ret= */ NULL);
         if (r < 0)
                 return r;
 
@@ -3626,13 +3628,19 @@ int home_resize_luks(
                 }
 
                 r = apply_resize_partition(image_fd, disk_uuid, table, partition, new_partition_size);
-                if (r < 0)
+                if (r < 0) {
+                        /* The old partition table refers to space beyond the shrunk image, restore the
+                         * original image size so that it remains usable. */
+                        if (S_ISREG(st.st_mode) && ftruncate(image_fd, old_image_size) < 0)
+                                log_warning_errno(errno, "Failed to restore size of '%s', ignoring: %m", ip);
+
                         return r;
+                }
                 if (r > 0)
                         log_info("Shrinking of partition completed.");
 
                 if (S_ISBLK(st.st_mode))
-                        (void) reread_partition_table_fd(image_fd, /* flags= */ 0);
+                        (void) reread_partition_table_fd(image_fd, /* flags= */ 0, /* args= */ NULL);
 
         } else { /* → Grow */
                 if (!FLAGS_SET(flags, HOME_SETUP_RESIZE_DONT_SYNC_IDENTITIES)) {
@@ -3686,7 +3694,7 @@ int home_passwd_luks(
                 const PasswordCache *cache, /* the passwords acquired via PKCS#11/FIDO2 security tokens */
                 char **effective_passwords  /* new passwords */) {
 
-        size_t volume_key_size, max_key_slots, n_effective;
+        size_t volume_key_size, max_key_slots, n_effective, n_occupied = 0;
         _cleanup_(erase_and_freep) void *volume_key = NULL;
         struct crypt_pbkdf_type good_pbkdf, minimal_pbkdf;
         const char *type;
@@ -3696,7 +3704,7 @@ int home_passwd_luks(
         assert(user_record_storage(h) == USER_LUKS);
         assert(setup);
 
-        r = dlopen_cryptsetup();
+        r = dlopen_cryptsetup(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -3718,7 +3726,7 @@ int home_passwd_luks(
         if (!volume_key)
                 return log_oom();
 
-        r = luks_get_volume_key(h, setup->crypt_device, cache, volume_key, &volume_key_size, NULL);
+        r = luks_get_volume_key(h, setup->crypt_device, cache, volume_key, &volume_key_size, /* ret_key_serial= */ NULL);
         if (r == -ENOKEY)
                 return log_error_errno(SYNTHETIC_ERRNO(ENOKEY), "Failed to unlock LUKS superblock with supplied passwords.");
         if (r < 0)
@@ -3726,44 +3734,97 @@ int home_passwd_luks(
 
         n_effective = strv_length(effective_passwords);
 
+        for (size_t i = 0; i < max_key_slots; i++)
+                switch (sym_crypt_keyslot_status(setup->crypt_device, i)) {
+                case CRYPT_SLOT_INACTIVE:
+                        break;
+                case CRYPT_SLOT_ACTIVE:
+                case CRYPT_SLOT_ACTIVE_LAST:
+                case CRYPT_SLOT_UNBOUND:
+                        n_occupied++;
+                        break;
+                default:
+                        return log_error_errno(SYNTHETIC_ERRNO(EIO),
+                                               "Failed to determine state of LUKS key slot %zu.", i);
+                }
+
+        if (n_effective > max_key_slots - n_occupied)
+                return log_error_errno(SYNTHETIC_ERRNO(ENOSPC),
+                                       "Not enough free LUKS key slots (%zu required, %zu available).",
+                                       n_effective, max_key_slots - n_occupied);
+
         build_good_pbkdf(&good_pbkdf, h);
         build_minimal_pbkdf(&minimal_pbkdf, h);
 
-        for (size_t i = 0; i < max_key_slots; i++) {
-                r = sym_crypt_keyslot_destroy(setup->crypt_device, i);
-                if (r < 0 && !IN_SET(r, -ENOENT, -EINVAL)) /* Returns EINVAL or ENOENT if there's no key in this slot already */
-                        return log_error_errno(r, "Failed to destroy LUKS password: %m");
+        /* Rotate the LUKS key slots in two passes, so that at every on-disk state at least one valid key slot
+         * exists for each password the user currently holds. First add all new passwords into free key slots
+         * (purely additive, hence non-destructive), and only once that fully succeeded destroy the old slots.
+         * If an add fails (e.g. the argon2 PBKDF, which is intentionally memory hungry, hits OOM), we roll
+         * back the slots added so far and return with the pre-existing slots untouched. The reverse order
+         * (destroy a slot first, then add its replacement at the same index) would, on such a failure, leave
+         * the slot destroyed with no replacement, permanently locking the user out. */
 
-                if (i >= n_effective) {
-                        if (r >= 0)
-                                log_info("Destroyed LUKS key slot %zu.", i);
-                        continue;
-                }
+        _cleanup_free_ int *new_slots = new(int, n_effective);
+        if (!new_slots)
+                return log_oom();
 
+        size_t n_added = 0;
+        for (size_t i = 0; i < n_effective; i++) {
                 if (password_cache_contains(cache, effective_passwords[i])) { /* Is this a FIDO2 or PKCS#11 password? */
-                        log_debug("Using minimal PBKDF for slot %zu", i);
+                        log_debug("Using minimal PBKDF for new key slot.");
                         r = sym_crypt_set_pbkdf_type(setup->crypt_device, &minimal_pbkdf);
                 } else {
-                        log_debug("Using good PBKDF for slot %zu", i);
+                        log_debug("Using good PBKDF for new key slot.");
                         r = sym_crypt_set_pbkdf_type(setup->crypt_device, &good_pbkdf);
                 }
-                if (r < 0)
-                        return log_error_errno(r, "Failed to tweak PBKDF for slot %zu: %m", i);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to tweak PBKDF for new key slot: %m");
+                        goto rollback;
+                }
 
                 r = sym_crypt_keyslot_add_by_volume_key(
                                 setup->crypt_device,
-                                i,
+                                CRYPT_ANY_SLOT,
                                 volume_key,
                                 volume_key_size,
                                 effective_passwords[i],
                                 strlen(effective_passwords[i]));
-                if (r < 0)
-                        return log_error_errno(r, "Failed to set up LUKS password: %m");
+                if (r < 0) {
+                        log_error_errno(r, "Failed to set up LUKS password: %m");
+                        goto rollback;
+                }
 
-                log_info("Updated LUKS key slot %zu.", i);
+                new_slots[n_added++] = r;
+                log_info("Added LUKS key slot %i.", r);
+        }
+
+        /* All replacement slots are committed now; drop every slot that isn't one we just added. */
+        for (size_t i = 0; i < max_key_slots; i++) {
+                bool keep = false;
+
+                for (size_t j = 0; j < n_added; j++)
+                        if (new_slots[j] == (int) i) {
+                                keep = true;
+                                break;
+                        }
+                if (keep)
+                        continue;
+
+                r = sym_crypt_keyslot_destroy(setup->crypt_device, i);
+                if (r < 0 && !IN_SET(r, -ENOENT, -EINVAL)) /* Returns EINVAL or ENOENT if there's no key in this slot already */
+                        return log_error_errno(r, "Failed to destroy LUKS password: %m");
+                if (r >= 0)
+                        log_info("Destroyed LUKS key slot %zu.", i);
         }
 
         return 1;
+
+rollback:
+        /* Undo the slots added in this call, so that the header is left exactly as we found it. */
+        for (size_t i = 0; i < n_added; i++)
+                (void) sym_crypt_keyslot_destroy(setup->crypt_device, new_slots[i]);
+
+        return r;
 }
 
 int home_lock_luks(UserRecord *h, HomeSetup *setup) {
@@ -3859,7 +3920,7 @@ static int device_is_gone(HomeSetup *setup) {
         r = sd_device_new_from_stat_rdev(&d, &st);
         if (r < 0) {
                 if (r != -ENODEV)
-                        return log_error_errno(errno, "Failed to allocate device object from block device node %s: %m", setup->dm_node);
+                        return log_error_errno(r, "Failed to allocate device object from block device node %s: %m", setup->dm_node);
 
                 return true;
         }
@@ -3881,7 +3942,7 @@ static int device_monitor_handler(sd_device_monitor *monitor, sd_device *device,
         if (r < 0)
                 return r;
         if (r > 0) /* Yay! we are done! */
-                (void) sd_event_exit(sd_device_monitor_get_event(monitor), 0);
+                (void) sd_event_exit(sd_device_monitor_get_event(monitor), /* code= */ 0);
 
         return 0;
 }
@@ -3942,7 +4003,7 @@ int wait_for_block_device_gone(HomeSetup *setup, usec_t timeout_usec) {
         }
 
         if (timeout_usec != USEC_INFINITY) {
-                r = sd_event_add_time_relative(event, NULL, CLOCK_MONOTONIC, timeout_usec, 0, NULL, NULL);
+                r = sd_event_add_time_relative(event, /* ret= */ NULL, CLOCK_MONOTONIC, timeout_usec, /* accuracy= */ 0, /* callback= */ NULL, /* userdata= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to add timer event: %m");
         }
@@ -3955,7 +4016,7 @@ int wait_for_block_device_gone(HomeSetup *setup, usec_t timeout_usec) {
         if (r < 0)
                 return r;
         if (r == 0)
-                return log_error_errno(r, "Device %s still around.", setup->dm_node);
+                return log_error_errno(SYNTHETIC_ERRNO(EBUSY), "Device %s still around.", setup->dm_node);
 
         log_debug("Successfully waited until device %s disappeared.", setup->dm_node);
         return 0;
@@ -3990,7 +4051,7 @@ int home_auto_shrink_luks(UserRecord *h, HomeSetup *setup, PasswordCache *cache)
                         HOME_SETUP_RESIZE_DONT_UNDO,
                         setup,
                         cache,
-                        NULL);
+                        /* ret_home= */ NULL);
         if (r < 0)
                 return r;
 

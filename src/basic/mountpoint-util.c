@@ -84,7 +84,13 @@ int name_to_handle_at_loop(
                 h->handle_bytes = n;
 
                 if (ret_unique_mnt_id) {
-                        uint64_t mnt_id;
+                        /* Here, explicitly initialize mnt_id, otherwise valgrind complains:
+                         *
+                         * ==175708== Conditional jump or move depends on uninitialised value(s)
+                         * ==175708==    at 0x4BC33D1: inode_same_at (stat-util.c:610)
+                         * ==175708==    by 0x4BF1972: inode_same (stat-util.h:86)
+                         */
+                        uint64_t mnt_id = 0;
 
                         /* The kernel will still use this as uint64_t pointer */
                         r = name_to_handle_at(fd, path, h, (int *) &mnt_id, flags|AT_HANDLE_MNT_ID_UNIQUE);
@@ -236,7 +242,7 @@ struct file_handle* file_handle_dup(const struct file_handle *fh) {
 int is_mount_point_at(int dir_fd, const char *path, int flags) {
         int r;
 
-        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(dir_fd));
         assert((flags & ~AT_SYMLINK_FOLLOW) == 0);
 
         if (path_equal(path, "/"))
@@ -300,7 +306,7 @@ static int path_get_mnt_id_at_internal(int dir_fd, const char *path, bool unique
         struct statx sx;
         int r;
 
-        assert(dir_fd >= 0 || IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(dir_fd));
         assert(ret);
 
         r = xstatx(dir_fd, path,
@@ -319,6 +325,8 @@ static int path_get_mnt_id_at_internal(int dir_fd, const char *path, bool unique
 int path_get_mnt_id_at(int dir_fd, const char *path, int *ret) {
         uint64_t mnt_id;
         int r;
+
+        assert(ret);
 
         r = path_get_mnt_id_at_internal(dir_fd, path, /* unique = */ false, &mnt_id);
         if (r < 0)
@@ -377,6 +385,17 @@ bool fstype_needs_quota(const char *fstype) {
                           "f2fs");
 }
 
+bool fstype_has_internal_quota(const char *fstype) {
+        /* These filesystems have built-in quota support and do not need
+         * external quotacheck/quotaon services - see the "nothing needed"
+         * entries in fstype_needs_quota() above. */
+        return STR_IN_SET(fstype,
+                          "xfs",
+                          "gfs2",
+                          "ocfs2",
+                          "btrfs");
+}
+
 bool fstype_is_api_vfs(const char *fstype) {
         assert(fstype);
 
@@ -424,7 +443,7 @@ bool fstype_can_discard(const char *fstype) {
                 return true;
 
         /* On new kernels we can just ask the kernel */
-        return mount_option_supported(fstype, "discard", NULL) > 0;
+        return mount_option_supported(fstype, "discard", /* value= */ NULL) > 0;
 }
 
 const char* fstype_norecovery_option(const char *fstype) {
@@ -442,7 +461,7 @@ const char* fstype_norecovery_option(const char *fstype) {
          * it with rescue=nologreplay, so we check for the new name first and fall back to checking for the
          * old name if the new name doesn't work. */
         if (streq(fstype, "btrfs")) {
-                r = mount_option_supported(fstype, "rescue=nologreplay", NULL);
+                r = mount_option_supported(fstype, "rescue=nologreplay", /* value= */ NULL);
                 if (r == -EAGAIN) {
                         log_debug_errno(r, "Failed to check for btrfs 'rescue=nologreplay' option, assuming old kernel with 'norecovery': %m");
                         return "norecovery";
@@ -454,7 +473,7 @@ const char* fstype_norecovery_option(const char *fstype) {
         }
 
         /* On new kernels we can just ask the kernel */
-        return mount_option_supported(fstype, "norecovery", NULL) > 0 ? "norecovery" : NULL;
+        return mount_option_supported(fstype, "norecovery", /* value= */ NULL) > 0 ? "norecovery" : NULL;
 }
 
 bool fstype_can_fmask_dmask(const char *fstype) {
@@ -464,6 +483,22 @@ bool fstype_can_fmask_dmask(const char *fstype) {
          * not be allowed in our MAC context. If we don't know ourselves, on new kernels we can just ask the
          * kernel. */
         return streq(fstype, "vfat") || (mount_option_supported(fstype, "fmask", "0177") > 0 && mount_option_supported(fstype, "dmask", "0077") > 0);
+}
+
+bool fstype_can_ownership(const char *fstype) {
+        /* File systems which are not known to not support uid/gid ownership.
+         * For some types, this can be a bit murky. So just exclude the ones that for sure
+         * don't support with the current implementations in Linux. */
+
+        return !STR_IN_SET(ASSERT_PTR(fstype),
+                           "adfs",
+                           "exfat",
+                           "fat",
+                           "hfs",
+                           "hpfs",
+                           "msdos",
+                           "ntfs",
+                           "vfat");
 }
 
 bool fstype_can_uid_gid(const char *fstype) {
@@ -572,9 +607,9 @@ int mount_nofollow(
          * Note that this disables following only for the final component of the target, i.e symlinks within
          * the path of the target are honoured, as are symlinks in the source path everywhere. */
 
-        fd = open(target, O_PATH|O_CLOEXEC|O_NOFOLLOW);
+        fd = xopenat(AT_FDCWD, target, O_PATH|O_NOFOLLOW);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return mount_fd(source, fd, filesystemtype, mountflags, data);
 }
@@ -596,6 +631,9 @@ const char* mount_propagation_flag_to_string(unsigned long flags) {
 }
 
 int mount_propagation_flag_from_string(const char *name, unsigned long *ret) {
+
+        POINTER_MAY_BE_NULL(name);
+        assert(ret);
 
         if (isempty(name))
                 *ret = 0;
@@ -622,7 +660,7 @@ bool mount_new_api_supported(void) {
                 return cache;
 
         /* This is the newest API among the ones we use, so use it as boundary */
-        r = RET_NERRNO(mount_setattr(-EBADF, NULL, 0, NULL, 0));
+        r = RET_NERRNO(mount_setattr(-EBADF, /* path= */ NULL, /* flags= */ 0, /* attr= */ NULL, /* size= */ 0));
         if (r == 0 || ERRNO_IS_NOT_SUPPORTED(r)) /* This should return an error if it is working properly */
                 return (cache = false);
 
@@ -640,14 +678,18 @@ int mount_option_supported(const char *fstype, const char *key, const char *valu
         assert(key);
 
         fd = fsopen(fstype, FSOPEN_CLOEXEC);
-        if (fd < 0)
+        if (fd < 0) {
+                if (errno == ENODEV)
+                        return log_debug_errno(errno, "Kernel does not support file system type '%s'.", fstype);
+
                 return log_debug_errno(errno, "Failed to open superblock context for '%s': %m", fstype);
+        }
 
         /* Various file systems support fs context only in recent kernels (e.g. btrfs). For older kernels
          * fsconfig() with FSCONFIG_SET_STRING/FSCONFIG_SET_FLAG never fail. Which sucks, because we want to
          * use it for testing support, after all. Let's hence do a check if the file system got converted yet
          * first. */
-        if (fsconfig(fd, FSCONFIG_SET_FD, "adefinitelynotexistingmountoption", NULL, fd) < 0) {
+        if (fsconfig(fd, FSCONFIG_SET_FD, "adefinitelynotexistingmountoption", /* value= */ NULL, fd) < 0) {
                 /* If FSCONFIG_SET_FD is not supported for the fs, then the file system was not converted to
                  * the new mount API yet. If it returns EINVAL the mount option doesn't exist, but the fstype
                  * is converted. */
@@ -662,9 +704,9 @@ int mount_option_supported(const char *fstype, const char *key, const char *valu
                 return log_debug_errno(SYNTHETIC_ERRNO(EAGAIN), "FSCONFIG_SET_FD worked unexpectedly for '%s', whoa!", fstype);
 
         if (value)
-                r = fsconfig(fd, FSCONFIG_SET_STRING, key, value, 0);
+                r = fsconfig(fd, FSCONFIG_SET_STRING, key, value, /* aux= */ 0);
         else
-                r = fsconfig(fd, FSCONFIG_SET_FLAG, key, NULL, 0);
+                r = fsconfig(fd, FSCONFIG_SET_FLAG, key, /* value= */ NULL, /* aux= */ 0);
         if (r < 0) {
                 if (errno == EINVAL)
                         return false; /* EINVAL means option not supported. */

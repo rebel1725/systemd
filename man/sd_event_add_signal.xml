@@ -178,13 +178,13 @@
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
 
   <refsect1>
     <title>History</title>
     <para><function>sd_event_add_signal()</function>,
     <function>sd_event_signal_handler_t()</function>, and
-    <function>sd_event_source_get_signal()</function> were added in version 217.</para>
+    <function>sd_event_source_get_signal()</function> were added in version 221.</para>
   </refsect1>
 
   <refsect1>

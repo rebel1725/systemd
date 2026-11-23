@@ -31,6 +31,7 @@
 #include "varlink-io.systemd.Resolve.Hook.h"
 #include "varlink-io.systemd.service.h"
 #include "varlink-util.h"
+#include "xattr-util.h"
 
 typedef struct LookupParameters {
         const char *user_name;
@@ -97,7 +98,7 @@ static int user_lookup_uid(Manager *m, uid_t uid, char **ret_name, char **ret_re
                 return -ENOMEM;
 
         /* Don't synthesize invalid user/group names (too long...) */
-        if (!valid_user_group_name(n, 0))
+        if (!valid_user_group_name(n, /* flags= */ 0))
                 return -ESRCH;
 
         if (asprintf(&rn, "UID " UID_FMT " of Container %s", converted_uid, machine->name) < 0)
@@ -123,7 +124,7 @@ static int user_lookup_name(Manager *m, const char *name, uid_t *ret_uid, char *
         assert(ret_uid);
         assert(ret_real_name);
 
-        if (!valid_user_group_name(name, 0))
+        if (!valid_user_group_name(name, /* flags= */ 0))
                 return -ESRCH;
 
         e = startswith(name, "vu-");
@@ -188,16 +189,16 @@ static int vl_method_get_user_record(sd_varlink *link, sd_json_variant *paramete
                 return r;
 
         if (!streq_ptr(p.service, "io.systemd.Machine"))
-                return sd_varlink_error(link, "io.systemd.UserDatabase.BadService", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.BadService", /* parameters= */ NULL);
 
         if (uid_is_valid(p.uid))
                 r = user_lookup_uid(m, p.uid, &found_name, &found_real_name);
         else if (p.user_name)
                 r = user_lookup_name(m, p.user_name, &found_uid, &found_real_name);
         else
-                return sd_varlink_error(link, "io.systemd.UserDatabase.EnumerationNotSupported", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.EnumerationNotSupported", /* parameters= */ NULL);
         if (r == -ESRCH)
-                return sd_varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", /* parameters= */ NULL);
         if (r < 0)
                 return r;
 
@@ -205,7 +206,7 @@ static int vl_method_get_user_record(sd_varlink *link, sd_json_variant *paramete
         un = found_name ?: p.user_name;
 
         if (!user_match_lookup_parameters(&p, un, uid))
-                return sd_varlink_error(link, "io.systemd.UserDatabase.ConflictingRecordFound", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.ConflictingRecordFound", /* parameters= */ NULL);
 
         r = build_user_json(un, uid, found_real_name, &v);
         if (r < 0)
@@ -264,7 +265,7 @@ static int group_lookup_gid(Manager *m, gid_t gid, char **ret_name, char **ret_d
         if (asprintf(&n, "vg-%s-" GID_FMT, machine->name, converted_gid) < 0)
                 return -ENOMEM;
 
-        if (!valid_user_group_name(n, 0))
+        if (!valid_user_group_name(n, /* flags= */ 0))
                 return -ESRCH;
 
         if (asprintf(&d, "GID " GID_FMT " of Container %s", converted_gid, machine->name) < 0)
@@ -289,7 +290,7 @@ static int group_lookup_name(Manager *m, const char *name, gid_t *ret_gid, char 
         assert(ret_gid);
         assert(ret_description);
 
-        if (!valid_user_group_name(name, 0))
+        if (!valid_user_group_name(name, /* flags= */ 0))
                 return -ESRCH;
 
         e = startswith(name, "vg-");
@@ -354,16 +355,16 @@ static int vl_method_get_group_record(sd_varlink *link, sd_json_variant *paramet
                 return r;
 
         if (!streq_ptr(p.service, "io.systemd.Machine"))
-                return sd_varlink_error(link, "io.systemd.UserDatabase.BadService", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.BadService", /* parameters= */ NULL);
 
         if (gid_is_valid(p.gid))
                 r = group_lookup_gid(m, p.gid, &found_name, &found_description);
         else if (p.group_name)
                 r = group_lookup_name(m, p.group_name, &found_gid, &found_description);
         else
-                return sd_varlink_error(link, "io.systemd.UserDatabase.EnumerationNotSupported", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.EnumerationNotSupported", /* parameters= */ NULL);
         if (r == -ESRCH)
-                return sd_varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", /* parameters= */ NULL);
         if (r < 0)
                 return r;
 
@@ -371,7 +372,7 @@ static int vl_method_get_group_record(sd_varlink *link, sd_json_variant *paramet
         gn = found_name ?: p.group_name;
 
         if (!group_match_lookup_parameters(&p, gn, gid))
-                return sd_varlink_error(link, "io.systemd.UserDatabase.ConflictingRecordFound", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.ConflictingRecordFound", /* parameters= */ NULL);
 
         r = build_group_json(gn, gid, found_description, &v);
         if (r < 0)
@@ -399,10 +400,10 @@ static int vl_method_get_memberships(sd_varlink *link, sd_json_variant *paramete
                 return r;
 
         if (!streq_ptr(p.service, "io.systemd.Machine"))
-                return sd_varlink_error(link, "io.systemd.UserDatabase.BadService", NULL);
+                return sd_varlink_error(link, "io.systemd.UserDatabase.BadService", /* parameters= */ NULL);
 
         /* We don't support auxiliary groups for machines. */
-        return sd_varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", NULL);
+        return sd_varlink_error(link, "io.systemd.UserDatabase.NoRecordFound", /* parameters= */ NULL);
 }
 
 static int json_build_local_addresses(const struct local_address *addresses, size_t n_addresses, sd_json_variant **ret) {
@@ -442,9 +443,9 @@ static int list_machine_one_and_maybe_read_metadata(sd_varlink *link, Machine *m
                 if (r < 0 && am == ACQUIRE_METADATA_GRACEFUL)
                         log_debug_errno(r, "Failed to get address (graceful mode), ignoring: %m");
                 else if (r == -ENONET)
-                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NO_PRIVATE_NETWORKING, NULL);
+                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NO_PRIVATE_NETWORKING, /* parameters= */ NULL);
                 else if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NOT_AVAILABLE, NULL);
+                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NOT_AVAILABLE, /* parameters= */ NULL);
                 else if (r < 0)
                         return log_debug_errno(r, "Failed to get addresses: %m");
                 else {
@@ -457,9 +458,9 @@ static int list_machine_one_and_maybe_read_metadata(sd_varlink *link, Machine *m
                 if (r < 0 && am == ACQUIRE_METADATA_GRACEFUL)
                         log_debug_errno(r, "Failed to get OS release (graceful mode), ignoring: %m");
                 else if (r == -ENONET)
-                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NO_OS_RELEASE_INFORMATION, NULL);
+                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NO_OS_RELEASE_INFORMATION, /* parameters= */ NULL);
                 else if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NOT_AVAILABLE, NULL);
+                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NOT_AVAILABLE, /* parameters= */ NULL);
                 else if (r < 0)
                         return log_debug_errno(r, "Failed to get OS release: %m");
 
@@ -467,9 +468,9 @@ static int list_machine_one_and_maybe_read_metadata(sd_varlink *link, Machine *m
                 if (r < 0 && am == ACQUIRE_METADATA_GRACEFUL)
                         log_debug_errno(r, "Failed to get UID shift (graceful mode), ignoring: %m");
                 else if (r == -ENXIO)
-                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NO_UID_SHIFT, NULL);
+                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NO_UID_SHIFT, /* parameters= */ NULL);
                 else if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NOT_AVAILABLE, NULL);
+                        return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NOT_AVAILABLE, /* parameters= */ NULL);
                 else if (r < 0)
                         return log_debug_errno(r, "Failed to get UID shift: %m");
         }
@@ -478,7 +479,7 @@ static int list_machine_one_and_maybe_read_metadata(sd_varlink *link, Machine *m
                         &v,
                         SD_JSON_BUILD_PAIR_STRING("name", m->name),
                         SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(m->id), "id", SD_JSON_BUILD_ID128(m->id)),
-                        SD_JSON_BUILD_PAIR_STRING("class", machine_class_to_string(m->class)),
+                        JSON_BUILD_PAIR_ENUM("class", machine_class_to_string(m->class)),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("service", m->service),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("rootDirectory", m->root_directory),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("unit", m->unit),
@@ -489,6 +490,7 @@ static int list_machine_one_and_maybe_read_metadata(sd_varlink *link, Machine *m
                         JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("vSockCid", m->vsock_cid, VMADDR_CID_ANY),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("sshAddress", m->ssh_address),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("sshPrivateKeyPath", m->ssh_private_key_path),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("controlAddress", m->control_address),
                         JSON_BUILD_PAIR_VARIANT_NON_NULL("addresses", addr_array),
                         JSON_BUILD_PAIR_STRV_ENV_PAIR_NON_EMPTY("OSRelease", os_release),
                         JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL("UIDShift", shift, UID_INVALID),
@@ -534,7 +536,18 @@ static int vl_method_list(sd_varlink *link, sd_json_variant *parameters, sd_varl
         if (r != 0)
                 return r;
 
-        r = varlink_set_sentinel(link, VARLINK_ERROR_MACHINE_NO_SUCH_MACHINE);
+        if (m->runtime_scope != RUNTIME_SCOPE_USER && should_acquire_metadata(p.acquire_metadata)) {
+                r = varlink_verify_polkit_async(
+                                link,
+                                m->system_bus,
+                                "org.freedesktop.machine1.inspect-machines",
+                                (const char**) STRV_MAKE("name", strna(p.name)),
+                                &m->polkit_registry);
+                if (r <= 0)
+                        return r;
+        }
+
+        r = sd_varlink_set_sentinel(link, VARLINK_ERROR_MACHINE_NO_SUCH_MACHINE);
         if (r < 0)
                 return r;
 
@@ -550,7 +563,7 @@ static int vl_method_list(sd_varlink *link, sd_json_variant *parameters, sd_varl
         }
 
         if (!FLAGS_SET(flags, SD_VARLINK_METHOD_MORE))
-                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, /* parameters= */ NULL);
 
         Machine *machine;
         HASHMAP_FOREACH(machine, m->machines) {
@@ -585,7 +598,7 @@ static int lookup_machine_and_call_method(sd_varlink *link, sd_json_variant *par
 
         r = lookup_machine_by_name_or_pidref(link, manager, p.name, &p.pidref, &machine);
         if (r == -ESRCH)
-                return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NO_SUCH_MACHINE, NULL);
+                return sd_varlink_error(link, VARLINK_ERROR_MACHINE_NO_SUCH_MACHINE, /* parameters= */ NULL);
         if (r < 0)
                 return r;
 
@@ -620,7 +633,7 @@ static int list_image_one_and_maybe_read_metadata(Manager *m, sd_varlink *link, 
         assert(image);
 
         if (should_acquire_metadata(am) && !image->metadata_valid) {
-                r = image_read_metadata(image, /* root= */ NULL, &image_policy_container, m->runtime_scope);
+                r = image_read_metadata(image, /* root= */ NULL, &image_policy_container, m->runtime_scope, /* extra_flags= */ 0);
                 if (r < 0 && am != ACQUIRE_METADATA_GRACEFUL)
                         return log_debug_errno(r, "Failed to read image metadata: %m");
                 if (r < 0)
@@ -681,7 +694,18 @@ static int vl_method_list_images(sd_varlink *link, sd_json_variant *parameters, 
         if (r != 0)
                 return r;
 
-        r = varlink_set_sentinel(link, VARLINK_ERROR_MACHINE_IMAGE_NO_SUCH_IMAGE);
+        if (m->runtime_scope != RUNTIME_SCOPE_USER && should_acquire_metadata(p.acquire_metadata)) {
+                r = varlink_verify_polkit_async(
+                                link,
+                                m->system_bus,
+                                "org.freedesktop.machine1.inspect-images",
+                                (const char**) STRV_MAKE("name", strna(p.image_name)),
+                                &m->polkit_registry);
+                if (r <= 0)
+                        return r;
+        }
+
+        r = sd_varlink_set_sentinel(link, VARLINK_ERROR_MACHINE_IMAGE_NO_SUCH_IMAGE);
         if (r < 0)
                 return r;
 
@@ -701,7 +725,7 @@ static int vl_method_list_images(sd_varlink *link, sd_json_variant *parameters, 
         }
 
         if (!FLAGS_SET(flags, SD_VARLINK_METHOD_MORE))
-                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, /* parameters= */ NULL);
 
         _cleanup_hashmap_free_ Hashmap *images = NULL;
         r = image_discover(m->runtime_scope, IMAGE_MACHINE, /* root= */ NULL, &images);
@@ -750,6 +774,14 @@ static int manager_varlink_init_userdb(Manager *m) {
         r = sd_varlink_server_listen_address(s, VARLINK_PATH_MACHINED_USERDB, 0666 | SD_VARLINK_SERVER_MODE_MKDIR_0755);
         if (r < 0)
                 return log_error_errno(r, "Failed to bind to varlink socket %s: %m", VARLINK_PATH_MACHINED_USERDB);
+
+        /* Reduce the noise routed to us: advertise that only look-ups for the higher UID range */
+        char text[DECIMAL_STR_MAX(uid_t) + 1 + DECIMAL_STR_MAX(gid_t) + 1];
+        xsprintf(text, UID_FMT "-" UID_FMT, (uid_t) 0x10000U, (uid_t) UINT32_C(0xfffffffe));
+        FOREACH_STRING(xattr, "user.userdb.uid", "user.userdb.gid")
+                (void) xsetxattr(AT_FDCWD, VARLINK_PATH_MACHINED_USERDB, /* at_flags= */ 0, xattr, text);
+        (void) xsetxattr(AT_FDCWD, VARLINK_PATH_MACHINED_USERDB, /* at_flags= */ 0, "user.userdb.username", "vu-*");
+        (void) xsetxattr(AT_FDCWD, VARLINK_PATH_MACHINED_USERDB, /* at_flags= */ 0, "user.userdb.groupname", "vg-*");
 
         r = sd_varlink_server_attach_event(s, m->event, SD_EVENT_PRIORITY_NORMAL);
         if (r < 0)
@@ -806,6 +838,7 @@ static int manager_varlink_init_machine(Manager *m) {
                         "io.systemd.MachineImage.CleanPool",    vl_method_clean_pool,
                         "io.systemd.service.Ping",              varlink_method_ping,
                         "io.systemd.service.SetLogLevel",       varlink_method_set_log_level,
+                        "io.systemd.service.GetLogLevel",       varlink_method_get_log_level,
                         "io.systemd.service.GetEnvironment",    varlink_method_get_environment);
         if (r < 0)
                 return log_error_errno(r, "Failed to register varlink methods: %m");

@@ -69,6 +69,17 @@ static SD_VARLINK_DEFINE_METHOD(
                 SD_VARLINK_FIELD_COMMENT("The decrypted plaintext data in Base64 encoding."),
                 SD_VARLINK_DEFINE_OUTPUT(data, SD_VARLINK_STRING, 0));
 
+static SD_VARLINK_DEFINE_METHOD(
+                MakeAddon,
+                SD_VARLINK_FIELD_COMMENT("The name of the credential, a string suitable for inclusion in a file name. The credential is placed in the addon under this name."),
+                SD_VARLINK_DEFINE_INPUT(name, SD_VARLINK_STRING, 0),
+                SD_VARLINK_FIELD_COMMENT("Plaintext credential data. Suitable only for textual data. Either this field or 'data' (below) must be provided."),
+                SD_VARLINK_DEFINE_INPUT(text, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("Plaintext credential data, encoded in Base64. Suitable for binary data. Either this field or 'text' (above) must be provided."),
+                SD_VARLINK_DEFINE_INPUT(data, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
+                SD_VARLINK_FIELD_COMMENT("The systemd-stub addon in Base64 encoding, a PE binary carrying the credential in plaintext. It is neither signed nor encrypted, and hence only used by systemd-stub if the booted UKI profile trusts addons on first use. Store it with the suffix '.addon.efi'."),
+                SD_VARLINK_DEFINE_OUTPUT(blob, SD_VARLINK_STRING, 0));
+
 static SD_VARLINK_DEFINE_ERROR(BadFormat);
 static SD_VARLINK_DEFINE_ERROR(NameMismatch);
 static SD_VARLINK_DEFINE_ERROR(TimeMismatch);
@@ -79,11 +90,14 @@ static SD_VARLINK_DEFINE_ERROR(NullKeyNotAllowed);
 static SD_VARLINK_DEFINE_ERROR(KeyBelongsToOtherTPM);
 static SD_VARLINK_DEFINE_ERROR(TPMInDictionaryLockout);
 static SD_VARLINK_DEFINE_ERROR(UnexpectedPCRState);
+static SD_VARLINK_DEFINE_ERROR(PCRsKeptChanging);
+static SD_VARLINK_DEFINE_ERROR(NVIndexUnusable);
+static SD_VARLINK_DEFINE_ERROR(NoAddonStub);
 
 SD_VARLINK_DEFINE_INTERFACE(
                 io_systemd_Credentials,
                 "io.systemd.Credentials",
-                SD_VARLINK_INTERFACE_COMMENT("APIs for encrypting and decrypting service credentials."),
+                SD_VARLINK_INTERFACE_COMMENT("APIs for encrypting and decrypting service credentials, and for wrapping them in systemd-stub addons."),
                 SD_VARLINK_SYMBOL_COMMENT("The intended scope for the credential."),
                 &vl_type_Scope,
                 SD_VARLINK_SYMBOL_COMMENT("Selects the key(s) to encrypt the credentials with."),
@@ -92,6 +106,8 @@ SD_VARLINK_DEFINE_INTERFACE(
                 &vl_method_Encrypt,
                 SD_VARLINK_SYMBOL_COMMENT("Decrypts an encrypted credential, returns plaintext data."),
                 &vl_method_Decrypt,
+                SD_VARLINK_SYMBOL_COMMENT("Wraps a plaintext credential in an unsigned systemd-stub addon, which passes it to the system as system credential."),
+                &vl_method_MakeAddon,
                 SD_VARLINK_SYMBOL_COMMENT("Indicates that a corrupt and unsupported encrypted credential was provided."),
                 &vl_error_BadFormat,
                 SD_VARLINK_SYMBOL_COMMENT("The specified name does not match the name stored in the credential."),
@@ -104,11 +120,17 @@ SD_VARLINK_DEFINE_INTERFACE(
                 &vl_error_BadScope,
                 SD_VARLINK_SYMBOL_COMMENT("PCR signature required for decryption, but not found."),
                 &vl_error_CantFindPCRSignature,
-                SD_VARLINK_SYMBOL_COMMENT("The key was encrypted with a null key, but that's now allowed during decryption."),
+                SD_VARLINK_SYMBOL_COMMENT("The key was encrypted with a null key, but that's not allowed during decryption."),
                 &vl_error_NullKeyNotAllowed,
                 SD_VARLINK_SYMBOL_COMMENT("The TPM integrity check for this key failed, key probably belongs to another TPM, or was corrupted."),
                 &vl_error_KeyBelongsToOtherTPM,
                 SD_VARLINK_SYMBOL_COMMENT("The TPM is in dictionary lockout mode, cannot operate."),
                 &vl_error_TPMInDictionaryLockout,
                 SD_VARLINK_SYMBOL_COMMENT("Unexpected TPM PCR state of the system."),
-                &vl_error_UnexpectedPCRState);
+                &vl_error_UnexpectedPCRState,
+                SD_VARLINK_SYMBOL_COMMENT("PCR values kept changing while unsealing the TPM2 secret, something on this system extends a PCR continuously."),
+                &vl_error_PCRsKeptChanging,
+                SD_VARLINK_SYMBOL_COMMENT("The NV index referenced by the key is missing, unwritten, or unusable, it could be for another system."),
+                &vl_error_NVIndexUnusable,
+                SD_VARLINK_SYMBOL_COMMENT("The systemd-stub addon stub to build the addon from is not installed."),
+                &vl_error_NoAddonStub);

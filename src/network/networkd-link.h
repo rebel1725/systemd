@@ -23,6 +23,33 @@ typedef enum LinkState {
         _LINK_STATE_INVALID = -EINVAL,
 } LinkState;
 
+typedef enum LinkConfiguringReason {
+        LINK_CONFIGURING_REASON_TRAFFIC_CONTROL,
+        LINK_CONFIGURING_REASON_LINK_LAYER,
+        LINK_CONFIGURING_REASON_ACTIVATION,
+        LINK_CONFIGURING_REASON_STACKED_NETDEVS,
+        LINK_CONFIGURING_REASON_STATIC_ADDRESSES,
+        LINK_CONFIGURING_REASON_STATIC_ADDRESS_LABELS,
+        LINK_CONFIGURING_REASON_STATIC_BRIDGE_FDB,
+        LINK_CONFIGURING_REASON_STATIC_BRIDGE_MDB,
+        LINK_CONFIGURING_REASON_STATIC_NEIGHBORS,
+        LINK_CONFIGURING_REASON_STATIC_NEIGHBOR_PROXY,
+        LINK_CONFIGURING_REASON_STATIC_NEXTHOPS,
+        LINK_CONFIGURING_REASON_STATIC_ROUTES,
+        LINK_CONFIGURING_REASON_STATIC_ROUTING_POLICY_RULES,
+        LINK_CONFIGURING_REASON_SR_IOV,
+        LINK_CONFIGURING_REASON_BEARER,
+        LINK_CONFIGURING_REASON_IPV6LL,
+        LINK_CONFIGURING_REASON_STATIC_ADDRESS_NOT_READY,
+        LINK_CONFIGURING_REASON_DHCP4_6RD,
+        LINK_CONFIGURING_REASON_DHCP4_6RD_PREFIX,
+        LINK_CONFIGURING_REASON_DHCP6_PD,
+        LINK_CONFIGURING_REASON_DHCP6_PD_PREFIX,
+        LINK_CONFIGURING_REASON_DYNAMIC_ADDRESSING,
+        _LINK_CONFIGURING_REASON_MAX,
+        _LINK_CONFIGURING_REASON_INVALID = -EINVAL,
+} LinkConfiguringReason;
+
 typedef enum LinkReconfigurationFlag {
         LINK_RECONFIGURE_UNCONDITIONALLY = 1 << 0, /* Reconfigure an interface even if .network file is unchanged. */
         LINK_RECONFIGURE_CLEANLY         = 1 << 1, /* Drop all existing configs before reconfiguring. Otherwise, reuse existing configs as possible as we can. */
@@ -98,8 +125,8 @@ typedef struct Link {
         unsigned static_address_label_messages;
         unsigned static_bridge_fdb_messages;
         unsigned static_bridge_mdb_messages;
-        unsigned static_ipv6_proxy_ndp_messages;
         unsigned static_neighbor_messages;
+        unsigned static_neighbor_proxy_messages;
         unsigned static_nexthop_messages;
         unsigned static_route_messages;
         unsigned static_routing_policy_rule_messages;
@@ -117,7 +144,6 @@ typedef struct Link {
 
         sd_dhcp_client *dhcp_client;
         sd_dhcp_lease *dhcp_lease;
-        char *lease_file;
         unsigned dhcp4_messages;
         bool dhcp4_configured;
         char *dhcp4_6rd_tunnel_name;
@@ -131,8 +157,8 @@ typedef struct Link {
         bool static_address_labels_configured:1;
         bool static_bridge_fdb_configured:1;
         bool static_bridge_mdb_configured:1;
-        bool static_ipv6_proxy_ndp_configured:1;
         bool static_neighbors_configured:1;
+        bool static_neighbor_proxy_configured:1;
         bool static_nexthops_configured:1;
         bool static_routes_configured:1;
         bool static_routing_policy_rules_configured:1;
@@ -144,6 +170,8 @@ typedef struct Link {
         bool bridge_vlan_set:1;
         bool bearer_configured:1;
 
+        sd_dhcp_relay_interface *dhcp_relay_interface;
+        sd_dhcp_relay_interface *dhcp_relay_interface_compat;
         sd_dhcp_server *dhcp_server;
 
         sd_ndisc *ndisc;
@@ -155,6 +183,11 @@ typedef struct Link {
         Set *ndisc_pref64;
         Set *ndisc_redirects;
         Set *ndisc_dnr;
+        Set *ndisc_prefixes;
+        sd_event_source *ndisc_dhcp6_renew;
+        usec_t ndisc_dhcp6_renew_usec;
+        bool ndisc_prefixes_changed;
+        bool ndisc_router_received;
         uint32_t ndisc_mtu;
         unsigned ndisc_messages;
         bool ndisc_configured;
@@ -221,9 +254,11 @@ int link_get_master(Link *link, Link **ret);
 int link_getlink_handler_internal(sd_netlink *rtnl, sd_netlink_message *m, Link *link, const char *error_msg);
 int link_call_getlink(Link *link, link_netlink_message_handler_t callback);
 int link_handle_bound_to_list(Link *link);
+int link_append_to_master(Link *link);
 
 void link_enter_failed(Link *link);
 void link_set_state(Link *link, LinkState state);
+LinkConfiguringReason link_get_configuring_reason(Link *link);
 void link_check_ready(Link *link);
 
 void link_update_operstate(Link *link, bool also_update_master);
@@ -234,18 +269,22 @@ bool link_multicast_enabled(Link *link);
 
 bool link_ipv6_enabled(Link *link);
 int link_ipv6ll_gained(Link *link);
+int link_ipv6ll_lost(Link *link, const struct in6_addr *dropped_ipv6ll, bool has_replacement);
 bool link_has_ipv6_connectivity(Link *link);
 
+int link_drop_requests(Link *link, NetworkConfigSource source);
 int link_stop_engines(Link *link, bool may_keep_dynamic);
 
 DECLARE_STRING_TABLE_LOOKUP(link_state, LinkState);
+DECLARE_STRING_TABLE_LOOKUP(link_configuring_reason, LinkConfiguringReason);
+DECLARE_STRING_TABLE_LOOKUP_TO_STRING(link_configuring_reason_message, LinkConfiguringReason);
 
 int link_request_stacked_netdevs(Link *link, NetDevLocalAddressType type);
 
 int link_reconfigure_impl(Link *link, LinkReconfigurationFlag flags);
 int link_reconfigure_full(Link *link, LinkReconfigurationFlag flags, sd_bus_message *message, sd_varlink *varlink, unsigned *counter);
 static inline int link_reconfigure(Link *link, LinkReconfigurationFlag flags) {
-        return link_reconfigure_full(link, flags, NULL, NULL, NULL);
+        return link_reconfigure_full(link, flags, /* message= */ NULL, /* varlink= */ NULL, /* counter= */ NULL);
 }
 
 int link_check_initialized(Link *link);
@@ -260,3 +299,5 @@ void link_required_operstate_for_online(Link *link, LinkOperationalStateRange *r
 AddressFamily link_required_family_for_online(Link *link);
 
 bool link_has_local_lease_domain(Link *link);
+
+void link_set_dns(Link *link, struct in_addr_full **dns, unsigned n_dns);

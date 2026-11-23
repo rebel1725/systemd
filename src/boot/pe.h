@@ -2,6 +2,7 @@
 #pragma once
 
 #include "efi.h"
+#include "sha256.h"
 
 /* PE flags in the Characteristics attribute of the optional header indicating executable code */
 #define PE_CODE 0x00000020U
@@ -36,13 +37,16 @@ static inline bool PE_SECTION_VECTOR_IS_SET(const PeSectionVector *v) {
 
 EFI_STATUS pe_section_table_from_base(
                 const void *base,
+                size_t base_len,
                 const PeSectionHeader **ret_section_table,
-                size_t *ret_n_section_table);
+                size_t *ret_n_section_table,
+                size_t *ret_size_in_memory);
 
 EFI_STATUS pe_section_table_from_file(
                 EFI_FILE *handle,
                 PeSectionHeader **ret_section_table,
-                size_t *ret_n_section_table);
+                size_t *ret_n_section_table,
+                size_t *ret_size_in_memory);
 
 EFI_STATUS pe_locate_profile_sections(
                 const PeSectionHeader section_table[],
@@ -50,14 +54,31 @@ EFI_STATUS pe_locate_profile_sections(
                 const char* const section_names[],
                 unsigned profile,
                 size_t validate_base,
+                size_t size_in_memory,
                 PeSectionVector sections[]);
 
 EFI_STATUS pe_memory_locate_sections(
                 const void *base,
+                size_t base_len,
                 const char *const section_names[],
                 PeSectionVector sections[]);
 
-EFI_STATUS pe_kernel_info(const void *base, uint32_t *ret_entry_point, uint32_t *ret_compat_entry_point, size_t *ret_size_in_memory);
+EFI_STATUS pe_buffer_locate_sections(
+                const void *buffer,
+                size_t size,
+                const char *const section_names[],
+                PeSectionVector sections[]);
+
+EFI_STATUS pe_buffer_has_signature(const void *buffer, size_t size, bool *ret);
+EFI_STATUS pe_buffer_authenticode_sha256(const void *buffer, size_t size, uint8_t ret[static SHA256_DIGEST_SIZE]);
+
+EFI_STATUS pe_kernel_info(
+                const void *base,
+                size_t base_len,
+                uint32_t *ret_entry_point,
+                uint32_t *ret_compat_entry_point,
+                size_t *ret_size_in_memory,
+                uint32_t *ret_section_alignment);
 
 EFI_STATUS pe_kernel_check_no_relocation(const void *base);
 

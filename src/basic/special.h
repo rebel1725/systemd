@@ -103,12 +103,16 @@
 #define SPECIAL_DBUS_SOCKET "dbus.socket"
 #define SPECIAL_JOURNALD_SOCKET "systemd-journald.socket"
 #define SPECIAL_JOURNALD_SERVICE "systemd-journald.service"
+#define SPECIAL_PTYBROKERD_SOCKET "systemd-ptybrokerd.socket"
 #define SPECIAL_TMPFILES_SETUP_SERVICE "systemd-tmpfiles-setup.service"
 
 /* Magic init signals */
 #define SPECIAL_KBREQUEST_TARGET "kbrequest.target"
 #define SPECIAL_SIGPWR_TARGET "sigpwr.target"
 #define SPECIAL_CTRL_ALT_DEL_TARGET "ctrl-alt-del.target"
+
+/* The unit to use as fallback if ctrl-alt-del.target (which is usually an alias) cannot be loaded. */
+#define FALLBACK_CTRL_ALT_DEL_TARGET "reboot.target"
 
 /* Where we add all our system units, users and machines by default */
 #define SPECIAL_SYSTEM_SLICE "system.slice"

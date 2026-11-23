@@ -1,20 +1,23 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <unistd.h>
 
 #include "sd-daemon.h"
 #include "sd-event.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
 #include "conf-parser.h"
 #include "daemon-util.h"
+#include "dlopen-note.h"
 #include "extract-word.h"
 #include "fd-util.h"
-#include "format-util.h"
 #include "fileio.h"
+#include "format-util.h"
+#include "fs-util.h"
 #include "hashmap.h"
+#include "journal-authenticate.h"
 #include "journal-compression-util.h"
 #include "journal-remote.h"
 #include "journal-remote-write.h"
@@ -24,7 +27,7 @@
 #include "parse-argument.h"
 #include "parse-helpers.h"
 #include "parse-util.h"
-#include "pretty-print.h"
+#include "path-util.h"
 #include "process-util.h"
 #include "socket-netlink.h"
 #include "socket-util.h"
@@ -32,6 +35,7 @@
 #include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
+#include "verbs.h"
 
 #define PRIV_KEY_FILE CERTIFICATE_ROOT "/private/journal-remote.pem"
 #define CERT_FILE     CERTIFICATE_ROOT "/certs/journal-remote.pem"
@@ -45,6 +49,7 @@ static char *arg_listen_https = NULL;
 static char **arg_files = NULL;
 static bool arg_compress = true;
 static bool arg_seal = false;
+static bool arg_add_client_certificate_subject = false;
 static int http_socket = -1, https_socket = -1;
 static char **arg_gnutls_log = NULL;
 
@@ -80,6 +85,14 @@ STATIC_DESTRUCTOR_REGISTER(arg_trust, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_output, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_compression, ordered_hashmap_freep);
 
+COMMAND(
+        "systemd-journal-remote\0",
+        "Write external journal events to journal files.",
+        .argspec = "[{FILE|-}…]\0",
+        .footer = "Note: file descriptors from sd_listen_fds() will be consumed, too.",
+        .man_page = "systemd-journal-remote.service(8)",
+);
+
 static const char* const journal_write_split_mode_table[_JOURNAL_WRITE_SPLIT_MAX] = {
         [JOURNAL_WRITE_SPLIT_NONE] = "none",
         [JOURNAL_WRITE_SPLIT_HOST] = "host",
@@ -106,7 +119,7 @@ static MHDDaemonWrapper* MHDDaemonWrapper_free(MHDDaemonWrapper *d) {
         d->timer_event = sd_event_source_unref(d->timer_event);
 
         if (d->daemon)
-                MHD_stop_daemon(d->daemon);
+                sym_MHD_stop_daemon(d->daemon);
 
         return mfree(d);
 }
@@ -127,13 +140,13 @@ DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
 static int spawn_child(const char *child, char **argv) {
         int fd[2], r;
 
-        if (pipe(fd) < 0)
+        if (pipe2(fd, O_CLOEXEC) < 0)
                 return log_error_errno(errno, "Failed to create pager pipe: %m");
 
         r = pidref_safe_fork_full(
                         "(remote)",
                         (int[]) {STDIN_FILENO, fd[1], STDERR_FILENO },
-                        NULL, 0,
+                        /* except_fds= */ NULL, /* n_except_fds= */ 0,
                         FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|FORK_REARRANGE_STDIO|FORK_LOG|FORK_RLIMIT_NOFILE_SAFE,
                         /* ret= */ NULL);
         if (r < 0) {
@@ -143,14 +156,14 @@ static int spawn_child(const char *child, char **argv) {
 
         /* In the child */
         if (r == 0) {
-                execvp(child, argv);
-                log_error_errno(errno, "Failed to exec child %s: %m", child);
+                r = execvp_safe(child, argv);
+                log_error_errno(r, "Failed to exec child %s: %m", child);
                 _exit(EXIT_FAILURE);
         }
 
         safe_close(fd[1]);
 
-        r = fd_nonblock(fd[0], true);
+        r = fd_nonblock(fd[0], /* nonblock= */ true);
         if (r < 0)
                 log_warning_errno(r, "Failed to set child pipe to non-blocking: %m");
 
@@ -209,7 +222,7 @@ static int build_accept_encoding(char **ret) {
 
         const CompressionConfig *cc;
         ORDERED_HASHMAP_FOREACH(cc, arg_compression) {
-                const char *c = compression_lowercase_to_string(cc->algorithm);
+                const char *c = compression_to_string(cc->algorithm);
                 if (strextendf_with_separator(&buf, ",", "%s;q=%.1f", c, q) < 0)
                         return -ENOMEM;
                 q -= step;
@@ -219,10 +232,13 @@ static int build_accept_encoding(char **ret) {
         return 0;
 }
 
-static int request_meta(void **connection_cls, int fd, char *hostname) {
+static int request_meta(void **connection_cls, int fd, char *_hostname) {
         int r;
 
         assert(connection_cls);
+
+        /* This takes ownership of the hostname in all cases, including on failure. */
+        _cleanup_free_ char *hostname = TAKE_PTR(_hostname);
 
         if (*connection_cls)
                 return 0; /* already assigned. */
@@ -230,12 +246,17 @@ static int request_meta(void **connection_cls, int fd, char *hostname) {
         Writer *writer;
         r = journal_remote_get_writer(journal_remote_server_global, hostname, &writer);
         if (r < 0)
-                return log_warning_errno(r, "Failed to get writer for source %s: %m",
-                                         hostname);
+                return log_warning_errno(r, "Failed to get writer for source %s: %m", hostname);
 
-        _cleanup_(source_freep) RemoteSource *source = source_new(fd, true, hostname, writer);
+        _cleanup_(source_freep) RemoteSource *source = source_new(fd, /* passive_fd= */ true, TAKE_PTR(hostname), writer);
         if (!source)
                 return log_oom();
+
+        if (journal_remote_server_global->add_client_certificate_subject && journal_remote_server_global->check_trust) {
+                source->client_certificate_subject = strjoin(REMOTE_CERTIFICATE_SUBJECT_FIELD, source->importer.name);
+                if (!source->client_certificate_subject)
+                        return log_oom();
+        }
 
         log_debug("Added RemoteSource as connection metadata %p", source);
 
@@ -286,7 +307,7 @@ static int process_http_upload(
                         _cleanup_free_ char *buf = NULL;
                         size_t buf_size;
 
-                        r = decompress_blob(source->compression, upload_data, *upload_data_size, (void **) &buf, &buf_size, 0);
+                        r = decompress_blob(source->compression, upload_data, *upload_data_size, (void **) &buf, &buf_size, DATA_SIZE_MAX);
                         if (r < 0)
                                 return mhd_respondf(connection, r, MHD_HTTP_BAD_REQUEST, "Decompression of received blob failed.");
 
@@ -359,9 +380,9 @@ static mhd_result request_handler(
 
         if (*connection_cls) {
                 RemoteSource *source = *connection_cls;
-                header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Encoding");
+                header = sym_MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Encoding");
                 if (header) {
-                        Compression c = compression_lowercase_from_string(header);
+                        Compression c = compression_from_string_harder(header);
                         if (c <= 0 || !compression_supported(c))
                                 return mhd_respondf(connection, 0, MHD_HTTP_UNSUPPORTED_MEDIA_TYPE,
                                                     "Unsupported Content-Encoding type: %s", header);
@@ -380,12 +401,12 @@ static mhd_result request_handler(
         if (!streq(url, "/upload"))
                 return mhd_respond(connection, MHD_HTTP_NOT_FOUND, "Not found.");
 
-        header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Type");
+        header = sym_MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Type");
         if (!header || !streq(header, "application/vnd.fdo.journal"))
                 return mhd_respond(connection, MHD_HTTP_UNSUPPORTED_MEDIA_TYPE,
                                    "Content-Type: application/vnd.fdo.journal is required.");
 
-        header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Transfer-Encoding");
+        header = sym_MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Transfer-Encoding");
         if (header) {
                 if (!strcaseeq(header, "chunked"))
                         return mhd_respondf(connection, 0, MHD_HTTP_BAD_REQUEST,
@@ -394,7 +415,7 @@ static mhd_result request_handler(
                 chunked = true;
         }
 
-        header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Length");
+        header = sym_MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Content-Length");
         if (header) {
                 size_t len;
 
@@ -418,8 +439,8 @@ static mhd_result request_handler(
         {
                 const union MHD_ConnectionInfo *ci;
 
-                ci = MHD_get_connection_info(connection,
-                                             MHD_CONNECTION_INFO_CONNECTION_FD);
+                ci = sym_MHD_get_connection_info(connection,
+                                                 MHD_CONNECTION_INFO_CONNECTION_FD);
                 if (!ci) {
                         log_error("MHD_get_connection_info failed: cannot get remote fd");
                         return mhd_respond(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
@@ -435,7 +456,7 @@ static mhd_result request_handler(
                 if (r < 0)
                         return code;
         } else {
-                r = getpeername_pretty(fd, false, &hostname);
+                r = getpeername_pretty(fd, /* include_port= */ false, &hostname);
                 if (r < 0)
                         return mhd_respond(connection, MHD_HTTP_INTERNAL_SERVER_ERROR,
                                            "Cannot check remote hostname.");
@@ -443,13 +464,12 @@ static mhd_result request_handler(
 
         assert(hostname);
 
-        r = request_meta(connection_cls, fd, hostname);
+        r = request_meta(connection_cls, fd, TAKE_PTR(hostname));
         if (r == -ENOMEM)
                 return respond_oom(connection);
         else if (r < 0)
                 return mhd_respondf(connection, r, MHD_HTTP_INTERNAL_SERVER_ERROR, "%m");
 
-        hostname = NULL;
         return MHD_YES;
 }
 
@@ -462,6 +482,12 @@ static int setup_microhttpd_server(RemoteServer *s,
                                    const char *trust) {
 
 #if HAVE_MICROHTTPD
+        int r;
+
+        r = dlopen_microhttpd(LOG_ERR);
+        if (r < 0)
+                return r;
+
         struct MHD_OptionItem opts[] = {
                 { MHD_OPTION_EXTERNAL_LOGGER, (intptr_t) microhttpd_logger},
                 { MHD_OPTION_NOTIFY_COMPLETED, (intptr_t) request_meta_free},
@@ -481,11 +507,11 @@ static int setup_microhttpd_server(RemoteServer *s,
 
         _cleanup_(MHDDaemonWrapper_freep) MHDDaemonWrapper *d = NULL;
         const union MHD_DaemonInfo *info;
-        int r, epoll_fd;
+        int epoll_fd;
 
         assert(fd >= 0);
 
-        r = fd_nonblock(fd, true);
+        r = fd_nonblock(fd, /* nonblock= */ true);
         if (r < 0)
                 return log_error_errno(r, "Failed to make fd:%d nonblocking: %m", fd);
 
@@ -521,21 +547,27 @@ static int setup_microhttpd_server(RemoteServer *s,
         d = new(MHDDaemonWrapper, 1);
         if (!d)
                 return log_oom();
+        *d = (MHDDaemonWrapper) {
+                .fd = (uint64_t) fd,
+        };
 
-        d->fd = (uint64_t) fd;
-
-        d->daemon = MHD_start_daemon(flags, 0,
-                                     NULL, NULL,
-                                     request_handler, NULL,
-                                     MHD_OPTION_ARRAY, opts,
-                                     MHD_OPTION_END);
+        d->daemon = sym_MHD_start_daemon(
+                        flags,
+                        /* port= */ 0,
+                        /* apc= */ NULL,
+                        /* apc_cls= */ NULL,
+                        request_handler,
+                        /* dh_cls= */ NULL,
+                        MHD_OPTION_ARRAY,
+                        opts,
+                        MHD_OPTION_END);
         if (!d->daemon)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to start μhttp daemon");
 
         log_debug("Started MHD %s daemon on fd:%d (wrapper @ %p)",
                   key ? "HTTPS" : "HTTP", fd, d);
 
-        info = MHD_get_daemon_info(d->daemon, MHD_DAEMON_INFO_EPOLL_FD_LINUX_ONLY);
+        info = sym_MHD_get_daemon_info(d->daemon, MHD_DAEMON_INFO_EPOLL_FD_LINUX_ONLY);
         if (!info)
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "μhttp returned NULL daemon info");
 
@@ -554,7 +586,7 @@ static int setup_microhttpd_server(RemoteServer *s,
                 return log_error_errno(r, "Failed to set source name: %m");
 
         r = sd_event_add_time(s->event, &d->timer_event,
-                              CLOCK_MONOTONIC, UINT64_MAX, 0,
+                              CLOCK_MONOTONIC, UINT64_MAX, /* accuracy= */ 0,
                               null_timer_event_handler, d);
         if (r < 0)
                 return log_error_errno(r, "Failed to add timer_event: %m");
@@ -584,7 +616,7 @@ static int setup_microhttpd_socket(RemoteServer *s,
                                    const char *trust) {
         int fd;
 
-        fd = make_socket_fd(LOG_DEBUG, address, SOCK_STREAM, SOCK_CLOEXEC);
+        fd = make_socket_fd(LOG_DEBUG, address, SOCK_STREAM, /* flags= */ 0);
         if (fd < 0)
                 return fd;
 
@@ -596,7 +628,7 @@ static int setup_microhttpd_socket(RemoteServer *s,
 static int null_timer_event_handler(sd_event_source *timer_event,
                                     uint64_t usec,
                                     void *userdata) {
-        return dispatch_http_event(timer_event, 0, 0, userdata);
+        return dispatch_http_event(timer_event, /* fd= */ 0, /* revents= */ 0, userdata);
 }
 
 static int dispatch_http_event(sd_event_source *event,
@@ -604,15 +636,18 @@ static int dispatch_http_event(sd_event_source *event,
                                uint32_t revents,
                                void *userdata) {
         MHDDaemonWrapper *d = ASSERT_PTR(userdata);
+        RemoteServer *s = ASSERT_PTR(journal_remote_server_global);
         int r;
         MHD_UNSIGNED_LONG_LONG timeout = ULLONG_MAX;
 
-        r = MHD_run(d->daemon);
-        if (r == MHD_NO)
-                // FIXME: unregister daemon
+        r = sym_MHD_run(d->daemon);
+        if (r == MHD_NO) {
+                s->active--;
+                hashmap_remove(s->daemons, &d->fd);
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "MHD_run failed!");
-        if (MHD_get_timeout(d->daemon, &timeout) == MHD_NO)
+        }
+        if (sym_MHD_get_timeout(d->daemon, &timeout) == MHD_NO)
                 timeout = ULLONG_MAX;
 
         r = sd_event_source_set_time(d->timer_event, timeout);
@@ -637,7 +672,7 @@ static int dispatch_http_event(sd_event_source *event,
 static int setup_raw_socket(RemoteServer *s, const char *address) {
         int fd;
 
-        fd = make_socket_fd(LOG_INFO, address, SOCK_STREAM, SOCK_CLOEXEC);
+        fd = make_socket_fd(LOG_INFO, address, SOCK_STREAM, /* flags= */ 0);
         if (fd < 0)
                 return fd;
 
@@ -665,7 +700,7 @@ static int create_remoteserver(
         if (r < 0)
                 return log_error_errno(r, "Failed to install SIGINT/SIGTERM handlers: %m");
 
-        n = sd_listen_fds(true);
+        n = sd_listen_fds(/* unset_environment= */ true);
         if (n < 0)
                 return log_error_errno(n, "Failed to read listening file descriptors from environment: %m");
         else
@@ -676,25 +711,25 @@ static int create_remoteserver(
                                        "Received fewer sockets than expected");
 
         for (fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + n; fd++) {
-                if (sd_is_socket(fd, AF_UNSPEC, 0, true)) {
+                if (sd_is_socket(fd, AF_UNSPEC, /* type= */ 0, /* listening= */ true)) {
                         log_debug("Received a listening socket (fd:%d)", fd);
 
                         if (fd == http_socket)
-                                r = setup_microhttpd_server(s, fd, NULL, NULL, NULL);
+                                r = setup_microhttpd_server(s, fd, /* key= */ NULL, /* cert= */ NULL, /* trust= */ NULL);
                         else if (fd == https_socket)
                                 r = setup_microhttpd_server(s, fd, key, cert, trust);
                         else
                                 r = journal_remote_add_raw_socket(s, fd);
-                } else if (sd_is_socket(fd, AF_UNSPEC, 0, false)) {
+                } else if (sd_is_socket(fd, AF_UNSPEC, /* type= */ 0, /* listening= */ false)) {
                         char *hostname;
 
-                        r = getpeername_pretty(fd, false, &hostname);
+                        r = getpeername_pretty(fd, /* include_port= */ false, &hostname);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to retrieve remote name: %m");
 
                         log_debug("Received a connection socket (fd:%d) from %s", fd, hostname);
 
-                        r = journal_remote_add_source(s, fd, hostname, true);
+                        r = journal_remote_add_source(s, fd, hostname, /* own_name= */ true);
                 } else
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "Unknown socket passed on fd:%d", fd);
@@ -709,7 +744,7 @@ static int create_remoteserver(
                 if (fd < 0)
                         return fd;
 
-                r = journal_remote_add_source(s, fd, arg_output, false);
+                r = journal_remote_add_source(s, fd, arg_output, /* own_name= */ false);
                 if (r < 0)
                         return r;
         }
@@ -736,7 +771,7 @@ static int create_remoteserver(
 
                 hostname = strndupa_safe(hostname, strcspn(hostname, "/:"));
 
-                r = journal_remote_add_source(s, fd, (char *) hostname, false);
+                r = journal_remote_add_source(s, fd, (char *) hostname, /* own_name= */ false);
                 if (r < 0)
                         return r;
         }
@@ -749,7 +784,7 @@ static int create_remoteserver(
         }
 
         if (arg_listen_http) {
-                r = setup_microhttpd_socket(s, arg_listen_http, NULL, NULL, NULL);
+                r = setup_microhttpd_socket(s, arg_listen_http, /* key= */ NULL, /* cert= */ NULL, /* trust= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -771,13 +806,13 @@ static int create_remoteserver(
                 } else {
                         log_debug("Reading file %s...", *file);
 
-                        fd = open(*file, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+                        fd = xopenat(AT_FDCWD, *file, O_RDONLY|O_NOCTTY|O_NONBLOCK);
                         if (fd < 0)
-                                return log_error_errno(errno, "Failed to open %s: %m", *file);
+                                return log_error_errno(fd, "Failed to open %s: %m", *file);
                         output_name = *file;
                 }
 
-                r = journal_remote_add_source(s, fd, (char*) output_name, false);
+                r = journal_remote_add_source(s, fd, (char*) output_name, /* own_name= */ false);
                 if (r < 0)
                         return r;
         }
@@ -790,7 +825,7 @@ static int create_remoteserver(
                 /* In this case we know what the writer will be
                    called, so we can create it and verify that we can
                    create output as expected. */
-                r = journal_remote_get_writer(s, NULL, &s->_single_writer);
+                r = journal_remote_get_writer(s, /* host= */ NULL, &s->_single_writer);
                 if (r < 0)
                         return log_warning_errno(r, "Failed to get writer: %m");
         }
@@ -825,8 +860,25 @@ static int parse_config(void) {
                 { "Remote",  "MaxFiles",               config_parse_uint64,           0, &arg_n_max_files },
                 { "Remote",  "KeepFree",               config_parse_iec_uint64,       0, &arg_keep_free   },
                 { "Remote",  "Compression",            config_parse_compression,      0, &arg_compression },
+                { "Remote",  "AddClientCertificateSubject", config_parse_bool,         0, &arg_add_client_certificate_subject },
                 {}
         };
+
+        const char *config_file = secure_getenv("SYSTEMD_JOURNAL_REMOTE_CONFIG_FILE");
+        if (config_file) {
+                if (isempty(config_file) || path_equal(config_file, "/dev/null"))
+                        return 0;
+
+                return config_parse(
+                                /* unit= */ NULL,
+                                config_file,
+                                /* f= */ NULL,
+                                "Remote\0",
+                                config_item_table_lookup, items,
+                                CONFIG_PARSE_WARN,
+                                /* userdata= */ NULL,
+                                /* ret_stat= */ NULL);
+        }
 
         return config_parse_standard_file_with_dropins(
                         "systemd/journal-remote.conf",
@@ -836,157 +888,88 @@ static int parse_config(void) {
                         /* userdata= */ NULL);
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-journal-remote.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] {FILE|-}...\n\n"
-               "Write external journal events to journal file(s).\n\n"
-               "  -h --help                 Show this help\n"
-               "     --version              Show package version\n"
-               "     --url=URL              Read events from systemd-journal-gatewayd at URL\n"
-               "     --getter=COMMAND       Read events from the output of COMMAND\n"
-               "     --listen-raw=ADDR      Listen for connections at ADDR\n"
-               "     --listen-http=ADDR     Listen for HTTP connections at ADDR\n"
-               "     --listen-https=ADDR    Listen for HTTPS connections at ADDR\n"
-               "  -o --output=FILE|DIR      Write output to FILE or DIR/external-*.journal\n"
-               "     --compress[=BOOL]      Use compression in the output journal (default: yes)\n"
-               "     --seal[=BOOL]          Use event sealing (default: no)\n"
-               "     --key=FILENAME         SSL key in PEM format (default:\n"
-               "                            \"" PRIV_KEY_FILE "\")\n"
-               "     --cert=FILENAME        SSL certificate in PEM format (default:\n"
-               "                            \"" CERT_FILE "\")\n"
-               "     --trust=FILENAME|all   SSL CA certificate or disable checking (default:\n"
-               "                            \"" TRUST_FILE "\")\n"
-               "     --gnutls-log=CATEGORY...\n"
-               "                            Specify a list of gnutls logging categories\n"
-               "     --split-mode=none|host How many output files to create\n"
-               "\nNote: file descriptors from sd_listen_fds() will be consumed, too.\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               link);
-
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_URL,
-                ARG_LISTEN_RAW,
-                ARG_LISTEN_HTTP,
-                ARG_LISTEN_HTTPS,
-                ARG_GETTER,
-                ARG_SPLIT_MODE,
-                ARG_COMPRESS,
-                ARG_SEAL,
-                ARG_KEY,
-                ARG_CERT,
-                ARG_TRUST,
-                ARG_GNUTLS_LOG,
-        };
-
-        static const struct option options[] = {
-                { "help",         no_argument,       NULL, 'h'              },
-                { "version",      no_argument,       NULL, ARG_VERSION      },
-                { "url",          required_argument, NULL, ARG_URL          },
-                { "getter",       required_argument, NULL, ARG_GETTER       },
-                { "listen-raw",   required_argument, NULL, ARG_LISTEN_RAW   },
-                { "listen-http",  required_argument, NULL, ARG_LISTEN_HTTP  },
-                { "listen-https", required_argument, NULL, ARG_LISTEN_HTTPS },
-                { "output",       required_argument, NULL, 'o'              },
-                { "split-mode",   required_argument, NULL, ARG_SPLIT_MODE   },
-                { "compress",     optional_argument, NULL, ARG_COMPRESS     },
-                { "seal",         optional_argument, NULL, ARG_SEAL         },
-                { "key",          required_argument, NULL, ARG_KEY          },
-                { "cert",         required_argument, NULL, ARG_CERT         },
-                { "trust",        required_argument, NULL, ARG_TRUST        },
-                { "gnutls-log",   required_argument, NULL, ARG_GNUTLS_LOG   },
-                {}
-        };
-
-        int c, r;
+        int r;
         bool type_a, type_b;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "ho:", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_URL:
-                        r = free_and_strdup_warn(&arg_url, optarg);
+                OPTION_LONG("url", "URL", "Read events from systemd-journal-gatewayd at URL"):
+                        r = free_and_strdup_warn(&arg_url, opts.arg);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_GETTER:
-                        r = free_and_strdup_warn(&arg_getter, optarg);
+                OPTION_LONG("getter", "COMMAND", "Read events from the output of COMMAND"):
+                        r = free_and_strdup_warn(&arg_getter, opts.arg);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_LISTEN_RAW:
-                        r = free_and_strdup_warn(&arg_listen_raw, optarg);
+                OPTION_LONG("listen-raw", "ADDR", "Listen for connections at ADDR"):
+                        r = free_and_strdup_warn(&arg_listen_raw, opts.arg);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_LISTEN_HTTP:
+                OPTION_LONG("listen-http", "ADDR", "Listen for HTTP connections at ADDR"):
                         if (arg_listen_http || http_socket >= 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Cannot currently use --listen-http= more than once");
 
-                        r = negative_fd(optarg);
+                        r = negative_fd(opts.arg);
                         if (r >= 0)
                                 http_socket = r;
                         else {
-                                r = free_and_strdup_warn(&arg_listen_http, optarg);
+                                r = free_and_strdup_warn(&arg_listen_http, opts.arg);
                                 if (r < 0)
                                         return r;
                         }
                         break;
 
-                case ARG_LISTEN_HTTPS:
+                OPTION_LONG("listen-https", "ADDR", "Listen for HTTPS connections at ADDR"):
                         if (arg_listen_https || https_socket >= 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Cannot currently use --listen-https= more than once");
 
-                        r = negative_fd(optarg);
+                        r = negative_fd(opts.arg);
                         if (r >= 0)
                                 https_socket = r;
                         else {
-                                r = free_and_strdup_warn(&arg_listen_https, optarg);
+                                r = free_and_strdup_warn(&arg_listen_https, opts.arg);
                                 if (r < 0)
                                         return r;
                         }
                         break;
 
-                case ARG_KEY:
-                        r = free_and_strdup_warn(&arg_key, optarg);
+                OPTION_LONG("key", "FILENAME", "SSL key in PEM format (default: \"" PRIV_KEY_FILE "\")"):
+                        r = free_and_strdup_warn(&arg_key, opts.arg);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_CERT:
-                        r = free_and_strdup_warn(&arg_cert, optarg);
+                OPTION_LONG("cert", "FILENAME", "SSL certificate in PEM format (default: \"" CERT_FILE "\")"):
+                        r = free_and_strdup_warn(&arg_cert, opts.arg);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_TRUST:
+                OPTION_LONG("trust", "FILENAME|all",
+                            "SSL CA certificate or disable checking (default: \"" TRUST_FILE "\")"):
 #if HAVE_GNUTLS
-                        r = free_and_strdup_warn(&arg_trust, optarg);
+                        r = free_and_strdup_warn(&arg_trust, opts.arg);
                         if (r < 0)
                                 return r;
 #else
@@ -994,36 +977,38 @@ static int parse_argv(int argc, char *argv[]) {
 #endif
                         break;
 
-                case 'o':
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_output);
+                OPTION('o', "output", "FILE|DIR", "Write output to FILE or DIR/external-*.journal"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_output);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_SPLIT_MODE:
-                        arg_split_mode = journal_write_split_mode_from_string(optarg);
+                OPTION_LONG("split-mode", "none|host", "How many output files to create"):
+                        arg_split_mode = journal_write_split_mode_from_string(opts.arg);
                         if (arg_split_mode == _JOURNAL_WRITE_SPLIT_INVALID)
-                                return log_error_errno(arg_split_mode, "Invalid split mode: %s", optarg);
+                                return log_error_errno(arg_split_mode, "Invalid split mode: %s", opts.arg);
                         break;
 
-                case ARG_COMPRESS:
-                        r = parse_boolean_argument("--compress", optarg, &arg_compress);
+                OPTION_LONG_FLAGS(OPTION_OPTIONAL_ARG, "compress", "BOOL",
+                                  "Use compression in the output journal (default: yes)"):
+                        r = parse_boolean_argument("--compress", opts.arg, &arg_compress);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_SEAL:
-                        r = parse_boolean_argument("--seal", optarg, &arg_seal);
+                OPTION_LONG_FLAGS(OPTION_OPTIONAL_ARG, "seal", "BOOL",
+                                  "Use event sealing (default: no)"):
+                        r = parse_boolean_argument("--seal", opts.arg, &arg_seal);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_GNUTLS_LOG:
+                OPTION_LONG("gnutls-log", "CATEGORY,...", "Specify a list of gnutls logging categories"):
 #if HAVE_GNUTLS
-                        for (const char *p = optarg;;) {
+                        for (const char *p = opts.arg;;) {
                                 _cleanup_free_ char *word = NULL;
 
-                                r = extract_first_word(&p, &word, ",", 0);
+                                r = extract_first_word(&p, &word, ",", /* flags= */ 0);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to parse --gnutls-log= argument: %m");
                                 if (r == 0)
@@ -1037,14 +1022,35 @@ static int parse_argv(int argc, char *argv[]) {
 #endif
                         break;
 
-                case '?':
-                        return -EINVAL;
+                OPTION_LONG("max-use", "BYTES", "Maximum disk space to use"):
+                        r = parse_size(opts.arg, 1024, &arg_max_use);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --max-use= value: %s", opts.arg);
+                        break;
 
-                default:
-                        assert_not_reached();
+                OPTION_LONG("keep-free", "BYTES", "Minimum disk space to keep free"):
+                        r = parse_size(opts.arg, 1024, &arg_keep_free);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --keep-free= value: %s", opts.arg);
+                        break;
+
+                OPTION_LONG("max-file-size", "BYTES", "Maximum size of individual journal files"):
+                        r = parse_size(opts.arg, 1024, &arg_max_size);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --max-file-size= value: %s", opts.arg);
+                        break;
+
+                OPTION_LONG("max-files", "N", "Maximum number of journal files to keep"):
+                        r = safe_atou64(opts.arg, &arg_n_max_files);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --max-files= value: %s", opts.arg);
+                        break;
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        arg_files = strv_copy(strv_skip(argv, optind));
+        arg_files = strv_copy(option_parser_get_args(&opts));
         if (!arg_files)
                 return log_oom();
 
@@ -1052,7 +1058,7 @@ static int parse_argv(int argc, char *argv[]) {
         type_b = arg_url
                 || arg_listen_raw
                 || arg_listen_http || arg_listen_https
-                || sd_listen_fds(false) > 0;
+                || sd_listen_fds(/* unset_environment= */ false) > 0;
         if (type_a && type_b)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Cannot use file input or --getter= with "
@@ -1073,7 +1079,7 @@ static int parse_argv(int argc, char *argv[]) {
                 arg_split_mode = JOURNAL_WRITE_SPLIT_HOST;
 
         if (arg_split_mode == JOURNAL_WRITE_SPLIT_NONE && arg_output) {
-                if (is_dir(arg_output, true) > 0)
+                if (is_dir(arg_output, /* follow= */ true) > 0)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                "For SplitMode=none, output must be a file.");
                 if (!endswith(arg_output, ".journal"))
@@ -1082,7 +1088,7 @@ static int parse_argv(int argc, char *argv[]) {
         }
 
         if (arg_split_mode == JOURNAL_WRITE_SPLIT_HOST
-            && arg_output && is_dir(arg_output, true) <= 0)
+            && arg_output && is_dir(arg_output, /* follow= */ true) <= 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "For SplitMode=host, output must be a directory.");
 
@@ -1103,11 +1109,13 @@ static int parse_argv(int argc, char *argv[]) {
 static int load_certificates(char **key, char **cert, char **trust) {
         int r;
 
+        assert(trust);
+
         r = read_full_file_full(
                         AT_FDCWD, arg_key ?: PRIV_KEY_FILE, UINT64_MAX, SIZE_MAX,
                         READ_FULL_FILE_SECURE|READ_FULL_FILE_WARN_WORLD_READABLE|READ_FULL_FILE_CONNECT_SOCKET,
-                        NULL,
-                        key, NULL);
+                        /* bind_name= */ NULL,
+                        key, /* ret_size= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to read key from file '%s': %m",
                                        arg_key ?: PRIV_KEY_FILE);
@@ -1115,8 +1123,8 @@ static int load_certificates(char **key, char **cert, char **trust) {
         r = read_full_file_full(
                         AT_FDCWD, arg_cert ?: CERT_FILE, UINT64_MAX, SIZE_MAX,
                         READ_FULL_FILE_CONNECT_SOCKET,
-                        NULL,
-                        cert, NULL);
+                        /* bind_name= */ NULL,
+                        cert, /* ret_size= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to read certificate from file '%s': %m",
                                        arg_cert ?: CERT_FILE);
@@ -1127,8 +1135,8 @@ static int load_certificates(char **key, char **cert, char **trust) {
                 r = read_full_file_full(
                                 AT_FDCWD, arg_trust ?: TRUST_FILE, UINT64_MAX, SIZE_MAX,
                                 READ_FULL_FILE_CONNECT_SOCKET,
-                                NULL,
-                                trust, NULL);
+                                /* bind_name= */ NULL,
+                                trust, /* ret_size= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read CA certificate file '%s': %m",
                                                arg_trust ?: TRUST_FILE);
@@ -1148,7 +1156,15 @@ static int run(int argc, char **argv) {
         _cleanup_free_ char *cert = NULL, *trust = NULL;
         int r;
 
+        COMPRESS_DEFAULT_NOTE;
+        LIBCRYPTO_NOTE(suggested);
+        LIBGNUTLS_NOTE(suggested);
+        LIBMICROHTTPD_NOTE(required);
+        LIBSELINUX_NOTE(recommended);
+
         log_setup();
+
+        journal_auth_init();
 
         r = parse_config();
         if (r < 0)
@@ -1179,6 +1195,11 @@ static int run(int argc, char **argv) {
 
                 s.check_trust = !arg_trust_all;
         }
+
+        s.add_client_certificate_subject = arg_add_client_certificate_subject;
+        if (s.add_client_certificate_subject && !s.check_trust)
+                log_notice("Client certificate verification is unavailable or disabled; "
+                           "removing incoming certificate subjects without adding a verified subject.");
 
         journal_reset_metrics(&s.metrics);
         s.metrics.max_use = arg_max_use;
@@ -1214,7 +1235,7 @@ static int run(int argc, char **argv) {
         }
 
         notify_message = NULL;
-        (void) sd_notifyf(false,
+        (void) sd_notifyf(/* unset_environment= */ false,
                           "STOPPING=1\n"
                           "STATUS=Shutting down after writing %" PRIu64 " entries...", s.event_count);
 

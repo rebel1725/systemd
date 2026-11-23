@@ -3,7 +3,7 @@
 
 #include <sys/stat.h>
 
-#include "basic-forward.h"
+#include "forward.h"
 
 typedef enum ConfFilesFlags {
         CONF_FILES_EXECUTABLE               = 1 << 0, /* inode must be marked executable */
@@ -16,6 +16,9 @@ typedef enum ConfFilesFlags {
         CONF_FILES_TRUNCATE_SUFFIX          = 1 << 6, /* truncate specified suffix from return filename or path */
         CONF_FILES_WARN                     = 1 << 7, /* warn on some errors */
         CONF_FILES_DONT_PREFIX_ROOT         = 1 << 8, /* don't prefix the specified root path to the resulting paths */
+        CONF_FILES_CHASE_SAFE               = 1 << 9, /* refuse unsafe ownership transitions while resolving */
+        CONF_FILES_CHASE_MAX_MODE           = 1 << 10, /* directories at most 0775, files at most 0664, hence
+                                                        * not for CONF_FILES_EXECUTABLE */
 } ConfFilesFlags;
 
 typedef struct ConfFile {
@@ -29,7 +32,7 @@ typedef struct ConfFile {
 
 ConfFile* conf_file_free(ConfFile *c);
 DEFINE_TRIVIAL_CLEANUP_FUNC(ConfFile*, conf_file_free);
-void conf_file_free_many(ConfFile **array, size_t n);
+void conf_file_free_array(ConfFile **array, size_t n);
 
 int conf_file_new_at(const char *path, const char *root, int rfd, ConfFilesFlags flags, ConfFile **ret);
 int conf_file_new(const char *path, const char *root, ConfFilesFlags flags, ConfFile **ret);

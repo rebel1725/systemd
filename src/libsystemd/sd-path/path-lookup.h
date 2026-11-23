@@ -3,7 +3,7 @@
 
 #include "sd-path.h"
 
-#include "sd-forward.h"
+#include "forward.h"
 #include "runtime-scope.h"
 
 typedef enum LookupPathsFlags {
@@ -25,6 +25,8 @@ typedef struct LookupPaths {
         /* Where units from a portable service image shall be placed. */
         char *persistent_attached;
         char *runtime_attached;
+
+        char *vendor_config;
 
         /* Where to place generated unit files (i.e. those a "generator" tool generated). Note the special semantics of
          * this directory: the generators are flushed each time a "systemctl daemon-reload" is issued. The user should
@@ -60,6 +62,10 @@ void lookup_paths_done(LookupPaths *p);
 int config_directory_generic(RuntimeScope scope, const char *suffix, char **ret);
 int runtime_directory_generic(RuntimeScope scope, const char *suffix, char **ret);
 int runtime_directory(RuntimeScope scope, const char *fallback_suffix, char **ret);
+int runtime_directory_resolve(RuntimeScope scope, const char *suffix, const char *identifier, char **ret);
+int runtime_directory_make(RuntimeScope scope, const char *suffix, const char *identifier, char **ret);
+int state_directory_generic(RuntimeScope scope, const char *suffix, char **ret);
+int state_directory(RuntimeScope scope, const char *fallback_suffix, char **ret);
 
 /* We don't treat /etc/xdg/systemd/ in these functions as the xdg base dir spec suggests because we assume
  * that is a link to /etc/systemd/ anyway. */
@@ -74,16 +80,20 @@ static inline int xdg_user_config_dir(const char *suffix, char **ret) {
 static inline int xdg_user_data_dir(const char *suffix, char **ret) {
         return sd_path_lookup(SD_PATH_USER_SHARED, suffix, ret);
 }
+static inline int xdg_user_state_dir(const char *suffix, char **ret) {
+        return sd_path_lookup(SD_PATH_USER_STATE_PRIVATE, suffix, ret);
+}
 
 bool path_is_user_data_dir(const char *path);
 bool path_is_user_config_dir(const char *path);
+bool path_is_valid_search_path(const char *path) _pure_;
 
-char** generator_binary_paths_internal(RuntimeScope scope, bool env_generator);
-static inline char** generator_binary_paths(RuntimeScope runtime_scope) {
-        return generator_binary_paths_internal(runtime_scope, false);
+int generator_binary_paths_internal(RuntimeScope scope, bool env_generator, char ***ret);
+static inline int generator_binary_paths(RuntimeScope runtime_scope, char ***ret) {
+        return generator_binary_paths_internal(runtime_scope, /* env_generator= */ false, ret);
 }
-static inline char** env_generator_binary_paths(RuntimeScope runtime_scope) {
-        return generator_binary_paths_internal(runtime_scope, true);
+static inline int env_generator_binary_paths(RuntimeScope runtime_scope, char ***ret) {
+        return generator_binary_paths_internal(runtime_scope, /* env_generator= */ true, ret);
 }
 
 static inline int credential_store_path(RuntimeScope runtime_scope, char ***ret) {

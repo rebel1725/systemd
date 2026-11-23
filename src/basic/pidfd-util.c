@@ -92,6 +92,48 @@ int pidfd_get_info(int fd, struct pidfd_info *info) {
         return 0;
 }
 
+int pidfd_info_mask_is_supported(uint64_t mask) {
+        static thread_local uint64_t cached_mask = 0;
+        static thread_local int cached = 0; /* 0 when not cached, 1 when cached, negative errno on failure. */
+        int r;
+
+        if (cached < 0)
+                return cached;
+
+        if (cached == 0) {
+                _cleanup_close_ int pidfd = r = RET_NERRNO(pidfd_open(getpid_cached(), /* flags= */ 0));
+                if (r < 0)
+                        return r;
+
+                struct pidfd_info info = {
+                        .mask = PIDFD_INFO_SUPPORTED_MASK, /* Since dfd78546c95330db2252e0d7e937a15ab5eddb4e (v6.19). */
+                };
+
+                r = pidfd_get_info(pidfd, &info);
+                if (r == -EOPNOTSUPP)
+                        return (cached = -EOPNOTSUPP);
+                if (r < 0)
+                        return r;
+
+                if (FLAGS_SET(info.mask, PIDFD_INFO_SUPPORTED_MASK) &&
+                    FLAGS_SET(info.supported_mask, PIDFD_INFO_SUPPORTED_MASK))
+                        /* The kernel is v6.19 or newer. Let's use the provided supported_mask. */
+                        cached_mask = info.supported_mask;
+                else
+                        /* The kernel is older than v6.19. These three flags have been supported since
+                         * ioctl(PIDFD_GET_INFO) was introduced, so a successful pidfd_get_info() call
+                         * guarantees they are supported. However, there is no reliable way to
+                         * determine whether PIDFD_INFO_EXIT and PIDFD_INFO_COREDUMP are supported, as
+                         * they predate PIDFD_INFO_SUPPORTED_MASK, so assume they are not. */
+                        cached_mask = PIDFD_INFO_PID | PIDFD_INFO_CREDS | PIDFD_INFO_CGROUPID;
+
+                cached = true;
+        }
+
+        /* Return true when all requested features are supported. */
+        return FLAGS_SET(cached_mask, mask);
+}
+
 static int pidfd_get_pid_fdinfo(int fd, pid_t *ret) {
         char path[STRLEN("/proc/self/fdinfo/") + DECIMAL_STR_MAX(int)];
         _cleanup_free_ char *p = NULL;
@@ -277,31 +319,42 @@ int pidfd_get_inode_id(int fd, uint64_t *ret) {
         return pidfd_get_inode_id_impl(fd, ret);
 }
 
+static thread_local uint64_t cached_pidfd_id = 0;
+static thread_local pid_t cached_pidfd_id_initialized = 0; /* < 0: cached error; == 0: invalid; > 0: valid and pid that was current */
+
+void reset_cached_pidfd_id(void) {
+        /* Invoked in the child after a fork()/clone(). */
+        cached_pidfd_id = 0;
+        cached_pidfd_id_initialized = 0;
+}
+
 int pidfd_get_inode_id_self_cached(uint64_t *ret) {
-        static thread_local uint64_t cached = 0;
-        static thread_local pid_t initialized = 0; /* < 0: cached error; == 0: invalid; > 0: valid and pid that was current */
         int r;
 
         assert(ret);
 
-        if (initialized == getpid_cached()) {
-                *ret = cached;
+        /* Note that matching the PID is not sufficient to detect that the cached ID is stale: if we are
+         * PID 1 in a PID namespace and clone off a child into a new PID namespace, it will be PID 1 too,
+         * but of course it's a different process with a different pidfd ID. Hence the cache is also
+         * explicitly flushed via reset_cached_pidfd_id() in the child after fork()/clone(). */
+        if (getpid_cached() == cached_pidfd_id_initialized) {
+                *ret = cached_pidfd_id;
                 return 0;
         }
-        if (initialized < 0)
-                return initialized;
+        if (cached_pidfd_id_initialized < 0)
+                return cached_pidfd_id_initialized;
 
-        _cleanup_close_ int fd = pidfd_open(getpid_cached(), 0);
+        _cleanup_close_ int fd = pidfd_open(getpid_cached(), /* flags= */ 0);
         if (fd < 0)
                 return -errno;
 
-        r = pidfd_get_inode_id(fd, &cached);
+        r = pidfd_get_inode_id(fd, &cached_pidfd_id);
         if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                return (initialized = -EOPNOTSUPP);
+                return (cached_pidfd_id_initialized = -EOPNOTSUPP);
         if (r < 0)
                 return r;
 
-        *ret = cached;
-        initialized = getpid_cached();
+        *ret = cached_pidfd_id;
+        cached_pidfd_id_initialized = getpid_cached();
         return 0;
 }

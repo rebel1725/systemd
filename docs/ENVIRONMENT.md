@@ -35,11 +35,19 @@ All tools:
   no-ops. If that's what's explicitly desired, you might consider setting
   `$SYSTEMD_OFFLINE=1`.
 
+* `$SYSTEMD_IN_INITRD` — takes a boolean. If set, overrides initrd detection.
+  This is useful for debugging and testing initrd-only programs in the main
+  system.
+
 * `$SYSTEMD_FIRST_BOOT=0|1` — if set, assume "first boot" condition to be false
   or true, instead of checking the flag file created by PID 1.
 
-* `$SD_EVENT_PROFILE_DELAYS=1` — if set, the sd-event event loop implementation
-  will print latency information at runtime.
+* `$SYSTEMD_INVOKED_AS=name` — override argv[0] for detection of a multicall
+  binary. E.g. `SYSTEMD_INVOKED_AS=systemd-udevd build/udevadm`.
+
+* `$SYSTEMD_EXPERIMENTAL=0|1` — if set to true, experimental features may be
+  used. This variable is not checked if the build was configured with
+  "-Dexperimental=disabled".
 
 * `$SYSTEMD_PROC_CMDLINE` — if set, the contents are used as the kernel command
   line instead of the actual one in `/proc/cmdline`. This is useful for
@@ -72,18 +80,35 @@ All tools:
   `/etc/veritytab`. Only useful for debugging. Currently only supported by
   `systemd-veritysetup-generator`.
 
+* `$SYSTEMD_CLONETAB` — if set, use this path instead of
+  `/etc/clonetab`. Only useful for debugging. Currently only supported by
+  `systemd-clonesetup-generator`.
+
 * `$SYSTEMD_DEFAULT_HOSTNAME` — override the compiled-in fallback hostname
   (relevant in particular for the system manager and `systemd-hostnamed`).
   Must be a valid hostname (either a single label or a FQDN).
 
-* `$SYSTEMD_IN_INITRD` — takes a boolean. If set, overrides initrd detection.
-  This is useful for debugging and testing initrd-only programs in the main
-  system.
+* `$SYSTEMD_HOSTNAME_WORDLIST_PATH` — search this directory for the numbered
+  hostname word list files used by the `$` wildcard in hostname patterns (see
+  `hostname(5)`), instead of the built-in search path. Only useful for
+  debugging and testing.
+
+* `$SD_EVENT_PROFILE_DELAYS=1` — if set, the sd-event event loop implementation
+  will print latency information at runtime.
+
+* `$SYSTEMD_EVENT_IO_URING=` — takes a boolean. If true, every sd-event event
+  loop uses io_uring for fiber I/O. If false, no event loop uses io_uring. If
+  unset, only the event loops of programs that enable io_uring use it. Only
+  useful for testing.
 
 * `$SYSTEMD_BUS_TIMEOUT=SECS` — specifies the maximum time to wait for method call
   completion. If no time unit is specified, assumes seconds. The usual other units
   are understood, too (us, ms, s, min, h, d, w, month, y). If it is not set or set
   to 0, then the built-in default is used.
+
+* `$SYSTEMD_POLKIT_AGENT_FALLBACK=` — takes a boolean. If false, the polkit
+  agent spawned on the terminal takes precedence over any agent registered for
+  the session.
 
 * `$SYSTEMD_MEMPOOL=0` — if set, the internal memory caching logic employed by
   hash tables is turned off, and libc `malloc()` is used for all allocations.
@@ -128,7 +153,16 @@ All tools:
   stable `<ROOTHASH>-verity` device mapper name. The default for this depends
   on the subsystem in question. Usually,
   RootImage=/ExtensionImages=/MountImages= in unit files default to enabled,
-  while other uses default to disabled for this.
+  while other uses default to disabled for this. For unprivileged clients of
+  `systemd-mountfsd`, reuse requires the same backing image file.
+
+* `$SYSTEMD_DISSECT_TPM2_UNLOCK=` — takes a boolean. If false, turns off
+  unlocking of LUKS encrypted partitions in disk images via a TPM2 token
+  enrolled in the LUKS2 header (e.g. via `systemd-cryptenroll --tpm2-device=…`)
+  for the tools that do this by default if no passphrase is supplied, i.e.
+  `systemd-dissect`, `systemd-nspawn` and `systemd-sysext`/`systemd-confext`.
+  It cannot turn this on for other uses (including `systemd-mountfsd`),
+  which act on behalf of unprivileged clients.
 
 `systemctl`:
 
@@ -271,6 +305,9 @@ All tools:
   the worker process is killed by the manager process. Defaults to 10 seconds,
   maximum allowed is 5 hours.
 
+* `$SYSTEMD_UDEV_USE_INOTIFY=` — If true, use inotify instead of fanotify for
+  device node watches (`OPTIONS+="watch"`). Defaults to false.
+
 `udevadm` and `systemd-hwdb`:
 
 * `SYSTEMD_HWDB_UPDATE_BYPASS=` — If set to "1", execution of hwdb updates is skipped
@@ -288,6 +325,14 @@ All tools:
 * `$SYSTEMD_NSS_DYNAMIC_BYPASS=1` — if set, `nss-systemd` won't return
   user/group records for dynamically registered service users (i.e. users
   registered through `DynamicUser=1`).
+
+* `$SYSTEMD_NSS_SERVER_SIDE_NSS=1` - if set, `nss-systemd` also queries the
+  `io.systemd.NameServiceSwitch` and `io.systemd.Multiplexer` userdb services.
+  `systemd-userdbd.service` implements the services and looks up the user/group
+  records via glibc NSS. Set this in a sandbox that has the host's userdb
+  sockets bind mounted into `/run/systemd/userdb/`, to resolve the host's users
+  and groups. Outside of such a sandbox, `getent passwd` and `getent group` list
+  the records of the other NSS modules twice.
 
 * `$SYSTEMD_NSS_LOG_LEVEL=<level>` — If set, sets the log level for `nss-systemd`
   and other NSS plugins specifically. Takes priority over `$SYSTEMD_LOG_LEVEL`.
@@ -390,7 +435,19 @@ All tools:
 
 * `$SYSTEMD_LOCALE_DIRECTORY=` — The directory must be absolute and normalized.
   If unset, the default locale directory of the C library (`/usr/lib/locale/`
-  for glibc and `/usr/share/i18n/locales/musl/` for musl) will be used.
+  for glibc) will be used. On musl, directories `/etc/musl/locale`,
+  `/usr/share/musl/locale`, `/share/musl/locale` and for compatibility reasons
+  `/usr/share/i18n/locales/musl` will be searched.
+
+`systemd-creds`, `systemd-firstboot`:
+
+* `$SYSTEMD_ADDON_STUB=` — path to the systemd-stub addon stub to build addons
+  from, with `systemd-creds make-addon` or `systemd-firstboot --addon=`. If
+  unset, the stub for the architecture of the local system,
+  `/usr/lib/systemd/boot/efi/addon<ARCH>.efi.stub`, is used. Set this to build
+  addons for a different architecture. Not honoured by the
+  `io.systemd.Credentials.MakeAddon` Varlink method, which always uses the
+  default stub.
 
 `systemd-resolved`:
 
@@ -500,6 +557,17 @@ is suppressed by default.
   operation. If not set, defaults to true. If disabled installation of images
   will be quicker, but not as safe.
 
+`systemd-importd`/`systemd-pull` and `systemd-sysupdate`:
+
+* `$SYSTEMD_OPENPGP_KEYRING` — takes an absolute path to an OpenPGP keyring
+  file. If set and non-empty, signature verification on download uses this
+  keyring instead of the default `/etc/systemd/import-pubring.pgp`,
+  `/etc/systemd/import-pubring.gpg`, and `/usr/lib/systemd/import-pubring.pgp`
+  keyrings.
+  Useful when running unprivileged in the user context, with custom transfer
+  definitions (e.g. `systemd-sysupdate --definitions=…`), or for testing.
+  Has no effect when signature verification is disabled.
+
 `systemd-dissect`, `systemd-nspawn` and all other tools that may operate on
 disk images with `--image=` or similar:
 
@@ -525,7 +593,9 @@ disk images with `--image=` or similar:
   (which is the default), the signature of suitable disk images is validated
   against any of the certificates in `/etc/verity.d/*.crt` (and similar
   directories in `/usr/lib/`, `/run`, …) or passed to the kernel for validation
-  against its built-in certificates.
+  against its built-in certificates. A signature that fails validation only
+  prevents activation if the image policy allows `signed` but not `verity`, see
+  `systemd.image-policy(7)`.
 
 * `$SYSTEMD_DISSECT_VERITY_TIMEOUT_SEC=sec` — takes a timespan, which controls
   the timeout waiting for the image to be configured. Defaults to 100 msec.
@@ -542,6 +612,18 @@ disk images with `--image=` or similar:
   unspecified the image dissection logic will automatically probe the file
   system type (subject to `$SYSTEMD_DISSECT_FILE_SYSTEMS`, see above), except
   for ESP and XBOOTLDR where the file system type is set to VFAT.
+
+* `$SYSTEMD_DISSECT_VALIDATEFS=` — takes a boolean, which controls whether to
+  validate the constraints a file system declares about itself via the
+  `user.validatefs.*` extended attributes on its root inode (as set by
+  `systemd-repart`'s `AddValidateFS=` setting, see
+  `systemd-validatefs@.service(8)`), when mounting partitions of a disk image.
+  Defaults to on, in which case a partition whose file system constraints are
+  not fulfilled (for example because it is mounted to a different place than
+  it declares, or because it declares GPT partition metadata constraints but
+  is not placed on a GPT partition) is refused. Set this to "0" to disable
+  validation. Note that when the image is mounted via `systemd-mountfsd`, the
+  environment of the daemon matters, not the one of the client.
 
 * `$SYSTEMD_LOOP_DIRECT_IO` – takes a boolean, which controls whether to enable
   `LO_FLAGS_DIRECT_IO` (i.e. direct IO + asynchronous IO) on loopback block
@@ -679,6 +761,11 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
   string format. Overrides the default maximum allowed size for a file-descriptor
   based input record to be stored in the journal.
 
+* `$SYSTEMD_JOURNAL_REMOTE_CONFIG_FILE` – path to a configuration file for
+  `systemd-journal-remote`. When set, the specified file is used instead of the
+  default configuration file and drop-in directories. If set to the empty string
+  or `/dev/null`, configuration file parsing is skipped entirely.
+
 * `$SYSTEMD_CATALOG` – path to the compiled catalog database file to use for
   `journalctl -x`, `journalctl --update-catalog`, `journalctl --list-catalog`
   and related calls.
@@ -707,6 +794,17 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
   to override the filesystem type for all partitions with `Type=root`, you can
   set `SYSTEMD_REPART_OVERRIDE_FSTYPE_ROOT=ext4`.
 
+`systemd-sysinstall`:
+
+* `$SYSTEMD_SYSINSTALL_PERMIT_AUTO_TARGET_LOOP` – takes a boolean. If true,
+  loopback block devices are considered as candidates when the installation
+  target device is picked automatically (i.e. when `--device-auto` is used).
+  By default, loopback devices are never picked automatically, since they are
+  hardly ever the disk an unattended installation is supposed to end up on.
+  This is primarily useful for testing purposes, where loopback devices are
+  used as stand-ins for real disks. Only honoured if `systemd-sysinstall` is
+  not invoked with elevated privileges (i.e. via `secure_getenv()`).
+
 `systemd-nspawn`, `systemd-networkd`:
 
 * `$SYSTEMD_FIREWALL_BACKEND` – takes a string, either `iptables` or
@@ -722,6 +820,15 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
 
 * `$SYSTEMD_LLDP_SEND_MACHINE_ID` - takes a boolean, If true, systemd-networkd
   sends machine ID as chassis ID through LLDP protocol.
+
+* `$SYSTEMD_NETWORK_MAX_ADDRESSES_PER_LINK` – takes a positive integer.
+  Defaults to 16384. Limits the number of addresses that `systemd-networkd`
+  may add per link.
+
+* `$SYSTEMD_NETWORK_MAX_STATIC_ADDRESSES_PER_NETWORK` – takes a positive
+  integer. Defaults to 8192. Limits the number of static addresses that
+  `systemd-networkd` may add per `.network` file. The effective limit is capped
+  by `$SYSTEMD_NETWORK_MAX_ADDRESSES_PER_LINK`.
 
 `systemd-storagetm`:
 
@@ -815,6 +922,13 @@ Tools using the Varlink protocol (such as `varlinkctl`) or sd-bus (such as
   keyring in which `systemd-ask-password` caches the queried password. Defaults
   to `user`.
 
+`systemd-efivars-clear`:
+
+* `SYSTEMD_EFIVARS_ALLOW_CLEAR` – takes a boolean. Overrides the effect of the
+  `systemd.efivars_allow_clear=` kernel command line option: if set to false,
+  requesting erasing of the boot loader's EFI variables is skipped, and the
+  command immediately exits successfully.
+
 `systemd-tpm2-clear`:
 
 * `SYSTEMD_TPM2_ALLOW_CLEAR` – takes a boolean. Overrides the effect of the
@@ -857,3 +971,15 @@ Tools using the Varlink protocol (such as `varlinkctl`) or sd-bus (such as
   'freshness' check via `BEST-BEFORE-YYYY-MM-DD` files in `SHA256SUMS` manifest
   files is disabled, and updating from outdated manifests will not result in an
   error.
+
+* `$SYSTEMD_SYSUPDATE_FORCE_NOTIFY` – takes a boolean. If true the notification
+  callouts in `/run/systemd/sysupdate/notify/` are invoked even when no update
+  was applied (i.e. the system was already up-to-date). In this case the
+  notification carries no list of updated resources. This is useful to
+  unconditionally trigger follow-up work such as relinking a kernel or
+  recomputing a TPM policy.
+
+`systemd-report-geoip`:
+
+* `$SYSTEMD_REPORT_GEOIP_ENDPOINT` – takes an HTTP endpoint
+  URL. Overrides the GeoIP endpoint to use.

@@ -2,7 +2,7 @@
 #pragma once
 
 #include "compress.h"
-#include "shared-forward.h"
+#include "forward.h"
 #include "journal-importer.h"
 #include "journal-remote-write.h"
 
@@ -15,6 +15,7 @@ typedef struct RemoteSource {
         sd_event_source *buffer_event;
         Compression compression;
         char *encoding;
+        char *client_certificate_subject;
 } RemoteSource;
 
 RemoteSource* source_new(int fd, bool passive_fd, char *name, Writer *writer);

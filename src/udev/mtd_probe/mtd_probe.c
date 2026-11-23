@@ -19,67 +19,43 @@
  */
 
 #include <fcntl.h>
-#include <getopt.h>
 #include <mtd/mtd-user.h>
-#include <stdio.h>
 #include <sys/ioctl.h>
 
-#include "build.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "mtd_probe.h"
+#include "verbs.h"
 
-static const char *arg_device = NULL;
-
-static int parse_argv(int argc, char *argv[]) {
-        static const struct option options[] = {
-                { "help",     no_argument, NULL, 'h' },
-                { "version",  no_argument, NULL, 'v' },
-                {}
-        };
-        int c;
-
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
-                switch (c) {
-                case 'h':
-                        printf("%s /dev/mtd[n]\n\n"
-                               "  -h --help     Show this help text\n"
-                               "     --version  Show package version\n",
-                               program_invocation_short_name);
-                        return 0;
-                case 'v':
-                        return version();
-                case '?':
-                        return -EINVAL;
-                default:
-                        assert_not_reached();
-                }
-
-        if (argc > 2)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error: unexpected argument.");
-
-        arg_device = argv[optind];
-        return 1;
-}
+COMMAND(
+        "mtd_probe\0",
+        "Probe MTD devices.",
+        .argspec = "/dev/mtdN\0",
+        .option_namespace = "common",
+);
 
 static int run(int argc, char** argv) {
         _cleanup_close_ int mtd_fd = -EBADF;
         mtd_info_t mtd_info;
         int r;
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = common_parse_argv_full(argc, argv, /* min_args= */ 1, /* max_args= */ 1, &args);
         if (r <= 0)
                 return r;
 
-        mtd_fd = open(argv[1], O_RDONLY|O_CLOEXEC|O_NOCTTY);
+        const char *device = args[0];
+
+        mtd_fd = xopenat(AT_FDCWD, device, O_RDONLY|O_NOCTTY);
         if (mtd_fd < 0) {
-                bool ignore = ERRNO_IS_DEVICE_ABSENT_OR_EMPTY(errno);
-                log_full_errno(ignore ? LOG_DEBUG : LOG_WARNING, errno,
+                bool ignore = ERRNO_IS_NEG_DEVICE_ABSENT_OR_EMPTY(mtd_fd);
+                log_full_errno(ignore ? LOG_DEBUG : LOG_WARNING, mtd_fd,
                                "Failed to open device node '%s'%s: %m",
-                               argv[1], ignore ? ", ignoring" : "");
-                return ignore ? 0 : -errno;
+                               device, ignore ? ", ignoring" : "");
+                return ignore ? 0 : mtd_fd;
         }
 
         if (ioctl(mtd_fd, MEMGETINFO, &mtd_info) < 0)

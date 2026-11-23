@@ -2,7 +2,6 @@
 #pragma once
 
 #include "bond-util.h"
-#include "shared-forward.h"
 #include "netdev.h"
 
 typedef struct Bond {
@@ -18,6 +17,7 @@ typedef struct Bond {
         BondPrimaryReselect primary_reselect;
 
         int tlb_dynamic_lb;
+        int lacp_active;
 
         bool all_slaves_active;
 

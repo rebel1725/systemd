@@ -15,6 +15,7 @@
 #include "dirent-util.h"
 #include "env-util.h"
 #include "errno-util.h"
+#include "escape.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -30,7 +31,6 @@
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
-#include "utf8.h"
 
 int device_new_aux(sd_device **ret) {
         sd_device *device;
@@ -47,6 +47,7 @@ int device_new_aux(sd_device **ret) {
                 .devuid = UID_INVALID,
                 .devgid = GID_INVALID,
                 .action = _SD_DEVICE_ACTION_INVALID,
+                .database_version = OLDEST_UDEV_DATABASE_VERSION,
         };
 
         *ret = device;
@@ -82,12 +83,16 @@ static sd_device* device_free(sd_device *device) {
 
 DEFINE_PUBLIC_TRIVIAL_REF_UNREF_FUNC(sd_device, sd_device, device_free);
 
-static bool property_is_valid(const char *key, const char *value) {
-        /* Device properties may be saved to database file, then may be parsed from the file. When if a
-         * property contains spurious characters, then the parser may be confused. Let's refuse spurious
-         * properties, even if it is internal, which will not be saved to database file, for consistency. */
+bool device_property_name_is_valid(const char *name) {
+        return !isempty(name) && in_charset(name, ALPHANUMERICAL "_.");
+}
 
-        if (isempty(key) || !in_charset(key, ALPHANUMERICAL "_."))
+static bool property_is_valid(const char *key, const char *value) {
+        /* Device properties may be saved to database file, then may be parsed from the file. If a property
+         * contains spurious characters, then the parser may be confused. Let's refuse spurious properties,
+         * even if it is internal, which will not be saved to database file, for consistency. */
+
+        if (!device_property_name_is_valid(key))
                 return false;
 
         /* an empty value means unset the property, hence that's fine. */
@@ -95,10 +100,10 @@ static bool property_is_valid(const char *key, const char *value) {
                 return true;
 
         /* refuse invalid UTF8 and control characters */
-        if (!utf8_is_valid(value) || string_has_cc(value, /* ok= */ NULL))
-                return false;
-
-        return true;
+        return string_is_safe(value,
+                              STRING_ALLOW_BACKSLASHES |
+                              STRING_ALLOW_QUOTES |
+                              STRING_ALLOW_GLOBS);
 }
 
 int device_add_property_aux(sd_device *device, const char *key, const char *value, bool db) {
@@ -107,8 +112,15 @@ int device_add_property_aux(sd_device *device, const char *key, const char *valu
         assert(device);
         assert(key);
 
-        if (!property_is_valid(key, value))
+        if (!property_is_valid(key, value)) {
+                if (DEBUG_LOGGING) {
+                        _cleanup_free_ char *escaped_key = cescape(key),
+                                *escaped_value = cescape(strempty(value));
+                        log_device_debug(device, "sd-device: Refusing invalid property: %s=%s",
+                                         strnull(escaped_key), strnull(escaped_value));
+                }
                 return -EINVAL;
+        }
 
         if (db)
                 properties = &device->properties_db;
@@ -170,7 +182,7 @@ int device_set_syspath(sd_device *device, const char *_syspath, bool verify) {
                 /* The input path maybe a symlink located outside of /sys. Let's try to chase the symlink at first.
                  * The primary use case is that e.g. /proc/device-tree is a symlink to /sys/firmware/devicetree/base.
                  * By chasing symlinks in the path at first, we can call sd_device_new_from_path() with such path. */
-                r = chase(_syspath, NULL, 0, &syspath, &fd);
+                r = chase(_syspath, /* root= */ NULL, /* flags= */ 0, &syspath, &fd);
                 if (r == -ENOENT)
                          /* the device does not exist (any more?) */
                         return log_trace_errno(SYNTHETIC_ERRNO(ENODEV),
@@ -183,7 +195,7 @@ int device_set_syspath(sd_device *device, const char *_syspath, bool verify) {
                         char *p;
 
                         /* /sys is a symlink to somewhere sysfs is mounted on? In that case, we convert the path to real sysfs to "/sys". */
-                        r = chase("/sys", NULL, 0, &real_sys, NULL);
+                        r = chase("/sys", /* root= */ NULL, /* flags= */ 0, &real_sys, /* ret_fd= */ NULL);
                         if (r < 0)
                                 return log_debug_errno(r, "sd-device: Failed to chase symlink /sys: %m");
 
@@ -374,7 +386,7 @@ _public_ int sd_device_new_from_ifname(sd_device **ret, const char *ifname) {
                         return r;
         }
 
-        r = rtnl_resolve_ifname_full(NULL, RESOLVE_IFNAME_ALTERNATIVE | RESOLVE_IFNAME_NUMERIC, ifname, &main_name, NULL);
+        r = rtnl_resolve_ifname_full(/* rtnl= */ NULL, RESOLVE_IFNAME_ALTERNATIVE | RESOLVE_IFNAME_NUMERIC, ifname, &main_name, /* ret_altnames= */ NULL);
         if (r < 0)
                 return r;
 
@@ -389,7 +401,7 @@ _public_ int sd_device_new_from_ifindex(sd_device **ret, int ifindex) {
         assert_return(ret, -EINVAL);
         assert_return(ifindex > 0, -EINVAL);
 
-        r = rtnl_get_ifname(NULL, ifindex, &ifname);
+        r = rtnl_get_ifname(/* rtnl= */ NULL, ifindex, &ifname);
         if (r < 0)
                 return r;
 
@@ -563,6 +575,17 @@ _public_ int sd_device_new_from_stat_rdev(sd_device **ret, const struct stat *st
         assert_return(st, -EINVAL);
 
         return device_new_from_mode_and_devnum(ret, st->st_mode, st->st_rdev);
+}
+
+_public_ int sd_device_new_from_device_node_fd(sd_device **ret, int fd) {
+        assert_return(ret, -EINVAL);
+        assert_return(fd >= 0, -EBADF);
+
+        struct stat st;
+        if (fstat(fd, &st) < 0)
+                return -errno;
+
+        return sd_device_new_from_stat_rdev(ret, &st);
 }
 
 static int device_new_from_devname(sd_device **ret, const char *devname, bool strict) {
@@ -846,25 +869,30 @@ int device_read_uevent_file(sd_device *device) {
         STRV_FOREACH(s, v) {
                 char *eq = strchr(*s, '=');
                 if (!eq) {
-                        log_device_debug(device, "sd-device: Invalid uevent line, ignoring: %s", *s);
+                        _cleanup_free_ char *escaped = cescape(*s);
+                        log_device_debug(device, "sd-device: Invalid uevent line, ignoring: %s", strnull(escaped));
                         continue;
                 }
 
                 *eq = '\0';
 
                 r = handle_uevent_line(device, *s, eq + 1, &major, &minor);
-                if (r < 0)
+                if (r < 0) {
+                        _cleanup_free_ char *escaped_key = cescape(*s), *escaped_value = cescape(eq + 1);
                         log_device_debug_errno(device, r,
                                                "sd-device: Failed to handle uevent entry '%s=%s', ignoring: %m",
-                                               *s, eq + 1);
+                                               strnull(escaped_key), strnull(escaped_value));
+                }
         }
 
         if (major) {
                 r = device_set_devnum(device, major, minor);
-                if (r < 0)
+                if (r < 0) {
+                        _cleanup_free_ char *escaped_major = cescape(major), *escaped_minor = minor ? cescape(minor) : NULL;
                         log_device_debug_errno(device, r,
                                                "sd-device: Failed to set 'MAJOR=%s' and/or 'MINOR=%s' from uevent, ignoring: %m",
-                                               major, strna(minor));
+                                               strnull(escaped_major), minor ? strnull(escaped_minor) : "n/a");
+                }
         }
 
         r = device_in_subsystem(device, "drivers");
@@ -880,7 +908,7 @@ int device_read_uevent_file(sd_device *device) {
         return 0;
 }
 
-_public_ int sd_device_get_ifindex(sd_device *device, int *ifindex) {
+_public_ int sd_device_get_ifindex(sd_device *device, int *ret) {
         int r;
 
         assert_return(device, -EINVAL);
@@ -892,8 +920,8 @@ _public_ int sd_device_get_ifindex(sd_device *device, int *ifindex) {
         if (device->ifindex <= 0)
                 return -ENOENT;
 
-        if (ifindex)
-                *ifindex = device->ifindex;
+        if (ret)
+                *ret = device->ifindex;
 
         return 0;
 }
@@ -904,7 +932,7 @@ int device_get_ifname(sd_device *device, const char **ret) {
         assert_return(device, -EINVAL);
 
         /* First, check if the device is a network interface. */
-        r = sd_device_get_ifindex(device, NULL);
+        r = sd_device_get_ifindex(device, /* ret= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1053,7 +1081,7 @@ static int device_enumerate_children(sd_device *device) {
         if (device->children_enumerated)
                 return 0; /* Already enumerated. */
 
-        r = device_enumerate_children_internal(device, NULL, &stack, &children);
+        r = device_enumerate_children_internal(device, /* subdir= */ NULL, &stack, &children);
         if (r < 0)
                 return r;
 
@@ -1250,7 +1278,7 @@ _public_ int sd_device_get_subsystem(sd_device *device, const char **ret) {
         if (!device->subsystem_set) {
                 const char *subsystem;
 
-                r = sd_device_get_sysattr_value(device, "subsystem", &subsystem);
+                r = device_get_sysattr_safe_string(device, "subsystem", &subsystem);
                 if (r < 0 && r != -ENOENT)
                         return log_device_debug_errno(device, r,
                                                       "sd-device: Failed to read subsystem for %s: %m",
@@ -1265,7 +1293,7 @@ _public_ int sd_device_get_subsystem(sd_device *device, const char **ret) {
                 else if (!isempty(PATH_STARTSWITH_SET(device->devpath, "/class/", "/bus/")))
                         r = device_set_subsystem(device, "subsystem");
                 else
-                        r = device_set_subsystem(device, NULL);
+                        r = device_set_subsystem(device, /* subsystem= */ NULL);
                 if (r < 0)
                         return log_device_debug_errno(device, r,
                                                       "sd-device: Failed to set subsystem for %s: %m",
@@ -1340,7 +1368,7 @@ _public_ int sd_device_get_parent_with_subsystem_devtype(sd_device *device, cons
         }
 }
 
-_public_ int sd_device_get_devnum(sd_device *device, dev_t *devnum) {
+_public_ int sd_device_get_devnum(sd_device *device, dev_t *ret) {
         int r;
 
         assert_return(device, -EINVAL);
@@ -1352,8 +1380,8 @@ _public_ int sd_device_get_devnum(sd_device *device, dev_t *devnum) {
         if (major(device->devnum) <= 0)
                 return -ENOENT;
 
-        if (devnum)
-                *devnum = device->devnum;
+        if (ret)
+                *ret = device->devnum;
 
         return 0;
 }
@@ -1390,7 +1418,7 @@ _public_ int sd_device_get_driver(sd_device *device, const char **ret) {
         if (!device->driver_set) {
                 const char *driver = NULL;
 
-                r = sd_device_get_sysattr_value(device, "driver", &driver);
+                r = device_get_sysattr_safe_string(device, "driver", &driver);
                 if (r < 0 && r != -ENOENT)
                         return log_device_debug_errno(device, r,
                                                       "sd-device: Failed to read driver: %m");
@@ -1722,10 +1750,7 @@ static int handle_db_line(sd_device *device, char key, const char *value) {
                 return safe_atoi(value, &device->devlink_priority);
 
         case 'W':
-                /* Deprecated. Previously, watch handle is both saved in database and /run/udev/watch.
-                 * However, the handle saved in database may not be updated when the handle is updated
-                 * or removed. Moreover, it is not necessary to store the handle within the database,
-                 * as its value becomes meaningless when udevd is restarted. */
+                /* Deprecated. Was used for the inotify watch handle. */
                 return 0;
 
         case 'V':
@@ -1966,25 +1991,10 @@ _public_ const char* sd_device_get_tag_next(sd_device *device) {
         return v;
 }
 
-static bool device_database_supports_current_tags(sd_device *device) {
-        assert(device);
-
-        (void) device_read_db(device);
-
-        /* The current tags (saved in Q field) feature is implemented in database version 1.
-         * If the database version is 0, then the tags (NOT current tags, saved in G field) are not
-         * sticky. Thus, we can safely bypass the operations for the current tags (Q) to tags (G). */
-
-        return device->database_version >= 1;
-}
-
 _public_ const char* sd_device_get_current_tag_first(sd_device *device) {
         void *v;
 
         assert_return(device, NULL);
-
-        if (!device_database_supports_current_tags(device))
-                return sd_device_get_tag_first(device);
 
         (void) device_read_db(device);
 
@@ -1999,9 +2009,6 @@ _public_ const char* sd_device_get_current_tag_next(sd_device *device) {
         void *v;
 
         assert_return(device, NULL);
-
-        if (!device_database_supports_current_tags(device))
-                return sd_device_get_tag_next(device);
 
         (void) device_read_db(device);
 
@@ -2056,7 +2063,7 @@ int device_properties_prepare(sd_device *device) {
         if (device->property_devlinks_outdated) {
                 _cleanup_free_ char *devlinks = NULL;
 
-                r = set_strjoin(device->devlinks, " ", false, &devlinks);
+                r = set_strjoin(device->devlinks, " ", /* wrap_with_separator= */ false, &devlinks);
                 if (r < 0)
                         return r;
 
@@ -2072,7 +2079,7 @@ int device_properties_prepare(sd_device *device) {
         if (device->property_tags_outdated) {
                 _cleanup_free_ char *tags = NULL;
 
-                r = set_strjoin(device->all_tags, ":", true, &tags);
+                r = set_strjoin(device->all_tags, ":", /* wrap_with_separator= */ true, &tags);
                 if (r < 0)
                         return r;
 
@@ -2083,7 +2090,7 @@ int device_properties_prepare(sd_device *device) {
                 }
 
                 tags = mfree(tags);
-                r = set_strjoin(device->current_tags, ":", true, &tags);
+                r = set_strjoin(device->current_tags, ":", /* wrap_with_separator= */ true, &tags);
                 if (r < 0)
                         return r;
 
@@ -2212,7 +2219,7 @@ static int device_sysattrs_read_all(sd_device *device) {
         if (device->sysattrs_read)
                 return 0;
 
-        r = device_sysattrs_read_all_internal(device, NULL, &stack);
+        r = device_sysattrs_read_all_internal(device, /* subdir= */ NULL, &stack);
         if (r < 0)
                 return r;
 
@@ -2273,15 +2280,12 @@ _public_ int sd_device_has_current_tag(sd_device *device, const char *tag) {
         assert_return(device, -EINVAL);
         assert_return(tag, -EINVAL);
 
-        if (!device_database_supports_current_tags(device))
-                return sd_device_has_tag(device, tag);
-
         (void) device_read_db(device);
 
         return set_contains(device->current_tags, tag);
 }
 
-_public_ int sd_device_get_property_value(sd_device *device, const char *key, const char **ret_value) {
+_public_ int sd_device_get_property_value(sd_device *device, const char *key, const char **ret) {
         const char *value;
         int r;
 
@@ -2296,8 +2300,8 @@ _public_ int sd_device_get_property_value(sd_device *device, const char *key, co
         if (!value)
                 return -ENOENT;
 
-        if (ret_value)
-                *ret_value = value;
+        if (ret)
+                *ret = value;
         return 0;
 }
 
@@ -2628,11 +2632,24 @@ cache_result:
         return device_get_cached_sysattr_value(device, sysattr, ret_value, ret_size);
 }
 
-_public_ int sd_device_get_sysattr_value(sd_device *device, const char *sysattr, const char **ret_value) {
-        return sd_device_get_sysattr_value_with_size(device, sysattr, ret_value, NULL);
+_public_ int sd_device_get_sysattr_value(sd_device *device, const char *sysattr, const char **ret) {
+        return sd_device_get_sysattr_value_with_size(device, sysattr, ret, /* ret_size= */ NULL);
 }
 
-int device_get_sysattr_int(sd_device *device, const char *sysattr, int *ret_value) {
+int device_get_sysattr_streq(sd_device *device, const char *sysattr, const char *expected) {
+        const char *value;
+        int r;
+
+        assert(expected);
+
+        r = sd_device_get_sysattr_value(device, sysattr, &value);
+        if (r < 0)
+                return r;
+
+        return streq(value, expected);
+}
+
+int device_get_sysattr_safe_string(sd_device *device, const char *sysattr, const char **ret) {
         const char *value;
         int r;
 
@@ -2640,73 +2657,72 @@ int device_get_sysattr_int(sd_device *device, const char *sysattr, int *ret_valu
         if (r < 0)
                 return r;
 
-        int v;
-        r = safe_atoi(value, &v);
-        if (r < 0)
-                return log_device_debug_errno(device, r, "Failed to parse '%s' attribute: %m", sysattr);
+        if (!string_is_safe(value,
+                            STRING_ALLOW_EMPTY |
+                            STRING_ALLOW_NEWLINES |
+                            STRING_ALLOW_BACKSLASHES |
+                            STRING_ALLOW_QUOTES |
+                            STRING_ALLOW_GLOBS)) {
+                if (DEBUG_LOGGING) {
+                        _cleanup_free_ char *escaped = cescape(value);
+                        log_device_debug(device, "sd-device: '%s' sysattr contains invalid characters, refusing: %s",
+                                         sysattr, strnull(escaped));
+                }
+                return -ENXIO;
+        }
 
-        if (ret_value)
-                *ret_value = v;
-        /* We return "true" if the value is positive. */
-        return v > 0;
+        if (ret)
+                *ret = value;
+
+        return 0;
 }
 
-int device_get_sysattr_unsigned_full(sd_device *device, const char *sysattr, unsigned base, unsigned *ret_value) {
-        const char *value;
-        int r;
+#define DEFINE_DEVICE_GET_SYSATTR_PARSE(name, type, parser)             \
+        int device_get_sysattr_##name(sd_device *device, const char *sysattr, type *ret) { \
+                const char *value;                                      \
+                int r;                                                  \
+                                                                        \
+                r = sd_device_get_sysattr_value(device, sysattr, &value); \
+                if (r < 0)                                              \
+                        return r;                                       \
+                                                                        \
+                type v;                                                 \
+                r = parser(value, &v);                                  \
+                if (r < 0)                                              \
+                        return log_device_debug_errno(device, r, "Failed to parse '%s' attribute: %m", sysattr); \
+                                                                        \
+                if (ret)                                                \
+                        *ret = v;                                       \
+                /* We return "true" if the value is positive. */        \
+                return v > 0;                                           \
+        }
 
-        r = sd_device_get_sysattr_value(device, sysattr, &value);
-        if (r < 0)
-                return r;
+#define DEFINE_DEVICE_GET_SYSATTR_PARSE_BASE(name, type, parser)  \
+        int device_get_sysattr_##name##_full(sd_device *device, const char *sysattr, unsigned base, type *ret) { \
+                const char *value;                                      \
+                int r;                                                  \
+                                                                        \
+                r = sd_device_get_sysattr_value(device, sysattr, &value); \
+                if (r < 0)                                              \
+                        return r;                                       \
+                                                                        \
+                type v;                                                 \
+                r = parser(value, base, &v);                            \
+                if (r < 0)                                              \
+                        return log_device_debug_errno(device, r, "Failed to parse '%s' attribute: %m", sysattr); \
+                                                                        \
+                if (ret)                                                \
+                        *ret = v;                                       \
+                /* We return "true" if the value is positive. */        \
+                return v > 0;                                           \
+        }
 
-        unsigned v;
-        r = safe_atou_full(value, base, &v);
-        if (r < 0)
-                return log_device_debug_errno(device, r, "Failed to parse '%s' attribute: %m", sysattr);
-
-        if (ret_value)
-                *ret_value = v;
-        /* We return "true" if the value is positive. */
-        return v > 0;
-}
-
-int device_get_sysattr_u32(sd_device *device, const char *sysattr, uint32_t *ret_value) {
-        const char *value;
-        int r;
-
-        r = sd_device_get_sysattr_value(device, sysattr, &value);
-        if (r < 0)
-                return r;
-
-        uint32_t v;
-        r = safe_atou32(value, &v);
-        if (r < 0)
-                return log_device_debug_errno(device, r, "Failed to parse '%s' attribute: %m", sysattr);
-
-        if (ret_value)
-                *ret_value = v;
-        /* We return "true" if the value is positive. */
-        return v > 0;
-}
-
-int device_get_sysattr_u64(sd_device *device, const char *sysattr, uint64_t *ret_value) {
-        const char *value;
-        int r;
-
-        r = sd_device_get_sysattr_value(device, sysattr, &value);
-        if (r < 0)
-                return r;
-
-        uint64_t v;
-        r = safe_atou64(value, &v);
-        if (r < 0)
-                return log_device_debug_errno(device, r, "Failed to parse '%s' attribute: %m", sysattr);
-
-        if (ret_value)
-                *ret_value = v;
-        /* We return "true" if the value is positive. */
-        return v > 0;
-}
+DEFINE_DEVICE_GET_SYSATTR_PARSE(int, int, safe_atoi);
+DEFINE_DEVICE_GET_SYSATTR_PARSE_BASE(unsigned, unsigned, safe_atou_full);
+DEFINE_DEVICE_GET_SYSATTR_PARSE_BASE(u8,  uint8_t,  safe_atou8_full);
+DEFINE_DEVICE_GET_SYSATTR_PARSE_BASE(u16, uint16_t, safe_atou16_full);
+DEFINE_DEVICE_GET_SYSATTR_PARSE_BASE(u32, uint32_t, safe_atou32_full);
+DEFINE_DEVICE_GET_SYSATTR_PARSE(u64, uint64_t, safe_atou64);
 
 int device_get_sysattr_bool(sd_device *device, const char *sysattr) {
         const char *value;
@@ -2773,7 +2789,7 @@ _public_ int sd_device_set_sysattr_value(sd_device *device, const char *sysattr,
                 return r;
         }
 
-        r = device_cache_sysattr_value(device, resolved, copied, 0);
+        r = device_cache_sysattr_value(device, resolved, copied, /* error= */ 0);
         if (r < 0)
                 log_device_debug_errno(device, r,
                                        "sd-device: failed to cache written attribute '%s' with '%s', ignoring: %m",
@@ -2808,7 +2824,7 @@ _public_ int sd_device_set_sysattr_valuef(sd_device *device, const char *sysattr
 }
 
 _public_ int sd_device_trigger(sd_device *device, sd_device_action_t action) {
-        return sd_device_trigger_with_uuid(device, action, NULL);
+        return sd_device_trigger_with_args(device, action, /* args= */ NULL, /* ret_uuid= */ NULL);
 }
 
 _public_ int sd_device_trigger_with_uuid(
@@ -2816,23 +2832,50 @@ _public_ int sd_device_trigger_with_uuid(
                 sd_device_action_t action,
                 sd_id128_t *ret_uuid) {
 
-        const char *s, *j;
-        sd_id128_t u;
+        return sd_device_trigger_with_args(device, action, /* args= */ NULL, ret_uuid);
+}
+
+_public_ int sd_device_trigger_with_args(
+                sd_device *device,
+                sd_device_action_t action,
+                char * const *args, /* KEY VALUE pairs */
+                sd_id128_t *ret_uuid) {
+
         int r;
 
         assert_return(device, -EINVAL);
 
-        s = device_action_to_string(action);
-        if (!s)
+        const char *a = device_action_to_string(action);
+        if (!a)
                 return -EINVAL;
 
+        if (strv_length(args) % 2 != 0)
+                return -EINVAL;
+
+        /* The kernel requests that both keys and values are alphanumerical. See action_arg_word_end() in
+         * lib/kobject_uevent.c and Documentation/ABI/testing/sysfs-uevent in the kernel. */
+        STRV_FOREACH(s, args)
+                if (isempty(*s) || !in_charset(*s, ALPHANUMERICAL))
+                        return -EINVAL;
+
+        sd_id128_t u;
         r = sd_id128_randomize(&u);
         if (r < 0)
                 return r;
 
-        j = strjoina(s, " ", SD_ID128_TO_UUID_STRING(u));
+        const char *j = strjoina(a, " ", SD_ID128_TO_UUID_STRING(u));
 
-        r = sd_device_set_sysattr_value(device, "uevent", j);
+        _cleanup_free_ char *joined = NULL;
+        STRV_FOREACH_PAIR(k, v, args) {
+                if (!joined) {
+                        joined = strjoin(j, " ", *k, "=", *v);
+                        if (!joined)
+                                return -ENOMEM;
+                } else if (!strextend(&joined, " ", *k, "=", *v))
+                        return -ENOMEM;
+        }
+
+        r = sd_device_set_sysattr_value(device, "uevent", joined ?: j);
         if (r < 0)
                 return r;
 
@@ -2841,7 +2884,7 @@ _public_ int sd_device_trigger_with_uuid(
         return 0;
 }
 
-_public_ int sd_device_open(sd_device *device, int flags) {
+int device_open(sd_device *device, int flags) {
         _cleanup_close_ int fd = -EBADF, fd2 = -EBADF;
         const char *devname;
         uint64_t q, diskseq = 0;
@@ -2849,8 +2892,10 @@ _public_ int sd_device_open(sd_device *device, int flags) {
         dev_t devnum;
         int r;
 
-        assert_return(device, -EINVAL);
-        assert_return(FLAGS_SET(flags, O_PATH) || !FLAGS_SET(flags, O_NOFOLLOW), -EINVAL);
+        assert(device);
+        assert(FLAGS_SET(flags, O_PATH) || !FLAGS_SET(flags, O_NOFOLLOW));
+
+        /* Like sd_device_open(), but O_CLOEXEC is always set */
 
         r = sd_device_get_devname(device, &devname);
         if (r == -ENOENT)
@@ -2864,9 +2909,11 @@ _public_ int sd_device_open(sd_device *device, int flags) {
         if (r < 0)
                 return r;
 
-        fd = open(devname, FLAGS_SET(flags, O_PATH) ? flags : O_CLOEXEC|O_NOFOLLOW|O_PATH);
+        /* With O_PATH open() ignores all but these flags, so must we */
+        fd = xopenat(AT_FDCWD, devname,
+                     FLAGS_SET(flags, O_PATH) ? flags & (O_PATH|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC) : O_NOFOLLOW|O_PATH);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         if (fstat(fd, &st) < 0)
                 return -errno;
@@ -2915,6 +2962,27 @@ _public_ int sd_device_open(sd_device *device, int flags) {
                 return -ENXIO;
 
         return TAKE_FD(fd2);
+}
+
+_public_ int sd_device_open(sd_device *device, int flags) {
+        _cleanup_close_ int fd = -EBADF;
+        int r;
+
+        assert_return(device, -EINVAL);
+        assert_return(FLAGS_SET(flags, O_PATH) || !FLAGS_SET(flags, O_NOFOLLOW), -EINVAL);
+
+        fd = device_open(device, flags);
+        if (fd < 0)
+                return fd;
+
+        /* We've historically returned non-cloexec fds. */
+        if (!FLAGS_SET(flags, O_CLOEXEC)) {
+                r = fd_cloexec(fd, /* cloexec= */ false);
+                if (r < 0)
+                        return r;
+        }
+
+        return TAKE_FD(fd);
 }
 
 int device_opendir(sd_device *device, const char *subdir, DIR **ret) {

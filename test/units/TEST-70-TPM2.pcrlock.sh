@@ -14,7 +14,16 @@ SD_MEASURE="/usr/lib/systemd/systemd-measure"
 
 if [[ ! -x "${SD_PCREXTEND:?}" ]] || [[ ! -x "${SD_PCRLOCK:?}" ]] || [[ ! -x "${SD_MEASURE:?}" ]] ; then
     echo "$SD_PCREXTEND or $SD_PCRLOCK or $SD_MEASURE not found, skipping pcrlock tests"
-    exit 0
+    exit 77
+fi
+
+# systemd-pcrlock requires that the firmware measured the boot. Occasionally the TPM breaks down already
+# during firmware execution in CI (all TCG2 measurements fail with EFI_DEVICE_ERROR, and systemd-stub
+# reports no active PCR banks), in which case we can't test anything here.
+if ! systemd-analyze has-tpm2 -q; then
+    systemd-analyze has-tpm2 ||:
+    echo "Firmware TPM2 support not available, skipping pcrlock tests"
+    exit 77
 fi
 
 at_exit() {
@@ -23,7 +32,26 @@ at_exit() {
         [[ -e /run/log/systemd/tpm2-measure.log ]] && jq --seq --slurp </run/log/systemd/tpm2-measure.log
     fi
 
-    return 0
+    set +e
+
+    systemd-cryptsetup detach pcrlock
+
+    if [[ -x "${SD_PCRLOCK:-}" ]]; then
+        "$SD_PCRLOCK" remove-policy
+        "$SD_PCRLOCK" unlock-firmware-config
+        "$SD_PCRLOCK" unlock-gpt
+        "$SD_PCRLOCK" unlock-machine-id
+        "$SD_PCRLOCK" unlock-file-system
+        "$SD_PCRLOCK" unlock-raw --pcrlock=/var/lib/pcrlock.d/910-test70.pcrlock
+        "$SD_PCRLOCK" unlock-raw --pcrlock=/var/lib/pcrlock.d/920-test70.pcrlock
+    fi
+
+    rm -rf /tmp/fakexbootldr /var/lib/pcrlock.d/123-empty.pcrlock.d /var/lib/pcrlock.d/930-many.pcrlock.d /run/systemd/system/systemd-pcrlock.socket.d
+    if [[ -n "${img:-}" ]]; then
+        rm -f "$img" "$img".private.pem "$img".public.pem "$img".pcrsign
+    fi
+    rm -f /tmp/borked /tmp/pcrlockpwd /var/lib/systemd/pcrlock.json /var/lib/systemd/pcrlock.json.gone
+    systemctl daemon-reload
 }
 
 trap at_exit EXIT
@@ -42,6 +70,18 @@ PCRS="1+2+3+4+5+16"
 # (as the PCR values simply won't match the log).
 rm -f /run/log/systemd/tpm2-measure.log
 
+# Add the os-separator measurements, they should be the only measurements that touch pcr 0…6 done from userspace.
+RS=$'\x1e'
+cat >/run/log/systemd/tpm2-measure.log <<EOF
+${RS}{"pcr":0,"digests":[{"hashAlg":"sha256","digest":"ff5b9d73dad709633ae76adf444012b57e913a12ed7403c3931145862f35f841"}],"content_type":"systemd","content":{"string":"os-separator","bootId":"5270738c127841a4b592f0fdc2839929","timestamp":2659711,"eventType":"os-separator"}}
+${RS}{"pcr":1,"digests":[{"hashAlg":"sha256","digest":"ff5b9d73dad709633ae76adf444012b57e913a12ed7403c3931145862f35f841"}],"content_type":"systemd","content":{"string":"os-separator","bootId":"5270738c127841a4b592f0fdc2839929","timestamp":2659775,"eventType":"os-separator"}}
+${RS}{"pcr":2,"digests":[{"hashAlg":"sha256","digest":"ff5b9d73dad709633ae76adf444012b57e913a12ed7403c3931145862f35f841"}],"content_type":"systemd","content":{"string":"os-separator","bootId":"5270738c127841a4b592f0fdc2839929","timestamp":2659805,"eventType":"os-separator"}}
+${RS}{"pcr":3,"digests":[{"hashAlg":"sha256","digest":"ff5b9d73dad709633ae76adf444012b57e913a12ed7403c3931145862f35f841"}],"content_type":"systemd","content":{"string":"os-separator","bootId":"5270738c127841a4b592f0fdc2839929","timestamp":2659829,"eventType":"os-separator"}}
+${RS}{"pcr":4,"digests":[{"hashAlg":"sha256","digest":"ff5b9d73dad709633ae76adf444012b57e913a12ed7403c3931145862f35f841"}],"content_type":"systemd","content":{"string":"os-separator","bootId":"5270738c127841a4b592f0fdc2839929","timestamp":2659851,"eventType":"os-separator"}}
+${RS}{"pcr":5,"digests":[{"hashAlg":"sha256","digest":"ff5b9d73dad709633ae76adf444012b57e913a12ed7403c3931145862f35f841"}],"content_type":"systemd","content":{"string":"os-separator","bootId":"5270738c127841a4b592f0fdc2839929","timestamp":2660099,"eventType":"os-separator"}}
+${RS}{"pcr":6,"digests":[{"hashAlg":"sha256","digest":"ff5b9d73dad709633ae76adf444012b57e913a12ed7403c3931145862f35f841"}],"content_type":"systemd","content":{"string":"os-separator","bootId":"5270738c127841a4b592f0fdc2839929","timestamp":2660139,"eventType":"os-separator"}}
+EOF
+
 # Reset TPM PCR 16 ("debug") explicitly, so that we can use it in a known good state
 tpm2_pcrreset 16
 
@@ -58,11 +98,47 @@ SYSTEMD_COLORS=256 "$SD_PCRLOCK"
 "$SD_PCRLOCK" is-supported
 "$SD_PCRLOCK" cel --no-pager --json=pretty
 "$SD_PCRLOCK" log --pcr="$PCRS"
+
+# The log header (the Spec ID event) is an EV_NO_ACTION event in the legacy event format, which should be
+# retained as the first record of the firmware log, with a single all-zero SHA1 digest.
+SPEC_ID_EVENT_CHECK='.recnum == 1 and .pcr == 0 and .content_type == "pcclient_std" and
+    .content.event_type == "EV_NO_ACTION" and
+    .digests == [{"hashAlg": "sha1", "digest": "0000000000000000000000000000000000000000"}] and
+    (.content.event_data | startswith("53706563204944204576656e74303300"))'
+if [[ -e /sys/kernel/security/tpm0/binary_bios_measurements ]]; then
+    "$SD_PCRLOCK" cel --json=short | jq -e ".[0] | $SPEC_ID_EVENT_CHECK" >/dev/null
+
+    # EV_NO_ACTION events are not extended into the PCRs, so everything other than the CEL output must still
+    # skip them. Don't restrict the PCRs here, as these events live on PCR 0.
+    "$SD_PCRLOCK" log --json=short |
+        jq -e 'any(.log[]; .pcr == 0) and (any(.log[]; .event == "no-action") | not)' >/dev/null
+fi
 "$SD_PCRLOCK" log --json=pretty --pcr="$PCRS"
 "$SD_PCRLOCK" list-components
 "$SD_PCRLOCK" list-components --location=250-
 "$SD_PCRLOCK" list-components --location=250-:350-
-"$SD_PCRLOCK" lock-firmware-config
+firmware_config_locked=yes
+output=$("$SD_PCRLOCK" lock-firmware-config 2>&1) || firmware_config_locked=no
+echo "$output" >&2
+if [[ "$firmware_config_locked" == no ]]; then
+    grep -Fx 'Event log for PCR 5 does not match PCR state, refusing.' <<<"$output" >/dev/null
+
+    # OVMF can extend PCR 5 with Exit Boot Services Invocation without recording the event. Only accept
+    # the refusal if that one missing firmware measurement exactly accounts for the observed PCR.
+    "$SD_PCRLOCK" log --json=short --pcr=5 | python3 -I -c '
+import hashlib, json, pathlib, sys
+event = b"Exit Boot Services Invocation"
+assert event not in pathlib.Path("/sys/kernel/security/tpm0/binary_bios_measurements").read_bytes()
+report = json.load(sys.stdin)
+assert sum(record["event"] == "os-separator" for record in report["log"]) == 1
+pcr = bytes(32)
+for record in report["log"]:
+    if record["event"] == "os-separator":
+        pcr = hashlib.sha256(pcr + hashlib.sha256(event).digest()).digest()
+    pcr = hashlib.sha256(pcr + bytes.fromhex(record["sha256"])).digest()
+assert pcr.hex() == report["pcrs"][0]["observedSHA256"]
+'
+fi
 "$SD_PCRLOCK" lock-gpt
 "$SD_PCRLOCK" lock-machine-id
 "$SD_PCRLOCK" lock-file-system
@@ -73,16 +149,95 @@ SYSTEMD_COLORS=256 "$SD_PCRLOCK"
 
 SD_STUB="$(find /usr/lib/systemd/boot/efi/ -name "systemd-boot*.efi" | head -n1)"
 if [[ -n "$SD_STUB" ]]; then
-    "$SD_PCRLOCK" lock-pe "$SD_STUB"
-    "$SD_PCRLOCK" lock-pe <"$SD_STUB"
-    "$SD_PCRLOCK" lock-uki "$SD_STUB"
-    "$SD_PCRLOCK" lock-uki <"$SD_STUB"
+    pe_direct="$("$SD_PCRLOCK" lock-pe "$SD_STUB")"
+    pe_stdin="$("$SD_PCRLOCK" lock-pe <"$SD_STUB")"
+    pe_pipe="$(cat "$SD_STUB" | "$SD_PCRLOCK" lock-pe)"
+    [[ "$pe_direct" == "$pe_stdin" ]]
+    [[ "$pe_stdin" == "$pe_pipe" ]]
+
+    uki_direct="$("$SD_PCRLOCK" lock-uki "$SD_STUB")"
+    uki_stdin="$("$SD_PCRLOCK" lock-uki <"$SD_STUB")"
+    uki_pipe="$(cat "$SD_STUB" | "$SD_PCRLOCK" lock-uki)"
+    [[ "$uki_direct" == "$uki_stdin" ]]
+    [[ "$uki_stdin" == "$uki_pipe" ]]
 fi
 
-PIN=huhu "$SD_PCRLOCK" make-policy --pcr="$PCRS" --recovery-pin=query
-# Repeat immediately (this call will have to reuse the nvindex, rather than create it)
-"$SD_PCRLOCK" make-policy --pcr="$PCRS"
-"$SD_PCRLOCK" make-policy --pcr="$PCRS" --force
+# lock-uki writes one .pcrlock file for each profile of a multi-profile UKI that enables PCRLOCK=. Profile @0
+# enables it by default, all other profiles do not.
+LINUX_STUB="/usr/lib/systemd/boot/efi/linux$(bootctl --print-efi-architecture || :).efi.stub"
+KERNEL="/usr/lib/modules/$(uname -r)/vmlinuz"
+if command -v ukify >/dev/null && [[ -f "$LINUX_STUB" && -f "$KERNEL" ]]; then
+    UKI_DIR="$(mktemp -d)"
+    UKI_LOCK="$UKI_DIR/650-uki.pcrlock.d/test.pcrlock"
+
+    ukify build --profile=$'TITLE=Storage Target Mode\nID=storagetm' --cmdline="rd.systemd.unit=storage-target-mode.target" --output="$UKI_DIR/profile1.efi"
+    ukify build --profile=$'TITLE=Debug\nID=debug\nPCRLOCK=yes' --cmdline="debug" --output="$UKI_DIR/profile2.efi"
+    ukify build --profile=$'TITLE=Broken\nID=broken\nPCRLOCK=maybe' --cmdline="broken" --output="$UKI_DIR/profile-broken.efi"
+    echo "ID=pcrlock-test" >"$UKI_DIR/os-release"
+    ukify build \
+          --stub="$LINUX_STUB" \
+          --linux="$KERNEL" \
+          --os-release="@$UKI_DIR/os-release" \
+          --cmdline="quiet" \
+          --profile=$'TITLE=Base\nID=base' \
+          --join-profile="$UKI_DIR/profile1.efi" \
+          --join-profile="$UKI_DIR/profile2.efi" \
+          --output="$UKI_DIR/multi.efi"
+
+    # Without --pcrlock= one JSON object per enabled profile is written to standard output.
+    [[ "$("$SD_PCRLOCK" lock-uki --json=short "$UKI_DIR/multi.efi" | wc -l)" -eq 2 ]]
+
+    "$SD_PCRLOCK" lock-uki --pcrlock="$UKI_LOCK" "$UKI_DIR/multi.efi"
+    test -f "$UKI_LOCK"
+    test ! -e "${UKI_LOCK%.pcrlock}@1.pcrlock"
+    test -f "${UKI_LOCK%.pcrlock}@2.pcrlock"
+    (! cmp "$UKI_LOCK" "${UKI_LOCK%.pcrlock}@2.pcrlock")
+
+    # The firmware measures the same PE binary into PCR 4 for every profile.
+    [[ "$(jq -c '.records[] | select(.pcr == 4)' "$UKI_LOCK")" == "$(jq -c '.records[] | select(.pcr == 4)' "${UKI_LOCK%.pcrlock}@2.pcrlock")" ]]
+
+    # Files of profiles that are not enabled anymore are removed. Files with names that lock-uki does not
+    # generate are kept.
+    touch "${UKI_LOCK%.pcrlock}@1.pcrlock" "${UKI_LOCK%.pcrlock}@7.pcrlock" "${UKI_LOCK%.pcrlock}@other.pcrlock" \
+          "${UKI_LOCK%.pcrlock}@0.pcrlock" "${UKI_LOCK%.pcrlock}@010.pcrlock" "${UKI_LOCK%.pcrlock}@999.pcrlock"
+    "$SD_PCRLOCK" lock-uki --pcrlock="$UKI_LOCK" "$UKI_DIR/multi.efi"
+    test ! -e "${UKI_LOCK%.pcrlock}@1.pcrlock"
+    test ! -e "${UKI_LOCK%.pcrlock}@7.pcrlock"
+    test -f "${UKI_LOCK%.pcrlock}@2.pcrlock"
+    test -f "${UKI_LOCK%.pcrlock}@other.pcrlock"
+    test -f "${UKI_LOCK%.pcrlock}@0.pcrlock"
+    test -f "${UKI_LOCK%.pcrlock}@010.pcrlock"
+    test -f "${UKI_LOCK%.pcrlock}@999.pcrlock"
+
+    "$SD_PCRLOCK" unlock-uki --pcrlock="$UKI_LOCK"
+    test ! -e "$UKI_LOCK"
+    test ! -e "${UKI_LOCK%.pcrlock}@2.pcrlock"
+    test -f "${UKI_LOCK%.pcrlock}@other.pcrlock"
+    test -f "${UKI_LOCK%.pcrlock}@010.pcrlock"
+
+    # Outside of a *.pcrlock.d/ directory the file of profile @2 would be a component of its own.
+    (! "$SD_PCRLOCK" lock-uki --pcrlock="$UKI_DIR/650-uki.pcrlock" "$UKI_DIR/multi.efi")
+    test ! -e "$UKI_DIR/650-uki.pcrlock"
+    test ! -e "$UKI_DIR/650-uki@2.pcrlock"
+
+    ukify build \
+          --stub="$LINUX_STUB" \
+          --linux="$KERNEL" \
+          --os-release="@$UKI_DIR/os-release" \
+          --profile=$'TITLE=Base\nID=base' \
+          --join-profile="$UKI_DIR/profile-broken.efi" \
+          --output="$UKI_DIR/broken.efi"
+    (! "$SD_PCRLOCK" lock-uki "$UKI_DIR/broken.efi")
+
+    rm -rf "$UKI_DIR"
+fi
+
+if "$SD_PCRLOCK" is-supported; then
+    PIN=huhu "$SD_PCRLOCK" make-policy --pcr="$PCRS" --recovery-pin=query
+    # Repeat immediately (this call will have to reuse the nvindex, rather than create it)
+    "$SD_PCRLOCK" make-policy --pcr="$PCRS"
+    "$SD_PCRLOCK" make-policy --pcr="$PCRS" --force
+fi
 
 img="/tmp/pcrlock.img"
 truncate -s 20M "$img"
@@ -129,6 +284,30 @@ echo -n test70-take-two | "$SD_PCRLOCK" lock-raw --pcrlock=/var/lib/pcrlock.d/92
 
 "$SD_PCRLOCK" cel --json=pretty
 
+systemd-cryptsetup attach pcrlock "$img" - tpm2-device=auto,tpm2-pcrlock=/var/lib/systemd/pcrlock.json,headless
+systemd-cryptsetup detach pcrlock
+
+# Now exercise the PolicyOR tree code path: more than 8 alternatives for a PCR. Add a component with 9
+# variants touching PCR 16, rebuild the policy (the current PCR 16 state still matches the policy generated
+# above, so the recovery PIN is not needed), then extend PCR 16 with the 9th variant and unlock again. A
+# flat PolicyOR could only hold 8 of these. The 9th variant is in the second group, so the nested walk also
+# has to submit a group slice with a non-zero start offset.
+mkdir -p /var/lib/pcrlock.d/930-many.pcrlock.d
+for i in $(seq -w 1 9); do
+    echo -n "test70-many-$i" | "$SD_PCRLOCK" lock-raw \
+        --pcrlock="/var/lib/pcrlock.d/930-many.pcrlock.d/${i}.pcrlock" --pcr=16
+done
+
+"$SD_PCRLOCK" predict --pcr="$PCRS"
+
+# The extra variants for PCR 16 must actually end up in the prediction, otherwise this block silently stops
+# covering the nested PolicyOR code path.
+"$SD_PCRLOCK" predict --json=short --pcr="$PCRS" | \
+    jq -e '[to_entries[] | .value[] | select(.pcr == 16) | .values | length] | length > 0 and all(. > 8)' >/dev/null
+
+"$SD_PCRLOCK" make-policy --pcr="$PCRS" --force
+
+"$SD_PCREXTEND" --pcr=16 test70-many-9
 systemd-cryptsetup attach pcrlock "$img" - tpm2-device=auto,tpm2-pcrlock=/var/lib/systemd/pcrlock.json,headless
 systemd-cryptsetup detach pcrlock
 
@@ -211,6 +390,21 @@ systemctl restart systemd-pcrlock.socket
 varlinkctl call /run/systemd/io.systemd.PCRLock io.systemd.PCRLock.RemovePolicy '{}'
 varlinkctl call /run/systemd/io.systemd.PCRLock io.systemd.PCRLock.MakePolicy '{}'
 varlinkctl call --collect --json=pretty /run/systemd/io.systemd.PCRLock io.systemd.PCRLock.ReadEventLog '{}'
+if [[ -e /sys/kernel/security/tpm0/binary_bios_measurements ]]; then
+    varlinkctl call --collect --json=short /run/systemd/io.systemd.PCRLock io.systemd.PCRLock.ReadEventLog '{}' |
+        jq -e ".[0].record | $SPEC_ID_EVENT_CHECK" >/dev/null
+fi
+varlinkctl call --collect --json=pretty /run/systemd/io.systemd.PCRLock io.systemd.PCRLock.ListComponents '{}'
+if [[ "$firmware_config_locked" == yes ]]; then
+    varlinkctl call /run/systemd/io.systemd.PCRLock io.systemd.PCRLock.Lock '{"category":"firmwareConfig"}'
+else
+    varlinkctl call --graceful=io.systemd.System /run/systemd/io.systemd.PCRLock io.systemd.PCRLock.Lock '{"category":"firmwareConfig"}' |
+        jq -e '.errnoName == "EBADMSG"' >/dev/null
+fi
+varlinkctl call /run/systemd/io.systemd.PCRLock io.systemd.PCRLock.Lock '{"category":"firmwareConfig","lock":false}'
+varlinkctl call /run/systemd/io.systemd.PCRLock io.systemd.PCRLock.Lock '{"category":"firmwareCode","lock":false}'
+varlinkctl call /run/systemd/io.systemd.PCRLock io.systemd.PCRLock.Lock '{"category":"secureBootPolicy","lock":false}'
+varlinkctl call /run/systemd/io.systemd.PCRLock io.systemd.PCRLock.Lock '{"category":"secureBootAuthority","lock":false}'
 
 rm "$img" /tmp/pcrlockpwd
 

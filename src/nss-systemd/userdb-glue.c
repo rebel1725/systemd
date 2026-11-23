@@ -14,7 +14,13 @@
 #include "userdb-glue.h"
 
 UserDBFlags nss_glue_userdb_flags(void) {
-        UserDBFlags flags = USERDB_EXCLUDE_NSS;
+        UserDBFlags flags = USERDB_EXCLUDE_CLIENT_NSS;
+
+        /* Server-side NSS usually returns the records that glibc already got from the NSS modules listed
+         * before nss-systemd in nsswitch.conf. A sandbox can bind mount the host's userdb sockets into
+         * /run/systemd/userdb/. In that sandbox, server-side NSS returns the host's records instead. */
+        if (secure_getenv_bool("SYSTEMD_NSS_SERVER_SIDE_NSS") <= 0)
+                flags |= USERDB_EXCLUDE_SERVER_NSS;
 
         /* Make sure that we don't go in circles when allocating a dynamic UID by checking our own database */
         if (secure_getenv_bool("SYSTEMD_NSS_DYNAMIC_BYPASS") > 0)
@@ -229,6 +235,8 @@ int nss_pack_group_record(
         assert(g->group_name);
         required = strlen(g->group_name) + 1;
 
+        required += strlen(PASSWORD_SEE_SHADOW) + 1;
+
         STRV_FOREACH(m, g->members) {
                 required += sizeof(char*);  /* space for ptr array entry */
                 required += strlen(*m) + 1;
@@ -267,11 +275,13 @@ int nss_pack_group_record(
         array[n] = NULL;
 
         *gr = (struct group) {
-                .gr_name = strcpy(p, g->group_name),
+                .gr_name = p,
                 .gr_gid = g->gid,
-                .gr_passwd = (char*) PASSWORD_SEE_SHADOW,
                 .gr_mem = array,
         };
+
+        gr->gr_passwd = stpcpy(gr->gr_name, g->group_name) + 1;
+        strcpy(gr->gr_passwd, PASSWORD_SEE_SHADOW);
 
         return 0;
 }
@@ -324,7 +334,7 @@ enum nss_status userdb_getgrnam(
 
                 blocked = true;
 
-                r = nss_group_record_by_name(name, false, &g);
+                r = nss_group_record_by_name(name, /* with_shadow= */ false, &g);
                 if (r == -ESRCH)
                         return NSS_STATUS_NOTFOUND;
                 if (r < 0) {
@@ -379,7 +389,7 @@ enum nss_status userdb_getgrgid(
 
                 blocked = true;
 
-                r = nss_group_record_by_gid(gid, false, &g);
+                r = nss_group_record_by_gid(gid, /* with_shadow= */ false, &g);
                 if (r == -ESRCH)
                         return NSS_STATUS_NOTFOUND;
                 if (r < 0) {
@@ -415,6 +425,9 @@ enum nss_status userdb_getgrgid(
  * string vector strv and stores amount of pointers in n and total
  * length of all contained strings including NUL bytes in len. */
 static void nss_count_strv(char * const *strv, size_t *n, size_t *len) {
+        assert(n);
+        assert(len);
+
         STRV_FOREACH(str, strv) {
                 (*len) += sizeof(char*);  /* space for array entry */
                 (*len) += strlen(*str) + 1;
@@ -472,7 +485,9 @@ int nss_pack_group_record_shadow(
 
         assert(buffer);
 
-        p = buffer + sizeof(void*) * (n + 1); /* place member strings right after the ptr array */
+        /* n already includes trailing NULL pointers from nss_count_strv(), unlike the
+         * non-shadow nss_pack_group_record() where n does not include them. */
+        p = buffer + sizeof(void*) * n;
         array = (char**) buffer; /* place ptr array at beginning of buffer, under assumption buffer is aligned */
 
         sgrp->sg_mem = array;

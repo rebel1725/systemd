@@ -5,11 +5,7 @@
 #include <netinet/in.h>
 #include <net/ethernet.h>
 
-#include "basic-forward.h"
-
-/* This is MAX_ADDR_LEN as defined in linux/netdevice.h, but net/if_arp.h
- * defines a macro of the same name with a much lower size. */
-#define HW_ADDR_MAX_SIZE 32
+#include "forward.h"
 
 struct hw_addr_data {
         size_t length;
@@ -24,7 +20,7 @@ struct hw_addr_data {
 
 int parse_hw_addr_full(const char *s, size_t expected_len, struct hw_addr_data *ret);
 static inline int parse_hw_addr(const char *s, struct hw_addr_data *ret) {
-        return parse_hw_addr_full(s, 0, ret);
+        return parse_hw_addr_full(s, /* expected_len= */ 0, ret);
 }
 int parse_ether_addr(const char *s, struct ether_addr *ret);
 
@@ -38,7 +34,7 @@ char* hw_addr_to_string_full(
                 HardwareAddressToStringFlags flags,
                 char buffer[static HW_ADDR_TO_STRING_MAX]);
 static inline char* hw_addr_to_string(const struct hw_addr_data *addr, char buffer[static HW_ADDR_TO_STRING_MAX]) {
-        return hw_addr_to_string_full(addr, 0, buffer);
+        return hw_addr_to_string_full(addr, /* flags= */ 0, buffer);
 }
 
 /* Note: the lifetime of the compound literal is the immediately surrounding block,
@@ -57,6 +53,7 @@ static inline bool hw_addr_equal(const struct hw_addr_data *a, const struct hw_a
         return hw_addr_compare(a, b) == 0;
 }
 bool hw_addr_is_null(const struct hw_addr_data *addr) _pure_;
+bool hw_addr_is_valid(const struct hw_addr_data *addr, uint16_t iftype);
 
 extern const struct hash_ops hw_addr_hash_ops;
 extern const struct hash_ops hw_addr_hash_ops_free;
@@ -105,3 +102,5 @@ extern const struct hash_ops ether_addr_hash_ops;
 extern const struct hash_ops ether_addr_hash_ops_free;
 
 void ether_addr_mark_random(struct ether_addr *addr);
+
+int hw_addr_ensure_broadcast(struct hw_addr_data *bcast_addr, uint16_t arp_type);

@@ -108,6 +108,8 @@ typedef struct SecurityInfo {
         Set *system_call_filter;
 
         mode_t _umask;
+
+        RuntimeScope runtime_scope;
 } SecurityInfo;
 
 struct security_assessor {
@@ -182,6 +184,13 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(SecurityInfo*, security_info_free);
 static bool security_info_runs_privileged(const SecurityInfo *i)  {
         assert(i);
 
+        /* For the common --user case the manager runs as a regular user and cannot switch
+         * UID, so user-scope services never end up privileged. We deliberately do not
+         * handle root-owned user managers (user@0.service) here: in that narrow case the
+         * service really is privileged and will be mis-classified. */
+        if (i->runtime_scope == RUNTIME_SCOPE_USER)
+                return false;
+
         if (STRPTR_IN_SET(i->user, "0", "root"))
                 return true;
 
@@ -231,6 +240,12 @@ static int assess_user(
                 b = 0;
         } else if (info->user && !STR_IN_SET(info->user, "0", "root", "")) {
                 d = "Service runs under a static non-root user identity";
+                b = 0;
+        } else if (info->runtime_scope == RUNTIME_SCOPE_USER) {
+                /* Same caveat as security_info_runs_privileged(): root-owned user
+                 * managers (user@0.service) will be reported as non-root here, which is
+                 * incorrect but matches the heuristic. */
+                d = "Service runs under the calling user's identity";
                 b = 0;
         } else {
                 *ret_badness = 10;
@@ -477,6 +492,12 @@ static int assess_remove_ipc(
         assert(ret_badness);
         assert(ret_description);
 
+        if (info->runtime_scope == RUNTIME_SCOPE_USER) {
+                *ret_badness = UINT64_MAX;
+                return strdup_to(ret_description,
+                                 "RemoveIPC= has no effect on per-user services");
+        }
+
         if (security_info_runs_privileged(info))
                 *ret_badness = UINT64_MAX;
         else
@@ -558,6 +579,8 @@ static int assess_system_call_architectures(
 }
 
 static bool syscall_names_in_filter(Set *s, bool allow_list, const SyscallFilterSet *f, const char **ret_offending_syscall) {
+        assert(ret_offending_syscall);
+
         NULSTR_FOREACH(syscall, f->value) {
                 if (syscall[0] == '@') {
                         const SyscallFilterSet *g;
@@ -575,8 +598,7 @@ static bool syscall_names_in_filter(Set *s, bool allow_list, const SyscallFilter
 
                 if (set_contains(s, syscall) == allow_list) {
                         log_debug("Offending syscall filter item: %s", syscall);
-                        if (ret_offending_syscall)
-                                *ret_offending_syscall = syscall;
+                        *ret_offending_syscall = syscall;
                         return true; /* bad! */
                 }
         }
@@ -604,7 +626,7 @@ static int assess_system_call_filter(
         uint64_t b;
         int r;
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0) {
                 *ret_badness = UINT64_MAX;
                 *ret_description = NULL;
@@ -1753,7 +1775,7 @@ static int assess(const SecurityInfo *info,
                 if (!details_table)
                         return log_oom();
 
-                r = table_set_json_field_name(details_table, 0, "set");
+                r = table_set_json_field_name(details_table, /* idx= */ 0, "set");
                 if (r < 0)
                         return log_error_errno(r, "Failed to set JSON field name of column 0: %m");
 
@@ -2291,7 +2313,7 @@ static int property_read_device_allow(
         return sd_bus_message_exit_container(m);
 }
 
-static int acquire_security_info(sd_bus *bus, const char *name, SecurityInfo *info, AnalyzeSecurityFlags flags) {
+static int acquire_security_info(sd_bus *bus, const char *name, SecurityInfo *info, RuntimeScope scope, AnalyzeSecurityFlags flags) {
 
         static const struct bus_properties_map security_map[] = {
                 { "AmbientCapabilities",     "t",       NULL,                                    offsetof(SecurityInfo, ambient_capabilities)      },
@@ -2337,7 +2359,7 @@ static int acquire_security_info(sd_bus *bus, const char *name, SecurityInfo *in
                 { "RootImage",               "s",       NULL,                                    offsetof(SecurityInfo, root_image)                },
                 { "SupplementaryGroups",     "as",      NULL,                                    offsetof(SecurityInfo, supplementary_groups)      },
                 { "SystemCallArchitectures", "as",      property_read_syscall_archs,             0                                                 },
-                { "SystemCallFilter",        "(as)",    property_read_system_call_filter,        0                                                 },
+                { "SystemCallFilter",        "(bas)",   property_read_system_call_filter,        0                                                 },
                 { "Type",                    "s",       NULL,                                    offsetof(SecurityInfo, type)                      },
                 { "UMask",                   "u",       property_read_umask,                     0                                                 },
                 { "User",                    "s",       NULL,                                    offsetof(SecurityInfo, user)                      },
@@ -2365,7 +2387,7 @@ static int acquire_security_info(sd_bus *bus, const char *name, SecurityInfo *in
                         security_map,
                         BUS_MAP_STRDUP | BUS_MAP_BOOLEAN_AS_BOOL,
                         &error,
-                        NULL,
+                        /* ret_reply= */ NULL,
                         info);
         if (r < 0)
                 return log_error_errno(r, "Failed to get unit properties: %s", bus_error_message(&error, r));
@@ -2412,12 +2434,15 @@ static int acquire_security_info(sd_bus *bus, const char *name, SecurityInfo *in
                 info->capability_bounding_set &= ~((UINT64_C(1) << CAP_MKNOD) |
                                                    (UINT64_C(1) << CAP_SYS_RAWIO));
 
+        info->runtime_scope = scope;
+
         return 0;
 }
 
 static int analyze_security_one(sd_bus *bus,
                                 const char *name,
                                 Table *overview_table,
+                                RuntimeScope scope,
                                 AnalyzeSecurityFlags flags,
                                 unsigned threshold,
                                 sd_json_variant *policy,
@@ -2433,7 +2458,7 @@ static int analyze_security_one(sd_bus *bus,
         assert(bus);
         assert(name);
 
-        r = acquire_security_info(bus, name, info, flags);
+        r = acquire_security_info(bus, name, info, scope, flags);
         if (r == -EMEDIUMTYPE) /* Ignore this one because not loaded or Type is oneshot */
                 return 0;
         if (r < 0)
@@ -2447,12 +2472,14 @@ static int analyze_security_one(sd_bus *bus,
 }
 
 /* Refactoring SecurityInfo so that it can make use of existing struct variables instead of reading from dbus */
-static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, SecurityInfo **ret_info) {
+static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, RuntimeScope scope, SecurityInfo **ret_info) {
         assert(ret_info);
 
         _cleanup_(security_info_freep) SecurityInfo *info = security_info_new();
         if (!info)
                 return log_oom();
+
+        info->runtime_scope = scope;
 
         if (u) {
                 if (u->id) {
@@ -2577,7 +2604,7 @@ static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, Security
                 info->_umask = c->umask;
 
 #if HAVE_SECCOMP
-                if (dlopen_libseccomp() >= 0) {
+                if (dlopen_libseccomp(LOG_DEBUG) >= 0) {
                         SET_FOREACH(key, c->syscall_archs) {
                                 const char *name;
 
@@ -2653,6 +2680,7 @@ static int get_security_info(Unit *u, ExecContext *c, CGroupContext *g, Security
 }
 
 static int offline_security_check(Unit *u,
+                                  RuntimeScope scope,
                                   unsigned threshold,
                                   sd_json_variant *policy,
                                   PagerFlags pager_flags,
@@ -2668,7 +2696,7 @@ static int offline_security_check(Unit *u,
         if (DEBUG_LOGGING)
                 unit_dump(u, stdout, "\t");
 
-        r = get_security_info(u, unit_get_exec_context(u), unit_get_cgroup_context(u), &info);
+        r = get_security_info(u, unit_get_exec_context(u), unit_get_cgroup_context(u), scope, &info);
         if (r < 0)
               return r;
 
@@ -2712,7 +2740,7 @@ static int offline_security_checks(
 
         log_debug("Starting manager...");
 
-        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, root);
+        r = manager_startup(m, /* serialization= */ NULL, /* fds= */ NULL, /* named_listen_fds= */ NULL, root);
         if (r < 0)
                 return r;
 
@@ -2759,12 +2787,12 @@ static int offline_security_checks(
                                 profile = profile_path;
                         }
 
-                        r = copy_file(profile, dropin, 0, 0644, 0);
+                        r = copy_file(profile, dropin, /* open_flags= */ 0, 0644, /* copy_flags= */ 0);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to copy: %m");
                 }
 
-                k = manager_load_startable_unit_or_warn(m, NULL, prepared, &units[count]);
+                k = manager_load_startable_unit_or_warn(m, /* name= */ NULL, prepared, LOG_ERR, &units[count]);
                 if (k < 0) {
                         RET_GATHER(r, k);
                         continue;
@@ -2774,7 +2802,7 @@ static int offline_security_checks(
         }
 
         for (size_t i = 0; i < count; i++)
-                RET_GATHER(r, offline_security_check(units[i], threshold, policy, pager_flags, json_format_flags));
+                RET_GATHER(r, offline_security_check(units[i], scope, threshold, policy, pager_flags, json_format_flags));
 
         return r;
 }
@@ -2819,7 +2847,7 @@ static int analyze_security(sd_bus *bus,
                                 "ListUnits",
                                 &error,
                                 &reply,
-                                NULL);
+                                /* types= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to list units: %s", bus_error_message(&error, r));
 
@@ -2854,7 +2882,7 @@ static int analyze_security(sd_bus *bus,
                 flags |= ANALYZE_SECURITY_SHORT|ANALYZE_SECURITY_ONLY_LOADED|ANALYZE_SECURITY_ONLY_LONG_RUNNING;
 
                 STRV_FOREACH(i, list) {
-                        r = analyze_security_one(bus, *i, overview_table, flags, threshold, policy, pager_flags, json_format_flags);
+                        r = analyze_security_one(bus, *i, overview_table, scope, flags, threshold, policy, pager_flags, json_format_flags);
                         if (r < 0 && ret >= 0)
                                 ret = r;
                 }
@@ -2869,7 +2897,7 @@ static int analyze_security(sd_bus *bus,
                                 fflush(stdout);
                         }
 
-                        r = unit_name_mangle(*i, 0, &mangled);
+                        r = unit_name_mangle(*i, /* flags= */ 0, &mangled);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to mangle unit name '%s': %m", *i);
 
@@ -2881,13 +2909,13 @@ static int analyze_security(sd_bus *bus,
                         if (unit_name_is_valid(mangled, UNIT_NAME_TEMPLATE)) {
                                 r = unit_name_replace_instance(mangled, arg_instance, &instance);
                                 if (r < 0)
-                                        return log_oom();
+                                        return log_error_errno(r, "Failed to replace instance in unit name %s: %m", mangled);
 
                                 name = instance;
                         } else
                                 name = mangled;
 
-                        r = analyze_security_one(bus, name, overview_table, flags, threshold, policy, pager_flags, json_format_flags);
+                        r = analyze_security_one(bus, name, overview_table, scope, flags, threshold, policy, pager_flags, json_format_flags);
                         if (r < 0 && ret >= 0)
                                 ret = r;
                 }
@@ -2911,7 +2939,7 @@ int verb_security(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
         if (!arg_offline) {
-                r = acquire_bus(&bus, NULL);
+                r = acquire_bus(&bus, /* use_full_bus= */ NULL);
                 if (r < 0)
                         return bus_log_connect_error(r, arg_transport, arg_runtime_scope);
         }

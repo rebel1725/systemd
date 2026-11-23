@@ -44,7 +44,7 @@ random_efi_timestamp() { printf "%0.10d" "$((1000000000 + RANDOM))"; }
 # The dmesg- filename contains the backend-type and the Common Platform Error Record, CPER,
 # record id, a 64-bit number.
 #
-# Files are processed in reverse lexigraphical order so as to properly reconstruct original dmesg.
+# Files are processed in reverse lexicographical order so as to properly reconstruct original dmesg.
 
 prepare_efi_logs() {
     local file="${1:?}"
@@ -71,6 +71,10 @@ prepare_efi_logs() {
 }
 
 prepare_erst_logs() {
+    # Called in command substitution ("$(prepare_erst_logs ...)"), where errexit is not inherited
+    # (no inherit_errexit), so re-enable it to make a failing pstore write abort the function.
+    set -e
+
     local file="${1:?}"
     local start_id="${2:?}"
     local id filename

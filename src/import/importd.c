@@ -19,6 +19,7 @@
 #include "constants.h"
 #include "daemon-util.h"
 #include "discover-image.h"
+#include "dlopen-note.h"
 #include "env-util.h"
 #include "event-util.h"
 #include "fd-util.h"
@@ -47,6 +48,7 @@
 #include "varlink-io.systemd.Import.h"
 #include "varlink-io.systemd.service.h"
 #include "varlink-util.h"
+#include "verbs.h"
 #include "web-util.h"
 
 typedef struct Manager Manager;
@@ -222,7 +224,7 @@ static void transfer_send_log_line(Transfer *t, const char *line) {
         assert(t);
         assert(line);
 
-        syslog_parse_priority(&line, &priority, true);
+        syslog_parse_priority(&line, &priority, /* with_facility= */ true);
 
         log_full(priority, "(transfer%" PRIu32 ") %s", t->id, line);
 
@@ -336,7 +338,7 @@ static int transfer_finalize(Transfer *t, bool success) {
 
         assert(t);
 
-        transfer_send_logs(t, true);
+        transfer_send_logs(t, /* flush= */ true);
 
         r = sd_bus_emit_signal(
                         t->manager->api_bus,
@@ -352,11 +354,11 @@ static int transfer_finalize(Transfer *t, bool success) {
                 log_error_errno(r, "Cannot emit message: %m");
 
         if (success)
-                r = varlink_many_reply(t->varlink_subscribed, NULL);
+                r = varlink_many_reply(t->varlink_subscribed, /* parameters= */ NULL);
         else if (t->n_canceled > 0)
-                r = varlink_many_error(t->varlink_subscribed, "io.systemd.Import.TransferCancelled", NULL);
+                r = varlink_many_error(t->varlink_subscribed, "io.systemd.Import.TransferCancelled", /* parameters= */ NULL);
         else
-                r = varlink_many_error(t->varlink_subscribed, "io.systemd.Import.TransferFailed", NULL);
+                r = varlink_many_error(t->varlink_subscribed, "io.systemd.Import.TransferFailed", /* parameters= */ NULL);
         if (r < 0)
                 log_warning_errno(r, "Cannot emit varlink reply, ignoring: %m");
 
@@ -418,9 +420,11 @@ static int transfer_on_log(sd_event_source *s, int fd, uint32_t revents, void *u
                 return 0;
         }
 
+        /* Silence static analyzers, l is bounded by read() count: sizeof - log_message_size */
+        assert((size_t) l <= sizeof(t->log_message) - t->log_message_size);
         t->log_message_size += l;
 
-        transfer_send_logs(t, false);
+        transfer_send_logs(t, /* flush= */ false);
 
         return 0;
 }
@@ -478,7 +482,7 @@ static int transfer_start(Transfer *t) {
                 if (r < 0)
                         log_warning_errno(r, "Failed to update $SYSTEMD_LOG_LEVEL, ignoring: %m");
 
-                r = setenv_systemd_exec_pid(true);
+                r = setenv_systemd_exec_pid(/* update_only= */ true);
                 if (r < 0)
                         log_warning_errno(r, "Failed to update $SYSTEMD_EXEC_PID, ignoring: %m");
 
@@ -718,11 +722,11 @@ static int manager_new(RuntimeScope scope, Manager **ret) {
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, (SIGRTMIN+18)|SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, NULL);
+        r = sd_event_add_signal(m->event, /* ret= */ NULL, (SIGRTMIN+18)|SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, /* userdata= */ NULL);
         if (r < 0)
                 return r;
 
-        r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
+        r = sd_event_add_memory_pressure(m->event, /* ret= */ NULL, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to allocate memory pressure event source, ignoring: %m");
 
@@ -1143,7 +1147,7 @@ static int method_pull_tar_or_raw_or_oci(sd_bus_message *msg, void *userdata, sd
                 if (r == 0)
                         return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
                                                  "Reference '%s' is invalid", remote);
-        } else if (!http_url_is_valid(remote) && !file_url_is_valid(remote))
+        } else if (!http_url_is_valid(remote) && !file_url_is_valid(remote) && !provider_url_is_valid(remote))
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS,
                                          "URL '%s' is invalid", remote);
 
@@ -1291,7 +1295,7 @@ static int method_cancel(sd_bus_message *msg, void *userdata, sd_bus_error *erro
 
         r = bus_verify_polkit_async(
                         msg,
-                        "org.freedesktop.import1.pull",
+                        "org.freedesktop.import1.cancel",
                         /* details= */ NULL,
                         &t->manager->polkit_registry,
                         error);
@@ -1304,7 +1308,7 @@ static int method_cancel(sd_bus_message *msg, void *userdata, sd_bus_error *erro
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(msg, NULL);
+        return sd_bus_reply_method_return(msg, /* types= */ NULL);
 }
 
 static int method_cancel_transfer(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
@@ -1340,7 +1344,7 @@ static int method_cancel_transfer(sd_bus_message *msg, void *userdata, sd_bus_er
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(msg, NULL);
+        return sd_bus_reply_method_return(msg, /* types= */ NULL);
 }
 
 static int method_list_images(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
@@ -1483,9 +1487,11 @@ static int transfer_node_enumerator(
                 sd_bus_error *error) {
 
         _cleanup_strv_free_ char **l = NULL;
-        Manager *m = userdata;
+        Manager *m = ASSERT_PTR(userdata);
         Transfer *t;
         unsigned k = 0;
+
+        assert(nodes);
 
         l = new0(char*, hashmap_size(m->transfers) + 1);
         if (!l)
@@ -1760,7 +1766,7 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to get system bus connection: %m");
 
-        r = sd_bus_attach_event(m->system_bus, m->event, 0);
+        r = sd_bus_attach_event(m->system_bus, m->event, /* priority= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach system bus to event loop: %m");
 
@@ -1773,7 +1779,7 @@ static int manager_connect_bus(Manager *m) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to get user bus connection: %m");
 
-                r = sd_bus_attach_event(m->api_bus, m->event, 0);
+                r = sd_bus_attach_event(m->api_bus, m->event, /* priority= */ 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to attach user bus to event loop: %m");
         }
@@ -1786,7 +1792,7 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_bus_request_name_async(m->api_bus, NULL, "org.freedesktop.import1", 0, NULL, NULL);
+        r = sd_bus_request_name_async(m->api_bus, /* ret_slot= */ NULL, "org.freedesktop.import1", /* flags= */ 0, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request name: %m");
 
@@ -1802,10 +1808,10 @@ static int make_transfer_json(Transfer *t, sd_json_variant **ret) {
 
         r = sd_json_buildo(ret,
                            SD_JSON_BUILD_PAIR_UNSIGNED("id", t->id),
-                           SD_JSON_BUILD_PAIR("type", JSON_BUILD_STRING_UNDERSCORIFY(transfer_type_to_string(t->type))),
+                           JSON_BUILD_PAIR_ENUM("type", transfer_type_to_string(t->type)),
                            SD_JSON_BUILD_PAIR_STRING("remote", t->remote),
                            SD_JSON_BUILD_PAIR_STRING("local", t->local),
-                           SD_JSON_BUILD_PAIR("class", JSON_BUILD_STRING_UNDERSCORIFY(image_class_to_string(t->class))),
+                           JSON_BUILD_PAIR_ENUM("class", image_class_to_string(t->class)),
                            SD_JSON_BUILD_PAIR_REAL("percent", transfer_percent_as_double(t)));
         if (r < 0)
                 return log_error_errno(r, "Failed to build transfer JSON data: %m");
@@ -1837,7 +1843,7 @@ static int vl_method_list_transfers(sd_varlink *link, sd_json_variant *parameter
         if (r != 0)
                 return r;
 
-        r = varlink_set_sentinel(link, "io.systemd.Import.NoTransfers");
+        r = sd_varlink_set_sentinel(link, "io.systemd.Import.NoTransfers");
         if (r < 0)
                 return r;
 
@@ -1908,7 +1914,7 @@ static int vl_method_pull(sd_varlink *link, sd_json_variant *parameters, sd_varl
                         return r;
                 if (r == 0)
                         return sd_varlink_error_invalid_parameter_name(link, "remote");
-        } else if (!http_url_is_valid(p.remote) && !file_url_is_valid(p.remote))
+        } else if (!http_url_is_valid(p.remote) && !file_url_is_valid(p.remote) && !provider_url_is_valid(p.remote))
                 return sd_varlink_error_invalid_parameter_name(link, "remote");
 
         if (p.local && !image_name_is_valid(p.local))
@@ -2019,6 +2025,7 @@ static int manager_connect_varlink(Manager *m) {
                         "io.systemd.Import.Pull",            vl_method_pull,
                         "io.systemd.service.Ping",           varlink_method_ping,
                         "io.systemd.service.SetLogLevel",    varlink_method_set_log_level,
+                        "io.systemd.service.GetLogLevel",    varlink_method_get_log_level,
                         "io.systemd.service.GetEnvironment", varlink_method_get_environment);
         if (r < 0)
                 return log_error_errno(r, "Failed to bind Varlink method calls: %m");
@@ -2074,16 +2081,27 @@ static void manager_parse_env(Manager *m) {
                 log_warning_errno(r, "Failed to parse $SYSTEMD_IMPORT_BTRFS_QUOTA: %m");
 }
 
+COMMAND(
+        "systemd-importd\0",
+        "Import and export VM and container images.",
+        .man_page = "systemd-importd.service(8)",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0"
+                "Runtime scope\0",
+);
+
 static int run(int argc, char *argv[]) {
         _cleanup_(manager_unrefp) Manager *m = NULL;
         RuntimeScope scope = RUNTIME_SCOPE_SYSTEM;
         int r;
 
+        LIBSELINUX_NOTE(recommended);
+
         log_setup();
 
-        r = service_parse_argv("systemd-importd.service",
-                               "VM and container image import and export service.",
-                               BUS_IMPLEMENTATIONS(&manager_object,
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object,
                                                    &log_control_object),
                                &scope,
                                argc, argv);
@@ -2106,7 +2124,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
-        r = sd_notify(false, NOTIFY_READY_MESSAGE);
+        r = sd_notify(/* unset_environment= */ false, NOTIFY_READY_MESSAGE);
         if (r < 0)
                 log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
 

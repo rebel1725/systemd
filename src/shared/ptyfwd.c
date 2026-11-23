@@ -11,6 +11,8 @@
 
 #include "alloc-util.h"
 #include "ansi-color.h"
+#include "ansi-seq.h"
+#include "csi-inband-resize.h"
 #include "env-util.h"
 #include "errno-util.h"
 #include "extract-word.h"
@@ -37,7 +39,10 @@ typedef enum AnsiColorState  {
         _ANSI_COLOR_STATE_INVALID = -EINVAL,
 } AnsiColorState;
 
-#define ANSI_SEQUENCE_LENGTH_MAX 192U
+/* Use the same limit as the AnsiSeqParser, so that a sequence that ptybrokerd considers too long (and hence
+ * passes on unscathed) is considered too long by us as well, and vice versa. Note that for CSI sequences
+ * the limit covers the parameter and intermediate bytes plus the final byte. */
+#define ANSI_SEQUENCE_LENGTH_MAX ANSI_SEQ_STRING_MAX
 #define ANSI_SEQUENCE_WINDOW_TITLE_MAX 128U
 
 assert_cc(ANSI_SEQUENCE_LENGTH_MAX > ANSI_SEQUENCE_WINDOW_TITLE_MAX);
@@ -110,9 +115,41 @@ struct PTYForward {
 
         char *title;           /* Window title to show by default */
         char *title_prefix;    /* If terminal client overrides window title, prefix this string */
+
+        /* CSI 2048/48 (in-band window resize notifications): we implement the terminal side towards
+         * the pty, i.e. we handle the requests to enable/disable/query the mode arriving via the master fd,
+         * and generate size reports into the input stream while it is enabled. */
+        AnsiSeqParser inband_resize_input_parser; /* Tracks ANSI sequence boundaries on the input (stdin → master) stream */
+        bool inband_resize_enabled;               /* CSI 2048/48 is currently enabled */
+        char *inband_resize_mode_reply;           /* A generated DECRPM reply, waiting for insertion into the input stream */
+        char *inband_resize_report;               /* A generated size report, waiting for insertion into the input stream */
 };
 
 #define ESCAPE_USEC (1*USEC_PER_SEC)
+
+/* Maximum size of the DECRPM replies we keep queued for insertion into the input stream. Must be well below
+ * LINE_MAX, since the queue is inserted into the input buffer in one go. */
+#define INBAND_RESIZE_MODE_REPLY_MAX 256U
+
+static int pty_forward_add_defer(PTYForward *f);
+
+static void pty_forward_inband_resize_disable(PTYForward *f) {
+        assert(f);
+
+        /* Disables CSI 2048/48, and drops a size report that has been generated already but not been
+         * inserted into the input stream yet. A pending DECRPM reply is left in place however: it answers a
+         * query made before, and the query deserves its answer. */
+        f->inband_resize_enabled = false;
+        f->inband_resize_report = mfree(f->inband_resize_report);
+}
+
+static void pty_forward_inband_resize_reset(PTYForward *f) {
+        assert(f);
+
+        /* Disables CSI 2048/48, and drops any replies not sent yet */
+        pty_forward_inband_resize_disable(f);
+        f->inband_resize_mode_reply = mfree(f->inband_resize_mode_reply);
+}
 
 static void pty_forward_disconnect(PTYForward *f) {
 
@@ -152,7 +189,7 @@ static void pty_forward_disconnect(PTYForward *f) {
                 }
 
                 /* STDIN/STDOUT should not be non-blocking normally, so let's reset it */
-                (void) fd_nonblock(f->output_fd, false);
+                (void) fd_nonblock(f->output_fd, /* nonblock= */ false);
 
                 if (f->close_output_fd)
                         f->output_fd = safe_close(f->output_fd);
@@ -162,7 +199,7 @@ static void pty_forward_disconnect(PTYForward *f) {
                 if (f->saved_stdin)
                         (void) tcsetattr(f->input_fd, TCSANOW, &f->saved_stdin_attr);
 
-                (void) fd_nonblock(f->input_fd, false);
+                (void) fd_nonblock(f->input_fd, /* nonblock= */ false);
                 if (f->close_input_fd)
                         f->input_fd = safe_close(f->input_fd);
         }
@@ -178,6 +215,9 @@ static void pty_forward_disconnect(PTYForward *f) {
         f->csi_sequence = mfree(f->csi_sequence);
         f->osc_sequence = mfree(f->osc_sequence);
         f->ansi_color_state = _ANSI_COLOR_STATE_INVALID;
+
+        pty_forward_inband_resize_reset(f);
+        ansi_seq_parser_done(&f->inband_resize_input_parser);
 }
 
 static int pty_forward_done(PTYForward *f, int rcode) {
@@ -459,6 +499,190 @@ static int insert_window_title_fix(PTYForward *f, size_t offset) {
         return insert_string(f, offset, joined);
 }
 
+static int pty_forward_inband_resize_insert(PTYForward *f, char **reply) {
+        assert(f);
+        assert(reply);
+
+        /* Inserts a pending reply into the input stream, but only at a safe position, i.e. never in the
+         * middle of an ANSI sequence the terminal is currently sending us, and only if there's room in the
+         * input buffer. */
+
+        if (!*reply)
+                return 0;
+
+        if (f->inband_resize_input_parser.state != ANSI_SEQ_STATE_GROUND)
+                return 0;
+
+        size_t l = strlen(*reply);
+        if (f->in_buffer_full + l > LINE_MAX)
+                return 0;
+
+        memcpy(f->in_buffer + f->in_buffer_full, *reply, l);
+        f->in_buffer_full += l;
+
+        *reply = mfree(*reply);
+        return 1;
+}
+
+static int pty_forward_inband_resize_flush(PTYForward *f) {
+        int r, ret;
+
+        assert(f);
+
+        /* Inserts the pending CSI 2048/48 replies into the input stream, if possible. The DECRPM reply goes
+         * first, so that the size report is never ahead of it. */
+
+        ret = r = pty_forward_inband_resize_insert(f, &f->inband_resize_mode_reply);
+        if (r < 0 || f->inband_resize_mode_reply)
+                return r;
+
+        r = pty_forward_inband_resize_insert(f, &f->inband_resize_report);
+        if (r < 0)
+                return r;
+
+        return ret > 0 || r > 0;
+}
+
+static int pty_forward_inband_resize_maybe_report(PTYForward *f) {
+        int r;
+
+        assert(f);
+
+        /* Generates a size report if CSI 2048/48 is enabled */
+
+        if (!f->inband_resize_enabled)
+                return 0;
+
+        /* Take the dimensions from the master if we can (it's authoritative: explicitly set dimensions end
+         * up there), with a fallback to the output fd (the master might not be a tty at all, for example
+         * when we are forwarding a monitor stream of ptybrokerd). */
+        struct winsize ws;
+        if (ioctl(f->master, TIOCGWINSZ, &ws) < 0 &&
+            ioctl(f->output_fd, TIOCGWINSZ, &ws) < 0) {
+                log_debug_errno(errno, "Failed to query terminal dimensions, ignoring: %m");
+                return 0;
+        }
+
+        /* If an earlier report is still waiting for insertion into the input stream, it is outdated now,
+         * hence replace it. */
+        _cleanup_free_ char *report = NULL;
+        r = inband_resize_format_report(
+                        &(const InbandResizeReport) {
+                                .lines = ws.ws_row,
+                                .columns = ws.ws_col,
+                                .height_pixels = ws.ws_ypixel,
+                                .width_pixels = ws.ws_xpixel,
+                        },
+                        &report);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to format window size report: %m");
+
+        free_and_replace(f->inband_resize_report, report);
+
+        return pty_forward_inband_resize_flush(f);
+}
+
+static int pty_forward_inband_resize_process(PTYForward *f, size_t *i) {
+        int r;
+
+        assert(f);
+        assert(i);
+        assert(*i < f->out_buffer_full);
+
+        /* Checks whether the CSI sequence that just completed at offset *i of the output buffer is a request
+         * regarding CSI 2048/48. If so, consumes it: we implement the terminal side towards the pty, hence
+         * such requests are addressed to us and must not leak to the outer terminal. If the request also
+         * covers other modes, the sequence is rewritten to cover only those. Returns > 0 if the sequence was
+         * consumed (and possibly rewritten), 0 otherwise. */
+
+        if (FLAGS_SET(f->flags, PTY_FORWARD_TRANSPARENT))
+                return 0;
+
+        /* All CSI 2048/48 requests are DEC private mode sequences, hence quickly skip everything else */
+        if (!f->csi_sequence || f->csi_sequence[0] != '?')
+                return 0;
+
+        _cleanup_free_ char *csi = strjoin(f->csi_sequence, CHAR_TO_STR(f->out_buffer[*i]));
+        if (!csi)
+                return -ENOMEM;
+
+        _cleanup_free_ char *remaining = NULL;
+        InbandResizeRequest request;
+        r = inband_resize_parse_request(csi, &request, &remaining);
+        if (r <= 0)
+                return r;
+
+        /* Excise the full sequence from the output buffer: CSI (2 bytes) + parameters + final byte. None of
+         * it can have been flushed yet, since out_buffer_write_len is only advanced outside of ANSI
+         * sequences. */
+        size_t l = 2 + strlen(csi);
+        assert(*i + 1 >= l);
+        size_t begin = *i + 1 - l;
+        assert(f->out_buffer_write_len <= begin);
+
+        memmove(f->out_buffer + begin, f->out_buffer + *i + 1, f->out_buffer_full - *i - 1);
+        f->out_buffer_full -= l;
+        *i = begin - 1; /* NB: this may wrap around to SIZE_MAX if the sequence started the buffer, which the
+                         * caller's loop increment brings back to 0 */
+
+        if (remaining) {
+                /* Put the request for the other modes back in */
+                _cleanup_free_ char *s = strjoin("\x1B[", remaining);
+                if (!s)
+                        return -ENOMEM;
+
+                r = insert_string(f, begin, s);
+                if (r < 0)
+                        return r;
+
+                *i += r;
+        }
+
+        switch (request) {
+
+        case INBAND_RESIZE_ENABLE:
+                /* As per spec, enabling the mode results in an immediate report, even if it was enabled
+                 * already */
+                f->inband_resize_enabled = true;
+                r = pty_forward_inband_resize_maybe_report(f);
+                if (r < 0)
+                        return r;
+                break;
+
+        case INBAND_RESIZE_DISABLE:
+                pty_forward_inband_resize_disable(f);
+                break;
+
+        case INBAND_RESIZE_QUERY: {
+                _cleanup_free_ char *reply = NULL;
+                r = inband_resize_format_mode_report(
+                                f->inband_resize_enabled ? INBAND_RESIZE_MODE_SET : INBAND_RESIZE_MODE_RESET,
+                                &reply);
+                if (r < 0)
+                        return r;
+
+                /* If an earlier reply is still waiting for insertion into the input stream, queue this one
+                 * after it, so that every query gets its answer. But put a limit on this, so that a payload
+                 * flooding us with queries while the input stream is stalled can't make us grow the queue
+                 * without bounds. */
+                if (strlen_ptr(f->inband_resize_mode_reply) + strlen(reply) > INBAND_RESIZE_MODE_REPLY_MAX)
+                        log_debug("Too many CSI 2048/48 replies pending, dropping reply.");
+                else if (!strextend(&f->inband_resize_mode_reply, reply))
+                        return -ENOMEM;
+
+                r = pty_forward_inband_resize_flush(f);
+                if (r < 0)
+                        return r;
+                break;
+        }
+
+        default:
+                assert_not_reached();
+        }
+
+        return 1;
+}
+
 static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
         int r;
 
@@ -498,6 +722,10 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
                                         return r;
 
                                 i += r;
+
+                                /* A full reset resets all modes, including CSI 2048/48 */
+                                pty_forward_inband_resize_disable(f);
+
                                 f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
                         } else
                                 f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
@@ -509,8 +737,9 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
                                 /* If this is a "parameter" or "intermediary" byte (i.e. ranges 0x20…0x2F and
                                  * 0x30…0x3F) then we are still in the CSI sequence */
 
-                                if (strlen_ptr(f->csi_sequence) >= ANSI_SEQUENCE_LENGTH_MAX) {
-                                        /* Safety check: lets not accept unbounded CSI sequences */
+                                if (strlen_ptr(f->csi_sequence) + 1 >= ANSI_SEQUENCE_LENGTH_MAX) {
+                                        /* Safety check: lets not accept unbounded CSI sequences (leave
+                                         * room for the final byte) */
 
                                         f->csi_sequence = mfree(f->csi_sequence);
                                         f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
@@ -534,6 +763,11 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
                                                 return r;
 
                                         i += r;
+                                } else {
+                                        /* Maybe a CSI 2048/48 request, which we handle ourselves */
+                                        r = pty_forward_inband_resize_process(f, &i);
+                                        if (r < 0)
+                                                return r;
                                 }
 
                                 f->csi_sequence = mfree(f->csi_sequence);
@@ -601,6 +835,17 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
         return 0;
 }
 
+static void pty_forward_master_hangup(PTYForward *f) {
+        assert(f);
+
+        /* The master side is gone: stop all I/O on it */
+
+        f->master_readable = f->master_writable = false;
+        f->master_hangup = true;
+
+        f->master_event_source = sd_event_source_unref(f->master_event_source);
+}
+
 static int do_shovel(PTYForward *f) {
         ssize_t k;
         int r;
@@ -648,6 +893,16 @@ static int do_shovel(PTYForward *f) {
         for (;;) {
                 bool did_something = false;
 
+                /* If a CSI 2048/48 reply is still waiting for insertion into the input stream, try again
+                 * now: the input sequence tracker might have progressed or the input buffer might have
+                 * drained since we last tried. Do this independently of stdin readability, so that a reply
+                 * is never stuck just because the user doesn't type. */
+                r = pty_forward_inband_resize_flush(f);
+                if (r < 0)
+                        return r;
+                if (r > 0)
+                        did_something = true;
+
                 if (f->stdin_readable && f->in_buffer_full < LINE_MAX) {
 
                         k = read(f->input_fd, f->in_buffer + f->in_buffer_full, LINE_MAX - f->in_buffer_full);
@@ -669,19 +924,27 @@ static int do_shovel(PTYForward *f) {
 
                                 f->stdin_event_source = sd_event_source_unref(f->stdin_event_source);
                         } else {
-                                /* Check if ^] has been pressed three times within one second. If we get this we quite
-                                 * immediately. */
-                                RequestOperation q = look_for_escape(f, f->in_buffer + f->in_buffer_full, k);
-                                f->in_buffer_full += (size_t) k;
-                                if (q < 0)
-                                        return q;
-                                if (q == REQUEST_EXIT)
-                                        return -ECANCELED;
-                                if (q >= REQUEST_HOTKEY_A && q <= REQUEST_HOTKEY_Z && f->hotkey_handler) {
-                                        r = f->hotkey_handler(f, q - REQUEST_HOTKEY_BASE, f->hotkey_userdata);
-                                        if (r < 0)
-                                                return r;
-                                }
+                                if (!FLAGS_SET(f->flags, PTY_FORWARD_TRANSPARENT)) {
+                                        /* Keep the input ANSI sequence tracker up-to-date, so that we know
+                                         * where CSI 2048/48 replies may be inserted safely */
+                                        for (ssize_t j = 0; j < k; j++)
+                                                (void) ansi_seq_parser_feed_harder(&f->inband_resize_input_parser, f->in_buffer[f->in_buffer_full + j]);
+
+                                        /* Check if ^] has been pressed three times within one second. If we get this we quit
+                                         * immediately. */
+                                        RequestOperation q = look_for_escape(f, f->in_buffer + f->in_buffer_full, k);
+                                        f->in_buffer_full += (size_t) k;
+                                        if (q < 0)
+                                                return q;
+                                        if (q == REQUEST_EXIT)
+                                                return -ECANCELED;
+                                        if (q >= REQUEST_HOTKEY_A && q <= REQUEST_HOTKEY_Z && f->hotkey_handler) {
+                                                r = f->hotkey_handler(f, q - REQUEST_HOTKEY_BASE, f->hotkey_userdata);
+                                                if (r < 0)
+                                                        return r;
+                                        }
+                                } else
+                                        f->in_buffer_full += (size_t) k;
                         }
 
                         did_something = true;
@@ -694,12 +957,9 @@ static int do_shovel(PTYForward *f) {
 
                                 if (IN_SET(errno, EAGAIN, EIO))
                                         f->master_writable = false;
-                                else if (IN_SET(errno, EPIPE, ECONNRESET)) {
-                                        f->master_writable = f->master_readable = false;
-                                        f->master_hangup = true;
-
-                                        f->master_event_source = sd_event_source_unref(f->master_event_source);
-                                } else
+                                else if (ERRNO_IS_DISCONNECT(errno))
+                                        pty_forward_master_hangup(f);
+                                else
                                         return log_error_errno(errno, "write(): %m");
                         } else {
                                 assert(f->in_buffer_full >= (size_t) k);
@@ -721,14 +981,14 @@ static int do_shovel(PTYForward *f) {
 
                                 if (errno == EAGAIN || (errno == EIO && !pty_forward_vhangup_honored(f)))
                                         f->master_readable = false;
-                                else if (IN_SET(errno, EPIPE, ECONNRESET, EIO)) {
-                                        f->master_readable = f->master_writable = false;
-                                        f->master_hangup = true;
-
-                                        f->master_event_source = sd_event_source_unref(f->master_event_source);
-                                } else
+                                else if (errno == EIO || ERRNO_IS_DISCONNECT(errno))
+                                        pty_forward_master_hangup(f);
+                                else
                                         return log_error_errno(errno, "Failed to read from pty master fd: %m");
-                        } else {
+                        } else if (k == 0)
+                                /* EOF on master? (can only really happen if the master wasn't really a master) */
+                                pty_forward_master_hangup(f);
+                        else {
                                 f->read_from_master = true;
                                 size_t scan_index = f->out_buffer_full;
                                 f->out_buffer_full += (size_t) k;
@@ -801,13 +1061,13 @@ static int shovel(PTYForward *f) {
 
                 if ((f->out_buffer_write_len <= 0 || f->stdout_hangup) &&
                     (f->in_buffer_full <= 0 || f->master_hangup))
-                        return pty_forward_done(f, 0);
+                        return pty_forward_done(f, /* rcode= */ 0);
         }
 
         /* If we were asked to drain, and there's nothing more to handle from the master, then call the callback
          * too. */
         if (f->drain && drained(f))
-                return pty_forward_done(f, 0);
+                return pty_forward_done(f, /* rcode= */ 0);
 
         return 0;
 }
@@ -881,24 +1141,25 @@ static int on_sigwinch_event(sd_event_source *e, const struct signalfd_siginfo *
         if (ioctl(f->output_fd, TIOCGWINSZ, &ws) >= 0)
                 (void) ioctl(f->master, TIOCSWINSZ, &ws);
 
+        /* If CSI 2048/48 is enabled, report the new size. (ignore failures) */
+        if (pty_forward_inband_resize_maybe_report(f) > 0)
+                (void) pty_forward_add_defer(f);
+
         return 0;
 }
 
 static int on_exit_event(sd_event_source *e, void *userdata) {
         PTYForward *f = ASSERT_PTR(userdata);
-        int r;
 
         assert(e);
         assert(e == f->exit_event_source);
 
-        if (!pty_forward_drain(f)) {
-                /* If not drained, try to drain the buffer. */
-                r = shovel_force(f);
-                if (r < 0)
-                        return r;
-        }
-
-        return pty_forward_done(f, 0);
+        /* The event loop is exiting while the forwarder is still active. Force a final synchronous drain of
+         * whatever is still buffered. shovel() may complete the drain and call pty_forward_done(), which
+         * can free f via the hangup handler, so we must not touch f afterwards, only propagate the return
+         * value, exactly like on_master_event() does. */
+        f->drain = true;
+        return shovel_force(f);
 }
 
 static int on_defer_event(sd_event_source *s, void *userdata) {
@@ -931,6 +1192,24 @@ int pty_forward_new(
         assert(master >= 0);
         assert(ret);
 
+        if (!FLAGS_SET(flags, PTY_FORWARD_READ_ONLY)) {
+                /* If stdin isn't actually opened for reading, or refers to the read end of a pipe (or
+                 * socket) whose peer has already hung up, then there's nothing for us to forward — imply
+                 * read-only mode. */
+                r = RET_NERRNO(fcntl(STDIN_FILENO, F_GETFL));
+                if (r < 0 && r != -EBADF)
+                        return log_debug_errno(r, "Failed to query stdin flags: %m");
+                if (r == -EBADF || (r & O_ACCMODE_STRICT) == O_WRONLY)
+                        flags |= PTY_FORWARD_READ_ONLY;
+                else {
+                        r = pipe_eof(STDIN_FILENO);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to check whether stdin is at EOF, ignoring: %m");
+                        else if (r > 0)
+                                flags |= PTY_FORWARD_READ_ONLY;
+                }
+        }
+
         f = new(PTYForward, 1);
         if (!f)
                 return -ENOMEM;
@@ -959,19 +1238,16 @@ int pty_forward_new(
                  * them. This has two advantages: when we are killed abruptly the stdin/stdout fds won't be
                  * left in O_NONBLOCK state for the next process using them. In addition, if some process
                  * running in the background wants to continue writing to our stdout it can do so without
-                 * being confused by O_NONBLOCK.
-                 * We keep O_APPEND (if present) on the output FD and (try to) keep current file position on
-                 * both input and output FD (principle of least surprise).
-                 */
+                 * being confused by O_NONBLOCK. Regular file output is dup'ed instead, to keep the file offset
+                 * shared with the caller. */
 
-                f->input_fd = fd_reopen_propagate_append_and_position(
-                                STDIN_FILENO, O_RDONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+                f->input_fd = fd_dup_or_reopen_stdio_nonblock(STDIN_FILENO, O_RDONLY);
                 if (f->input_fd < 0) {
                         /* Handle failures gracefully, after all certain fd types cannot be reopened
                          * (sockets, …) */
                         log_debug_errno(f->input_fd, "Failed to reopen stdin, using original fd: %m");
 
-                        r = fd_nonblock(STDIN_FILENO, true);
+                        r = fd_nonblock(STDIN_FILENO, /* nonblock= */ true);
                         if (r < 0)
                                 return r;
 
@@ -979,12 +1255,11 @@ int pty_forward_new(
                 } else
                         f->close_input_fd = true;
 
-                f->output_fd = fd_reopen_propagate_append_and_position(
-                                STDOUT_FILENO, O_WRONLY|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+                f->output_fd = fd_dup_or_reopen_stdio_nonblock(STDOUT_FILENO, O_WRONLY);
                 if (f->output_fd < 0) {
                         log_debug_errno(f->output_fd, "Failed to reopen stdout, using original fd: %m");
 
-                        r = fd_nonblock(STDOUT_FILENO, true);
+                        r = fd_nonblock(STDOUT_FILENO, /* nonblock= */ true);
                         if (r < 0)
                                 return r;
 
@@ -993,7 +1268,7 @@ int pty_forward_new(
                         f->close_output_fd = true;
         }
 
-        r = fd_nonblock(master, true);
+        r = fd_nonblock(master, /* nonblock= */ true);
         if (r < 0)
                 return r;
 
@@ -1163,9 +1438,11 @@ int pty_forward_set_priority(PTYForward *f, int64_t priority) {
                         return r;
         }
 
-        r = sd_event_source_set_priority(f->stdout_event_source, priority);
-        if (r < 0)
-                return r;
+        if (f->stdout_event_source) {
+                r = sd_event_source_set_priority(f->stdout_event_source, priority);
+                if (r < 0)
+                        return r;
+        }
 
         r = sd_event_source_set_priority(f->master_event_source, priority);
         if (r < 0)
@@ -1213,6 +1490,10 @@ int pty_forward_set_width_height(PTYForward *f, unsigned width, unsigned height)
 
         /* Make sure we ignore SIGWINCH window size events from now on */
         f->sigwinch_event_source = sd_event_source_unref(f->sigwinch_event_source);
+
+        /* If CSI 2048/48 is enabled, report the new size */
+        if (pty_forward_inband_resize_maybe_report(f) > 0)
+                (void) pty_forward_add_defer(f);
 
         return 0;
 }

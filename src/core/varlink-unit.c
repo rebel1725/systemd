@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "sd-bus.h"
 #include "sd-json.h"
 
 #include "bitfield.h"
@@ -10,21 +11,38 @@
 #include "execute.h"
 #include "format-util.h"
 #include "install.h"
+#include "job.h"
 #include "json-util.h"
+#include "locale-util.h"
 #include "manager.h"
+#include "object-tags.h"
 #include "path-util.h"
 #include "pidref.h"
+#include "scope.h"
 #include "selinux-access.h"
+#include "service.h"
 #include "set.h"
 #include "strv.h"
+#include "unit-name.h"
 #include "unit.h"
+#include "varlink-automount.h"
 #include "varlink-cgroup.h"
+#include "varlink-common.h"
 #include "varlink-execute.h"
+#include "varlink-job.h"
+#include "varlink-kill.h"
+#include "varlink-mount.h"
+#include "varlink-path.h"
+#include "varlink-scope.h"
+#include "varlink-service.h"
+#include "varlink-socket.h"
+#include "varlink-swap.h"
+#include "varlink-timer.h"
 #include "varlink-unit.h"
 #include "varlink-util.h"
 
 #define JSON_BUILD_EMERGENCY_ACTION_NON_EMPTY(name, value) \
-        SD_JSON_BUILD_PAIR_CONDITION(value > EMERGENCY_ACTION_NONE, name, SD_JSON_BUILD_STRING(emergency_action_to_string(value)))
+        SD_JSON_BUILD_PAIR_CONDITION(value > EMERGENCY_ACTION_NONE, name, JSON_BUILD_STRING_UNDERSCORIFY(emergency_action_to_string(value)))
 
 static int unit_dependencies_build_json(sd_json_variant **ret, const char *name, void *userdata) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
@@ -112,6 +130,18 @@ static int unit_context_build_json(sd_json_variant **ret, const char *name, void
          * If it make sense to place a property into a config/unit file it belongs to Context.
          * Otherwise it's a 'Runtime'. */
 
+        /* TODO missing callbacks */
+        static const sd_json_build_callback_t unit_type_callbacks[_UNIT_TYPE_MAX] = {
+                [UNIT_AUTOMOUNT] = automount_context_build_json,
+                [UNIT_MOUNT]     = mount_context_build_json,
+                [UNIT_PATH]      = path_context_build_json,
+                [UNIT_SCOPE]     = scope_context_build_json,
+                [UNIT_SERVICE]   = service_context_build_json,
+                [UNIT_SOCKET]    = socket_context_build_json,
+                [UNIT_SWAP]      = swap_context_build_json,
+                [UNIT_TIMER]     = timer_context_build_json,
+        };
+
         return sd_json_buildo(
                         ASSERT_PTR(ret),
                         SD_JSON_BUILD_PAIR_STRING("Type", unit_type_to_string(u->type)),
@@ -122,6 +152,7 @@ static int unit_context_build_json(sd_json_variant **ret, const char *name, void
                          * https://www.freedesktop.org/software/systemd/man/latest/systemd.unit.html#%5BUnit%5D%20Section%20Options */
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("Description", u->description),
                         JSON_BUILD_PAIR_STRV_NON_EMPTY("Documentation", u->documentation),
+                        JSON_BUILD_PAIR_STRV_NON_EMPTY("Tags", u->tags),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("Wants", unit_dependencies_build_json, u),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("WantedBy", unit_dependencies_build_json, u),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("Requires", unit_dependencies_build_json, u),
@@ -149,8 +180,8 @@ static int unit_context_build_json(sd_json_variant **ret, const char *name, void
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("JoinsNamespaceOf", unit_dependencies_build_json, u),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("RequiresMountsFor", unit_mounts_for_build_json, &u->mounts_for),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("WantsMountsFor", unit_mounts_for_build_json, &u->mounts_for),
-                        SD_JSON_BUILD_PAIR_STRING("OnSuccessJobMode", job_mode_to_string(u->on_success_job_mode)),
-                        SD_JSON_BUILD_PAIR_STRING("OnFailureJobMode", job_mode_to_string(u->on_failure_job_mode)),
+                        JSON_BUILD_PAIR_ENUM("OnSuccessJobMode", job_mode_to_string(u->on_success_job_mode)),
+                        JSON_BUILD_PAIR_ENUM("OnFailureJobMode", job_mode_to_string(u->on_failure_job_mode)),
                         SD_JSON_BUILD_PAIR_BOOLEAN("IgnoreOnIsolate", u->ignore_on_isolate),
                         SD_JSON_BUILD_PAIR_BOOLEAN("StopWhenUnneeded", u->stop_when_unneeded),
                         SD_JSON_BUILD_PAIR_BOOLEAN("RefuseManualStart", u->refuse_manual_start),
@@ -158,7 +189,7 @@ static int unit_context_build_json(sd_json_variant **ret, const char *name, void
                         SD_JSON_BUILD_PAIR_BOOLEAN("AllowIsolate", u->allow_isolate),
                         SD_JSON_BUILD_PAIR_BOOLEAN("DefaultDependencies", u->default_dependencies),
                         SD_JSON_BUILD_PAIR_BOOLEAN("SurviveFinalKillSignal", u->survive_final_kill_signal),
-                        SD_JSON_BUILD_PAIR_STRING("CollectMode", collect_mode_to_string(u->collect_mode)),
+                        JSON_BUILD_PAIR_ENUM("CollectMode", collect_mode_to_string(u->collect_mode)),
                         JSON_BUILD_EMERGENCY_ACTION_NON_EMPTY("FailureAction", u->failure_action),
                         JSON_BUILD_EMERGENCY_ACTION_NON_EMPTY("SuccessAction", u->success_action),
                         JSON_BUILD_PAIR_INTEGER_NON_NEGATIVE("FailureActionExitStatus", u->failure_action_exit_status),
@@ -189,18 +220,9 @@ static int unit_context_build_json(sd_json_variant **ret, const char *name, void
                         SD_JSON_BUILD_PAIR_BOOLEAN("DebugInvocation", u->debug_invocation),
 
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("CGroup", unit_cgroup_context_build_json, u),
-                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("Exec", unit_exec_context_build_json, u));
-
-        // TODO follow up PRs:
-        // JSON_BUILD_PAIR_CALLBACK_NON_NULL("Exec", exec_context_build_json, u)
-        // JSON_BUILD_PAIR_CALLBACK_NON_NULL("Kill", kill_context_build_json, u)
-        // Mount/Automount context
-        // Path context
-        // Scope context
-        // Swap context
-        // Timer context
-        // Service context
-        // Socket context
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("Exec", unit_exec_context_build_json, u),
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("Kill", unit_kill_context_build_json, unit_get_kill_context(u)),
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL(unit_type_to_capitalized_string(u->type), unit_type_callbacks[u->type], u));
 }
 
 static int can_clean_build_json(sd_json_variant **ret, const char *name, void *userdata) {
@@ -225,7 +247,7 @@ static int can_clean_build_json(sd_json_variant **ret, const char *name, void *u
         }
 
         if (FLAGS_SET(mask, EXEC_CLEAN_FDSTORE)) {
-                r = sd_json_variant_append_arrayb(&v, SD_JSON_BUILD_STRING("fdstore"));
+                r = sd_json_variant_append_arrayb(&v, JSON_BUILD_CONST_STRING("fdstore"));
                 if (r < 0)
                         return r;
         }
@@ -280,6 +302,18 @@ static int unit_runtime_build_json(sd_json_variant **ret, const char *name, void
         Unit *u = ASSERT_PTR(userdata);
         Unit *f = unit_following(u);
 
+        /* TODO missing callbacks */
+        static const sd_json_build_callback_t unit_type_callbacks[_UNIT_TYPE_MAX] = {
+                [UNIT_AUTOMOUNT] = automount_runtime_build_json,
+                [UNIT_MOUNT]     = mount_runtime_build_json,
+                [UNIT_PATH]      = path_runtime_build_json,
+                [UNIT_SCOPE]     = scope_runtime_build_json,
+                [UNIT_SERVICE]   = service_runtime_build_json,
+                [UNIT_SOCKET]    = socket_runtime_build_json,
+                [UNIT_SWAP]      = swap_runtime_build_json,
+                [UNIT_TIMER]     = timer_runtime_build_json,
+        };
+
         return sd_json_buildo(
                         ASSERT_PTR(ret),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("Following", f ? f->id : NULL),
@@ -306,10 +340,11 @@ static int unit_runtime_build_json(sd_json_variant **ret, const char *name, void
                         SD_JSON_BUILD_PAIR_BOOLEAN("AssertResult", u->assert_result),
                         JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("ConditionTimestamp", &u->condition_timestamp),
                         JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("AssertTimestamp", &u->assert_timestamp),
-                        SD_JSON_BUILD_PAIR_CONDITION(!sd_id128_is_null(u->invocation_id), "InvocationID", SD_JSON_BUILD_UUID(u->invocation_id)),
+                        SD_JSON_BUILD_PAIR_CONDITION(unit_has_invocation_id(u), "InvocationID", SD_JSON_BUILD_UUID(u->invocation_id)),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("Markers", markers_build_json, &u->markers),
                         JSON_BUILD_PAIR_CALLBACK_NON_NULL("ActivationDetails", activation_details_build_json, u->activation_details),
-                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("CGroup", unit_cgroup_runtime_build_json, u));
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL("CGroup", unit_cgroup_runtime_build_json, u),
+                        JSON_BUILD_PAIR_CALLBACK_NON_NULL(unit_type_to_capitalized_string(u->type), unit_type_callbacks[u->type], u));
 }
 
 static int list_unit_one(sd_varlink *link, Unit *unit) {
@@ -331,7 +366,7 @@ static int list_unit_one_with_selinux_access_check(sd_varlink *link, Unit *unit)
         if (r < 0)
                 /* If mac_selinux_unit_access_check_varlink() returned a error,
                  * it means that SELinux enforce is on. It also does all the logging(). */
-                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, /* parameters= */ NULL);
 
         return list_unit_one(link, unit);
 }
@@ -378,9 +413,9 @@ static int load_unit_and_check(sd_varlink *link, Manager *manager, const char *n
         /* manager_load_unit() will create an object regardless of whether the unit actually exists, so
          * check the state and refuse if it's not in a good state. */
         if (IN_SET(unit->load_state, UNIT_NOT_FOUND, UNIT_STUB, UNIT_MERGED))
-                return sd_varlink_error(link, "io.systemd.Unit.NoSuchUnit", NULL);
+                return sd_varlink_error(link, "io.systemd.Unit.NoSuchUnit", /* parameters= */ NULL);
         if (unit->load_state == UNIT_BAD_SETTING)
-                return sd_varlink_error(link, "io.systemd.Unit.UnitError", NULL);
+                return sd_varlink_error(link, "io.systemd.Unit.UnitError", /* parameters= */ NULL);
         if (unit->load_state == UNIT_ERROR)
                 return sd_varlink_errorbo(
                         link,
@@ -389,7 +424,7 @@ static int load_unit_and_check(sd_varlink *link, Manager *manager, const char *n
                         SD_JSON_BUILD_PAIR_INTEGER("errno", unit->load_error),
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("errnoName", "io.systemd.Unit.UnitError"));
         if (unit->load_state == UNIT_MASKED)
-                return sd_varlink_error(link, "io.systemd.Unit.UnitMasked", NULL);
+                return sd_varlink_error(link, "io.systemd.Unit.UnitMasked", /* parameters= */ NULL);
         assert(UNIT_IS_LOAD_COMPLETE(unit->load_state));
 
         *ret_unit = unit;
@@ -512,9 +547,9 @@ int vl_method_list_units(sd_varlink *link, sd_json_variant *parameters, sd_varli
                 return list_unit_one_with_selinux_access_check(link, unit);
 
         if (!FLAGS_SET(flags, SD_VARLINK_METHOD_MORE))
-                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, /* parameters= */ NULL);
 
-        r = varlink_set_sentinel(link, VARLINK_ERROR_UNIT_NO_SUCH_UNIT);
+        r = sd_varlink_set_sentinel(link, VARLINK_ERROR_UNIT_NO_SUCH_UNIT);
         if (r < 0)
                 return r;
 
@@ -522,6 +557,10 @@ int vl_method_list_units(sd_varlink *link, sd_json_variant *parameters, sd_varli
                 /* ignore aliases */
                 if (k != unit->id)
                         continue;
+
+                r = mac_selinux_unit_access_check_varlink(unit, link, "status");
+                if (r < 0)
+                        continue; /* silently skip units the caller is not allowed to see */
 
                 r = list_unit_one(link, unit);
                 if (r < 0)
@@ -537,6 +576,7 @@ int varlink_unit_queue_job_one(
                 JobMode mode,
                 bool reload_if_possible,
                 uint32_t *ret_job_id,
+                Job **ret_job,
                 sd_bus_error *reterr_bus_error) {
 
         int r;
@@ -557,6 +597,8 @@ int varlink_unit_queue_job_one(
 
         if (ret_job_id)
                 *ret_job_id = j->id;
+        if (ret_job)
+                *ret_job = j;
 
         return 0;
 }
@@ -568,13 +610,968 @@ int varlink_error_no_such_unit(sd_varlink *v, const char *name) {
                         JSON_BUILD_PAIR_STRING_NON_EMPTY("parameter", name));
 }
 
+void varlink_unit_send_change_signal(Unit *u) {
+        assert(u);
+
+        if (!u->varlink_unit_change)
+                return;
+
+        (void) sd_varlink_notifybo(
+                        u->varlink_unit_change,
+                        SD_JSON_BUILD_PAIR_CALLBACK("runtime", unit_runtime_build_json, u));
+}
+
+void varlink_job_send_change_signal(Job *j) {
+        assert(j);
+
+        if (!j->varlink || !j->varlink_notify_job_changes)
+                return;
+
+        (void) sd_varlink_notifybo(
+                        j->varlink,
+                        SD_JSON_BUILD_PAIR_CALLBACK("job", job_build_json, j));
+}
+
+void varlink_job_detach_client(Job *j) {
+        assert(j);
+        assert(j->unit);
+
+        if (!j->varlink)
+                return;
+
+        /* Only drop the unit change subscription if it belongs to this very method call. A unit can carry
+         * two jobs at the same time (the regular one and a NOP one), which may be watched by two different
+         * connections. Detaching one client must not tear down the other one's subscription. */
+        if (j->unit->varlink_unit_change == j->varlink)
+                j->unit->varlink_unit_change = sd_varlink_unref(j->unit->varlink_unit_change);
+
+        j->varlink = sd_varlink_unref(j->varlink);
+        j->varlink_notify_job_changes = false;
+}
+
+void varlink_error_or_close(sd_varlink *link, int error) {
+        int r;
+
+        assert(link);
+
+        r = sd_varlink_error_errno(link, error);
+
+        /* sd_varlink_error_errno() above returns a negative errno even when it queues the reply successfully.
+         * The r < 0 check is redundant here, but matches varlink_dispatch_method(). The state check ensures
+         * we close only if the call still needs a reply, letting a queued error reach the client otherwise. */
+        if (r < 0 && sd_varlink_wants_reply(link)) {
+                log_debug_errno(r, "Failed to send varlink error reply, closing connection: %m");
+                (void) sd_varlink_close(link);
+        }
+}
+
+void varlink_job_send_removed_signal(Job *j) {
+        int r;
+
+        assert(j);
+
+        if (!j->varlink)
+                return;
+
+        /* Keep the connection alive across subscription cleanup. */
+        _cleanup_(sd_varlink_unrefp) sd_varlink *link = sd_varlink_ref(j->varlink);
+
+        /* Send the final reply, which completes the method call */
+        r = sd_varlink_replybo(
+                        j->varlink,
+                        SD_JSON_BUILD_PAIR_CALLBACK("context", unit_context_build_json, j->unit),
+                        SD_JSON_BUILD_PAIR_CALLBACK("runtime", unit_runtime_build_json, j->unit),
+                        SD_JSON_BUILD_PAIR_CALLBACK("job", job_build_json, j));
+
+        varlink_job_detach_client(j);
+
+        if (r < 0) {
+                log_unit_debug_errno(j->unit, r, "Failed to send final varlink job reply, sending error reply: %m");
+                /* The job is going away, so complete the call with an error or disconnect the client. */
+                varlink_error_or_close(link, r);
+        }
+}
+
+typedef struct VarlinkJobClient {
+        sd_varlink *varlink;
+        bool notify_job_changes;
+        bool notify_unit_changes;
+} VarlinkJobClient;
+
+static VarlinkJobClient* varlink_job_client_free(VarlinkJobClient *w) {
+        if (!w)
+                return NULL;
+
+        sd_varlink_unref(w->varlink);
+        return mfree(w);
+}
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(VarlinkJobClient*, varlink_job_client_free);
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+                varlink_job_client_hash_ops,
+                void, trivial_hash_func, trivial_compare_func,
+                VarlinkJobClient, varlink_job_client_free);
+
+int varlink_job_stash_client_full(
+                Manager *m,
+                uint32_t job_id,
+                sd_varlink *link,
+                bool notify_job_changes,
+                bool notify_unit_changes) {
+
+        int r;
+
+        assert(m);
+        assert(link);
+
+        _cleanup_(varlink_job_client_freep) VarlinkJobClient *w = new(VarlinkJobClient, 1);
+        if (!w)
+                return -ENOMEM;
+
+        *w = (VarlinkJobClient) {
+                .varlink = sd_varlink_ref(link),
+                .notify_job_changes = notify_job_changes,
+                .notify_unit_changes = notify_unit_changes,
+        };
+
+        r = hashmap_ensure_put(&m->stashed_varlink_job_clients, &varlink_job_client_hash_ops, UINT32_TO_PTR(job_id), w);
+        if (r < 0)
+                return r;
+
+        assert(r > 0);
+        TAKE_PTR(w);
+        return 0;
+}
+
+void varlink_job_stash_client(Job *j) {
+        _cleanup_(sd_varlink_unrefp) sd_varlink *link = NULL;
+        int r;
+
+        assert(j);
+        assert(j->manager);
+        assert(j->unit);
+
+        /* The connection outlives the reload but the job doesn't, hence keep it by job id for job_coldplug().
+         * On reexecution the connection is serialized instead, see job_serialize(). */
+        if (!j->varlink)
+                return;
+
+        r = varlink_job_stash_client_full(
+                        j->manager,
+                        j->id,
+                        j->varlink,
+                        j->varlink_notify_job_changes,
+                        j->unit->varlink_unit_change == j->varlink);
+        if (r < 0) {
+                log_unit_warning_errno(j->unit, r, "Failed to stash varlink client of job %" PRIu32 ", sending error reply: %m", j->id);
+                link = sd_varlink_ref(j->varlink);
+                varlink_job_detach_client(j);
+                varlink_error_or_close(link, r);
+        }
+}
+
+void varlink_job_unstash_client(Job *j) {
+        assert(j);
+        assert(j->manager);
+        assert(j->unit);
+
+        _cleanup_(varlink_job_client_freep) VarlinkJobClient *w = NULL;
+
+        w = hashmap_remove(j->manager->stashed_varlink_job_clients, UINT32_TO_PTR(j->id));
+        if (!w)
+                return;
+
+        assert(!j->varlink);
+
+        j->varlink = sd_varlink_ref(w->varlink);
+        j->varlink_notify_job_changes = w->notify_job_changes;
+
+        if (w->notify_unit_changes && !j->unit->varlink_unit_change)
+                j->unit->varlink_unit_change = sd_varlink_ref(w->varlink);
+}
+
+void varlink_job_drop_stashed_client(Manager *m, sd_varlink *link) {
+        VarlinkJobClient *w;
+        void *id;
+
+        assert(m);
+        assert(link);
+
+        HASHMAP_FOREACH_KEY(w, id, m->stashed_varlink_job_clients)
+                if (w->varlink == link) {
+                        varlink_job_client_free(hashmap_remove(m->stashed_varlink_job_clients, id));
+                        break;
+                }
+}
+
+void varlink_job_flush_stashed_clients(Manager *m) {
+        VarlinkJobClient *w;
+        void *id;
+
+        assert(m);
+
+        /* Closing a connection invokes vl_disconnect(), which removes entries from the manager's stash. */
+        _cleanup_hashmap_free_ Hashmap *clients = TAKE_PTR(m->stashed_varlink_job_clients);
+
+        /* Jobs aren't guaranteed to come back after a reload, e.g. when coldplug cancels them */
+        HASHMAP_FOREACH_KEY(w, id, clients) {
+                const char *k;
+                Unit *u;
+
+                log_info("Job %" PRIu32 " did not survive the reload, cancelling its varlink client.", PTR_TO_UINT32(id));
+
+                HASHMAP_FOREACH_KEY(u, k, m->units) {
+                        if (k != u->id)
+                                continue;
+
+                        if (u->varlink_unit_change == w->varlink) {
+                                u->varlink_unit_change = sd_varlink_unref(u->varlink_unit_change);
+                                break;
+                        }
+                }
+
+                varlink_error_or_close(w->varlink, ECANCELED);
+        }
+}
+
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_job_mode, JobMode, job_mode_from_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_collect_mode, CollectMode, collect_mode_from_string);
+static DEFINE_VARLINK_APPLY_ENUM(collect_mode, CollectMode, collect_mode_to_string);
+static JSON_DISPATCH_ENUM_DEFINE(dispatch_job_type, JobType, job_type_from_string);
+
+typedef struct StartTransientContextParameters {
+        const char *id;
+        const char *description;
+        char **tags;
+        CollectMode collect_mode;
+        char **dependencies[_UNIT_DEPENDENCY_MAX];
+        TransientExecContextParameters *exec;
+        TransientKillContextParameters *kill;
+        TransientServiceParameters *service;
+        TransientScopeParameters *scope;
+        TransientCGroupContextParameters *cgroup;
+
+        sd_bus_error bus_error; /* For errors mapped through D-Bus machinery */
+        char *bad_field; /* Field path for error propagation. */
+} StartTransientContextParameters;
+
+static void start_transient_context_parameters_done(StartTransientContextParameters *p) {
+        assert(p);
+
+        FOREACH_ELEMENT(d, p->dependencies)
+                strv_free(*d);
+
+        strv_free(p->tags);
+        transient_exec_context_parameters_free(p->exec);
+        transient_service_parameters_free(p->service);
+        transient_scope_parameters_free(p->scope);
+        transient_kill_context_parameters_free(p->kill);
+        transient_cgroup_context_parameters_free(p->cgroup);
+        sd_bus_error_free(&p->bus_error);
+        free(p->bad_field);
+}
+
+static void start_transient_context_parameters_init(StartTransientContextParameters *p) {
+        assert(p);
+        *p = (StartTransientContextParameters) {
+                .collect_mode = _COLLECT_MODE_INVALID,
+        };
+}
+
+typedef struct StartTransientParameters {
+        StartTransientContextParameters context;
+        JobMode mode;
+        int notify_job_changes;
+        int notify_unit_changes;
+
+        sd_bus_error bus_error; /* For errors mapped through D-Bus machinery. */
+        char *bad_field; /* Field path for error propagation. */
+} StartTransientParameters;
+
+static void start_transient_parameters_done(StartTransientParameters *p) {
+        assert(p);
+        start_transient_context_parameters_done(&p->context);
+        sd_bus_error_free(&p->bus_error);
+        free(p->bad_field);
+}
+
+static void start_transient_parameters_init(StartTransientParameters *p) {
+        assert(p);
+        *p = (StartTransientParameters) {
+                .mode = _JOB_MODE_INVALID,
+                .notify_job_changes = -1,
+                .notify_unit_changes = -1,
+        };
+        start_transient_context_parameters_init(&p->context);
+}
+
+static int dispatch_transient_tags(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        char ***ret = ASSERT_PTR(userdata);
+
+        assert(variant);
+
+        /* We want json_dispatch_object_tags, but we also want to differentiate between an explicit null and
+         * an empty array of tags */
+        if (sd_json_variant_is_array(variant) && sd_json_variant_elements(variant) == 0) {
+                char **empty = new0(char*, 1);
+                if (!empty)
+                        return -ENOMEM;
+
+                return strv_free_and_replace(*ret, empty);
+        }
+
+        return json_dispatch_object_tags(name, variant, flags, ret);
+}
+
+static int dispatch_transient_cgroup(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        StartTransientContextParameters *p = ASSERT_PTR(userdata);
+        return transient_cgroup_context_dispatch(variant, &p->cgroup, &p->bad_field);
+}
+
+static int dispatch_dependency(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        char ***dest = ASSERT_PTR(userdata);
+        _cleanup_strv_free_ char **units = NULL;
+        int r;
+
+        r = sd_json_dispatch_strv(name, variant, /* flags= */ 0, &units);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(unit, units)
+                if (!unit_name_is_valid(*unit, UNIT_NAME_PLAIN|UNIT_NAME_INSTANCE))
+                        return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a valid unit name.", strna(name));
+
+        return strv_free_and_replace(*dest, units);
+}
+
+static int dispatch_transient_service(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        StartTransientContextParameters *p = ASSERT_PTR(userdata);
+        return transient_service_dispatch(variant, &p->service, &p->bad_field);
+}
+
+static int dispatch_transient_scope(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        StartTransientContextParameters *p = ASSERT_PTR(userdata);
+        return transient_scope_dispatch(variant, &p->scope, &p->bad_field, &p->bus_error);
+}
+
+static int dispatch_transient_kill(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        StartTransientContextParameters *p = ASSERT_PTR(userdata);
+        return transient_kill_context_dispatch(variant, &p->kill, &p->bad_field);
+}
+
+static int dispatch_transient_exec_context(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        StartTransientContextParameters *p = ASSERT_PTR(userdata);
+        return transient_exec_context_dispatch(variant, &p->exec, &p->bad_field);
+}
+
+static int dispatch_transient_context_preauth(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "ID", SD_JSON_VARIANT_STRING, json_dispatch_const_unit_name, offsetof(StartTransientContextParameters, id), SD_JSON_MANDATORY },
+                {}
+        };
+
+        StartTransientParameters *p = ASSERT_PTR(userdata);
+        const char *bad_field;
+        int r;
+
+        /* Keep pre-auth dispatch to the bare minimum needed for Polkit. Leave other work until after
+         * authorization: opening file descriptors or allocating large buffers here would let unauthorized
+         * callers exhaust our resources. SD_JSON_ALLOW_EXTENSIONS skips the remaining fields here;
+         * the post-auth dispatch will validate them and reject unknown fields. */
+        r = sd_json_dispatch_full(variant, dispatch_table, /* bad= */ NULL, SD_JSON_ALLOW_EXTENSIONS, &p->context, &bad_field);
+        if (r < 0) {
+                sd_bus_error_move(&p->bus_error, &p->context.bus_error);
+                if (bad_field)
+                        varlink_propagate_bad_field(bad_field, /* child_bad_field= */ NULL, &p->bad_field);
+                return r;
+        }
+
+        /* Reject unsupported unit types early, before asking for authorization. */
+        UnitType t = unit_name_to_type(p->context.id);
+        if (t < 0)
+                return varlink_propagate_bad_field_errno(EINVAL, "ID", /* child_bad_field= */ NULL, &p->bad_field);
+
+        if (!unit_vtable[t]->can_transient)
+                return -EMEDIUMTYPE;
+
+        return 0;
+}
+
+static int dispatch_transient_context_postauth(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field base_context_dispatch[] = {
+                /* ID is already validated and stored before authorization via dispatch_transient_context_preauth(). */
+                { "ID",          SD_JSON_VARIANT_STRING, NULL,                            0,                                                       0                 },
+                { "Description", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string,   offsetof(StartTransientContextParameters, description),  SD_JSON_NULLABLE  },
+                { "Tags",        SD_JSON_VARIANT_ARRAY,  dispatch_transient_tags,         offsetof(StartTransientContextParameters, tags),         SD_JSON_NULLABLE  },
+                { "CollectMode", SD_JSON_VARIANT_STRING, dispatch_collect_mode,           offsetof(StartTransientContextParameters, collect_mode), SD_JSON_NULLABLE  },
+                { "Exec",        SD_JSON_VARIANT_OBJECT, dispatch_transient_exec_context, 0,                                                       SD_JSON_NULLABLE  },
+                { "Kill",        SD_JSON_VARIANT_OBJECT, dispatch_transient_kill,         0,                                                       SD_JSON_NULLABLE  },
+                { "Service",     SD_JSON_VARIANT_OBJECT, dispatch_transient_service,      0,                                                       SD_JSON_NULLABLE  },
+                { "Scope",       SD_JSON_VARIANT_OBJECT, dispatch_transient_scope,        0,                                                       SD_JSON_NULLABLE  },
+                { "CGroup",      SD_JSON_VARIANT_OBJECT, dispatch_transient_cgroup,       0,                                                       SD_JSON_NULLABLE  },
+        };
+        /* Build dispatch table only once, it's constant. */
+        static sd_json_dispatch_field context_dispatch[ELEMENTSOF(base_context_dispatch) + _UNIT_DEPENDENCY_MAX + 1] = {};
+        static bool context_dispatch_set = false;
+
+        if (!context_dispatch_set) {
+                size_t i = 0;
+
+                FOREACH_ELEMENT(field, base_context_dispatch)
+                        context_dispatch[i++] = *field;
+
+                for (UnitDependency dep = 0; dep < _UNIT_DEPENDENCY_MAX; dep++) {
+                        if (!unit_dependency_can_be_transient(dep))
+                                continue;
+                        context_dispatch[i++] = (sd_json_dispatch_field) {
+                                .name = unit_dependency_to_string(dep),
+                                .type = SD_JSON_VARIANT_ARRAY,
+                                .callback = dispatch_dependency,
+                                .offset = offsetof(StartTransientContextParameters, dependencies[dep]),
+                                .flags = SD_JSON_NULLABLE,
+                        };
+                }
+                context_dispatch_set = true;
+        }
+
+        StartTransientParameters *p = ASSERT_PTR(userdata);
+        const char *bad_field = NULL;
+        int r;
+
+        /* Don't propagate the caller's flags (in particular SD_JSON_MANDATORY from the outer 'context'
+         * field) into the nested dispatch, otherwise every inner field becomes mandatory. */
+        r = sd_json_dispatch_full(variant, context_dispatch, /* bad= */ NULL, /* flags= */ 0, &p->context, &bad_field);
+        if (r < 0) {
+                sd_bus_error_move(&p->bus_error, &p->context.bus_error);
+                if (bad_field)
+                        varlink_propagate_bad_field(bad_field, p->context.bad_field, &p->bad_field);
+        }
+        return r;
+}
+
+static int apply_tags(Unit *u, char *const *add_tags) {
+        int r;
+
+        assert(u);
+
+        if (!add_tags)
+                return 0;
+
+        if (strv_isempty(add_tags)) {
+                u->tags = strv_free(u->tags);
+                unit_write_setting(u, UNIT_RUNTIME, "Tags", "Tags=");
+                return 0;
+        }
+
+        _cleanup_strv_free_ char **tags = NULL;
+        r = object_tags_edit(u->tags, add_tags, /* remove= */ NULL, &tags);
+        if (r == -E2BIG)
+                return log_debug_errno(r, "Too many unit tags.");
+        if (r < 0)
+                return r;
+
+        strv_free_and_replace (u->tags, tags);
+
+        STRV_FOREACH(tag, add_tags)
+                unit_write_settingf(u, UNIT_RUNTIME, "Tags", "Tags=%s", *tag);
+
+        return 0;
+}
+
+static int transient_unit_apply_properties(Unit *u, StartTransientContextParameters *p, char **reterr_bad_field) {
+        int r;
+
+        assert(u);
+        assert(p);
+
+        if (p->description) {
+                r = unit_set_description(u, p->description);
+                if (r < 0)
+                        return r;
+                unit_write_settingf(u, UNIT_RUNTIME|UNIT_ESCAPE_SPECIFIERS, "Description", "Description=%s", p->description);
+        }
+
+        r = apply_tags(u, p->tags);
+        if (r < 0) {
+                varlink_propagate_bad_field("Tags", /* child_bad_field= */ NULL, reterr_bad_field);
+                return r;
+        }
+
+        varlink_apply_enum_collect_mode(u, "CollectMode", &u->collect_mode, p->collect_mode,
+                                        /* refuse= */ NULL, UNIT_RUNTIME);
+
+        for (UnitDependency dep_type = 0; dep_type < _UNIT_DEPENDENCY_MAX; dep_type++) {
+                if (!unit_dependency_can_be_transient(dep_type))
+                        continue;
+
+                const char *dep_type_name = unit_dependency_to_string(dep_type);
+                STRV_FOREACH(dep, p->dependencies[dep_type]) {
+                        r = unit_add_dependency_by_name(u, dep_type, *dep, /* add_reference= */ true, UNIT_DEPENDENCY_FILE);
+                        if (r < 0)
+                                return varlink_propagate_bad_field_errno(r, dep_type_name, /* child_bad_field= */ NULL, reterr_bad_field);
+
+                        _cleanup_free_ char *label = strjoin(dep_type_name, "-", *dep);
+                        if (!label)
+                                return -ENOMEM;
+                        unit_write_settingf(u, UNIT_RUNTIME, label, "%s=%s", dep_type_name, *dep);
+                }
+        }
+
+        return 0;
+}
+
+static int varlink_reply_unit_job(sd_varlink *link, Unit *u, Job *j) {
+        assert(link);
+        assert(u);
+        assert(j);
+
+        return sd_varlink_replybo(
+                        link,
+                        SD_JSON_BUILD_PAIR_CALLBACK("context", unit_context_build_json, u),
+                        SD_JSON_BUILD_PAIR_CALLBACK("runtime", unit_runtime_build_json, u),
+                        SD_JSON_BUILD_PAIR_CALLBACK("job", job_build_json, j));
+}
+
+static int varlink_reply_or_watch_unit_job(
+                sd_varlink *link,
+                Unit *u,
+                Job *j,
+                bool notify_job_changes,
+                bool notify_unit_changes) {
+
+        int r;
+
+        assert(link);
+        assert(u);
+        assert(j);
+
+        /* Non-streaming, or fire-and-forget (no notification flags set): return full unit context
+         * and runtime, plus the job object so the caller can correlate with later state. */
+        if (!notify_job_changes && !notify_unit_changes)
+                return varlink_reply_unit_job(link, u, j);
+
+        /* Streaming: attach to the job for the final reply, and optionally to the unit for state change
+         * notifications. j->varlink owns the stream lifetime, u->varlink_unit_change is just a flag to
+         * also send unit state notifications along the way.
+         *
+         * Because jobs coalesce, a concurrent streaming request may map onto a job (or unit) that is
+         * already being watched by another connection. Only a single streaming subscriber is supported,
+         * so reject the second one instead of clobbering the first. */
+        /* TODO: support multiple watchers. */
+        if (j->varlink || (notify_unit_changes && u->varlink_unit_change))
+                return sd_varlink_error(link, VARLINK_ERROR_UNIT_ALREADY_BEING_WATCHED, /* parameters= */ NULL);
+
+        /* Keep the method call around across reexecution, job_serialize() takes care of it */
+        r = sd_varlink_set_serialize_pending(link, true);
+        if (r < 0)
+                return r;
+
+        j->varlink = sd_varlink_ref(link);
+        j->varlink_notify_job_changes = notify_job_changes;
+        if (notify_unit_changes)
+                u->varlink_unit_change = sd_varlink_ref(link);
+
+        /* Send initial job state notification if requested. Unit state change notifications are not sent
+         * here; they will arrive via varlink_unit_send_change_signal() when the unit actually transitions,
+         * matching D-Bus PropertiesChanged behavior. */
+        if (notify_job_changes) {
+                r = sd_varlink_notifybo(
+                                link,
+                                SD_JSON_BUILD_PAIR_CALLBACK("job", job_build_json, j));
+                if (r < 0)
+                        log_unit_debug_errno(u, r, "Failed to send varlink job notification, ignoring: %m");
+        }
+
+        return 0;
+}
+
+typedef struct EnqueueJobParameters {
+        char **names;
+        JobType job_type;
+        JobMode mode;
+        int notify_job_changes;
+        int notify_unit_changes;
+} EnqueueJobParameters;
+
+static void enqueue_job_parameters_done(EnqueueJobParameters *p) {
+        assert(p);
+
+        strv_free(p->names);
+}
+
+static int dispatch_unit_names(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        _cleanup_strv_free_ char **l = NULL;
+        char ***ret = ASSERT_PTR(userdata);
+        int r;
+
+        r = sd_json_dispatch_strv(name, variant, flags, &l);
+        if (r < 0)
+                return r;
+
+        if (strv_isempty(l) && FLAGS_SET(flags, SD_JSON_MANDATORY))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL),
+                                "JSON field '%s' is mandatory, but is an empty array.", strna(name));
+
+        /* Match the EnqueueUnitJobMany() D-Bus limit. */
+        if (strv_length(l) > (size_t) MANAGER_MAX_NAMES / 2)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(E2BIG),
+                                "JSON field '%s' contains too many unit names.", strna(name));
+
+        STRV_FOREACH(i, l)
+                if (!unit_name_is_valid(*i, UNIT_NAME_PLAIN|UNIT_NAME_INSTANCE))
+                        return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL),
+                                        "JSON field '%s' contains an invalid unit name.", strna(name));
+
+        return strv_free_and_replace(*ret, l);
+}
+
+static int prepare_unit_names(sd_varlink *link, char **names) {
+        int r;
+
+        assert(link);
+
+        /* Callers without privileges get a polkit query for each unit, and every answer restarts the method
+         * call, so bound the work they can ask for. */
+        if (strv_length(names) > MANAGER_MAX_POLKIT_NAMES) {
+                r = varlink_check_peer_privilege(link);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return sd_varlink_error_invalid_parameter_name(link, "names");
+        }
+
+        strv_uniq(names);
+        return 0;
+}
+
+int vl_method_enqueue_unit_job(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "names",             SD_JSON_VARIANT_ARRAY,   dispatch_unit_names,       offsetof(EnqueueJobParameters, names),               SD_JSON_MANDATORY },
+                { "jobType",           SD_JSON_VARIANT_STRING,  dispatch_job_type,         offsetof(EnqueueJobParameters, job_type),            SD_JSON_MANDATORY },
+                { "mode",              SD_JSON_VARIANT_STRING,  dispatch_job_mode,         offsetof(EnqueueJobParameters, mode),                SD_JSON_NULLABLE  },
+                { "notifyJobChanges",  SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate, offsetof(EnqueueJobParameters, notify_job_changes),  SD_JSON_NULLABLE  },
+                { "notifyUnitChanges", SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate, offsetof(EnqueueJobParameters, notify_unit_changes), SD_JSON_NULLABLE  },
+                {}
+        };
+
+        _cleanup_(enqueue_job_parameters_done) EnqueueJobParameters p = {
+                .job_type = _JOB_TYPE_INVALID,
+                .mode = _JOB_MODE_INVALID,
+                .notify_job_changes = -1,
+                .notify_unit_changes = -1,
+        };
+        _cleanup_(sd_bus_error_free) sd_bus_error bus_error = SD_BUS_ERROR_NULL;
+        Manager *manager = ASSERT_PTR(userdata);
+        int r;
+
+        assert(link);
+        assert(parameters);
+
+        r = sd_varlink_dispatch(link, parameters, dispatch_table, &p);
+        if (r != 0)
+                return r;
+
+        if (p.mode < 0)
+                p.mode = JOB_REPLACE;
+
+        r = prepare_unit_names(link, p.names);
+        if (r != 0)
+                return r;
+
+        size_t n = strv_length(p.names);
+        bool notify = p.notify_job_changes > 0 || p.notify_unit_changes > 0;
+
+        if ((n > 1 || notify) && !FLAGS_SET(flags, SD_VARLINK_METHOD_MORE))
+                return sd_varlink_error(link, SD_VARLINK_ERROR_EXPECTED_MORE, /* parameters= */ NULL);
+
+        /* A notification stream currently tracks only one job and unit. */
+        if (n > 1 && notify)
+                return sd_varlink_error(link, SD_VARLINK_ERROR_OPERATION_NOT_SUPPORTED, /* parameters= */ NULL);
+
+        /* Resolve aliases before authorization, and pass the canonical unit name to polkit. */
+        STRV_FOREACH(name, p.names) {
+                Unit *u;
+
+                r = load_unit_and_check(link, manager, *name, &u);
+                if (r < 0)
+                        return r;
+
+                const UnitPolkitDetails details = {
+                        .unit = u,
+                        .verb = job_type_to_string(p.job_type),
+                        .message = N_("Authentication is required to manage unit '$(unit)'."),
+                };
+                r = varlink_verify_manage_units_async(link, manager, &details);
+                if (r <= 0)
+                        return r;
+        }
+
+        Unit *first = NULL;
+        STRV_FOREACH(name, p.names) {
+                Unit *u;
+
+                r = load_unit_and_check(link, manager, *name, &u);
+                if (r < 0)
+                        return r;
+
+                r = mac_selinux_unit_access_check_varlink(u, link, job_type_to_access_method(p.job_type));
+                if (r < 0)
+                        return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, /* parameters= */ NULL);
+
+                /* Reject an occupied unit subscription before enqueuing jobs. */
+                if (p.notify_unit_changes > 0 && u->varlink_unit_change)
+                        return sd_varlink_error(link, VARLINK_ERROR_UNIT_ALREADY_BEING_WATCHED, /* parameters= */ NULL);
+
+                if (!first)
+                        first = u;
+        }
+
+        assert(first);
+
+        if (n == 1) {
+                Job *j;
+                r = varlink_unit_queue_job_one(first, p.job_type, p.mode, /* reload_if_possible= */ false, /* ret_job_id= */ NULL, &j, &bus_error);
+                if (r < 0)
+                        return varlink_reply_bus_error(link, r, &bus_error);
+
+                return varlink_reply_or_watch_unit_job(link, first, j, p.notify_job_changes > 0, p.notify_unit_changes > 0);
+        }
+
+        /* Multiple units: enqueue all jobs in a single transaction */
+        _cleanup_set_free_ Set *jobs = set_new(/* hash_ops= */ NULL);
+        if (!jobs)
+                return -ENOMEM;
+
+        r = manager_add_jobs(
+                        manager,
+                        p.job_type,
+                        p.names,
+                        /* reload_if_possible= */ false,
+                        p.mode,
+                        /* extra_flags= */ 0,
+                        /* affected_jobs= */ NULL,
+                        &bus_error,
+                        jobs);
+        if (r < 0)
+                return varlink_reply_bus_error(link, r, &bus_error);
+
+        r = sd_varlink_set_sentinel(link, /* error_id= */ NULL);
+        if (r < 0)
+                return r;
+
+        Job *j;
+        SET_FOREACH(j, jobs) {
+                /* Before we send the method reply, force out the announcement JobNew for this job */
+                bus_job_send_pending_change_signal(j, /* including_new= */ true);
+
+                r = varlink_reply_unit_job(link, j->unit, j);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+static int varlink_error_unit_invalid_parameter(sd_varlink *link, const char *bad_field, const char *child_bad_field) {
+        _cleanup_free_ char *bad_field_path = NULL;
+        varlink_propagate_bad_field(bad_field, child_bad_field, &bad_field_path);
+        return sd_varlink_error_invalid_parameter_name(link, bad_field_path ?: bad_field);
+}
+
+static int varlink_error_unit_property_not_supported(sd_varlink *link, const char *bad_field, const char *child_bad_field) {
+        _cleanup_free_ char *bad_field_path = NULL;
+
+        varlink_propagate_bad_field(bad_field, child_bad_field, &bad_field_path);
+        return sd_varlink_errorbo(
+                        link,
+                        VARLINK_ERROR_UNIT_PROPERTY_NOT_SUPPORTED,
+                        SD_JSON_BUILD_PAIR_STRING("property", bad_field_path ?: bad_field));
+}
+
+int vl_method_start_transient_unit(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dispatch_table_preauth[] = {
+                { "context", SD_JSON_VARIANT_OBJECT, dispatch_transient_context_preauth, 0, SD_JSON_MANDATORY },
+                {}
+        };
+
+        static const sd_json_dispatch_field dispatch_table_postauth[] = {
+                { "context",            SD_JSON_VARIANT_OBJECT,  dispatch_transient_context_postauth, 0,                                              SD_JSON_MANDATORY },
+                { "mode",               SD_JSON_VARIANT_STRING,  dispatch_job_mode,          offsetof(StartTransientParameters, mode),                SD_JSON_NULLABLE  },
+                { "notifyJobChanges",   SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate,  offsetof(StartTransientParameters, notify_job_changes),  SD_JSON_NULLABLE  },
+                { "notifyUnitChanges",  SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate,  offsetof(StartTransientParameters, notify_unit_changes), SD_JSON_NULLABLE  },
+                {}
+        };
+
+        _cleanup_(sd_bus_error_free) sd_bus_error bus_error = SD_BUS_ERROR_NULL;
+        _cleanup_(start_transient_parameters_done) StartTransientParameters p = {};
+        _cleanup_free_ char *child_bad_field = NULL;
+        Manager *manager = ASSERT_PTR(userdata);
+        const char *bad_field;
+        Unit *u;
+        int r;
+
+        assert(link);
+        assert(parameters);
+
+        start_transient_parameters_init(&p);
+
+        r = mac_selinux_access_check_varlink(link, "start");
+        if (r < 0)
+                return r;
+
+        /* SD_JSON_ALLOW_EXTENSIONS leaves the other method parameters for the post-auth dispatch,
+         * which will validate them and reject unknown fields. */
+        r = sd_json_dispatch_full(parameters, dispatch_table_preauth, /* bad= */ NULL, SD_JSON_ALLOW_EXTENSIONS, &p, &bad_field);
+        if (r == -EMEDIUMTYPE)
+                return sd_varlink_error(link, VARLINK_ERROR_UNIT_TYPE_NOT_SUPPORTED, /* parameters= */ NULL);
+        if (r < 0) {
+                if (sd_bus_error_is_set(&p.bus_error))
+                        return varlink_reply_bus_error(link, r, &p.bus_error);
+                if (bad_field)
+                        return varlink_error_unit_invalid_parameter(link, bad_field, p.bad_field);
+
+                return r;
+        }
+
+        const UnitPolkitDetails details = {
+                .id = p.context.id,
+                .verb = "start",
+                .message = N_("Authentication is required to start transient unit '$(unit)'."),
+        };
+        r = varlink_verify_manage_units_async(link, manager, &details);
+        if (r <= 0)
+                return r;
+
+        r = sd_json_dispatch_full(parameters, dispatch_table_postauth, /* bad= */ NULL, /* flags= */ 0, &p, &bad_field);
+        if (r < 0) {
+                if (sd_bus_error_is_set(&p.bus_error))
+                        return varlink_reply_bus_error(link, r, &p.bus_error);
+                if (bad_field) {
+                        if (r == -EADDRNOTAVAIL)
+                                return varlink_error_unit_property_not_supported(link, bad_field, p.bad_field);
+
+                        return varlink_error_unit_invalid_parameter(link, bad_field, p.bad_field);
+                }
+                return r;
+        }
+
+        if (p.mode < 0)
+                p.mode = JOB_REPLACE;
+
+        /* Resolve stdio fd indices against the fds attached to this method call before the unit exists,
+         * so a failure (bad index, wrong access mode) doesn't leave a half-configured transient unit. */
+        r = transient_service_resolve_stdio_fds(link, p.context.service, &child_bad_field);
+        if (IN_SET(r, -ENXIO, -EPROTOTYPE, -EBADFD, -EISDIR)) /* bad index or unsuitable fd */
+                return varlink_error_unit_invalid_parameter(link, "context.Service", child_bad_field);
+        if (r < 0)
+                return sd_varlink_error_errno(link, r);
+
+        r = manager_setup_transient_unit(manager, p.context.id, &u, &bus_error);
+        if (r < 0)
+                return varlink_reply_bus_error(link, r, &bus_error);
+
+        /* Apply unit-level properties from context */
+        r = transient_unit_apply_properties(u, &p.context, &child_bad_field);
+        if (r == -EINVAL)
+                return varlink_error_unit_invalid_parameter(link, "context", child_bad_field);
+        if (r < 0)
+                return sd_varlink_error_errno(link, r);
+
+        /* Apply context.Exec only when an Exec object was actually sent */
+        if (p.context.exec) {
+                ExecContext *c = unit_get_exec_context(u);
+                if (!c)
+                        return sd_varlink_error(link, VARLINK_ERROR_UNIT_TYPE_NOT_SUPPORTED, /* parameters= */ NULL);
+
+                r = transient_exec_context_apply_properties(u, c, p.context.exec, &child_bad_field);
+                if (r == -EINVAL)
+                        return varlink_error_unit_invalid_parameter(link, "context.Exec", child_bad_field);
+                if (r < 0)
+                        return sd_varlink_error_errno(link, r);
+        }
+
+        /* Apply context.Kill only when a Kill object was actually sent, on unit types that have a kill
+         * context. */
+        if (p.context.kill) {
+                KillContext *k = unit_get_kill_context(u);
+                if (!k)
+                        return sd_varlink_error(link, VARLINK_ERROR_UNIT_TYPE_NOT_SUPPORTED, /* parameters= */ NULL);
+
+                r = transient_kill_context_apply_properties(u, k, p.context.kill);
+                if (r < 0)
+                        return sd_varlink_error_errno(link, r);
+        }
+
+        /* Apply cgroup properties from context.CGroup */
+        if (p.context.cgroup) {
+                CGroupContext *cc = unit_get_cgroup_context(u);
+                if (!cc)
+                        return sd_varlink_error(link, VARLINK_ERROR_UNIT_TYPE_NOT_SUPPORTED, /* parameters= */ NULL);
+
+                r = transient_cgroup_context_apply_properties(u, cc, p.context.cgroup, &child_bad_field);
+                if (r == -EINVAL)
+                        return varlink_error_unit_invalid_parameter(link, "context.CGroup", child_bad_field);
+                if (r < 0)
+                        return sd_varlink_error_errno(link, r);
+        }
+
+        /* Apply service-specific properties from context.Service */
+        Service *service = SERVICE(u);
+        if (service && p.context.service) {
+                r = transient_service_apply_properties(service, p.context.service, &child_bad_field);
+                if (r == -EINVAL)
+                        return varlink_error_unit_invalid_parameter(link, "context.Service", child_bad_field);
+                if (r < 0)
+                        return sd_varlink_error_errno(link, r);
+        } else if (p.context.service)
+                return sd_varlink_error(link, VARLINK_ERROR_UNIT_TYPE_NOT_SUPPORTED, /* parameters= */ NULL);
+
+        Scope *scope = SCOPE(u);
+        if (scope) {
+                r = transient_scope_apply_properties(scope, p.context.scope, link, &child_bad_field, &bus_error);
+                if (r == -EINVAL)
+                        return varlink_error_unit_invalid_parameter(link, "context.Scope", child_bad_field);
+                if (r < 0)
+                        return varlink_reply_bus_error(link, r, &bus_error);
+        } else if (p.context.scope)
+                return sd_varlink_error(link, VARLINK_ERROR_UNIT_TYPE_NOT_SUPPORTED, /* parameters= */ NULL);
+
+        unit_add_to_load_queue(u);
+        manager_dispatch_load_queue(manager);
+
+        if (u->load_state == UNIT_BAD_SETTING)
+                return sd_varlink_error_invalid_parameter_name(link, "context");
+        if (!UNIT_IS_LOAD_COMPLETE(u->load_state))
+                return sd_varlink_error(link, VARLINK_ERROR_UNIT_NO_SUCH_UNIT, /* parameters= */ NULL);
+
+        Job *j;
+        r = varlink_unit_queue_job_one(
+                        u,
+                        JOB_START,
+                        p.mode,
+                        /* reload_if_possible= */ false,
+                        /* ret_job_id= */ NULL,
+                        &j,
+                        &bus_error);
+        if (r < 0)
+                return varlink_reply_bus_error(link, r, &bus_error);
+
+        bool more = FLAGS_SET(flags, SD_VARLINK_METHOD_MORE);
+
+        return varlink_reply_or_watch_unit_job(
+                        link, u, j,
+                        more && p.notify_job_changes > 0,
+                        more && p.notify_unit_changes > 0);
+}
+
 typedef struct UnitSetPropertiesParameters {
-        const char *unsupported_property; /* For error reporting */
         const char *name;
         bool runtime;
 
-        bool markers_found;
+        bool markers_set;
         unsigned markers, markers_mask;
+
+        const char *bad_field; /* For error reporting */
 } UnitSetPropertiesParameters;
 
 static int parse_unit_markers(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
@@ -609,7 +1606,7 @@ static int parse_unit_markers(const char *name, sd_json_variant *variant, sd_jso
 
         p->markers = settings;
         p->markers_mask = mask;
-        p->markers_found = true;
+        p->markers_set = true;
 
         return 0;
 }
@@ -619,16 +1616,9 @@ static int unit_dispatch_properties(const char *name, sd_json_variant *variant, 
                 { "Markers", SD_JSON_VARIANT_ARRAY, parse_unit_markers, 0, 0 },
                 {}
         };
-        UnitSetPropertiesParameters *p = ASSERT_PTR(userdata);
-        const char *bad_field = NULL;
-        int r;
 
-        r = sd_json_dispatch_full(variant, dispatch_table, /* bad= */ NULL, flags, userdata, &bad_field);
-        if (r == -EADDRNOTAVAIL && !isempty(bad_field))
-                /* When properties contains a valid field, but that we don't currently support, make sure to
-                 * return the offending property, rather than generic invalid argument. */
-                p->unsupported_property = bad_field;
-        return r;
+        UnitSetPropertiesParameters *p = ASSERT_PTR(userdata);
+        return sd_json_dispatch_full(variant, dispatch_table, /* bad= */ NULL, flags, userdata, &p->bad_field);
 }
 
 int vl_method_set_unit_properties(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -650,17 +1640,20 @@ int vl_method_set_unit_properties(sd_varlink *link, sd_json_variant *parameters,
 
         r = sd_json_dispatch_full(parameters, dispatch_table, /* bad= */ NULL, /* flags= */ 0, &p, &bad_field);
         if (r < 0) {
-                /* When properties contains a valid field, but that we don't currently support, make sure to
-                 * return a specific error, rather than generic invalid argument. */
-                if (streq_ptr(bad_field, "properties") && r == -EADDRNOTAVAIL)
-                        return sd_varlink_errorbo(
-                                link,
-                                "io.systemd.Unit.PropertyNotSupported",
-                                SD_JSON_BUILD_PAIR_CONDITION(!!p.unsupported_property, "property", SD_JSON_BUILD_STRING(p.unsupported_property)));
-                if (bad_field)
-                        return sd_varlink_error_invalid_parameter_name(link, bad_field);
+                if (bad_field) {
+                        /* When properties contains a valid field, but that we don't currently support, make sure to
+                         * return a specific error, rather than generic invalid argument. */
+                        if (r == -EADDRNOTAVAIL)
+                                return varlink_error_unit_property_not_supported(link, bad_field, p.bad_field);
+
+                        return varlink_error_unit_invalid_parameter(link, bad_field, p.bad_field);
+                }
                 return r;
         }
+
+        /* Only Markers is supported, and it cannot be persisted as unit configuration. */
+        if (!p.runtime)
+                return varlink_error_unit_property_not_supported(link, "runtime", /* child_bad_field= */ NULL);
 
         r = load_unit_and_check(link, manager, p.name, &unit);
         if (r < 0)
@@ -668,19 +1661,27 @@ int vl_method_set_unit_properties(sd_varlink *link, sd_json_variant *parameters,
 
         r = mac_selinux_unit_access_check_varlink(unit, link, "start");
         if (r < 0)
-                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, NULL);
+                return sd_varlink_error(link, SD_VARLINK_ERROR_PERMISSION_DENIED, /* parameters= */ NULL);
 
-        r = varlink_verify_polkit_async(
-                        link,
-                        manager->system_bus,
-                        "org.freedesktop.systemd1.manage-units",
-                        /* details= */ NULL,
-                        &manager->polkit_registry);
+        const UnitPolkitDetails details = {
+                .unit = unit,
+                .verb = "set-property",
+                .message = N_("Authentication is required to set properties on '$(unit)'."),
+        };
+        r = varlink_verify_manage_units_async(link, manager, &details);
         if (r <= 0)
                 return r;
 
-        if (p.markers_found)
-                unit->markers = unit_normalize_markers((unit->markers & ~p.markers_mask), p.markers);
+        if (p.markers_set) {
+                /* If the unit is not active or activating, setting needs-restart should be noop. */
+                if (FLAGS_SET(p.markers, 1u << UNIT_MARKER_NEEDS_RESTART) &&
+                    !UNIT_IS_ACTIVE_OR_ACTIVATING(unit_active_state(unit))) {
+                        log_unit_debug(unit, "Ignoring needs-restart marker: unit is not active.");
+                        p.markers &= ~(1u << UNIT_MARKER_NEEDS_RESTART);
+                }
 
-        return sd_varlink_reply(link, NULL);
+                unit->markers = unit_normalize_markers((unit->markers & ~p.markers_mask), p.markers);
+        }
+
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }

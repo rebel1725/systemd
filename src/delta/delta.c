@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <unistd.h>
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "build.h"
 #include "chase.h"
 #include "dirent-util.h"
@@ -20,36 +22,35 @@
 #include "parse-argument.h"
 #include "path-util.h"
 #include "pidref.h"
-#include "pretty-print.h"
 #include "process-util.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
+#include "verbs.h"
 
-static const char prefixes[] =
-        "/etc\0"
-        "/run\0"
-        "/usr/local/lib\0"
-        "/usr/local/share\0"
-        "/usr/lib\0"
+#define PREFIXES                                \
+        "/etc\0"                                \
+        "/run\0"                                \
+        "/usr/local/lib\0"                      \
+        "/usr/local/share\0"                    \
+        "/usr/lib\0"                            \
         "/usr/share\0"
-        ;
 
-static const char suffixes[] =
-        "sysctl.d\0"
-        "tmpfiles.d\0"
-        "modules-load.d\0"
-        "binfmt.d\0"
-        "systemd/system\0"
+#define SUFFIXES                                \
+        "sysctl.d\0"                            \
+        "tmpfiles.d\0"                          \
+        "modules-load.d\0"                      \
+        "binfmt.d\0"                            \
+        "systemd/system\0"                      \
+        "systemd/user\0"                        \
+        "systemd/system-preset\0"               \
+        "systemd/user-preset\0"                 \
+        "udev/rules.d\0"                        \
+        "modprobe.d\0"
+
+#define HAVE_DROPINS                            \
+        "systemd/system\0"                      \
         "systemd/user\0"
-        "systemd/system-preset\0"
-        "systemd/user-preset\0"
-        "udev/rules.d\0"
-        "modprobe.d\0";
-
-static const char have_dropins[] =
-        "systemd/system\0"
-        "systemd/user\0";
 
 static PagerFlags arg_pager_flags = 0;
 static int arg_diff = -1;
@@ -66,15 +67,23 @@ static enum {
         (SHOW_MASKED | SHOW_EQUIVALENT | SHOW_REDIRECTED | SHOW_OVERRIDDEN | SHOW_EXTENDED)
 } arg_flags = 0;
 
+COMMAND(
+        "systemd-delta\0",
+        "Find overridden configuration files.",
+        .argspec = "[SUFFIX…]\0",
+        .man_page = "systemd-delta(1)",
+        .pager_flags = &arg_pager_flags,
+);
+
 static int equivalent(const char *a, const char *b) {
         _cleanup_free_ char *x = NULL, *y = NULL;
         int r;
 
-        r = chase(a, NULL, CHASE_TRAIL_SLASH, &x, NULL);
+        r = chase(a, /* root= */ NULL, CHASE_TRAIL_SLASH, &x, /* ret_fd= */ NULL);
         if (r < 0)
                 return r;
 
-        r = chase(b, NULL, CHASE_TRAIL_SLASH, &y, NULL);
+        r = chase(b, /* root= */ NULL, CHASE_TRAIL_SLASH, &y, /* ret_fd= */ NULL);
         if (r < 0)
                 return r;
 
@@ -173,9 +182,9 @@ static int found_override(const char *top, const char *bottom) {
         if (r < 0)
                 return r;
         if (r == 0) {
-                execlp("diff", "diff", "-us", "--", bottom, top, NULL);
+                r = execvp_safe("diff", STRV_MAKE("diff", "-us", "--", bottom, top));
                 log_open();
-                log_error_errno(errno, "Failed to execute diff: %m");
+                log_error_errno(r, "Failed to execute diff: %m");
                 _exit(EXIT_FAILURE);
         }
 
@@ -233,6 +242,12 @@ static int enumerate_dir_d(
         _cleanup_strv_free_ char **list = NULL;
         char *c;
         int r;
+
+        assert(top);
+        assert(bottom);
+        assert(drops);
+        assert(toppath);
+        assert(drop);
 
         assert(!endswith(drop, "/"));
 
@@ -376,10 +391,10 @@ static int process_suffix(const char *suffix, const char *onlyprefix) {
         assert(!startswith(suffix, "/"));
         assert(!strstr(suffix, "//"));
 
-        bool dropins = nulstr_contains(have_dropins, suffix);
+        bool dropins = nulstr_contains(HAVE_DROPINS, suffix);
 
         _cleanup_ordered_hashmap_free_ OrderedHashmap *top = NULL, *bottom = NULL, *drops = NULL;
-        NULSTR_FOREACH(p, prefixes) {
+        NULSTR_FOREACH(p, PREFIXES) {
                 _cleanup_free_ char *t = NULL;
 
                 t = path_join(p, suffix);
@@ -422,7 +437,7 @@ static int process_suffix(const char *suffix, const char *onlyprefix) {
 static int process_suffixes(const char *onlyprefix) {
         int n_found = 0, r;
 
-        NULSTR_FOREACH(n, suffixes) {
+        NULSTR_FOREACH(n, SUFFIXES) {
                 r = process_suffix(n, onlyprefix);
                 if (r < 0)
                         return r;
@@ -437,10 +452,10 @@ static int process_suffix_chop(const char *arg) {
         assert(arg);
 
         if (!path_is_absolute(arg))
-                return process_suffix(arg, NULL);
+                return process_suffix(arg, /* onlyprefix= */ NULL);
 
         /* Strip prefix from the suffix */
-        NULSTR_FOREACH(p, prefixes) {
+        NULSTR_FOREACH(p, PREFIXES) {
                 const char *suffix;
 
                 suffix = startswith(arg, p);
@@ -455,28 +470,6 @@ static int process_suffix_chop(const char *arg) {
 
         return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                "Invalid suffix specification %s.", arg);
-}
-
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-delta", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] [SUFFIX...]\n\n"
-               "Find overridden configuration files.\n\n"
-               "  -h --help           Show this help\n"
-               "     --version        Show package version\n"
-               "     --no-pager       Do not pipe output into a pager\n"
-               "     --diff[=1|0]     Show a diff when overridden files differ\n"
-               "  -t --type=LIST...   Only display a selected set of override types\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               link);
-
-        return 0;
 }
 
 static int parse_flags(const char *flag_str, int flags) {
@@ -509,66 +502,47 @@ static int parse_flags(const char *flag_str, int flags) {
         }
 }
 
-static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_NO_PAGER = 0x100,
-                ARG_DIFF,
-                ARG_VERSION
-        };
-
-        static const struct option options[] = {
-                { "help",      no_argument,       NULL, 'h'          },
-                { "version",   no_argument,       NULL, ARG_VERSION  },
-                { "no-pager",  no_argument,       NULL, ARG_NO_PAGER },
-                { "diff",      optional_argument, NULL, ARG_DIFF     },
-                { "type",      required_argument, NULL, 't'          },
-                {}
-        };
-
-        int c, r;
-
-        assert(argc >= 1);
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
+        assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "ht:", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_NO_PAGER:
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case 't': {
-                        int f;
-                        f = parse_flags(optarg, arg_flags);
-                        if (f < 0)
+                OPTION('t', "type", "TYPE...", "Only display a selected set of override types"):
+                        r = parse_flags(opts.arg, arg_flags);
+                        if (r < 0)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Failed to parse flags field.");
-                        arg_flags = f;
+                        arg_flags = r;
                         break;
-                }
 
-                case ARG_DIFF:
-                        r = parse_boolean_argument("--diff", optarg, NULL);
+                OPTION_LONG_FLAGS(OPTION_OPTIONAL_ARG, "diff", "yes|no",
+                                  "Show a diff when overridden files differ"):
+                        r = parse_boolean_argument("--diff", opts.arg, /* ret= */ NULL);
                         if (r < 0)
                                 return r;
                         arg_diff = r;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
+        *ret_args = option_parser_get_args(&opts);
         return 1;
 }
 
@@ -577,7 +551,8 @@ static int run(int argc, char *argv[]) {
 
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
@@ -591,19 +566,18 @@ static int run(int argc, char *argv[]) {
 
         pager_open(arg_pager_flags);
 
-        if (optind < argc) {
-                for (int i = optind; i < argc; i++) {
-                        path_simplify(argv[i]);
+        if (!strv_isempty(args)) {
+                STRV_FOREACH(i, args) {
+                        path_simplify(*i);
 
-                        k = process_suffix_chop(argv[i]);
+                        k = process_suffix_chop(*i);
                         if (k < 0)
                                 r = k;
                         else
                                 n_found += k;
                 }
-
         } else {
-                k = process_suffixes(NULL);
+                k = process_suffixes(/* onlyprefix= */ NULL);
                 if (k < 0)
                         r = k;
                 else

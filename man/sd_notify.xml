@@ -209,6 +209,11 @@
         to allow the service manager to track the service's internal state, and present it to the user.
         </para>
 
+        <para>Starting with version 259, transitioning to the STOPPING state is final and cannot be undone
+        with another notification. If after sending <literal>STOPPING=1</literal> the service doesn't
+        terminate within the stop timeout, all remaining processes in the unit will be killed.
+        </para>
+
         <xi:include href="version-info.xml" xpointer="v217"/></listitem>
       </varlistentry>
 
@@ -428,6 +433,17 @@
         <para>For further information on the file descriptor store see the <ulink
         url="https://systemd.io/FILE_DESCRIPTOR_STORE">File Descriptor Store</ulink> overview.</para>
 
+        <para>On kernels that support the <ulink
+        url="https://docs.kernel.org/userspace-api/liveupdate.html">Live Update Orchestrator</ulink>,
+        compatible file descriptors stored this way (such as <citerefentry
+        project='man-pages'><refentrytitle>memfd_create</refentrytitle><manvolnum>2</manvolnum></citerefentry>)
+        are additionally preserved across <literal>kexec</literal>-based reboots and handed back to the
+        service on the other side, provided <varname>FileDescriptorStorePreserve=yes</varname> is set on
+        the service (see
+        <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>).
+        See the <ulink url="https://systemd.io/FILE_DESCRIPTOR_STORE">File Descriptor Store</ulink>
+        overview for details.</para>
+
         <xi:include href="version-info.xml" xpointer="v219"/></listitem>
       </varlistentry>
 
@@ -439,6 +455,27 @@
         remove.</para>
 
         <xi:include href="version-info.xml" xpointer="v236"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>FDSTOREWIPE=…</term>
+
+        <listitem><para>Removes file descriptors from the service's file descriptor store whose names match
+        the specified shell-style glob. Matching is case-sensitive and follows
+        <citerefentry project='man-pages'><refentrytitle>fnmatch</refentrytitle><manvolnum>3</manvolnum></citerefentry>
+        with no flags set. In particular, <literal>*</literal> matches all names, including empty names,
+        names starting with a dot, and names containing slashes. A pattern without wildcard characters
+        matches only that exact name.</para>
+
+        <para>The pattern must be non-empty, consist of printable ASCII characters except <literal>:</literal>,
+        and be no longer than 255 characters. Wildcards may be escaped with a backslash to match them
+        literally.</para>
+
+        <para><varname>FDNAME=</varname> is ignored if specified. Wiping an empty store or using a pattern
+        that matches no names has no effect. Other FD Store operations specified in the same message are
+        ignored.</para>
+
+        <xi:include href="version-info.xml" xpointer="v263"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -653,9 +690,11 @@ sd_notify_barrier(0, 5 * 1000000);
 
   <refsect1>
     <title>History</title>
-    <para><function>sd_pid_notify()</function>,
-    <function>sd_pid_notifyf()</function>, and
-    <function>sd_pid_notify_with_fds()</function> were added in version 219.</para>
+    <para><function>sd_notify()</function> and
+    <function>sd_notifyf()</function> were added in version 1.</para>
+    <para><function>sd_pid_notify()</function> and
+    <function>sd_pid_notifyf()</function> were added in version 214.</para>
+    <para><function>sd_pid_notify_with_fds()</function> was added in version 219.</para>
     <para><function>sd_notify_barrier()</function> was added in version 246.</para>
     <para><function>sd_pid_notifyf_with_fds()</function> and
     <function>sd_pid_notify_barrier()</function> were added in version 254.</para>

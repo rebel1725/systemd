@@ -70,7 +70,7 @@ mkdir -p /var/lib/machines
 mount --bind "$(mktemp --tmpdir=/var/tmp -d)" /var/lib/machines
 
 testcase_sanity() {
-    local template root image uuid tmpdir
+    local template root image uuid tmpdir output
 
     tmpdir="$(mktemp -d)"
     template="$(mktemp -d /tmp/nspawn-template.XXX)"
@@ -86,6 +86,14 @@ testcase_sanity() {
 
     systemd-nspawn --help --no-pager
     systemd-nspawn --version
+
+    # Explicit invalid container-side veth names must be rejected instead of
+    # silently replaced with the host-side name.
+    if output=$(SYSTEMD_LOG_TARGET=console systemd-nspawn --network-veth-extra=host0:bad/name --directory=/nonexistent 2>&1); then
+        echo >&2 "invalid --network-veth-extra= container interface name was accepted"
+        return 1
+    fi
+    assert_in "Failed to parse --network-veth-extra= parameter" "$output"
 
     # --template=
     root="$(mktemp -u -d /var/lib/machines/TEST-13-NSPAWN.sanity.XXX)"
@@ -115,12 +123,14 @@ testcase_sanity() {
     systemd-nspawn --register=no \
                    --directory="$root" \
                    --volatile \
+                   --restrict-address-families=unix,inet \
                    bash -xec 'test -e /usr/has-usr; touch /usr/read-only && exit 1; touch /nope'
     test ! -e "$root/nope"
     test ! -e "$root/usr/read-only"
     systemd-nspawn --register=no \
                    --directory="$root" \
                    --volatile=yes \
+                   --restrict-address-families='unix inet' \
                    bash -xec 'test -e /usr/has-usr; touch /usr/read-only && exit 1; touch /nope'
     test ! -e "$root/nope"
     test ! -e "$root/usr/read-only"
@@ -128,6 +138,7 @@ testcase_sanity() {
     systemd-nspawn --register=no \
                    --directory="$root" \
                    --volatile=state \
+                   --restrict-address-families=unix,inet,inet6 \
                    bash -xec 'test -e /usr/has-usr; mountpoint /var; touch /read-only && exit 1; touch /var/nope'
     test ! -e "$root/read-only"
     test ! -e "$root/var/nope"
@@ -202,7 +213,7 @@ testcase_sanity() {
     systemd-nspawn --register=no --directory="$root" bash -xec '[[ $$ -eq 1 ]]'
     systemd-nspawn --register=no --directory="$root" --as-pid2 bash -xec '[[ $$ -eq 2 ]]'
 
-    # --user=
+    # --uid=
     # "Fake" getent passwd's bare minimum, so we don't have to pull it in
     # with all the DSO shenanigans
     cat >"$root/bin/getent" <<\EOF
@@ -222,6 +233,9 @@ EOF
     # as bash isn't invoked with the necessary environment variables for that.
     useradd --root="$root" --uid 1000 --user-group --create-home testuser
     systemd-nspawn --register=no --directory="$root" bash -xec '[[ $USER == root ]]'
+    systemd-nspawn --register=no --directory="$root" --uid=testuser bash -xec '[[ $USER == testuser ]]'
+    # Backward compat: --user NAME (space-separated) and --user=testuser should still work
+    systemd-nspawn --register=no --directory="$root" --user testuser bash -xec '[[ $USER == testuser ]]'
     systemd-nspawn --register=no --directory="$root" --user=testuser bash -xec '[[ $USER == testuser ]]'
 
     # --settings= + .nspawn files
@@ -291,6 +305,27 @@ EOF
                    --tmpfs=/var:rw,nosuid,noexec \
                    bash -xec 'touch /var/nope'
     test ! -e "$root/var/nope"
+    # --tmpfs with --private-users and uid/gid options
+    systemd-nspawn --register=no \
+                   --directory="$root" \
+                   --private-users=pick \
+                   --tmpfs=/test:rw,nosuid,noexec,uid=1000,gid=1000 \
+                   bash -xec '[[ "$(stat -c %u /test)" == 1000 ]] && [[ "$(stat -c %g /test)" == 1000 ]]'
+    systemd-nspawn --register=no \
+                   --directory="$root" \
+                   --private-users=pick \
+                   --tmpfs=/test:rw,nosuid,noexec,uid=1000 \
+                   bash -xec '[[ "$(stat -c %u:%g /test)" == "1000:0" ]]'
+    systemd-nspawn --register=no \
+                   --directory="$root" \
+                   --private-users=pick \
+                   --tmpfs=/test:rw,nosuid,noexec,gid=1000 \
+                   bash -xec '[[ "$(stat -c %u:%g /test)" == "0:1000" ]]'
+    (! systemd-nspawn --register=no \
+                      --directory="$root" \
+                      --private-users=65536:1 \
+                      --tmpfs=/test:rw,nosuid,noexec,uid=1 \
+                      true)
     # --overlay=
     systemd-nspawn --register=no \
                    --directory="$root" \
@@ -335,10 +370,10 @@ EOF
                    --load-credential=cred.path:/tmp/cred.path \
                    --set-credential="cred.set:hello world" \
                    bash -xec '[[ "$(</run/host/credentials/cred.path)" == "foo bar" ]]; [[ "$(</run/host/credentials/cred.set)" == "hello world" ]]'
-    # Combine with --user to ensure creds are still readable
+    # Combine with --uid to ensure creds are still readable
     systemd-nspawn --register=no \
                    --directory="$root" \
-                   --user=testuser \
+                   --uid=testuser \
                    --no-new-privileges=yes \
                    --load-credential=cred.path:/tmp/cred.path \
                    --set-credential="cred.set:hello world" \
@@ -396,17 +431,48 @@ EOF
     (! systemd-nspawn --rlimit==)
 }
 
+testcase_restrict_address_families() {
+    local root
+
+    root="$(mktemp -u -d /var/lib/machines/TEST-13-NSPAWN.restrict-af.XXX)"
+    create_dummy_container "$root"
+
+    # ip(8) needs an AF_NETLINK socket, so it must fail when netlink is not allowed...
+    (! systemd-nspawn --register=no --directory="$root" --restrict-address-families=unix,inet ip link show lo)
+    (! systemd-nspawn --register=no --directory="$root" --restrict-address-families='AF_UNIX AF_INET' ip link show lo)
+    (! systemd-nspawn --register=no --directory="$root" --restrict-address-families=~netlink ip link show lo)
+    (! systemd-nspawn --register=no --directory="$root" --restrict-address-families=none ip link show lo)
+    # ...and work when it is, however the list is spelled.
+    systemd-nspawn --register=no --directory="$root" --restrict-address-families=unix,inet,netlink ip link show lo
+    systemd-nspawn --register=no --directory="$root" --restrict-address-families='unix inet AF_NETLINK' ip link show lo
+    systemd-nspawn --register=no --directory="$root" --restrict-address-families=~packet ip link show lo
+    systemd-nspawn --register=no --directory="$root" --restrict-address-families=none true
+    # Repeated options are combined.
+    systemd-nspawn --register=no --directory="$root" \
+                   --restrict-address-families=unix,inet \
+                   --restrict-address-families=netlink \
+                   ip link show lo
+
+    rm -fr "$root"
+}
+
 testcase_check_default_inaccessible_paths() {
     local root container inaccessible_paths path exp
 
     # Taken from src/nspawn/nspawn-mount.c:mount_all()
     inaccessible_paths=(
         "/proc/kallsyms"
-        "/proc/kcore"
         "/proc/keys"
         "/proc/sysrq-trigger"
         "/proc/timer_list"
     )
+
+    # /proc/kcore may not exist on some kernels, e.g. Alpine/Nura.
+    if [[ -e /proc/kcore ]]; then
+        inaccessible_paths+=(
+            "/proc/kcore"
+        )
+    fi
 
     root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.default_inaccessible_paths.XXX)"
     container="$(basename "$root")"
@@ -575,7 +641,7 @@ ip link | grep wl-renamed1
 EOF
     fi
 
-    timeout 30 systemd-nspawn --directory="$root"
+    timeout --foreground 30 systemd-nspawn --directory="$root"
 
     # And now for stuff that needs to run separately
     #
@@ -601,6 +667,119 @@ EOF
     done
 
     rm -fr "$root" "/run/systemd/nspawn/$container.nspawn"
+}
+
+testcase_nspawn_settings_credentials() {
+    local root container
+
+    mkdir -p /run/systemd/nspawn
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.nspawn-settings-credentials.XXX)"
+    container="$(basename "$root")"
+    create_dummy_container "$root"
+    rm -f "/etc/systemd/nspawn/$container.nspawn"
+    echo "foo bar" >/tmp/cred.path
+    rm -f /tmp/cred.missing
+
+    # Settings files in /run/systemd/nspawn/ are trusted, hence may load credentials from the host
+    cat >"/run/systemd/nspawn/$container.nspawn" <<EOF
+[Exec]
+SetCredential=cred.reset:nope
+SetCredential=
+LoadCredential=cred.load-reset:/tmp/cred.path
+LoadCredential=
+SetCredential=cred.set:hello world
+SetCredential=cred.escaped:a\\nb
+SetCredential=cred.replaced:old
+SetCredential=cred.replaced:new
+LoadCredential=cred.path:/tmp/cred.missing
+LoadCredential=cred.path:/tmp/cred.path
+LoadCredential=cred.load-wins:/tmp/cred.path
+SetCredential=cred.load-wins:fallback
+SetCredential=cred.fallback:fallback
+LoadCredential=cred.fallback:/tmp/cred.missing
+LoadCredential=cred.inherited:svc.cred
+LoadCredential=cred.inherited-missing:svc.missing
+LoadCredential=cred.inherited-fallback:svc.missing
+SetCredential=cred.inherited-fallback:fallback
+SetCredential=cred.no-separator
+LoadCredential=cred.no-separator
+SetCredential=cred/invalid:value
+LoadCredential=cred/invalid:/tmp/cred.path
+LoadCredential=cred.relative:tmp/cred.path
+LoadCredential=cred.unnormalized:/tmp/../tmp/cred.path
+
+[Files]
+${COVERAGE_BUILD_DIR:+"Bind=$COVERAGE_BUILD_DIR"}
+EOF
+    cat >"$root/creds.sh" <<\EOF
+#!/usr/bin/env bash
+set -ex
+
+[[ "$CREDENTIALS_DIRECTORY" == /run/host/credentials ]]
+[[ "$(</run/host/credentials/cred.set)" == "hello world" ]]
+[[ "$(</run/host/credentials/cred.escaped)" == $'a\nb' ]]
+[[ "$(</run/host/credentials/cred.replaced)" == new ]]
+[[ "$(</run/host/credentials/cred.path)" == "foo bar" ]]
+[[ "$(</run/host/credentials/cred.load-wins)" == "foo bar" ]]
+[[ "$(</run/host/credentials/cred.fallback)" == fallback ]]
+[[ ! -e /run/host/credentials/cred.reset ]]
+[[ ! -e /run/host/credentials/cred.load-reset ]]
+# Invalid assignments are ignored
+[[ ! -e /run/host/credentials/cred.no-separator ]]
+[[ ! -e /run/host/credentials/cred.relative ]]
+[[ ! -e /run/host/credentials/cred.unnormalized ]]
+[[ ! -e /run/host/credentials/cred ]]
+if [[ -n "${EXPECTED_INHERITED:-}" ]]; then
+    [[ "$(</run/host/credentials/cred.inherited)" == "$EXPECTED_INHERITED" ]]
+else
+    [[ ! -e /run/host/credentials/cred.inherited ]]
+fi
+EOF
+    # A credential to be inherited from systemd-nspawn is skipped if it wasn't passed to it...
+    systemd-nspawn --register=no --directory="$root" bash /creds.sh
+
+    # ... and passed on if it was
+    systemd-run --wait \
+                -p SetCredential=svc.cred:from-service \
+                systemd-nspawn --register=no \
+                               --directory="$root" \
+                               --setenv=EXPECTED_INHERITED=from-service \
+                               bash /creds.sh
+
+    # Credentials on the command line take precedence over all credential settings
+    systemd-nspawn --register=no \
+                   --directory="$root" \
+                   --set-credential=cred.cmdline:yes \
+                   bash -xec 'test -e /run/host/credentials/cred.cmdline; test ! -e /run/host/credentials/cred.set'
+
+    # ... unless --settings=override is used, in which case the settings replace the command line ones
+    systemd-nspawn --register=no \
+                   --directory="$root" \
+                   --settings=override \
+                   --set-credential=cred.set:cmdline \
+                   --set-credential=cred.cmdline:yes \
+                   bash -xec '[[ "$(</run/host/credentials/cred.set)" == "hello world" ]]; test ! -e /run/host/credentials/cred.cmdline'
+
+    # A settings file next to the image isn't trusted, so it may not load credentials from the host, and
+    # SetCredential= is used instead. Bind= is ignored in untrusted files too, hence pass the coverage
+    # directory on the command line.
+    mv "/run/systemd/nspawn/$container.nspawn" "/var/lib/machines/$container.nspawn"
+    systemd-nspawn --register=no \
+                   --directory="$root" \
+                   ${COVERAGE_BUILD_DIR:+--bind="$COVERAGE_BUILD_DIR"} \
+                   bash -xec '[[ "$(</run/host/credentials/cred.load-wins)" == fallback ]]; test ! -e /run/host/credentials/cred.path'
+
+    # A missing credential file is fatal if there is no fallback
+    cat >"/run/systemd/nspawn/$container.nspawn" <<EOF
+[Exec]
+LoadCredential=cred.missing:/tmp/cred.missing
+
+[Files]
+${COVERAGE_BUILD_DIR:+"Bind=$COVERAGE_BUILD_DIR"}
+EOF
+    (! systemd-nspawn --register=no --directory="$root" true)
+
+    rm -fr "$root" "/run/systemd/nspawn/$container.nspawn" "/var/lib/machines/$container.nspawn" /tmp/cred.path
 }
 
 bind_user_cleanup() {
@@ -907,7 +1086,7 @@ testcase_owneridmap() {
 
     create_dummy_container "$root"
 
-    # --user=
+    # --uid=
     # "Fake" getent passwd's bare minimum, so we don't have to pull it in
     # with all the DSO shenanigans
     cat >"$root/bin/getent" <<\EOF
@@ -933,7 +1112,7 @@ EOF
             systemd-nspawn --register=no \
                            --directory="$root" \
                            -U \
-                           --user=testuser \
+                           --uid=testuser \
                            --bind=/tmp/owneridmap/bind:/home/testuser:owneridmap \
                            ${COVERAGE_BUILD_DIR:+--bind="$COVERAGE_BUILD_DIR"} \
                            bash -c "$cmd" |& tee nspawn.out; then
@@ -962,6 +1141,189 @@ testcase_notification_socket() {
 
     systemd-nspawn --register=no --directory="$root" bash -x -c "$cmd"
     systemd-nspawn --register=no --directory="$root" -U bash -x -c "$cmd"
+
+    rm -fr "$root"
+}
+
+testcase_fdstore_wipe() {
+    local root commands n_fds names unit=test-nspawn-fdstore-wipe.service
+
+    if ! dummy_container_has /usr/bin/test-fdstore; then
+        echo "test-fdstore is not available in the container template, skipping the test..."
+        return 0
+    fi
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.fdstore_wipe.XXX)"
+    create_dummy_container "$root"
+
+    cat >"$root/entrypoint.sh" <<'EOF'
+#!/usr/bin/env bash
+set -e
+exec /usr/bin/test-fdstore store
+EOF
+    chmod +x "$root/entrypoint.sh"
+
+    # FD-store wipes must work without access to either manager bus.
+    systemd-run --unit="$unit" -p Type=notify -p NotifyAccess=all -p KillMode=mixed \
+        -p StartLimitIntervalSec=0 \
+        -p 'InaccessiblePaths=-/run/dbus -/run/systemd/private' \
+        -p Delegate=yes -p DelegateSubgroup=supervisor \
+        -p FileDescriptorStoreMax=4 -p FileDescriptorStorePreserve=yes \
+        -p 'ExecReload=/bin/sh -c "exec systemd-notify --fd=3 --fdname=nspawn-only 3</dev/null"' \
+        systemd-nspawn --register=no --keep-unit --directory="$root" \
+        --notify-ready=yes --kill-signal=SIGTERM /entrypoint.sh
+    timeout 30s bash -c \
+        'until [[ "$(systemctl show "$1" -P NFileDescriptorStore)" -eq 2 ]]; do sleep 0.5; done' _ "$unit"
+
+    systemctl reload "$unit"
+    assert_eq "$(systemctl show "$unit" -P NFileDescriptorStore)" 3
+
+    for commands in "check wipe=missing*" "check wipe=" "check wipe=1" "check wipe=test-fd-" \
+                    "check wipe=test-fd-[[:alpha:]]" "check wipe=test-fd-[a]" "wipe=test-fd-?" "store wipe=test-fd-[a-z]" \
+                    "store wipe=*" "wipe"; do
+        case "$commands" in
+            "check wipe=missing*"|"check wipe="|"check wipe=1"|"check wipe=test-fd-"|"check wipe=test-fd-[[:alpha:]]")
+                n_fds=3
+                names='["nspawn-only", "payload-test-fd-a", "payload-test-fd-b"]'
+                ;;
+            "check wipe=test-fd-[a]")
+                n_fds=2
+                names='["nspawn-only", "payload-test-fd-b"]'
+                ;;
+            *)
+                n_fds=1
+                names='["nspawn-only"]'
+                ;;
+        esac
+
+        cat >"$root/entrypoint.sh" <<EOF
+#!/usr/bin/env bash
+set -ef
+exec /usr/bin/test-fdstore $commands
+EOF
+        systemctl restart "$unit"
+        timeout 30s bash -c \
+            'until [[ "$(systemctl show "$1" -P NFileDescriptorStore)" -eq "$2" ]]; do sleep 0.5; done' _ "$unit" "$n_fds"
+        systemd-analyze fdstore "$unit" --json=short | jq -e --argjson names "$names" '[.[].fdname] | sort == $names'
+        systemctl is-active --quiet "$unit"
+    done
+
+    systemctl stop "$unit"
+    systemctl clean "$unit" --what=fdstore
+    rm -fr "$root"
+}
+
+testcase_socket_activation() {
+    # Verify that the socket activation environment variables are properly propagated into the
+    # container, i.e. that $LISTEN_FDNAMES survives, and that $LISTEN_PID refers to the process that
+    # actually ends up running the payload (PID 2 when --as-pid2 is used).
+    # https://github.com/systemd/systemd/issues/43764
+    local root entrypoint socket1 socket2 nspawn
+
+    if ! dummy_container_has /usr/bin/test-fdstore; then
+        echo "test-fdstore is not available in the container template, skipping the test..."
+        return 0
+    fi
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.socket-activation.XXX)"
+    create_dummy_container "$root"
+
+    entrypoint="$root/entrypoint.sh"
+    socket1="/run/TEST-13-NSPAWN-socket-activation-1.sock"
+    socket2="/run/TEST-13-NSPAWN-socket-activation-2.sock"
+    rm -f "$socket1" "$socket2"
+
+    cat >"$entrypoint" <<\EOF
+#!/usr/bin/env bash
+set -ex
+
+env | grep '^LISTEN_'
+test "$LISTEN_FDS" = "${EXPECTED_FDS:-1}"
+test "${LISTEN_FDNAMES-unset}" = "$EXPECTED_FDNAMES"
+if [[ -v EXPECTED_PID ]]; then
+    test "$LISTEN_PID" = "$EXPECTED_PID"
+    # $LISTEN_PIDFDID must not refer to a different process than $LISTEN_PID
+    test "${LISTEN_PIDFDID-unset}" = "unset"
+else
+    test "$LISTEN_PID" = "$$"
+fi
+for ((fd = 3; fd < 3 + LISTEN_FDS; fd++)); do
+    test -S "/proc/self/fd/$fd"
+done
+if [[ ! -v EXPECTED_PID ]]; then
+    # sd_listen_fds() only accepts the fds if both $LISTEN_PID and $LISTEN_PIDFDID refer to the calling
+    # process. exec keeps both our PID and our pidfd inode ID.
+    exec /usr/bin/test-fdstore listen exit
+fi
+EOF
+    chmod +x "$entrypoint"
+
+    nspawn=(systemd-nspawn --register=no --directory="$root")
+
+    # Without --as-pid2 the payload is PID 1 in the container...
+    systemd-socket-activate --listen="$socket1" --fdname=hoge --now -- \
+        "${nspawn[@]}" --setenv=EXPECTED_FDNAMES=hoge "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # ...and with --as-pid2 it's PID 2, as the stub PID 1 forks it off.
+    systemd-socket-activate --listen="$socket1" --fdname=hoge --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=hoge "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # Multiple file descriptors are passed on in order
+    systemd-socket-activate --listen="$socket1" --listen="$socket2" --fdname=hoge --fdname=fuga --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDS=2 --setenv=EXPECTED_FDNAMES=hoge:fuga \
+                       "${entrypoint##"$root"}"
+    rm -f "$socket1" "$socket2"
+
+    # Escape sequences in $LISTEN_FDNAMES are resolved the same way sd_listen_fds_with_names() does, and the
+    # names are escaped again when passed on, so that the payload ends up with the same names
+    systemd-socket-activate --listen="$socket1" --listen="$socket2" \
+                            --fdname='ho\ge' --fdname='fu\\ga' --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDS=2 --setenv='EXPECTED_FDNAMES=hoge:fu\\ga' \
+                       "${entrypoint##"$root"}"
+    rm -f "$socket1" "$socket2"
+
+    # The prefix nspawn adds to the names of fd store entries it forwards upstream is stripped again, but
+    # only if nspawn actually forwards fd store entries, i.e. it has an upstream fd store
+    systemd-socket-activate --listen="$socket1" --fdname=payload-hoge --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=payload-hoge "${entrypoint##"$root"}"
+    rm -f "$socket1"
+    systemd-run --wait --pipe -p Type=notify -p NotifyAccess=all -p FileDescriptorStoreMax=1 -- \
+        bash -c 'exec systemd-socket-activate -E NOTIFY_SOCKET -E FDSTORE "$@"' _ \
+            --listen="$socket1" --fdname=payload-hoge --now -- \
+            "${nspawn[@]}" --keep-unit --as-pid2 --setenv=EXPECTED_FDNAMES=hoge "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # $LISTEN_FDNAMES is not passed on if it is not set, ...
+    systemd-socket-activate --listen="$socket1" --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=unset "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # ...doesn't match the number of file descriptors, ...
+    systemd-socket-activate --listen="$socket1" --fdname=hoge --fdname=fuga --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=unset "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # ...cannot be parsed, ...
+    # shellcheck disable=SC1003
+    systemd-socket-activate --listen="$socket1" --fdname='hoge\' --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=unset "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # ...or contains invalid names
+    systemd-socket-activate --listen="$socket1" --fdname=$'ho\tge' --now -- \
+        "${nspawn[@]}" --as-pid2 --setenv=EXPECTED_FDNAMES=unset "${entrypoint##"$root"}"
+    rm -f "$socket1"
+
+    # An explicit --setenv= takes precedence over the socket activation variables, and $LISTEN_PIDFDID is
+    # not set if $LISTEN_PID is overridden
+    systemd-socket-activate --listen="$socket1" --fdname=hoge --now -- \
+        "${nspawn[@]}" --as-pid2 \
+                       --setenv=LISTEN_FDNAMES=override --setenv=EXPECTED_FDNAMES=override \
+                       --setenv=LISTEN_PID=4711 --setenv=EXPECTED_PID=4711 \
+                       "${entrypoint##"$root"}"
+    rm -f "$socket1"
 
     rm -fr "$root"
 }
@@ -1182,9 +1544,44 @@ matrix_run_one() {
                        ip a | grep -v -E '^1: lo.*UP'
     ip netns del nspawn_test
 
+    # test --network-namespace-path works when combined with --private-users=pick
+    ip netns add nspawn_test
+    ip netns exec nspawn_test ip link add foo type dummy
+
+    if [[ "$IS_USERNS_SUPPORTED" == "yes" && "$api_vfs_writable" == "no" ]]; then
+        SYSTEMD_NSPAWN_USE_CGNS="$use_cgns" SYSTEMD_NSPAWN_API_VFS_WRITABLE="$api_vfs_writable" \
+            systemd-nspawn --register=no \
+                           --directory="$root" \
+                           --private-users=pick \
+                           --network-namespace-path=/run/netns/nspawn_test \
+                           ip link show dev foo
+    fi
+
+    ip netns del nspawn_test
+
     rm -fr "$root"
 
     return 0
+}
+
+testcase_ping_group_range() {
+    local range root
+
+    if [[ "$IS_USERNS_SUPPORTED" == "no" ]]; then
+        echo "Skipping user namespace test..."
+        return 0
+    fi
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.ping-group-range.XXX)"
+    create_dummy_container "$root"
+    trap 'rm -fr "$root"' RETURN ERR
+
+    range="$(systemd-nspawn --pipe --register=no \
+                            --directory="$root" \
+                            --private-network \
+                            --private-users=pick \
+                            cat /proc/sys/net/ipv4/ping_group_range)"
+    assert_eq "${range//[[:space:]]/ }" "0 65535"
 }
 
 testcase_api_vfs() {
@@ -1347,7 +1744,10 @@ testcase_unpriv() {
 }
 
 testcase_fuse() {
-    if [[ "$(cat <>/dev/fuse 2>&1)" != 'cat: -: Operation not permitted' ]]; then
+    # On some kernels reading from /dev/fuse without an attached connection blocks indefinitely
+    # rather than returning EPERM, so guard the probe with a short timeout and skip the test
+    # whenever we don't get the expected error string.
+    if [[ "$(timeout --foreground 5 cat <>/dev/fuse 2>&1)" != 'cat: -: Operation not permitted' ]]; then
         echo "FUSE is not supported, skipping the test..."
         return 0
     fi
@@ -1378,7 +1778,7 @@ testcase_fuse() {
     #    "cat: -: Operation not permitted"                   # pass the test; opened but not read
     #    "bash: line 1: /dev/fuse: Operation not permitted"  # fail the test; could not open
     #    ""                                                  # fail the test; reading worked
-    [[ "$(systemd-nspawn --register=no --pipe --directory="$root" \
+    [[ "$(timeout --foreground 30 systemd-nspawn --register=no --pipe --directory="$root" \
               bash -c 'cat <>/dev/fuse' 2>&1)" == 'cat: -: Operation not permitted' ]]
 
     rm -fr "$root"
@@ -1387,7 +1787,7 @@ testcase_fuse() {
 testcase_unpriv_fuse() {
     # Same as above, but for unprivileged operation.
 
-    if [[ "$(cat <>/dev/fuse 2>&1)" != 'cat: -: Operation not permitted' ]]; then
+    if [[ "$(timeout --foreground 5 cat <>/dev/fuse 2>&1)" != 'cat: -: Operation not permitted' ]]; then
         echo "FUSE is not supported, skipping the test..."
         return 0
     fi
@@ -1406,7 +1806,7 @@ testcase_unpriv_fuse() {
     create_dummy_ddi "$tmpdir" "$name"
     chown --recursive testuser: "$tmpdir"
 
-    [[ "$(run0 -u testuser --pipe systemd-run \
+    [[ "$(timeout --foreground 60 run0 -u testuser --pipe systemd-run \
               --user \
               --pipe \
               --property=Delegate=yes \
@@ -1487,6 +1887,16 @@ testcase_unpriv_dir() {
 
     assert_eq "$(run0 --pipe -u testuser systemd-nspawn --pipe --register=no -D "$root" --private-users=managed --private-network bash -c 'echo foobar')" "foobar"
     assert_eq "$(run0 --pipe -u testuser systemd-nspawn --pipe --register=no -D "$root" --private-network bash -c 'echo foobar')" "foobar"
+
+    # The OS tree checks must also work if the foreign-owned root directory isn't accessible to the
+    # unprivileged user, both for /usr/ (non-boot) and os-release (--boot)
+    chmod 0700 "$root"
+    assert_eq "$(run0 --pipe -u testuser systemd-nspawn --pipe --register=no -D "$root" --private-network bash -c 'echo foobar')" "foobar"
+    run0 --pipe -u testuser systemd-nspawn --pipe --register=no -D "$root" --private-network --boot
+    rm -f "$root/etc/os-release" "$root/usr/lib/os-release"
+    (! run0 --pipe -u testuser systemd-nspawn --pipe --register=no -D "$root" --private-network --boot)
+    run0 --pipe -u testuser --setenv=SYSTEMD_NSPAWN_CHECK_OS_RELEASE=0 \
+        systemd-nspawn --pipe --register=no -D "$root" --private-network --boot
     chown root:root "$root/.."
 
     rm -rf "$root"
@@ -1498,7 +1908,7 @@ testcase_link_journal_host() {
     root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.link-journal.XXX)"
     create_dummy_container "$root"
 
-    systemd-id128 new > "$root"/etc/machine-id
+    systemd-id128 new >"$root"/etc/machine-id
 
     hoge="/var/log/journal/$(cat "$root"/etc/machine-id)/"
     mkdir -p "$hoge"
@@ -1553,6 +1963,47 @@ testcase_volatile_link_journal_no_userns() {
     grep -q "4294967295" <<< "$acl_output" && exit 1
 
     rm -fr "$root" "$journal_dir"
+}
+
+testcase_boot_param_split() {
+    local root outdir
+
+    root="$(mktemp -d /var/lib/machines/TEST-13-NSPAWN.boot-param-split.XXX)"
+    outdir="$(mktemp -d)"
+    create_dummy_container "$root"
+
+    # Replace the init binary with a stub that records the argv and environment nspawn passes to it,
+    # so we can verify that kernel-cmdline-style KEY=VALUE arguments are split between PID 1's
+    # environment and argv the same way the kernel splits them.
+    mkdir -p "$root/usr/lib/systemd"
+    cat >"$root/usr/lib/systemd/systemd" <<'EOF'
+#!/bin/bash
+set -e
+printf '%s\n' "$@" >/output/argv
+env >/output/env
+EOF
+    chmod +x "$root/usr/lib/systemd/systemd"
+
+    # Cover the assignments that should land in env (FOO=bar, baz-qux=hello → baz_qux), the
+    # dotted assignments that should stay as argv (systemd.unit=…, some.thing=…), and the malformed
+    # entries that look env-like but must also stay as argv: empty key (=value), key starting with
+    # a digit (123=foo), key with characters that aren't valid in an env var name (foo!=bar).
+    systemd-nspawn --register=no \
+                   --directory="$root" \
+                   --bind="$outdir:/output" \
+                   --boot \
+                   FOO=bar baz-qux=hello systemd.unit=foo.target some.thing=yes plain-arg \
+                   =empty-key 123=leading-digit 'foo!=bad-char'
+
+    diff <(printf 'systemd.unit=foo.target\nsome.thing=yes\nplain-arg\n=empty-key\n123=leading-digit\nfoo!=bad-char\n') "$outdir/argv"
+    grep '^FOO=bar$' >/dev/null "$outdir/env"
+    grep '^baz_qux=hello$' >/dev/null "$outdir/env"
+    (! grep -E '^(systemd\.unit|some\.thing)=' >/dev/null "$outdir/env")
+    (! grep -E '^(FOO|baz_qux)=' >/dev/null "$outdir/argv")
+    (! grep -E '^(123|foo!?)=' >/dev/null "$outdir/env")
+    (! grep -E '^=' >/dev/null "$outdir/env")
+
+    rm -fr "$root" "$outdir"
 }
 
 testcase_cap_net_bind_service() {

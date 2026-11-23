@@ -9,9 +9,6 @@
 #include "resolve-util.h"
 #include "resolved-forward.h"
 
-#define LINK_SEARCH_DOMAINS_MAX 1024
-#define LINK_DNS_SERVERS_MAX 256
-
 typedef struct LinkAddress {
         Link *link;
 
@@ -106,6 +103,7 @@ bool link_get_default_route(Link *l);
 int link_save_user(Link *l);
 int link_load_user(Link *l);
 void link_remove_user(Link *l);
+void link_revert_settings(Link *l);
 
 int link_address_new(Link *l,
                 LinkAddress **ret,
@@ -120,3 +118,6 @@ void link_address_add_rrs(LinkAddress *a, bool force_remove);
 bool link_negative_trust_anchor_lookup(Link *l, const char *name);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Link*, link_free);
+
+int link_set_dns_servers(Link *l, struct in_addr_full **dns, size_t n_dns, ResolveConfigSource source);
+int link_set_search_domains(Link *l, char * const *domains, ResolveConfigSource source);

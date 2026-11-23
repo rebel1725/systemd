@@ -26,6 +26,7 @@ BUS_DEFINE_PROPERTY_GET(bus_property_get_tasks_max, "t", CGroupTasksMax, cgroup_
 BUS_DEFINE_PROPERTY_GET_ENUM(bus_property_get_cgroup_pressure_watch, cgroup_pressure_watch, CGroupPressureWatch);
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_cgroup_device_policy, cgroup_device_policy, CGroupDevicePolicy);
+static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_cpuset_partition, cpuset_partition, CPUSetPartition);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_managed_oom_mode, managed_oom_mode, ManagedOOMMode);
 static BUS_DEFINE_PROPERTY_GET_ENUM(property_get_managed_oom_preference, managed_oom_preference, ManagedOOMPreference);
 
@@ -385,6 +386,7 @@ const sd_bus_vtable bus_cgroup_vtable[] = {
         SD_BUS_PROPERTY("StartupAllowedCPUs", "ay", property_get_cpuset, offsetof(CGroupContext, startup_cpuset_cpus), 0),
         SD_BUS_PROPERTY("AllowedMemoryNodes", "ay", property_get_cpuset, offsetof(CGroupContext, cpuset_mems), 0),
         SD_BUS_PROPERTY("StartupAllowedMemoryNodes", "ay", property_get_cpuset, offsetof(CGroupContext, startup_cpuset_mems), 0),
+        SD_BUS_PROPERTY("CPUSetPartition", "s", property_get_cpuset_partition, offsetof(CGroupContext, cpuset_partition), 0),
         SD_BUS_PROPERTY("IOAccounting", "b", bus_property_get_bool, offsetof(CGroupContext, io_accounting), 0),
         SD_BUS_PROPERTY("IOWeight", "t", NULL, offsetof(CGroupContext, io_weight), 0),
         SD_BUS_PROPERTY("StartupIOWeight", "t", NULL, offsetof(CGroupContext, startup_io_weight), 0),
@@ -422,13 +424,18 @@ const sd_bus_vtable bus_cgroup_vtable[] = {
         SD_BUS_PROPERTY("ManagedOOMMemoryPressureLimit", "u", NULL, offsetof(CGroupContext, moom_mem_pressure_limit), 0),
         SD_BUS_PROPERTY("ManagedOOMMemoryPressureDurationUSec", "t", bus_property_get_usec, offsetof(CGroupContext, moom_mem_pressure_duration_usec), 0),
         SD_BUS_PROPERTY("ManagedOOMPreference", "s", property_get_managed_oom_preference, offsetof(CGroupContext, moom_preference), 0),
+        SD_BUS_PROPERTY("OOMRules", "as", NULL, offsetof(CGroupContext, moom_rules), 0),
         SD_BUS_PROPERTY("BPFProgram", "a(ss)", property_get_bpf_foreign_program, 0, 0),
         SD_BUS_PROPERTY("SocketBindAllow", "a(iiqq)", property_get_socket_bind, offsetof(CGroupContext, socket_bind_allow), 0),
         SD_BUS_PROPERTY("SocketBindDeny", "a(iiqq)", property_get_socket_bind, offsetof(CGroupContext, socket_bind_deny), 0),
         SD_BUS_PROPERTY("RestrictNetworkInterfaces", "(bas)", property_get_restrict_network_interfaces, 0, 0),
         SD_BUS_PROPERTY("BindNetworkInterface", "s", NULL, offsetof(CGroupContext, bind_network_interface), 0),
-        SD_BUS_PROPERTY("MemoryPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(CGroupContext, memory_pressure_watch), 0),
-        SD_BUS_PROPERTY("MemoryPressureThresholdUSec", "t", bus_property_get_usec, offsetof(CGroupContext, memory_pressure_threshold_usec), 0),
+        SD_BUS_PROPERTY("MemoryPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(CGroupContext, pressure[PRESSURE_MEMORY].watch), 0),
+        SD_BUS_PROPERTY("MemoryPressureThresholdUSec", "t", bus_property_get_usec, offsetof(CGroupContext, pressure[PRESSURE_MEMORY].threshold_usec), 0),
+        SD_BUS_PROPERTY("CPUPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(CGroupContext, pressure[PRESSURE_CPU].watch), 0),
+        SD_BUS_PROPERTY("CPUPressureThresholdUSec", "t", bus_property_get_usec, offsetof(CGroupContext, pressure[PRESSURE_CPU].threshold_usec), 0),
+        SD_BUS_PROPERTY("IOPressureWatch", "s", bus_property_get_cgroup_pressure_watch, offsetof(CGroupContext, pressure[PRESSURE_IO].watch), 0),
+        SD_BUS_PROPERTY("IOPressureThresholdUSec", "t", bus_property_get_usec, offsetof(CGroupContext, pressure[PRESSURE_IO].threshold_usec), 0),
         SD_BUS_PROPERTY("NFTSet", "a(iiss)", property_get_cgroup_nft_set, 0, 0),
         SD_BUS_PROPERTY("CoredumpReceive", "b", bus_property_get_bool, offsetof(CGroupContext, coredump_receive), 0),
 
@@ -627,7 +634,7 @@ static int bus_cgroup_set_transient_property(
                         STRV_FOREACH(entry, *filters)
                                 fprintf(f, "%s=%s\n", name, *entry);
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -703,7 +710,7 @@ static int bus_cgroup_set_transient_property(
                                                 bpf_cgroup_attach_type_to_string(fp->attach_type),
                                                 fp->bpffs_path);
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -712,9 +719,12 @@ static int bus_cgroup_set_transient_property(
 
                 return 1;
 
-        } else if (streq(name, "MemoryPressureWatch")) {
+        } else if (STR_IN_SET(name, "MemoryPressureWatch", "CPUPressureWatch", "IOPressureWatch")) {
                 CGroupPressureWatch p;
                 const char *t;
+
+                PressureResource pt = streq(name, "MemoryPressureWatch") ? PRESSURE_MEMORY :
+                                      streq(name, "CPUPressureWatch") ? PRESSURE_CPU : PRESSURE_IO;
 
                 r = sd_bus_message_read(message, "s", &t);
                 if (r < 0)
@@ -729,26 +739,29 @@ static int bus_cgroup_set_transient_property(
                 }
 
                 if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
-                        c->memory_pressure_watch = p;
-                        unit_write_settingf(u, flags, name, "MemoryPressureWatch=%s", strempty(cgroup_pressure_watch_to_string(p)));
+                        c->pressure[pt].watch = p;
+                        unit_write_settingf(u, flags, name, "%s=%s", name, strempty(cgroup_pressure_watch_to_string(p)));
                 }
 
                 return 1;
 
-        } else if (streq(name, "MemoryPressureThresholdUSec")) {
+        } else if (STR_IN_SET(name, "MemoryPressureThresholdUSec", "CPUPressureThresholdUSec", "IOPressureThresholdUSec")) {
                 uint64_t t;
+
+                PressureResource pt = streq(name, "MemoryPressureThresholdUSec") ? PRESSURE_MEMORY :
+                                      streq(name, "CPUPressureThresholdUSec") ? PRESSURE_CPU : PRESSURE_IO;
 
                 r = sd_bus_message_read(message, "t", &t);
                 if (r < 0)
                         return r;
 
                 if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
-                        c->memory_pressure_threshold_usec = t;
+                        c->pressure[pt].threshold_usec = t;
 
                         if (t == UINT64_MAX)
-                                unit_write_setting(u, flags, name, "MemoryPressureThresholdUSec=");
+                                unit_write_settingf(u, flags, name, "%s=", name);
                         else
-                                unit_write_settingf(u, flags, name, "MemoryPressureThresholdUSec=%" PRIu64, t);
+                                unit_write_settingf(u, flags, name, "%s=%" PRIu64, name, t);
                 }
 
                 return 1;
@@ -1240,7 +1253,7 @@ int bus_cgroup_set_property(
                 while ((r = sd_bus_message_read(message, "(st)", &path, &u64)) > 0) {
 
                         if (!path_is_normalized(path))
-                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", name, path);
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", path, name);
 
                         if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                                 CGroupIODeviceLimit *a = NULL;
@@ -1302,7 +1315,7 @@ int bus_cgroup_set_property(
                                 if (a->limits[iol_type] != cgroup_io_limit_defaults[iol_type])
                                         fprintf(f, "%s=%s %" PRIu64 "\n", name, a->path, a->limits[iol_type]);
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1323,7 +1336,7 @@ int bus_cgroup_set_property(
                 while ((r = sd_bus_message_read(message, "(st)", &path, &weight)) > 0) {
 
                         if (!path_is_normalized(path))
-                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", name, path);
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", path, name);
 
                         if (!CGROUP_WEIGHT_IS_OK(weight) || weight == CGROUP_WEIGHT_INVALID)
                                 return sd_bus_error_set(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "IODeviceWeight= value out of range");
@@ -1379,7 +1392,7 @@ int bus_cgroup_set_property(
                         LIST_FOREACH(device_weights, a, c->io_device_weights)
                                 fprintf(f, "IODeviceWeight=%s %" PRIu64 "\n", a->path, a->weight);
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1400,7 +1413,7 @@ int bus_cgroup_set_property(
                 while ((r = sd_bus_message_read(message, "(st)", &path, &target)) > 0) {
 
                         if (!path_is_normalized(path))
-                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", name, path);
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Path '%s' specified in %s= is not normalized.", path, name);
 
                         if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
                                 CGroupIODeviceLatency *a = NULL;
@@ -1454,7 +1467,7 @@ int bus_cgroup_set_property(
                                 fprintf(f, "IODeviceLatencyTargetSec=%s %s\n",
                                         a->path, FORMAT_TIMESPAN(a->target_usec, 1));
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1479,6 +1492,35 @@ int bus_cgroup_set_property(
                         c->device_policy = p;
                         unit_invalidate_cgroup(u, CGROUP_MASK_BPF_DEVICES);
                         unit_write_settingf(u, flags, name, "DevicePolicy=%s", policy);
+                }
+
+                return 1;
+
+        } else if (streq(name, "CPUSetPartition")) {
+                const char *partition_str;
+                CPUSetPartition p;
+
+                r = sd_bus_message_read(message, "s", &partition_str);
+                if (r < 0)
+                        return r;
+
+                if (isempty(partition_str))
+                        p = _CPUSET_PARTITION_INVALID;
+                else {
+                        p = cpuset_partition_from_string(partition_str);
+                        if (p < 0)
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS,
+                                                         "Invalid CPUSetPartition value: %s", partition_str);
+                }
+
+                if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                        c->cpuset_partition = p;
+                        unit_invalidate_cgroup(u, CGROUP_MASK_CPUSET);
+
+                        if (p == _CPUSET_PARTITION_INVALID)
+                                unit_write_settingf(u, flags, name, "%s=", name);
+                        else
+                                unit_write_settingf(u, flags, name, "%s=%s", name, partition_str);
                 }
 
                 return 1;
@@ -1539,7 +1581,7 @@ int bus_cgroup_set_property(
                         LIST_FOREACH(device_allow, a, c->device_allow)
                                 fprintf(f, "DeviceAllow=%s %s\n", a->path, cgroup_device_permissions_to_string(a->permissions));
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1648,7 +1690,7 @@ int bus_cgroup_set_property(
                                                 IN_ADDR_PREFIX_TO_STRING(p->family, &p->address, p->prefixlen));
                         }
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1755,6 +1797,38 @@ int bus_cgroup_set_property(
 
                 return 1;
         }
+
+        if (streq(name, "OOMRules")) {
+                _cleanup_strv_free_ char **oom_rules = NULL;
+
+                if (!UNIT_VTABLE(u)->can_set_managed_oom)
+                        return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Cannot set %s for this unit type", name);
+
+                r = sd_bus_message_read_strv(message, &oom_rules);
+                if (r < 0)
+                        return r;
+
+                STRV_FOREACH(rule, oom_rules)
+                        if (!string_is_safe(*rule, STRING_FILENAME))
+                                return sd_bus_error_setf(reterr_error, SD_BUS_ERROR_INVALID_ARGS, "Invalid rule name: %s", *rule);
+
+                strv_uniq(oom_rules);
+
+                if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+                        _cleanup_free_ char *joined = strv_join(oom_rules, " ");
+                        if (!joined)
+                                return -ENOMEM;
+
+                        strv_free_and_replace(c->moom_rules, oom_rules);
+
+                        unit_write_settingf(u, flags, name, "OOMRules=\nOOMRules=%s", joined);
+
+                        (void) manager_varlink_send_managed_oom_update(u);
+                }
+
+                return 1;
+        }
+
         if (STR_IN_SET(name, "SocketBindAllow", "SocketBindDeny")) {
                 CGroupSocketBindItem **list;
                 uint16_t nr_ports, port_min;
@@ -1834,7 +1908,7 @@ int bus_cgroup_set_property(
                                         fputc('\n', f);
                                 }
 
-                        r = memstream_finalize(&m, &buf, NULL);
+                        r = memstream_finalize(&m, &buf, /* ret_size= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -1892,7 +1966,9 @@ int bus_cgroup_set_property(
                                 }
                         }
 
-                        joined = strv_join(l, " ");
+                        /* Quote the names, so that names containing the separators (a comma is a valid character in
+                         * an interface name) or quotes survive being read back from the drop-in. */
+                        joined = unit_concat_strv(l, UNIT_ESCAPE_EXEC_SYNTAX);
                         if (!joined)
                                 return -ENOMEM;
 
@@ -2011,7 +2087,7 @@ int bus_cgroup_set_property(
                        "DefaultMemoryLowScale",
                        "DefaultStartupMemoryLow")) {
 
-                r = sd_bus_message_skip(message, NULL);
+                r = sd_bus_message_skip(message, /* types= */ NULL);
                 if (r < 0)
                         return r;
 

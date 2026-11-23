@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
@@ -12,6 +13,7 @@
 #include "copy.h"
 #include "creds-util.h"
 #include "dissect-image.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
@@ -39,7 +41,7 @@
 #include "strv.h"
 #include "sync-util.h"
 #include "time-util.h"
-#include "tmpfile-util-label.h"
+#include "tmpfile-util.h"
 #include "uid-classification.h"
 #include "uid-range.h"
 #include "user-util.h"
@@ -112,6 +114,14 @@ STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_image_policy, image_policy_freep);
 
+COMMAND(
+        "systemd-sysusers\0",
+        "Create system user and group accounts.",
+        .argspec = "[CONFIGURATION FILE…]\0",
+        .man_page = "systemd-sysusers.service(8)",
+        .pager_flags = &arg_pager_flags,
+);
+
 typedef struct Context {
         int audit_fd;
 
@@ -130,6 +140,8 @@ typedef struct Context {
 
         UGIDAllocationRange login_defs;
         bool login_defs_need_warning;
+
+        LabelContext *label_context;
 } Context;
 
 static void context_done(Context *c) {
@@ -150,6 +162,7 @@ static void context_done(Context *c) {
 
         set_free(c->names);
         uid_range_free(c->uid_range);
+        mac_label_context_free(c->label_context);
 }
 
 static void maybe_emit_login_defs_warning(Context *c) {
@@ -301,7 +314,7 @@ static int load_group_database(Context *c) {
         return r;
 }
 
-static int make_backup(const char *target, const char *x) {
+static int make_backup(const char *target, const char *x, LabelContext *label_context) {
         _cleanup_(unlink_and_freep) char *dst_tmp = NULL;
         _cleanup_fclose_ FILE *dst = NULL;
         _cleanup_close_ int src = -EBADF;
@@ -312,26 +325,28 @@ static int make_backup(const char *target, const char *x) {
         assert(target);
         assert(x);
 
-        src = open(x, O_RDONLY|O_CLOEXEC|O_NOCTTY);
+        src = xopenat(AT_FDCWD, x, O_RDONLY|O_NOCTTY);
         if (src < 0) {
-                if (errno == ENOENT) /* No backup necessary... */
+                if (src == -ENOENT) /* No backup necessary... */
                         return 0;
 
-                return -errno;
+                return src;
         }
 
         if (fstat(src, &st) < 0)
                 return -errno;
 
-        r = fopen_temporary_label(
+        r = fopen_temporary_at_label(
+                        AT_FDCWD,
                         target,   /* The path for which to the look up the label */
                         x,        /* Where we want the file actually to end up */
                         &dst,     /* The temporary file we write to */
-                        &dst_tmp);
+                        &dst_tmp,
+                        label_context);
         if (r < 0)
                 return r;
 
-        r = copy_bytes(src, fileno(dst), UINT64_MAX, COPY_REFLINK);
+        r = copy_bytes(src, fileno(dst), UINT64_MAX, /* copy_flags= */ 0);
         if (r < 0)
                 return r;
 
@@ -351,7 +366,7 @@ static int make_backup(const char *target, const char *x) {
                 return r;
 
         if (rename(dst_tmp, backup) < 0)
-                return errno;
+                return -errno;
 
         dst_tmp = mfree(dst_tmp); /* disable the unlink_and_freep() hook now that the file has been renamed */
         return 0;
@@ -466,6 +481,35 @@ static const char* pick_shell(const Item *i) {
         return NOLOGIN;
 }
 
+static int read_shell_credential(const Item *i, char **ret) {
+        _cleanup_free_ char *cn = NULL, *shell = NULL;
+        int r;
+
+        assert(i);
+
+        cn = strjoin("passwd.shell.", i->name);
+        if (!cn)
+                return -ENOMEM;
+
+        r = read_credential(cn, (void**) &shell, /* ret_size= */ NULL);
+        if (r < 0) {
+                log_debug_errno(r, "Couldn't read credential '%s', ignoring: %m", cn);
+                if (ret)
+                        *ret = NULL;
+                return 0;
+        }
+
+        path_simplify(shell);
+        if (!valid_shell(shell))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Shell credential '%s' specifies invalid login shell '%s'.",
+                                       cn, shell);
+
+        if (ret)
+                *ret = TAKE_PTR(shell);
+        return 0;
+}
+
 static int write_temporary_passwd(
                 Context *c,
                 const char *passwd_path,
@@ -479,16 +523,24 @@ static int write_temporary_passwd(
         int r;
 
         assert(c);
+        assert(ret_tmpfile);
+        assert(ret_tmpfile_path);
 
         if (ordered_hashmap_isempty(c->todo_uids))
                 goto done;
 
         if (arg_dry_run) {
+                ORDERED_HASHMAP_FOREACH(i, c->todo_uids) {
+                        r = read_shell_credential(i, /* ret= */ NULL);
+                        if (r < 0)
+                                return r;
+                }
+
                 log_info("Would write /etc/passwd%s", glyph(GLYPH_ELLIPSIS));
                 goto done;
         }
 
-        r = fopen_temporary_label("/etc/passwd", passwd_path, &passwd, &passwd_tmp);
+        r = fopen_temporary_at_label(AT_FDCWD, passwd_path, passwd_path, &passwd, &passwd_tmp, c->label_context);
         if (r < 0)
                 return log_debug_errno(r, "Failed to open temporary copy of %s: %m", passwd_path);
 
@@ -536,7 +588,7 @@ static int write_temporary_passwd(
         }
 
         ORDERED_HASHMAP_FOREACH(i, c->todo_uids) {
-                _cleanup_free_ char *creds_shell = NULL, *cn = NULL;
+                _cleanup_free_ char *creds_shell = NULL;
 
                 struct passwd n = {
                         .pw_name = i->name,
@@ -555,15 +607,10 @@ static int write_temporary_passwd(
                         .pw_shell = (char*) pick_shell(i),
                 };
 
-                /* Try to pick up the shell for this account via the credentials logic */
-                cn = strjoin("passwd.shell.", i->name);
-                if (!cn)
-                        return -ENOMEM;
-
-                r = read_credential(cn, (void**) &creds_shell, NULL);
+                r = read_shell_credential(i, &creds_shell);
                 if (r < 0)
-                        log_debug_errno(r, "Couldn't read credential '%s', ignoring: %m", cn);
-                else
+                        return r;
+                if (creds_shell)
                         n.pw_shell = creds_shell;
 
                 r = putpwent_sane(&n, passwd);
@@ -610,6 +657,8 @@ static int write_temporary_shadow(
         int r;
 
         assert(c);
+        assert(ret_tmpfile);
+        assert(ret_tmpfile_path);
 
         if (ordered_hashmap_isempty(c->todo_uids))
                 goto done;
@@ -619,7 +668,7 @@ static int write_temporary_shadow(
                 goto done;
         }
 
-        r = fopen_temporary_label("/etc/shadow", shadow_path, &shadow, &shadow_tmp);
+        r = fopen_temporary_at_label(AT_FDCWD, shadow_path, shadow_path, &shadow, &shadow_tmp, c->label_context);
         if (r < 0)
                 return log_debug_errno(r, "Failed to open temporary copy of %s: %m", shadow_path);
 
@@ -718,8 +767,6 @@ static int write_temporary_shadow(
                 if (r == 0)
                         break;
         }
-        if (!IN_SET(errno, 0, ENOENT))
-                return -errno;
 
         r = fflush_sync_and_check(shadow);
         if (r < 0)
@@ -745,6 +792,8 @@ static int write_temporary_group(
         int r;
 
         assert(c);
+        assert(ret_tmpfile);
+        assert(ret_tmpfile_path);
 
         if (ordered_hashmap_isempty(c->todo_gids) && ordered_hashmap_isempty(c->members))
                 goto done;
@@ -754,7 +803,7 @@ static int write_temporary_group(
                 goto done;
         }
 
-        r = fopen_temporary_label("/etc/group", group_path, &group, &group_tmp);
+        r = fopen_temporary_at_label(AT_FDCWD, group_path, group_path, &group, &group_tmp, c->label_context);
         if (r < 0)
                 return log_error_errno(r, "Failed to open temporary copy of %s: %m", group_path);
 
@@ -814,7 +863,7 @@ static int write_temporary_group(
                 r = putgrent_with_members(c, &n, group);
                 if (r < 0)
                         return log_error_errno(r, "Failed to add new group \"%s\" to temporary group file: %m",
-                                               gr->gr_name);
+                                               n.gr_name);
 
                 group_changed = true;
         }
@@ -862,6 +911,8 @@ static int write_temporary_gshadow(
         int r;
 
         assert(c);
+        assert(ret_tmpfile);
+        assert(ret_tmpfile_path);
 
         if (ordered_hashmap_isempty(c->todo_gids) && ordered_hashmap_isempty(c->members))
                 goto done;
@@ -871,7 +922,7 @@ static int write_temporary_gshadow(
                 goto done;
         }
 
-        r = fopen_temporary_label("/etc/gshadow", gshadow_path, &gshadow, &gshadow_tmp);
+        r = fopen_temporary_at_label(AT_FDCWD, gshadow_path, gshadow_path, &gshadow, &gshadow_tmp, c->label_context);
         if (r < 0)
                 return log_error_errno(r, "Failed to open temporary copy of %s: %m", gshadow_path);
 
@@ -887,10 +938,13 @@ static int write_temporary_gshadow(
                 while ((r = fgetsgent_sane(original, &sg)) > 0) {
 
                         i = ordered_hashmap_get(c->groups, sg->sg_namp);
-                        if (i && i->todo_group)
-                                return log_error_errno(SYNTHETIC_ERRNO(EEXIST),
-                                                       "%s: Group \"%s\" already exists.",
-                                                       gshadow_path, sg->sg_namp);
+                        if (i && i->todo_group) {
+                                /* The group already exists in /etc/gshadow. Only the
+                                 * /etc/gshadow stage is left, so we can safely remove
+                                 * the item from the todo set. */
+                                i->todo_group = false;
+                                ordered_hashmap_remove(c->todo_gids, GID_TO_PTR(i->gid));
+                        }
 
                         r = putsgent_with_members(c, sg, gshadow);
                         if (r < 0)
@@ -981,23 +1035,23 @@ static int write_files(Context *c) {
 
         /* Make a backup of the old files */
         if (group) {
-                r = make_backup("/etc/group", group_path);
+                r = make_backup(group_path, group_path, c->label_context);
                 if (r < 0)
                         return log_error_errno(r, "Failed to backup %s: %m", group_path);
         }
         if (gshadow) {
-                r = make_backup("/etc/gshadow", gshadow_path);
+                r = make_backup(gshadow_path, gshadow_path, c->label_context);
                 if (r < 0)
                         return log_error_errno(r, "Failed to backup %s: %m", gshadow_path);
         }
 
         if (passwd) {
-                r = make_backup("/etc/passwd", passwd_path);
+                r = make_backup(passwd_path, passwd_path, c->label_context);
                 if (r < 0)
                         return log_error_errno(r, "Failed to backup %s: %m", passwd_path);
         }
         if (shadow) {
-                r = make_backup("/etc/shadow", shadow_path);
+                r = make_backup(shadow_path, shadow_path, c->label_context);
                 if (r < 0)
                         return log_error_errno(r, "Failed to backup %s: %m", shadow_path);
         }
@@ -1214,12 +1268,12 @@ static int add_user(Context *c, Item *i) {
         if (!i->uid_set) {
                 uid_t candidate;
 
-                if (read_id_from_file(i, &candidate, NULL) > 0) {
+                if (read_id_from_file(i, &candidate, /* ret_gid= */ NULL) > 0) {
 
                         if (candidate <= 0 || !uid_range_contains(c->uid_range, candidate))
                                 log_debug("User ID " UID_FMT " of file not suitable for %s.", candidate, i->name);
                         else {
-                                r = uid_is_ok(c, candidate, i->name, true);
+                                r = uid_is_ok(c, candidate, i->name, /* check_with_gid= */ true);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to verify UID " UID_FMT ": %m", i->uid);
                                 else if (r > 0) {
@@ -1233,7 +1287,7 @@ static int add_user(Context *c, Item *i) {
 
         /* Otherwise, try to reuse the group ID */
         if (!i->uid_set && i->gid_set) {
-                r = uid_is_ok(c, (uid_t) i->gid, i->name, true);
+                r = uid_is_ok(c, (uid_t) i->gid, i->name, /* check_with_gid= */ true);
                 if (r < 0)
                         return log_error_errno(r, "Failed to verify UID " UID_FMT ": %m", i->uid);
                 if (r > 0) {
@@ -1251,7 +1305,7 @@ static int add_user(Context *c, Item *i) {
                         if (r < 0)
                                 return log_error_errno(r, "No free user ID available for %s.", i->name);
 
-                        r = uid_is_ok(c, c->search_uid, i->name, true);
+                        r = uid_is_ok(c, c->search_uid, i->name, /* check_with_gid= */ true);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to verify UID " UID_FMT ": %m", i->uid);
                         else if (r > 0)
@@ -1262,7 +1316,7 @@ static int add_user(Context *c, Item *i) {
                 i->uid = c->search_uid;
         }
 
-        r = ordered_hashmap_ensure_put(&c->todo_uids, NULL, UID_TO_PTR(i->uid), i);
+        r = ordered_hashmap_ensure_put(&c->todo_uids, /* hash_ops= */ NULL, UID_TO_PTR(i->uid), i);
         if (r == -EEXIST)
                 return log_error_errno(r, "Requested user %s with UID " UID_FMT " and gid" GID_FMT " to be created is duplicated "
                                        "or conflicts with another user.", i->name, i->uid, i->gid);
@@ -1381,7 +1435,7 @@ static int add_group(Context *c, Item *i) {
 
         /* Try to use the suggested numeric GID */
         if (i->gid_set) {
-                r = gid_is_ok(c, i->gid, i->name, false);
+                r = gid_is_ok(c, i->gid, i->name, /* check_with_uid= */ false);
                 if (r < 0)
                         return log_error_errno(r, "Failed to verify GID " GID_FMT ": %m", i->gid);
                 if (i->id_set_strict) {
@@ -1404,7 +1458,7 @@ static int add_group(Context *c, Item *i) {
 
         /* Try to reuse the numeric uid, if there's one */
         if (!i->gid_set && i->uid_set) {
-                r = gid_is_ok(c, (gid_t) i->uid, i->name, true);
+                r = gid_is_ok(c, (gid_t) i->uid, i->name, /* check_with_uid= */ true);
                 if (r < 0)
                         return log_error_errno(r, "Failed to verify GID " GID_FMT ": %m", i->gid);
                 if (r > 0) {
@@ -1417,12 +1471,12 @@ static int add_group(Context *c, Item *i) {
         if (!i->gid_set) {
                 gid_t candidate;
 
-                if (read_id_from_file(i, NULL, &candidate) > 0) {
+                if (read_id_from_file(i, /* ret_uid= */ NULL, &candidate) > 0) {
 
                         if (candidate <= 0 || !uid_range_contains(c->uid_range, candidate))
                                 log_debug("Group ID " GID_FMT " of file not suitable for %s.", candidate, i->name);
                         else {
-                                r = gid_is_ok(c, candidate, i->name, true);
+                                r = gid_is_ok(c, candidate, i->name, /* check_with_uid= */ true);
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to verify GID " GID_FMT ": %m", i->gid);
                                 else if (r > 0) {
@@ -1444,7 +1498,7 @@ static int add_group(Context *c, Item *i) {
                         if (r < 0)
                                 return log_error_errno(r, "No free group ID available for %s.", i->name);
 
-                        r = gid_is_ok(c, c->search_uid, i->name, true);
+                        r = gid_is_ok(c, c->search_uid, i->name, /* check_with_uid= */ true);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to verify GID " GID_FMT ": %m", i->gid);
                         else if (r > 0)
@@ -1455,7 +1509,7 @@ static int add_group(Context *c, Item *i) {
                 i->gid = c->search_uid;
         }
 
-        r = ordered_hashmap_ensure_put(&c->todo_gids, NULL, GID_TO_PTR(i->gid), i);
+        r = ordered_hashmap_ensure_put(&c->todo_gids, /* hash_ops= */ NULL, GID_TO_PTR(i->gid), i);
         if (r == -EEXIST)
                 return log_error_errno(r, "Requested group %s with GID "GID_FMT " to be created is duplicated or conflicts with another user.", i->name, i->gid);
         if (r == -ENOMEM)
@@ -1684,7 +1738,7 @@ static int item_equivalent(Item *a, Item *b) {
             !(is_nologin_shell(a_shell) && is_nologin_shell(b_shell))) {
                 _cleanup_free_ char *pa = NULL, *pb = NULL;
 
-                r = chase(a_shell, arg_root, CHASE_PREFIX_ROOT | CHASE_NONEXISTENT, &pa, NULL);
+                r = chase(a_shell, arg_root, CHASE_PREFIX_ROOT | CHASE_NONEXISTENT, &pa, /* ret_fd= */ NULL);
                 if (r < 0) {
                         log_full_errno(ERRNO_IS_RESOURCE(r) ? LOG_ERR : LOG_DEBUG,
                                        r, "Failed to look up path '%s%s%s': %m",
@@ -1692,7 +1746,7 @@ static int item_equivalent(Item *a, Item *b) {
                         return ERRNO_IS_RESOURCE(r) ? r : false;
                 }
 
-                r = chase(b_shell, arg_root, CHASE_PREFIX_ROOT | CHASE_NONEXISTENT, &pb, NULL);
+                r = chase(b_shell, arg_root, CHASE_PREFIX_ROOT | CHASE_NONEXISTENT, &pb, /* ret_fd= */ NULL);
                 if (r < 0) {
                         log_full_errno(ERRNO_IS_RESOURCE(r) ? LOG_ERR : LOG_DEBUG,
                                        r, "Failed to look up path '%s%s%s': %m",
@@ -1770,11 +1824,11 @@ static int parse_line(
                 name = mfree(name);
 
         if (name) {
-                r = specifier_printf(name, NAME_MAX, system_and_tmp_specifier_table, arg_root, NULL, &resolved_name);
+                r = specifier_printf(name, NAME_MAX, system_and_tmp_specifier_table, arg_root, /* userdata= */ NULL, &resolved_name);
                 if (r < 0)
                         return log_syntax(NULL, LOG_ERR, fname, line, r, "Failed to replace specifiers in '%s': %m", name);
 
-                if (!valid_user_group_name(resolved_name, 0))
+                if (!valid_user_group_name(resolved_name, /* flags= */ 0))
                         return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EINVAL),
                                           "'%s' is not a valid user or group name.", resolved_name);
         }
@@ -1784,7 +1838,7 @@ static int parse_line(
                 id = mfree(id);
 
         if (id) {
-                r = specifier_printf(id, PATH_MAX-1, system_and_tmp_specifier_table, arg_root, NULL, &resolved_id);
+                r = specifier_printf(id, PATH_MAX-1, system_and_tmp_specifier_table, arg_root, /* userdata= */ NULL, &resolved_id);
                 if (r < 0)
                         return log_syntax(NULL, LOG_ERR, fname, line, r,
                                           "Failed to replace specifiers in '%s': %m", name);
@@ -1795,7 +1849,7 @@ static int parse_line(
                 description = mfree(description);
 
         if (description) {
-                r = specifier_printf(description, LONG_LINE_MAX, system_and_tmp_specifier_table, arg_root, NULL, &resolved_description);
+                r = specifier_printf(description, LONG_LINE_MAX, system_and_tmp_specifier_table, arg_root, /* userdata= */ NULL, &resolved_description);
                 if (r < 0)
                         return log_syntax(NULL, LOG_ERR, fname, line, r,
                                           "Failed to replace specifiers in '%s': %m", description);
@@ -1810,7 +1864,7 @@ static int parse_line(
                 home = mfree(home);
 
         if (home) {
-                r = specifier_printf(home, PATH_MAX-1, system_and_tmp_specifier_table, arg_root, NULL, &resolved_home);
+                r = specifier_printf(home, PATH_MAX-1, system_and_tmp_specifier_table, arg_root, /* userdata= */ NULL, &resolved_home);
                 if (r < 0)
                         return log_syntax(NULL, LOG_ERR, fname, line, r,
                                           "Failed to replace specifiers in '%s': %m", home);
@@ -1827,7 +1881,7 @@ static int parse_line(
                 shell = mfree(shell);
 
         if (shell) {
-                r = specifier_printf(shell, PATH_MAX-1, system_and_tmp_specifier_table, arg_root, NULL, &resolved_shell);
+                r = specifier_printf(shell, PATH_MAX-1, system_and_tmp_specifier_table, arg_root, /* userdata= */ NULL, &resolved_shell);
                 if (r < 0)
                         return log_syntax(NULL, LOG_ERR, fname, line, r,
                                           "Failed to replace specifiers in '%s': %m", shell);
@@ -1881,7 +1935,7 @@ static int parse_line(
                         return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EINVAL),
                                           "Lines of type 'm' require a group name in the third field.");
 
-                if (!valid_user_group_name(resolved_id, 0))
+                if (!valid_user_group_name(resolved_id, /* flags= */ 0))
                         return log_syntax(NULL, LOG_ERR, fname, line, SYNTHETIC_ERRNO(EINVAL),
                                                "'%s' is not a valid user or group name.", resolved_id);
 
@@ -1919,7 +1973,7 @@ static int parse_line(
                                 if (split_pair(resolved_id, ":", &uid, &gid) == 0) {
                                         r = parse_gid(gid, &i->gid);
                                         if (r < 0) {
-                                                if (valid_user_group_name(gid, 0))
+                                                if (valid_user_group_name(gid, /* flags= */ 0))
                                                         i->group_name = TAKE_PTR(gid);
                                                 else
                                                         return log_syntax(NULL, LOG_ERR, fname, line, r,
@@ -2037,148 +2091,91 @@ static int cat_config(void) {
         _cleanup_strv_free_ char **files = NULL;
         int r;
 
-        r = conf_files_list_with_replacement(arg_root, CONF_PATHS_STRV("sysusers.d"), arg_replace, &files, NULL);
+        r = conf_files_list_with_replacement(arg_root, CONF_PATHS_STRV("sysusers.d"), arg_replace, &files, /* ret_inserted= */ NULL);
         if (r < 0)
                 return r;
 
         pager_open(arg_pager_flags);
 
-        return cat_files(NULL, files, arg_cat_flags);
+        return cat_files(/* file= */ NULL, files, arg_cat_flags);
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
         int r;
-
-        r = terminal_urlify_man("systemd-sysusers.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...] [CONFIGURATION FILE...]\n"
-               "\n%2$sCreates system user and group accounts.%4$s\n"
-               "\n%3$sCommands:%4$s\n"
-               "     --cat-config           Show configuration files\n"
-               "     --tldr                 Show non-comment parts of configuration\n"
-               "  -h --help                 Show this help\n"
-               "     --version              Show package version\n"
-               "\n%3$sOptions:%4$s\n"
-               "     --root=PATH            Operate on an alternate filesystem root\n"
-               "     --image=PATH           Operate on disk image as filesystem root\n"
-               "     --image-policy=POLICY  Specify disk image dissection policy\n"
-               "     --replace=PATH         Treat arguments as replacement for PATH\n"
-               "     --dry-run              Just print what would be done\n"
-               "     --inline               Treat arguments as configuration lines\n"
-               "     --no-pager             Do not pipe output into a pager\n"
-               "\nSee the %5$s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_underline(),
-               ansi_normal(),
-               link);
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_CAT_CONFIG,
-                ARG_TLDR,
-                ARG_ROOT,
-                ARG_IMAGE,
-                ARG_IMAGE_POLICY,
-                ARG_REPLACE,
-                ARG_DRY_RUN,
-                ARG_INLINE,
-                ARG_NO_PAGER,
-        };
-
-        static const struct option options[] = {
-                { "help",         no_argument,       NULL, 'h'              },
-                { "version",      no_argument,       NULL, ARG_VERSION      },
-                { "cat-config",   no_argument,       NULL, ARG_CAT_CONFIG   },
-                { "tldr",         no_argument,       NULL, ARG_TLDR         },
-                { "root",         required_argument, NULL, ARG_ROOT         },
-                { "image",        required_argument, NULL, ARG_IMAGE        },
-                { "image-policy", required_argument, NULL, ARG_IMAGE_POLICY },
-                { "replace",      required_argument, NULL, ARG_REPLACE      },
-                { "dry-run",      no_argument,       NULL, ARG_DRY_RUN      },
-                { "inline",       no_argument,       NULL, ARG_INLINE       },
-                { "no-pager",     no_argument,       NULL, ARG_NO_PAGER     },
-                {}
-        };
-
-        int c, r;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_GROUP("Commands"): {}
 
-                case ARG_VERSION:
-                        return version();
-
-                case ARG_CAT_CONFIG:
+                OPTION_COMMON_CAT_CONFIG:
                         arg_cat_flags = CAT_CONFIG_ON;
                         break;
 
-                case ARG_TLDR:
+                OPTION_COMMON_TLDR:
                         arg_cat_flags = CAT_TLDR;
                         break;
 
-                case ARG_ROOT:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_root);
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION_GROUP("Options"): {}
+
+                OPTION_LONG("root", "PATH", "Operate on an alternate filesystem root"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_root);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_IMAGE:
-                        r = parse_path_argument(optarg, /* suppress_root= */ false, &arg_image);
+                OPTION_LONG("image", "PATH", "Operate on disk image as filesystem root"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ false, &arg_image);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_IMAGE_POLICY:
-                        r = parse_image_policy_argument(optarg, &arg_image_policy);
+                OPTION_LONG("image-policy", "POLICY", "Specify disk image dissection policy"):
+                        r = parse_image_policy_argument(opts.arg, &arg_image_policy);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_REPLACE:
-                        if (!path_is_absolute(optarg))
+                OPTION_LONG("replace", "PATH", "Treat arguments as replacement for PATH"):
+                        if (!path_is_absolute(opts.arg))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "The argument to --replace= must be an absolute path.");
-                        if (!endswith(optarg, ".conf"))
+                        if (!endswith(opts.arg, ".conf"))
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "The argument to --replace= must have the extension '.conf'.");
 
-                        arg_replace = optarg;
+                        arg_replace = opts.arg;
                         break;
 
-                case ARG_DRY_RUN:
+                OPTION('n', "dry-run", NULL, "Just print what would be done"):
                         arg_dry_run = true;
                         break;
 
-                case ARG_INLINE:
+                OPTION_LONG("inline", NULL, "Treat arguments as configuration lines"):
                         arg_inline = true;
                         break;
 
-                case ARG_NO_PAGER:
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
+
+        char **args = option_parser_get_args(&opts);
+        size_t n_args = option_parser_get_n_args(&opts);
 
         if (arg_replace && arg_cat_flags != CAT_CONFIG_OFF)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -2188,7 +2185,7 @@ static int parse_argv(int argc, char *argv[]) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Option --inline is not supported with --cat-config/--tldr.");
 
-        if (arg_replace && optind >= argc)
+        if (arg_replace && n_args == 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "When --replace= is given, some configuration items must be specified.");
 
@@ -2196,6 +2193,7 @@ static int parse_argv(int argc, char *argv[]) {
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Use either --root= or --image=, the combination of both is not supported.");
 
+        *ret_args = args;
         return 1;
 }
 
@@ -2281,7 +2279,17 @@ static int run(int argc, char *argv[]) {
         Item *i;
         int r;
 
-        r = parse_argv(argc, argv);
+        LIBAUDIT_NOTE(recommended);
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPT_NOTE(recommended);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBCRYPTO_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+        TPM2_NOTE(suggested);
+
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
@@ -2323,6 +2331,10 @@ static int run(int argc, char *argv[]) {
                         return log_oom();
         }
 
+        r = mac_label_context_new(arg_root, &c.label_context);
+        if (r < 0)
+                return log_error_errno(r, "Failed to initialize label context for root '%s': %m", arg_root);
+
         /* Prepare to emit audit events, but only if we're operating on the host system. */
         if (!arg_root)
                 c.audit_fd = open_audit_fd_or_warn();
@@ -2331,10 +2343,10 @@ static int run(int argc, char *argv[]) {
          * insert the positional arguments at the specified place. Otherwise, if command line arguments are
          * specified, execute just them, and finally, without --replace= or any positional arguments, just
          * read configuration and execute it. */
-        if (arg_replace || optind >= argc)
-                r = read_config_files(&c, argv + optind);
+        if (arg_replace || strv_isempty(args))
+                r = read_config_files(&c, args);
         else
-                r = parse_arguments(&c, argv + optind);
+                r = parse_arguments(&c, args);
         if (r < 0)
                 return r;
 
@@ -2352,7 +2364,7 @@ static int run(int argc, char *argv[]) {
 
         if (!c.uid_range) {
                 /* Default to default range of SYSTEMD_UID_MIN..SYSTEM_UID_MAX. */
-                r = read_login_defs(&c.login_defs, NULL, arg_root);
+                r = read_login_defs(&c.login_defs, /* path= */ NULL, arg_root);
                 if (r < 0)
                         return log_error_errno(r, "Failed to read %s%s: %m",
                                                strempty(arg_root), "/etc/login.defs");

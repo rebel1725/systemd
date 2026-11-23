@@ -13,8 +13,8 @@ Documentation=man:systemd-nsresourced.service(8)
 Requires=systemd-nsresourced.socket
 Conflicts=shutdown.target
 Before=sysinit.target shutdown.target
-Wants=modprobe@tun.service
-After=modprobe@tun.service
+Wants=modprobe@tun.service modprobe@overlay.service
+After=modprobe@tun.service modprobe@overlay.service
 DefaultDependencies=no
 
 [Service]
@@ -37,6 +37,8 @@ ProtectSystem=strict
 RestrictAddressFamilies=AF_UNIX AF_NETLINK
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
+RuntimeDirectory=systemd/nsresource
+RuntimeDirectoryPreserve=yes
 SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM
 SystemCallFilter=@system-service bpf perf_event_open open_by_handle_at

@@ -53,6 +53,9 @@ bool has_local_address(const struct local_address *addresses, size_t n_addresses
 static void suppress_duplicates(struct local_address *list, size_t *n_list) {
         size_t old_size, new_size;
 
+        POINTER_MAY_BE_NULL(list);
+        assert(n_list);
+
         /* Removes duplicate entries, assumes the list of addresses is already sorted. Updates in-place. */
 
         if (*n_list < 2) /* list with less than two entries can't have duplicates */
@@ -88,6 +91,7 @@ static int add_local_address_full(
         assert(ifindex > 0);
         assert(IN_SET(family, AF_INET, AF_INET6));
         assert(address);
+        POINTER_MAY_BE_NULL(prefsrc);
 
         if (!GREEDY_REALLOC(*list, *n_list + 1))
                 return -ENOMEM;
@@ -143,11 +147,11 @@ int local_addresses(
         if (r < 0)
                 return r;
 
-        r = sd_netlink_message_set_request_dump(req, true);
+        r = sd_netlink_message_set_request_dump(req, /* dump= */ true);
         if (r < 0)
                 return r;
 
-        r = sd_netlink_call(rtnl, req, 0, &reply);
+        r = sd_netlink_call(rtnl, req, /* timeout= */ 0, &reply);
         if (r < 0)
                 return r;
 
@@ -397,11 +401,11 @@ int local_gateways(
         if (r < 0)
                 return r;
 
-        r = sd_netlink_message_set_request_dump(req, true);
+        r = sd_netlink_message_set_request_dump(req, /* dump= */ true);
         if (r < 0)
                 return r;
 
-        r = sd_netlink_call(rtnl, req, 0, &reply);
+        r = sd_netlink_call(rtnl, req, /* timeout= */ 0, &reply);
         if (r < 0)
                 return r;
 
@@ -471,7 +475,7 @@ int local_gateways(
                         if (r < 0 && r != -ENODATA)
                                 return r;
                         if (r >= 0) {
-                                r = add_local_gateway(&list, &n_list, ifi, priority, 0, family, &gateway, &prefsrc);
+                                r = add_local_gateway(&list, &n_list, ifi, priority, /* weight= */ 0, family, &gateway, &prefsrc);
                                 if (r < 0)
                                         return r;
 
@@ -493,7 +497,7 @@ int local_gateways(
                                         return -EBADMSG;
 
                                 /* Ignore prefsrc, and let's take the source address by socket command, if necessary. */
-                                r = add_local_gateway(&list, &n_list, ifi, priority, 0, via.family,
+                                r = add_local_gateway(&list, &n_list, ifi, priority, /* weight= */ 0, via.family,
                                                       &(union in_addr_union) { .in6 = via.address.in6 },
                                                       /* prefsrc= */ NULL);
                                 if (r < 0)

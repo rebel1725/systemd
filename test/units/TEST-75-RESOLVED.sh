@@ -232,7 +232,7 @@ manual_testcase_01_resolvectl() {
     ip link add hoge.foo type dummy
 
     # Cleanup
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup() {
         ip link del hoge
         ip link del hoge.foo
@@ -248,19 +248,14 @@ manual_testcase_01_resolvectl() {
     resolvectl dns hoge.foo 10.0.1.3 10.0.1.4
     assert_in '10.0.1.1 10.0.1.2' "$(resolvectl dns hoge)"
     assert_in '10.0.1.3 10.0.1.4' "$(resolvectl dns hoge.foo)"
-    if ! RESOLVCONF=$(command -v resolvconf 2>/dev/null); then
-        TMPDIR=$(mktemp -d -p /tmp resolvconf-tests.XXXXXX)
-        RESOLVCONF="$TMPDIR"/resolvconf
-        ln -s "$(command -v resolvectl 2>/dev/null)" "$RESOLVCONF"
-    fi
 
     # DNS servers
-    echo nameserver 10.0.2.1 10.0.2.2 | "$RESOLVCONF" -a hoge
-    echo nameserver 10.0.2.3 10.0.2.4 | "$RESOLVCONF" -a hoge.foo
+    echo nameserver 10.0.2.1 10.0.2.2 | SYSTEMD_INVOKED_AS=resolvconf resolvectl -a hoge
+    echo nameserver 10.0.2.3 10.0.2.4 | SYSTEMD_INVOKED_AS=resolvconf resolvectl -a hoge.foo
     assert_in '10.0.2.1 10.0.2.2' "$(resolvectl dns hoge)"
     assert_in '10.0.2.3 10.0.2.4' "$(resolvectl dns hoge.foo)"
-    echo nameserver 10.0.3.1 10.0.3.2 | "$RESOLVCONF" -a hoge.inet.ipsec.192.168.35
-    echo nameserver 10.0.3.3 10.0.3.4 | "$RESOLVCONF" -a hoge.foo.dhcp
+    echo nameserver 10.0.3.1 10.0.3.2 | SYSTEMD_INVOKED_AS=resolvconf resolvectl -a hoge.inet.ipsec.192.168.35
+    echo nameserver 10.0.3.3 10.0.3.4 | SYSTEMD_INVOKED_AS=resolvconf resolvectl -a hoge.foo.dhcp
     assert_in '10.0.3.1 10.0.3.2' "$(resolvectl dns hoge)"
     assert_in '10.0.3.3 10.0.3.4' "$(resolvectl dns hoge.foo)"
 
@@ -268,36 +263,65 @@ manual_testcase_01_resolvectl() {
     # without domain/search clears existing domain
     resolvectl domain hoge test-domain.example.com
     assert_in 'test-domain.example.com' "$(resolvectl domain hoge)"
-    echo nameserver 10.0.2.1 10.0.2.2 | "$RESOLVCONF" -a hoge
+    echo nameserver 10.0.2.1 10.0.2.2 | SYSTEMD_INVOKED_AS=resolvconf resolvectl -a hoge
     assert_not_in 'test-domain.example.com' "$(resolvectl domain hoge)"
     # cannot set domain without DNS servers
-    (! echo domain test-domain.example.com | "$RESOLVCONF" -a hoge)
+    (! echo domain test-domain.example.com | SYSTEMD_INVOKED_AS=resolvconf resolvectl -a hoge)
     # can set domain with DNS server(s)
-    echo -e "nameserver 10.0.2.1 10.0.2.2\ndomain test-domain1.example.com test-domain2.example.com\nsearch test-search-domain.example.com" | "$RESOLVCONF" -a hoge
+    echo -e "nameserver 10.0.2.1 10.0.2.2\ndomain test-domain1.example.com test-domain2.example.com\nsearch test-search-domain.example.com" | \
+        SYSTEMD_INVOKED_AS=resolvconf resolvectl -a hoge
     assert_in 'test-domain1.example.com' "$(resolvectl domain hoge)"
     assert_in 'test-domain2.example.com' "$(resolvectl domain hoge)"
     assert_in 'test-search-domain.example.com' "$(resolvectl domain hoge)"
+    resolvectl domain hoge keep.example
+    (! echo -e "nameserver 10.0.2.1\nsearch \"unterminated" | SYSTEMD_INVOKED_AS=resolvconf resolvectl -a hoge)
+    assert_in 'keep.example' "$(resolvectl domain hoge)"
 
     # Tests for 'resolvconf -x'
-    echo nameserver 10.0.2.1 | "$RESOLVCONF" -x -a hoge
+    echo nameserver 10.0.2.1 | SYSTEMD_INVOKED_AS=resolvconf resolvectl -x -a hoge
     assert_in '~.' "$(resolvectl domain hoge)"
     resolvectl domain hoge "hoge.example.com"
     assert_in 'hoge.example.com' "$(resolvectl domain hoge)"
     assert_not_in '~.' "$(resolvectl domain hoge)"
-    echo -e "nameserver 10.0.2.1\ndomain test-domain.example.com" | "$RESOLVCONF" -x -a hoge
+
+    local hoge_state
+    hoge_state="/run/systemd/resolve/netif/$(cat /sys/class/net/hoge/ifindex)"
+    resolvectl domain hoge "route-only-change.example.com"
+    assert_in "DOMAINS=route-only-change.example.com" "$(cat "$hoge_state")"
+    assert_in "route-only-change.example.com" "$(cat /run/systemd/resolve/resolv.conf /run/systemd/resolve/stub-resolv.conf)"
+    resolvectl domain hoge "~route-only-change.example.com"
+    assert_in "DOMAINS=~route-only-change.example.com" "$(cat "$hoge_state")"
+    assert_not_in "route-only-change.example.com" "$(cat /run/systemd/resolve/resolv.conf /run/systemd/resolve/stub-resolv.conf)"
+
+    resolvectl domain hoge "old.example.com"
+    local domains=()
+    for i in {1..1025}; do
+        domains+=("too-many-$i.example.com")
+    done
+    (! resolvectl domain hoge "${domains[@]}")
+    assert_in 'old.example.com' "$(resolvectl domain hoge)"
+
+    domains=()
+    for i in {1..1024}; do
+        domains+=("replacement-$i.example.com")
+    done
+    resolvectl domain hoge "${domains[@]}"
+    assert_not_in 'old.example.com' "$(resolvectl domain hoge)"
+    assert_in 'replacement-1024.example.com' "$(resolvectl domain hoge)"
+    echo -e "nameserver 10.0.2.1\ndomain test-domain.example.com" | SYSTEMD_INVOKED_AS=resolvconf resolvectl -x -a hoge
     assert_in 'test-domain.example.com' "$(resolvectl domain hoge)"
     assert_in '~.' "$(resolvectl domain hoge)"
 
     # Tests for 'resolvconf -p'
     resolvectl default-route hoge yes
     assert_in 'yes' "$(resolvectl default-route hoge)"
-    echo nameserver 10.0.3.3 10.0.3.4 | "$RESOLVCONF" -p -a hoge
+    echo nameserver 10.0.3.3 10.0.3.4 | SYSTEMD_INVOKED_AS=resolvconf resolvectl -p -a hoge
     assert_in 'no' "$(resolvectl default-route hoge)"
 
     # Tests for 'resolvconf -d'
     resolvectl dns hoge 10.0.3.1 10.0.3.2
     resolvectl domain hoge test-domain.example.com
-    "$RESOLVCONF" -d hoge
+    SYSTEMD_INVOKED_AS=resolvconf resolvectl -d hoge
     assert_not_in '10.0.3.1' "$(resolvectl dns hoge)"
     assert_not_in '10.0.3.2' "$(resolvectl dns hoge)"
     assert_not_in 'test-domain.example.com' "$(resolvectl domain hoge)"
@@ -312,6 +336,11 @@ manual_testcase_01_resolvectl() {
     assert_in '_localdnsstub' "$(dig @127.0.0.53 -x 127.0.0.53)"
     assert_in '127.0.0.54' "$(dig @127.0.0.53 _localdnsproxy)"
     assert_in '_localdnsproxy' "$(dig @127.0.0.53 -x 127.0.0.54)"
+
+    resolvectl log-level warning
+    assert_eq "$(resolvectl log-level)" "warning"
+    resolvectl log-level debug
+    assert_eq "$(resolvectl log-level)" "debug"
 }
 
 # Tests for mDNS and LLMNR settings
@@ -320,6 +349,7 @@ manual_testcase_02_mdns_llmnr() {
     ip link add hoge.foo type dummy
 
     # Cleanup
+    # shellcheck disable=SC2317,SC2329
     cleanup() {
         rm -f /run/systemd/resolved.conf.d/90-mdns-llmnr.conf
         ip link del hoge
@@ -407,6 +437,78 @@ manual_testcase_02_mdns_llmnr() {
     assert_in 'no' "$(resolvectl llmnr hoge)"
 }
 
+# Test for the D-Bus RegisterService()/UnregisterService() API
+manual_testcase_03_register_service() {
+    local cursor_file="" invocation_id
+
+    # Cleanup
+    # shellcheck disable=SC2317,SC2329
+    cleanup() {
+        rm -f /run/systemd/resolved.conf.d/90-mdns.conf "${cursor_file:-}"
+        ip link del mdns99 2>/dev/null || :
+        systemctl reload systemd-resolved.service
+    }
+
+    trap cleanup RETURN ERR
+
+    mkdir -p /run/systemd/resolved.conf.d
+    {
+        echo "[Resolve]"
+        echo "MulticastDNS=yes"
+    } >/run/systemd/resolved.conf.d/90-mdns.conf
+    restart_resolved
+    resolvectl log-level debug
+
+    # resolved is restarted automatically if it crashes (Restart=always), which would let the checks below
+    # pass for the wrong reason, so remember the invocation and verify it stayed the same at the end.
+    invocation_id=$(systemctl show -P InvocationID systemd-resolved.service)
+
+    # Make sure at least one link carries mDNS scopes, so that unregistration actually runs the
+    # per-scope goodbye/zone teardown.
+    ip link add mdns99 type dummy
+    ip link set mdns99 up
+    resolvectl mdns mdns99 yes
+
+    cursor_file=$(mktemp)
+    journalctl -n 0 --cursor-file="$cursor_file"
+
+    # The lifetime of a registered service is bound to the bus connection of the client that registered
+    # it. busctl disconnects right after the call, so the service should be unregistered again shortly
+    # after. Wait for the vanish handler log message as proof that the client tracking triggered the
+    # unregistration. See testcase_15_wait_online_dns() for why journalctl -f | grep -m1 is not used here.
+    assert_in '/org/freedesktop/resolve1/dnssd/testservice' \
+              "$(busctl call org.freedesktop.resolve1 /org/freedesktop/resolve1 org.freedesktop.resolve1.Manager \
+                     RegisterService 'sssqqqaa{say}' testservice '%H' _testservice._tcp 1234 0 0 0)"
+
+    timeout 30 bash -c "until journalctl --after-cursor=\"\$(cat \"$cursor_file\")\" SYSLOG_IDENTIFIER=systemd-resolved --grep \"Client of DNS-SD service 'testservice' vanished, unregistering.\" >/dev/null 2>&1; do sleep .5; done"
+
+    assert_not_in 'dnssd/testservice' "$(busctl tree org.freedesktop.resolve1)"
+
+    # Unregistering it again should fail specifically because the service is gone (busctl prints the
+    # D-Bus error message, not the error name), i.e. not because resolved crashed or the bus connection
+    # failed.
+    assert_in "DNS-SD service 'testservice' not known" \
+              "$(busctl call org.freedesktop.resolve1 /org/freedesktop/resolve1 org.freedesktop.resolve1.Manager \
+                     UnregisterService 'o' /org/freedesktop/resolve1/dnssd/testservice 2>&1 || :)"
+
+    # Re-registering the same identifier must succeed: before client tracking worked, the identifier
+    # stayed taken by the vanished client's service and this failed with DNSSD_SERVICE_EXISTS. Take a
+    # fresh cursor so the wait below cannot match the first round's identical message.
+    rm -f "$cursor_file"
+    journalctl -n 0 --cursor-file="$cursor_file"
+    assert_in '/org/freedesktop/resolve1/dnssd/testservice' \
+              "$(busctl call org.freedesktop.resolve1 /org/freedesktop/resolve1 org.freedesktop.resolve1.Manager \
+                     RegisterService 'sssqqqaa{say}' testservice '%H' _testservice._tcp 1234 0 0 0)"
+
+    timeout 30 bash -c "until journalctl --after-cursor=\"\$(cat \"$cursor_file\")\" SYSLOG_IDENTIFIER=systemd-resolved --grep \"Client of DNS-SD service 'testservice' vanished, unregistering.\" >/dev/null 2>&1; do sleep .5; done"
+
+    assert_not_in 'dnssd/testservice' "$(busctl tree org.freedesktop.resolve1)"
+
+    # resolved must not have crashed and gotten restarted along the way.
+    assert_eq "$(systemctl show -P InvocationID systemd-resolved.service)" "$invocation_id"
+    systemctl is-active systemd-resolved.service
+}
+
 testcase_03_23951() {
     : "--- nss-resolve/nss-myhostname tests"
 
@@ -487,6 +589,7 @@ testcase_07_22229() {
         "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa"
         "hello.invalid"
         "hello.alt"
+        "hello.onion"
     )
 
     for name in "${FILTERED_NAMES[@]}"; do
@@ -559,6 +662,10 @@ testcase_08_resolved() {
     run resolvectl query signed.test
     grep -qF "signed.test: 10.0.0.10" "$RUN_OUT"
     grep -qF "authenticated: yes" "$RUN_OUT"
+    (! run resolvectl --raw query localhost)
+    grep -qF -- "--raw may only be combined with --type= or dns: URIs." "$RUN_OUT"
+    resolvectl --raw=packet query --type=A signed.test >"$RUN_OUT"
+    test -s "$RUN_OUT"
     run dig @ns1.unsigned.test +short MX signed.test
     grep -qF "10 mail.signed.test." "$RUN_OUT"
     run resolvectl query --legend=no -t MX signed.test
@@ -573,10 +680,13 @@ testcase_08_resolved() {
     # Check SRV support
     run resolvectl service _mysvc._tcp signed.test
     grep -qF "myservice.signed.test:1234" "$RUN_OUT"
-    grep -qF "This is TXT for myservice" "$RUN_OUT"
+    (! grep -qF "This is TXT for myservice" "$RUN_OUT")
     grep -qF "10.0.0.20" "$RUN_OUT"
     grep -qF "fd00:dead:beef:cafe::17" "$RUN_OUT"
     grep -qF "authenticated: yes" "$RUN_OUT"
+    run resolvectl service "" _mysvc._tcp signed.test
+    grep -qF "myservice.signed.test:1234" "$RUN_OUT"
+    grep -qF "This is TXT for myservice" "$RUN_OUT"
 
     # Test service resolve over Varlink
     run varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveService '{"name":"","type":"_mysvc._tcp","domain":"signed.test"}'
@@ -611,6 +721,28 @@ testcase_08_resolved() {
     run resolvectl openpgp mr.smith@signed.test
     grep -qF "5a786cdc59c161cdafd818143705026636962198c66ed4c5b3da321e._openpgpkey.signed.test" "$RUN_OUT"
     grep -qF "authenticated: yes" "$RUN_OUT"
+    run resolvectl openpgp mr.smith@signed.test --json=short
+    grep -qF '"key":{"class":1,"type":61,"name":"5a786cdc59c161cdafd818143705026636962198c66ed4c5b3da321e._openpgpkey.signed.test"}' "$RUN_OUT"
+    grep -qF '"data":"' "$RUN_OUT"
+    (! run resolvectl openpgp mr.smith@untrusted.test --json=short)
+    grep -qF "Refusing to output unauthenticated DNS records that require authentication in JSON format." "$RUN_OUT"
+    run resolvectl openpgp mr.smith@signed.test --json=short --type=OPENPGPKEY
+    grep -qF '"key":{"class":1,"type":61,"name":"5a786cdc59c161cdafd818143705026636962198c66ed4c5b3da321e._openpgpkey.signed.test"}' "$RUN_OUT"
+    grep -qF '"data":"' "$RUN_OUT"
+    (! run resolvectl openpgp mr.smith@signed.test --json=short --type=A)
+    grep -qF -- "The openpgp command may only be combined with --type=OPENPGPKEY." "$RUN_OUT"
+    (! run resolvectl openpgp nobody@signed.test)
+    grep -qF "6382b3cc881412b77bfcaeed026001c00d9e3025e66c20f6e7e92f07._openpgpkey.signed.test" "$RUN_OUT"
+    (! grep -qF "efc75004" "$RUN_OUT")
+    (! run resolvectl openpgp nobody@signed.test --json=short)
+    grep -qF "6382b3cc881412b77bfcaeed026001c00d9e3025e66c20f6e7e92f07._openpgpkey.signed.test" "$RUN_OUT"
+    (! grep -qF "efc75004" "$RUN_OUT")
+    (! run resolvectl tlsa tcp)
+    grep -qF -- "The tlsa command requires at least one domain." "$RUN_OUT"
+    (! run resolvectl tlsa signed.test:invalid --json=short)
+    grep -qF 'Invalid port "invalid".' "$RUN_OUT"
+    (! run resolvectl tlsa signed.test --json=short --type=A)
+    grep -qF -- "The tlsa command may only be combined with --type=TLSA." "$RUN_OUT"
     # Check zone transfers (AXFR/IXFR)
     # Note: since resolved doesn't support zone transfers, let's just make sure it
     #       simply refuses such requests without choking on them
@@ -758,10 +890,14 @@ testcase_08_resolved() {
     (! run resolvectl query nope.forwarded.test)
     grep -qF "nope.forwarded.test" "$RUN_OUT"
     grep -qF "not found" "$RUN_OUT"
+    (! run resolvectl --json=short query -t A nope.forwarded.test)
+    jq -e '.name == "nope.forwarded.test" and .error == "io.systemd.Resolve.DNSError" and .rcode == 3 and .queryString == "nope.forwarded.test"' "$RUN_OUT"
 
     # SERVFAIL + EDE code 6: DNSSEC Bogus
     (! run resolvectl query edns-bogus-dnssec.forwarded.test)
     grep -qE "^edns-bogus-dnssec.forwarded.test:.+: upstream-failure \(DNSSEC Bogus\)" "$RUN_OUT"
+    (! run resolvectl --json=short query -t A edns-bogus-dnssec.forwarded.test)
+    jq -e '.name == "edns-bogus-dnssec.forwarded.test" and .error == "io.systemd.Resolve.DNSSECValidationFailed" and .result == "upstream-failure" and .extendedDNSErrorCode == 6' "$RUN_OUT"
     # Same thing, but over Varlink
     (! run varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveHostname '{"name" : "edns-bogus-dnssec.forwarded.test"}')
     grep -qF "io.systemd.Resolve.DNSSECValidationFailed" "$RUN_OUT"
@@ -772,9 +908,11 @@ testcase_08_resolved() {
     # SERVFAIL + EDE code 16: Censored + extra text
     (! run resolvectl query edns-extra-text.forwarded.test)
     grep -qE "^edns-extra-text.forwarded.test.+: SERVFAIL \(Censored: Nothing to see here!\)" "$RUN_OUT"
+    (! run resolvectl --json=short query -t A edns-extra-text.forwarded.test)
+    jq -e '.name == "edns-extra-text.forwarded.test" and .error == "io.systemd.Resolve.DNSError" and .rcode == 2 and .extendedDNSErrorCode == 16 and .extendedDNSErrorMessage == "Nothing to see here!" and .queryString == "edns-extra-text.forwarded.test"' "$RUN_OUT"
     (! run varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveHostname '{"name" : "edns-extra-text.forwarded.test"}')
     grep -qF "io.systemd.Resolve.DNSError" "$RUN_OUT"
-    grep -qF '{"rcode":2,"extendedDNSErrorCode":16,"extendedDNSErrorMessage":"Nothing to see here!"}' "$RUN_OUT"
+    grep -qF '{"rcode":2,"extendedDNSErrorCode":16,"extendedDNSErrorMessage":"Nothing to see here!","queryString":"edns-extra-text.forwarded.test"}' "$RUN_OUT"
     journalctl --sync
     journalctl -u systemd-resolved.service --cursor-file="$JOURNAL_CURSOR" --grep "Server returned error: SERVFAIL \(Censored: Nothing to see here!\)"
 
@@ -783,7 +921,7 @@ testcase_08_resolved() {
     grep -qE "^edns-code-zero.forwarded.test:.+: SERVFAIL \(Other: 🐱\)" "$RUN_OUT"
     (! run varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveHostname '{"name" : "edns-code-zero.forwarded.test"}')
     grep -qF "io.systemd.Resolve.DNSError" "$RUN_OUT"
-    grep -qF '{"rcode":2,"extendedDNSErrorCode":0,"extendedDNSErrorMessage":"🐱"}' "$RUN_OUT"
+    grep -qF '{"rcode":2,"extendedDNSErrorCode":0,"extendedDNSErrorMessage":"🐱","queryString":"edns-code-zero.forwarded.test"}' "$RUN_OUT"
     journalctl --sync
     journalctl -u systemd-resolved.service --cursor-file="$JOURNAL_CURSOR" --grep "Server returned error: SERVFAIL \(Other: 🐱\)"
 
@@ -792,7 +930,7 @@ testcase_08_resolved() {
     grep -qE "^edns-invalid-code.forwarded.test:.+: SERVFAIL \([0-9]+\)" "$RUN_OUT"
     (! run varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveHostname '{"name" : "edns-invalid-code.forwarded.test"}')
     grep -qF "io.systemd.Resolve.DNSError" "$RUN_OUT"
-    grep -qE '{"rcode":2,"extendedDNSErrorCode":[0-9]+}' "$RUN_OUT"
+    grep -qE '{"rcode":2,"extendedDNSErrorCode":[0-9]+,"queryString":"edns-invalid-code.forwarded.test"}' "$RUN_OUT"
     journalctl --sync
     journalctl -u systemd-resolved.service --cursor-file="$JOURNAL_CURSOR" --grep "Server returned error: SERVFAIL \(\d+\)"
 
@@ -801,14 +939,14 @@ testcase_08_resolved() {
     grep -qE '^edns-invalid-code-with-extra-text.forwarded.test:.+: SERVFAIL \([0-9]+: Hello \[#\]\$%~ World\)' "$RUN_OUT"
     (! run varlinkctl call /run/systemd/resolve/io.systemd.Resolve io.systemd.Resolve.ResolveHostname '{"name" : "edns-invalid-code-with-extra-text.forwarded.test"}')
     grep -qF "io.systemd.Resolve.DNSError" "$RUN_OUT"
-    grep -qE '{"rcode":2,"extendedDNSErrorCode":[0-9]+,"extendedDNSErrorMessage":"Hello \[#\]\$%~ World"}' "$RUN_OUT"
+    grep -qE '{"rcode":2,"extendedDNSErrorCode":[0-9]+,"extendedDNSErrorMessage":"Hello \[#\]\$%~ World","queryString":"edns-invalid-code-with-extra-text.forwarded.test"}' "$RUN_OUT"
     journalctl --sync
     journalctl -u systemd-resolved.service --cursor-file="$JOURNAL_CURSOR" --grep "Server returned error: SERVFAIL \(\d+: Hello \[\#\]\\$%~ World\)"
 }
 
 testcase_09_resolvectl_showcache() {
     # Cleanup
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup() {
         rm -f /run/systemd/resolved.conf.d/90-resolved.conf
         rm -f /run/systemd/network/10-dns2.netdev
@@ -870,7 +1008,7 @@ testcase_10_resolvectl_json() {
     local status_json
 
     # Cleanup
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup() {
         rm -f /run/systemd/resolved.conf.d/90-fallback.conf
         systemctl reload systemd-resolved.service
@@ -998,7 +1136,7 @@ testcase_11_nft() {
 
     . /etc/os-release
     if [[ "${ID_LIKE:-}" == alpine ]]; then
-        # FIXME: For some reasons, the following tests will fail on alpine/postmarketos.
+        # FIXME: For some reasons, the following tests will fail on Alpine/Nura.
         return 0
     fi
 
@@ -1041,7 +1179,7 @@ testcase_11_nft() {
 # Test resolvectl show-server-state
 testcase_12_resolvectl2() {
     # Cleanup
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup() {
         rm -f /run/systemd/resolved.conf.d/90-reload.conf
         systemctl reload systemd-resolved.service
@@ -1143,7 +1281,7 @@ testcase_13_varlink_subscribe_dns_configuration() {
     fi
 
     # Cleanup
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup() {
         echo "===== io.systemd.Resolve.Monitor.SubscribeDNSConfiguration output: ====="
         cat "$tmpfile"
@@ -1220,7 +1358,7 @@ testcase_13_varlink_subscribe_dns_configuration() {
 
 # Test RefuseRecordTypes
 testcase_14_refuse_record_types() {
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup() {
         rm -f /run/systemd/resolved.conf.d/90-refuserecords.conf
         restart_resolved
@@ -1262,13 +1400,13 @@ testcase_14_refuse_record_types() {
     grep -qF "127.128.0.5" "$RUN_OUT"
 
     (! run resolvectl query localhost5 --type=SRV)
-    grep -qF "DNS query type refused." "$RUN_OUT"
+    grep -qF "DNS query type refused" "$RUN_OUT"
 
     (! run resolvectl query localhost5 --type=TXT)
-    grep -qF "DNS query type refused." "$RUN_OUT"
+    grep -qF "DNS query type refused" "$RUN_OUT"
 
     (! run resolvectl query localhost5 --type=AAAA)
-    grep -qF "DNS query type refused." "$RUN_OUT"
+    grep -qF "DNS query type refused" "$RUN_OUT"
 
     run resolvectl query localhost5 --type=A
     grep -qF "127.128.0.5" "$RUN_OUT"
@@ -1308,11 +1446,11 @@ testcase_14_refuse_record_types() {
     grep -qF "does not have any RR of the requested type" "$RUN_OUT"
 
     (! run resolvectl query localhost5 --type=AAAA)
-    grep -qF "DNS query type refused." "$RUN_OUT"
+    grep -qF "DNS query type refused" "$RUN_OUT"
 
     run resolvectl service _mysvc._tcp signed.test
     grep -qF "myservice.signed.test:1234" "$RUN_OUT"
-    grep -qF "This is TXT for myservice" "$RUN_OUT"
+    (! grep -qF "This is TXT for myservice" "$RUN_OUT")
     grep -qF "10.0.0.20" "$RUN_OUT"
     (! grep -qF "fd00:dead:beef:cafe::17" "$RUN_OUT")
     grep -qF "authenticated: yes" "$RUN_OUT"
@@ -1334,7 +1472,7 @@ testcase_14_refuse_record_types() {
 
     run resolvectl service _mysvc._tcp signed.test
     grep -qF "myservice.signed.test:1234" "$RUN_OUT"
-    grep -qF "This is TXT for myservice" "$RUN_OUT"
+    (! grep -qF "This is TXT for myservice" "$RUN_OUT")
     (! grep -qF "10.0.0.20" "$RUN_OUT")
     (! grep -qF "fd00:dead:beef:cafe::17" "$RUN_OUT")
     grep -qF "authenticated: yes" "$RUN_OUT"
@@ -1382,12 +1520,12 @@ testcase_14_refuse_record_types() {
 # Test systemd-networkd-wait-online interactions with systemd-resolved
 testcase_15_wait_online_dns() {
     # Cleanup
-    # shellcheck disable=SC2317
+    # shellcheck disable=SC2317,SC2329
     cleanup() {
         echo "===== journalctl -u $unit ====="
         journalctl -b --no-pager --no-hostname --full -u "$unit"
         echo "=========="
-        rm -f "$override"
+        rm -f "$override" "$cursor_file"
         restart_resolved
         resolvectl revert dns0
     }
@@ -1396,6 +1534,7 @@ testcase_15_wait_online_dns() {
 
     local unit
     local override
+    local cursor_file
 
     unit="wait-online-dns-$(systemd-id128 new -u).service"
     override="/run/systemd/resolved.conf.d/90-global-dns.conf"
@@ -1416,12 +1555,26 @@ testcase_15_wait_online_dns() {
     systemctl stop systemd-resolved.service
     systemctl start systemd-resolved-monitor.socket systemd-resolved-varlink.socket
 
+    # Capture a journal cursor before starting the unit so we can match only on
+    # log messages emitted afterwards. We deliberately do not filter on
+    # _SYSTEMD_UNIT= because journald may attach stale cgroup metadata
+    # (e.g. _SYSTEMD_UNIT=init.scope) to the very first messages emitted by a
+    # freshly-spawned process, before its cgroup migration into the new service
+    # is observed. Filtering by SYSLOG_IDENTIFIER and a cursor is not affected
+    # by that race.
+    cursor_file=$(mktemp)
+    journalctl -n 0 --cursor-file="$cursor_file"
+
     # Begin systemd-networkd-wait-online --dns
     systemd-run -u "$unit" -p "Environment=SYSTEMD_LOG_LEVEL=debug" -p "Environment=SYSTEMD_LOG_TARGET=journal" --service-type=exec \
         /usr/lib/systemd/systemd-networkd-wait-online --timeout=0 --dns --interface=dns0
 
-    # Wait until it blocks waiting for updated DNS config
-    timeout 30 bash -c "journalctl -b -u $unit -f | grep -m1 'dns0: No.*DNS server is accessible'" >/dev/null
+    # Wait until it blocks waiting for updated DNS config.
+    # Note: don't use 'journalctl -f | grep -m1 ...' here. Once grep exits on
+    # match, journalctl -f will only notice the closed pipe on its next write
+    # attempt, which may never come for an otherwise idle unit, causing the
+    # pipeline to hang.
+    timeout 30 bash -c "until journalctl --after-cursor=\"\$(cat \"$cursor_file\")\" SYSLOG_IDENTIFIER=systemd-networkd-wait-online --grep 'dns0: No.*DNS server is accessible' >/dev/null 2>&1; do sleep 0.5; done"
 
     # Update the global configuration. Restart rather than reload systemd-resolved so that
     # systemd-networkd-wait-online has to re-connect to the varlink service.
@@ -1436,10 +1589,10 @@ testcase_15_wait_online_dns() {
     journalctl --sync
 
     # Check that a disconnect happened, and was handled.
-    journalctl -b -u "$unit" --grep="DNS configuration monitor disconnected, reconnecting..." >/dev/null
+    journalctl --after-cursor="$(cat "$cursor_file")" SYSLOG_IDENTIFIER=systemd-networkd-wait-online --grep="DNS configuration monitor disconnected, reconnecting..." >/dev/null
 
     # Check that dns0 was found to be online.
-    journalctl -b -u "$unit" --grep="dns0: link is configured by networkd and online." >/dev/null
+    journalctl --after-cursor="$(cat "$cursor_file")" SYSLOG_IDENTIFIER=systemd-networkd-wait-online --grep="dns0: link is configured by networkd and online." >/dev/null
 }
 
 testcase_delegate() {
@@ -1450,7 +1603,7 @@ testcase_delegate() {
     mkdir -p /run/systemd/dns-delegate.d/
     cat >/run/systemd/dns-delegate.d/testcase.dns-delegate <<EOF
 [Delegate]
-DNS=192.168.77.78
+DNS=192.168.77.78 192.168.77.78 192.168.77.79
 Domains=exercise.test
 FirewallMark=42
 EOF
@@ -1458,6 +1611,7 @@ EOF
     resolvectl status
 
     assert_eq "$(resolvectl --json=short | jq -rc '.[] | select(.delegate == "testcase") | .servers | .[0].addressString')" '192.168.77.78'
+    assert_eq "$(resolvectl --json=short | jq -rc '.[] | select(.delegate == "testcase") | .servers | .[1].addressString')" '192.168.77.79'
     assert_eq "$(resolvectl --json=short | jq -rc '.[] | select(.delegate == "testcase") | .searchDomains | .[0].name')" 'exercise.test'
 
     # Now that we installed the delegation the resolution should fail, because nothing is listening on that IP address
@@ -1487,6 +1641,454 @@ EOF
     grep -qF "1.2.3.4" "$RUN_OUT"
 }
 
+# Regression test for CVE/strict-DoT verification: when the global
+# DNSOverTLS= is "no" or "opportunistic" but a specific link is configured
+# with DNSOverTLS=yes (per-link strict mode), resolved must still enable
+# OpenSSL peer certificate verification and host/IP name checking on that
+# link. Previously dnstls_stream_connect_tls() looked at the manager-wide
+# field directly instead of dns_server_get_dns_over_tls_mode(), so a
+# self-signed/untrusted DoT server would be silently accepted on a strict
+# link, allowing trivial MITM.
+testcase_dot_strict_per_link_verify() {
+    if ! command -v openssl >/dev/null; then
+        echo "openssl not found, skipping per-link strict DoT test"
+        return 0
+    fi
+
+    local certdir s_server_pid="" link_addr="10.123.99.1"
+    local journal_cursor
+
+    certdir="$(mktemp -d)"
+
+    # shellcheck disable=SC2317,SC2329
+    cleanup() {
+        if [[ -n "$s_server_pid" ]] && kill -0 "$s_server_pid" 2>/dev/null; then
+            kill "$s_server_pid" || :
+            wait "$s_server_pid" 2>/dev/null || :
+        fi
+        rm -f /run/systemd/resolved.conf.d/95-strict-dot-test.conf
+        rm -f /run/systemd/network/10-dns3-strict-dot.netdev
+        rm -f /run/systemd/network/10-dns3-strict-dot.network
+        networkctl reload || :
+        ip link del dns3-sdot 2>/dev/null || :
+        systemctl reload systemd-resolved.service || :
+        rm -rf "$certdir" "$journal_cursor"
+    }
+
+    trap cleanup RETURN ERR
+
+    # Self-signed cert for CN=strict-dot.test, with a SAN matching the link
+    # IP. It is intentionally NOT in the system CA store, so peer
+    # verification (when actually enabled) MUST reject it.
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$certdir/key.pem" -out "$certdir/cert.pem" \
+        -subj "/CN=strict-dot.test" \
+        -addext "subjectAltName=IP:${link_addr},DNS:strict-dot.test" \
+        -days 1
+
+    # Dummy interface that hosts both the fake DoT server and the strict
+    # client-side configuration.
+    {
+        echo "[NetDev]"
+        echo "Name=dns3-sdot"
+        echo "Kind=dummy"
+    } >/run/systemd/network/10-dns3-strict-dot.netdev
+    {
+        echo "[Match]"
+        echo "Name=dns3-sdot"
+        echo ""
+        echo "[Network]"
+        echo "IPv6AcceptRA=no"
+        echo "Address=${link_addr}/24"
+        echo "DNS=${link_addr}"
+        echo "DNSOverTLS=yes"
+        echo "DNSSEC=no"
+    } >/run/systemd/network/10-dns3-strict-dot.network
+
+    # Force the manager-wide DoT mode to "no". Before the fix this would
+    # cause SSL_VERIFY_PEER to NOT be set, even though the link is strict.
+    {
+        echo "[Resolve]"
+        echo "DNSOverTLS=no"
+    } >/run/systemd/resolved.conf.d/95-strict-dot-test.conf
+
+    networkctl reload
+    networkctl reconfigure dns3-sdot
+    /usr/lib/systemd/systemd-networkd-wait-online --timeout=30 --interface=dns3-sdot --dns
+
+    systemctl reload systemd-resolved.service
+
+    assert_eq "$(resolvectl --json=short dnsovertls dns3-sdot | jq -rc '.[0].dnsOverTLS')" 'yes'
+
+    # Start an unauthenticated TLS listener using the self-signed cert.
+    # -naccept lets resolved reconnect a few times during retries.
+    openssl s_server \
+        -accept "${link_addr}:853" \
+        -cert "$certdir/cert.pem" -key "$certdir/key.pem" \
+        -quiet -naccept 8 </dev/null >/dev/null 2>&1 &
+    s_server_pid=$!
+
+    timeout 10s bash -c "until ss -lnt 'sport = :853' | grep -F ${link_addr} >/dev/null; do sleep 0.2; done"
+
+    journal_cursor="$(mktemp)"
+    journalctl -n0 -q --cursor-file="$journal_cursor"
+
+    # The query must fail: a strict-DoT link must refuse an untrusted cert.
+    set +e
+    timeout 15s resolvectl query -i dns3-sdot strict-dot.test
+    local rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+        echo "resolvectl query against untrusted DoT server on strict link succeeded, should have failed"
+        return 1
+    fi
+
+    # Ensure the test failed for the right reason
+    journalctl --sync
+    journalctl -u systemd-resolved.service --cursor-file="$journal_cursor" \
+        --grep "Failed to invoke SSL_do_handshake.*(certificate verify failed|self[- ]signed certificate|unable to get local issuer)"
+}
+
+testcase_cd_bypass_not_cached() {
+    # shellcheck disable=SC2317,SC2329
+    cleanup() {
+        resolvectl revert dns0
+        resolvectl flush-caches
+    }
+    trap cleanup RETURN ERR
+
+    # Queries with DO=1 CD=1 are passed on upstream as they are, CD bit included, hence the upstream server
+    # may skip checks for them. Their answers must not be cached for other clients, even if we don't
+    # validate on our own.
+    resolvectl dnssec dns0 no
+    resolvectl flush-caches
+    run dig +nostats +do +cd signed.test
+    grep -qF "10.0.0.10" "$RUN_OUT"
+    (! resolvectl query --type=A --network=no signed.test)
+    # … while answers to the same queries without CD are
+    run dig +nostats +do signed.test
+    grep -qF "10.0.0.10" "$RUN_OUT"
+    resolvectl query --type=A --network=no signed.test
+}
+
+testcase_static_record() {
+    mkdir -p /run/systemd/resolve/static.d/
+    cat >/run/systemd/resolve/static.d/statictest.rr <<EOF
+{
+        "key": { "name" : "statictest.waldo", "type" : 1 },
+        "address" : [ 5, 7, 9, 11 ]
+}
+EOF
+    cat >/run/systemd/resolve/static.d/statictest2.rr <<EOF
+[
+        {
+                "key": { "name" : "statictest2.waldo", "type" : 1 },
+                "address" : [ 5, 7, 9, 12 ]
+        },
+        {
+                "key": { "name" : "statictest2.waldo", "type" : 28 },
+                "address" : [ 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 12 ]
+        }
+]
+EOF
+    cat >/run/systemd/resolve/static.d/garbage.rr <<EOF
+[
+        {
+                "key": { "name" : "invalid...domain", "type" : 1 },
+                "address" : [ 5, 7, 9, 12 ]
+        },
+]
+EOF
+    cat >/run/systemd/resolve/static.d/garbage2.rr <<EOF
+[
+        {
+                "key": { "name" : "piff", "type" : 9 },
+        },
+]
+EOF
+
+    systemctl reload systemd-resolved
+
+    run resolvectl query statictest.waldo
+    grep -qF 5.7.9.11 "$RUN_OUT"
+
+    run resolvectl query statictest2.waldo
+    grep -qF 5.7.9.12 "$RUN_OUT"
+    grep -qF a0b:a0b:a0b:a0b:a0b:a0b:a0b:a0c "$RUN_OUT"
+
+    rm /run/systemd/resolve/static.d/statictest*.rr /run/systemd/resolve/static.d/garbage*.rr
+    systemctl reload systemd-resolved
+}
+
+do_test_varlink_link_methods() {
+    local ifname ifindex socket orig_config
+
+    ifname="${1:?}"
+    ifindex="$(cat "/sys/class/net/$ifname/ifindex")"
+    socket="${2:?}"
+
+    orig_config="$(resolvectl --json=pretty status "$ifname")"
+
+    # io.systemd.Resolve.Link.SetDNS
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNS \
+        '{"ifindex":"'"$ifindex"'","servers":[{"family":2,"address":[10,0,0,2],"port":53},{"family":10,"address":[253,0,222,173,190,239,202,254,0,0,0,0,0,0,0,2]}]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in '10.0.0.2' "$(resolvectl dns "$ifname")"
+    assert_in 'fd00:dead:beef:cafe::2' "$(resolvectl dns "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNS \
+        '{"ifindex":"'"$ifindex"'","servers":[]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_eq "$(resolvectl --json=short dns "$ifname" | jq -rc '.[0].servers')" 'null'
+
+    # io.systemd.Resolve.Link.SetDomains
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[{"name":"example.test","routeOnly":false},{"name":"internal.test","routeOnly":true}]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'example.test' "$(resolvectl domain "$ifindex")"
+    assert_in '~internal.test' "$(resolvectl domain "$ifindex")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_eq "$(resolvectl --json=short domain "$ifname" | jq -rc '.[0].searchDomains')" 'null'
+
+    # io.systemd.Resolve.Link.SetDNSSECNegativeTrustAnchors
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSSECNegativeTrustAnchors \
+        '{"ifindex":"'"$ifindex"'","negativeTrustAnchors":["local","test"]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_eq \
+        "$(resolvectl --json=short nta "$ifindex" | jq -rc '.[0].negativeTrustAnchors')" \
+        '["local","test"]'
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSSECNegativeTrustAnchors \
+        '{"ifindex":"'"$ifindex"'","negativeTrustAnchors":[]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_eq "$(resolvectl --json=short nta "$ifindex" | jq -rc '.[0].negativeTrustAnchors')" 'null'
+
+    # io.systemd.Resolve.Link.SetDNSDefaultRoute
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSDefaultRoute \
+        '{"ifindex":"'"$ifindex"'","defaultRoute":true}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'yes' "$(resolvectl default-route "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSDefaultRoute \
+        '{"ifindex":"'"$ifindex"'","defaultRoute":false}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'no' "$(resolvectl default-route "$ifname")"
+
+    # io.systemd.Resolve.Link.SetLLMNR
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetLLMNR \
+        '{"ifindex":"'"$ifindex"'","llmnr":"yes"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'yes' "$(resolvectl llmnr "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetLLMNR \
+        '{"ifindex":"'"$ifindex"'","llmnr":"resolve"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'resolve' "$(resolvectl llmnr "$ifname")"
+
+    # io.systemd.Resolve.Link.SetMulticastDNS
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetMulticastDNS \
+        '{"ifindex":"'"$ifindex"'","mDNS":"yes"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'yes' "$(resolvectl mdns "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetMulticastDNS \
+        '{"ifindex":"'"$ifindex"'","mDNS":"resolve"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'resolve' "$(resolvectl mdns "$ifname")"
+
+    # io.systemd.Resolve.Link.SetDNSOverTLS
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSOverTLS \
+        '{"ifindex":"'"$ifindex"'","dnsOverTLS":"opportunistic"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'opportunistic' "$(resolvectl dnsovertls "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSOverTLS \
+        '{"ifindex":"'"$ifindex"'","dnsOverTLS":"yes"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'yes' "$(resolvectl dnsovertls "$ifname")"
+
+    # io.systemd.Resolve.Link.SetDNSSEC
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSSEC \
+        '{"ifindex":"'"$ifindex"'","dnssec":"allow-downgrade"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'allow-downgrade' "$(resolvectl dnssec "$ifname")"
+
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDNSSEC \
+        '{"ifindex":"'"$ifindex"'","dnssec":"yes"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'yes' "$(resolvectl dnssec "$ifname")"
+
+    # io.systemd.Resolve.Link.RevertDNS
+    varlinkctl call "$socket" io.systemd.Resolve.Link.RevertDNS \
+        '{"ifindex":"'"$ifindex"'"}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_eq "$(resolvectl --json=pretty status "$ifname")" "$orig_config"
+}
+
+do_test_varlink_link_error() {
+    local ifname ifindex socket error
+
+    ifname="${1:?}"
+    ifindex="$(cat "/sys/class/net/$ifname/ifindex")"
+    socket="${2:?}"
+    error="${3:?}"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDNS \
+            '{"ifindex":"'"$ifindex"'","servers":[{"family":2,"address":[10,0,0,2],"port":53},{"family":10,"address":[253,0,222,173,190,239,202,254,0,0,0,0,0,0,0,2]}]}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[{"name":"example.test","routeOnly":false},{"name":"internal.test","routeOnly":true}]}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDNSSECNegativeTrustAnchors \
+        '{"ifindex":"'"$ifindex"'","negativeTrustAnchors":["local","test"]}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDNSDefaultRoute \
+            '{"ifindex":"'"$ifindex"'","defaultRoute":true}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetLLMNR \
+            '{"ifindex":"'"$ifindex"'","llmnr":"yes"}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetMulticastDNS \
+            '{"ifindex":"'"$ifindex"'","mDNS":"yes"}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDNSOverTLS \
+            '{"ifindex":"'"$ifindex"'","dnsOverTLS":"yes"}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.SetDNSSEC \
+            '{"ifindex":"'"$ifindex"'","dnssec":"yes"}' 2>&1)"
+
+    assert_in \
+        "$error" \
+        "$(varlinkctl call --graceful="$error" "$socket" io.systemd.Resolve.Link.RevertDNS \
+            '{"ifindex":"'"$ifindex"'"}' 2>&1)"
+}
+
+do_test_varlink_link_invalid_parameters() {
+    local ifname ifindex socket
+
+    ifname="${1:?}"
+    ifindex="$(cat "/sys/class/net/$ifname/ifindex")"
+    socket="${2:?}"
+
+    # Address and family are inconsistent
+    assert_in "io.systemd.System" "$(varlinkctl call --graceful=io.systemd.System "$socket" \
+        io.systemd.Resolve.Link.SetDNS \
+        '{"ifindex":"'"$ifindex"'","servers":[{"family":2,"address":[10,0,0,0,0,0,0,0,0,0,0,0,0,0,0,2]}]}' 2>&1)"
+
+    # Unspecified address
+    assert_in "io.systemd.System" "$(varlinkctl call --graceful=io.systemd.System "$socket" \
+        io.systemd.Resolve.Link.SetDNS \
+        '{"ifindex":"'"$ifindex"'","servers":[{"family":2,"address":[0,0,0,0]}]}' 2>&1)"
+
+    # Interface index of a server does not match with the request
+    assert_in '"parameter":"servers"' "$(varlinkctl call --graceful=org.varlink.service.InvalidParameter \
+        "$socket" io.systemd.Resolve.Link.SetDNS \
+        '{"ifindex":"'"$ifindex"'","servers":[{"family":2,"address":[10,0,0,2],"ifindex":1}]}' 2>&1)"
+
+    # Root domain as search domain
+    assert_in "io.systemd.System" "$(varlinkctl call --graceful=io.systemd.System "$socket" \
+        io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[{"name":"."}]}' 2>&1)"
+
+    # Invalid search domain
+    assert_in "io.systemd.System" "$(varlinkctl call --graceful=io.systemd.System "$socket" \
+        io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[{"name":".."}]}' 2>&1)"
+
+    # routeOnly may be null
+    varlinkctl call "$socket" io.systemd.Resolve.Link.SetDomains \
+        '{"ifindex":"'"$ifindex"'","searchDomains":[{"name":"example.test","routeOnly":null}]}'
+
+    [[ "$socket" == "/run/systemd/resolve/io.systemd.Resolve" ]] || systemctl reload systemd-resolved
+    assert_in 'example.test' "$(resolvectl domain "$ifname")"
+    assert_not_in '~example.test' "$(resolvectl domain "$ifname")"
+
+    # Invalid DNSSEC mode
+    assert_in "org.varlink.service.InvalidParameter" "$(varlinkctl call --graceful=org.varlink.service.InvalidParameter \
+        "$socket" io.systemd.Resolve.Link.SetDNSSEC \
+        '{"ifindex":"'"$ifindex"'","dnssec":"bogus"}' 2>&1)"
+
+    # Invalid NTA domain
+    assert_in "io.systemd.System" "$(varlinkctl call --graceful=io.systemd.System "$socket" \
+        io.systemd.Resolve.Link.SetDNSSECNegativeTrustAnchors \
+        '{"ifindex":"'"$ifindex"'","negativeTrustAnchors":[".."]}' 2>&1)"
+
+    # Cleanup
+    varlinkctl call "$socket" io.systemd.Resolve.Link.RevertDNS '{"ifindex":"'"$ifindex"'"}'
+}
+
+testcase_16_varlink_link_methods() {
+    # Cleanup
+    # shellcheck disable=SC2317,SC2329
+    cleanup() (
+        set +e
+        resolvectl revert dns0
+        ip link del hoge0
+        rm -f /run/systemd/resolved.conf.d/90-mdns-llmnr.conf
+        systemctl reload systemd-resolved.service
+    )
+    trap cleanup RETURN ERR
+
+    {
+        echo "[Resolve]"
+        echo "MulticastDNS=yes"
+        echo "LLMNR=yes"
+    } >/run/systemd/resolved.conf.d/90-mdns-llmnr.conf
+    systemctl reload systemd-resolved.service
+
+    ip link add hoge0 type dummy
+    ip link set hoge0 up
+
+    /usr/lib/systemd/systemd-networkd-wait-online --timeout=60 --interface=hoge0:degraded
+
+    do_test_varlink_link_methods "hoge0" "/run/systemd/resolve/io.systemd.Resolve"
+    do_test_varlink_link_methods "dns0" "/run/systemd/netif/io.systemd.Network"
+
+    do_test_varlink_link_invalid_parameters "hoge0" "/run/systemd/resolve/io.systemd.Resolve"
+    do_test_varlink_link_invalid_parameters "dns0" "/run/systemd/netif/io.systemd.Network"
+
+    do_test_varlink_link_error "dns0" "/run/systemd/resolve/io.systemd.Resolve" "io.systemd.Resolve.Link.ManagedByNetworkd"
+    do_test_varlink_link_error "hoge0" "/run/systemd/netif/io.systemd.Network" "io.systemd.Network.Link.InterfaceUnmanaged"
+    do_test_varlink_link_error "lo" "/run/systemd/resolve/io.systemd.Resolve" "io.systemd.Resolve.Link.IsLoopback"
+    do_test_varlink_link_error "lo" "/run/systemd/netif/io.systemd.Network" "io.systemd.Resolve.Link.IsLoopback"
+}
+
 # PRE-SETUP
 systemctl unmask systemd-resolved.service
 systemctl enable --now systemd-resolved.service
@@ -1494,6 +2096,7 @@ systemctl enable --now systemd-resolved.service
 # Need to be run before SETUP, otherwise things will break
 manual_testcase_01_resolvectl
 manual_testcase_02_mdns_llmnr
+manual_testcase_03_register_service
 
 # Run setup
 setup

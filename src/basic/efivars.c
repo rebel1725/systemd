@@ -11,6 +11,7 @@
 #include "chattr-util.h"
 #include "efivars.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "io-util.h"
 #include "log.h"
 #include "memory-util.h"
@@ -45,9 +46,9 @@ int efi_get_variable(
                 begin = now(CLOCK_MONOTONIC);
         }
 
-        _cleanup_close_ int fd = open(p, O_RDONLY|O_NOCTTY|O_CLOEXEC);
+        _cleanup_close_ int fd = xopenat(AT_FDCWD, p, O_RDONLY|O_NOCTTY);
         if (fd < 0)
-                return log_debug_errno(errno, "open(\"%s\") failed: %m", p);
+                return log_debug_errno(fd, "open(\"%s\") failed: %m", p);
 
         uint32_t attr;
         _cleanup_free_ char *buf = NULL;
@@ -87,14 +88,21 @@ int efi_get_variable(
                 }
 
                 /* We want +1 for the read call, and +3 for the additional terminating bytes added below. */
+                size_t file_size = (size_t) st.st_size, payload_size, read_size, alloc_size, read_limit;
+                if (!SUB_SAFE(&payload_size, file_size, sizeof(attr)) ||
+                    !ADD_SAFE(&read_size, payload_size, 1) ||
+                    !ADD_SAFE(&alloc_size, read_size, 3) ||
+                    !ADD_SAFE(&read_limit, file_size, 1))
+                        return log_debug_errno(SYNTHETIC_ERRNO(EOVERFLOW), "EFI variable '%s' size calculation overflow, refusing.", p);
+
                 free(buf);
-                buf = malloc((size_t) st.st_size - sizeof(attr) + CONST_MAX(1, 3));
+                buf = malloc(alloc_size);
                 if (!buf)
                         return -ENOMEM;
 
                 struct iovec iov[] = {
                         { &attr, sizeof(attr)                           },
-                        { buf,   (size_t) st.st_size - sizeof(attr) + 1 },
+                        { buf,   read_size                              },
                 };
 
                 n = readv(fd, iov, 2);
@@ -103,11 +111,11 @@ int efi_get_variable(
                                 return log_debug_errno(errno, "Reading from '%s' failed: %m", p);
 
                         log_debug("Reading from '%s' failed with EINTR, retrying.", p);
-                } else if ((size_t) n == sizeof(attr) + st.st_size + 1)
+                } else if ((size_t) n == read_limit)
                         /* We need to try again with a bigger buffer, the variable was apparently changed concurrently? */
                         log_debug("EFI variable '%s' larger than expected, retrying.", p);
                 else {
-                        assert((size_t) n < sizeof(attr) + st.st_size + 1);
+                        assert((size_t) n < read_limit);
                         break;
                 }
 
@@ -175,7 +183,7 @@ int efi_get_variable_string(const char *variable, char **ret) {
 
         assert(variable);
 
-        r = efi_get_variable(variable, NULL, &s, &ss);
+        r = efi_get_variable(variable, /* ret_attribute= */ NULL, &s, &ss);
         if (r < 0)
                 return r;
 
@@ -267,9 +275,9 @@ int efi_set_variable(const char *variable, const void *value, size_t size) {
                 return 0;
         }
 
-        fd = open(p, O_WRONLY|O_CREAT|O_NOCTTY|O_CLOEXEC, 0644);
+        fd = xopenat_full(AT_FDCWD, p, O_WRONLY|O_CREAT|O_NOCTTY, /* xopen_flags= */ 0, 0644);
         if (fd < 0) {
-                r = -errno;
+                r = fd;
                 goto finish;
         }
 
@@ -350,7 +358,7 @@ static int read_flag(const char *variable) {
         if (!is_efi_boot()) /* If this is not an EFI boot, assume the queried flags are zero */
                 return 0;
 
-        r = efi_get_variable(variable, NULL, &v, &s);
+        r = efi_get_variable(variable, /* ret_attribute= */ NULL, &v, &s);
         if (r < 0)
                 return r;
 

@@ -7,54 +7,28 @@
  */
 
 #include <fcntl.h>
-#include <getopt.h>
 #include <linux/hid.h>
 #include <stdio.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
-#include "build.h"
 #include "device-private.h"
 #include "device-util.h"
 #include "fd-util.h"
 #include "fido_id_desc.h"
+#include "fs-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "path-util.h"
 #include "udev-util.h"
+#include "verbs.h"
 
-static const char *arg_device = NULL;
-
-static int parse_argv(int argc, char *argv[]) {
-        static const struct option options[] = {
-                { "help",     no_argument, NULL, 'h' },
-                { "version",  no_argument, NULL, 'v' },
-                {}
-        };
-        int c;
-
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
-                switch (c) {
-                case 'h':
-                        printf("%s [OPTIONS...] SYSFS_PATH\n\n"
-                               "  -h --help     Show this help text\n"
-                               "     --version  Show package version\n",
-                               program_invocation_short_name);
-                        return 0;
-                case 'v':
-                        return version();
-                case '?':
-                        return -EINVAL;
-                default:
-                        assert_not_reached();
-                }
-
-        if (argc > 2)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Error: unexpected argument.");
-
-        arg_device = argv[optind];
-        return 1;
-}
+COMMAND(
+        "fido_id\0",
+        "Identify FIDO security tokens.",
+        .argspec = "[SYSFS_PATH]\0",
+        .option_namespace = "common",
+);
 
 static int run(int argc, char **argv) {
         _cleanup_(sd_device_unrefp) struct sd_device *device = NULL;
@@ -69,14 +43,15 @@ static int run(int argc, char **argv) {
         (void) udev_parse_config();
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = common_parse_argv_full(argc, argv, /* min_args= */ 0, /* max_args= */ 1, &args);
         if (r <= 0)
                 return r;
 
-        if (arg_device) {
-                r = sd_device_new_from_syspath(&device, arg_device);
+        if (args[0]) {
+                r = sd_device_new_from_syspath(&device, args[0]);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to get device from syspath %s: %m", arg_device);
+                        return log_error_errno(r, "Failed to get device from syspath %s: %m", args[0]);
         } else {
                 r = device_new_from_strv(&device, environ);
                 if (r < 0)
@@ -95,9 +70,9 @@ static int run(int argc, char **argv) {
         if (!desc_path)
                 return log_oom();
 
-        fd = open(desc_path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY);
+        fd = xopenat(AT_FDCWD, desc_path, O_RDONLY | O_NOFOLLOW | O_NOCTTY);
         if (fd < 0)
-                return log_device_error_errno(hid_device, errno,
+                return log_device_error_errno(hid_device, fd,
                                               "Failed to open report descriptor at '%s': %m", desc_path);
 
         desc_len = read(fd, desc, sizeof(desc));

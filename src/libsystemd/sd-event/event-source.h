@@ -6,7 +6,7 @@
 
 #include "sd-event.h"
 
-#include "sd-forward.h"
+#include "forward.h"
 #include "inotify-util.h"
 #include "list.h"
 #include "ratelimit.h"
@@ -26,6 +26,8 @@ typedef enum EventSourceType {
         SOURCE_WATCHDOG,
         SOURCE_INOTIFY,
         SOURCE_MEMORY_PRESSURE,
+        SOURCE_CPU_PRESSURE,
+        SOURCE_IO_PRESSURE,
         _SOURCE_EVENT_SOURCE_TYPE_MAX,
         _SOURCE_EVENT_SOURCE_TYPE_INVALID = -EINVAL,
 } EventSourceType;
@@ -42,8 +44,10 @@ typedef enum WakeupType {
         _WAKEUP_TYPE_INVALID = -EINVAL,
 } WakeupType;
 
+typedef struct clock_data ClockData;
 typedef struct inode_data InodeData;
 typedef struct inotify_data InotifyData;
+typedef struct signal_data SignalData;
 
 struct sd_event_source {
         WakeupType wakeup;
@@ -144,7 +148,7 @@ struct sd_event_source {
                         size_t write_buffer_size;
                         uint32_t events, revents;
                         LIST_FIELDS(sd_event_source, write_list);
-                } memory_pressure;
+                } pressure;
         };
 };
 
@@ -168,6 +172,8 @@ struct clock_data {
 
 struct signal_data {
         WakeupType wakeup;
+
+        unsigned n_ref;
 
         /* For each priority we maintain one signal fd, so that we
          * only have to dequeue a single event per priority at a
@@ -216,6 +222,8 @@ struct inode_data {
 /* A structure encapsulating an inotify fd */
 struct inotify_data {
         WakeupType wakeup;
+
+        unsigned n_ref;
 
         /* For each priority we maintain one inotify fd, so that we only have to dequeue a single event per priority at
          * a time */

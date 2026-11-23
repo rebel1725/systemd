@@ -345,6 +345,7 @@ int unit_name_unescape(const char *f, char **ret) {
         char *t;
 
         assert(f);
+        assert(ret);
 
         r = strdup(f);
         if (!r)
@@ -354,20 +355,22 @@ int unit_name_unescape(const char *f, char **ret) {
                 if (*f == '-')
                         *(t++) = '/';
                 else if (*f == '\\') {
-                        int a, b;
-
                         if (f[1] != 'x')
                                 return -EINVAL;
 
-                        a = unhexchar(f[2]);
+                        int a = unhexchar(f[2]);
                         if (a < 0)
                                 return -EINVAL;
 
-                        b = unhexchar(f[3]);
+                        int b = unhexchar(f[3]);
                         if (b < 0)
                                 return -EINVAL;
 
-                        *(t++) = (char) (((uint8_t) a << 4U) | (uint8_t) b);
+                        char c = (char) (((uint8_t) a << 4U) | (uint8_t) b);
+                        if (c == '\0')
+                                return -EINVAL;
+
+                        *(t++) = c;
                         f += 3;
                 } else
                         *(t++) = *f;
@@ -547,6 +550,8 @@ int unit_name_hash_long(const char *name, char **ret) {
         le64_t h;
         size_t len;
 
+        assert(ret);
+
         if (strlen(name) < UNIT_NAME_MAX)
                 return -EMSGSIZE;
 
@@ -713,7 +718,7 @@ int unit_name_mangle_with_suffix(
                 char **ret) {
 
         _cleanup_free_ char *s = NULL;
-        bool mangled, suggest_escape = true, warn = flags & UNIT_NAME_MANGLE_WARN;
+        bool mangled, suggest_escape = true, warn = FLAGS_SET(flags, UNIT_NAME_MANGLE_WARN);
         int r;
 
         assert(name);
@@ -727,12 +732,23 @@ int unit_name_mangle_with_suffix(
                 return -EINVAL;
 
         /* Already a fully valid unit name? If so, no mangling is necessary... */
-        if (unit_name_is_valid(name, UNIT_NAME_ANY))
+        if (unit_name_is_valid(name, UNIT_NAME_ANY)) {
+                if (FLAGS_SET(flags, UNIT_NAME_MANGLE_STRICT) && !endswith(name, suffix)) {
+                        const char *e = ASSERT_PTR(strrchr(name, '.'));
+
+                        return log_full_errno(warn ? LOG_NOTICE : LOG_DEBUG,
+                                              SYNTHETIC_ERRNO(EINVAL),
+                                              "Unit name \"%s\" has unit type \"%s\", but \"%s\" is expected%s%s.",
+                                              name, e + 1, suffix + 1,
+                                              operation ? " " : "", strempty(operation));
+                }
+
                 goto good;
+        }
 
         /* Already a fully valid globbing expression? If so, no mangling is necessary either... */
         if (string_is_glob(name) && in_charset(name, VALID_CHARS_GLOB)) {
-                if (flags & UNIT_NAME_MANGLE_GLOB)
+                if (FLAGS_SET(flags, UNIT_NAME_MANGLE_GLOB))
                         goto good;
                 log_full(warn ? LOG_NOTICE : LOG_DEBUG,
                          "Glob pattern passed%s%s, but globs are not supported for this.",
@@ -741,23 +757,41 @@ int unit_name_mangle_with_suffix(
         }
 
         if (path_is_absolute(name)) {
-                _cleanup_free_ char *n = NULL;
+                _cleanup_free_ char *n = NULL, *u = NULL;
 
                 r = path_simplify_alloc(name, &n);
                 if (r < 0)
                         return r;
 
                 if (is_device_path(n)) {
-                        r = unit_name_from_path(n, ".device", ret);
-                        if (r >= 0)
+                        r = unit_name_from_path(n, ".device", &u);
+                        if (r >= 0) {
+                                if (FLAGS_SET(flags, UNIT_NAME_MANGLE_STRICT) && !streq(suffix, ".device"))
+                                        return log_full_errno(warn ? LOG_NOTICE : LOG_DEBUG,
+                                                              SYNTHETIC_ERRNO(EINVAL),
+                                                              "Path \"%s\" resolves to unit type \"device\", but \"%s\" is expected%s%s.",
+                                                              name, suffix + 1,
+                                                              operation ? " " : "", strempty(operation));
+
+                                *ret = TAKE_PTR(u);
                                 return 1;
+                        }
                         if (r != -EINVAL)
                                 return r;
                 }
 
-                r = unit_name_from_path(n, ".mount", ret);
-                if (r >= 0)
+                r = unit_name_from_path(n, ".mount", &u);
+                if (r >= 0) {
+                        if (FLAGS_SET(flags, UNIT_NAME_MANGLE_STRICT) && !streq(suffix, ".mount"))
+                                return log_full_errno(warn ? LOG_NOTICE : LOG_DEBUG,
+                                                      SYNTHETIC_ERRNO(EINVAL),
+                                                      "Path \"%s\" resolves to unit type \"mount\", but \"%s\" is expected%s%s.",
+                                                      name, suffix + 1,
+                                                      operation ? " " : "", strempty(operation));
+
+                        *ret = TAKE_PTR(u);
                         return 1;
+                }
                 if (r != -EINVAL)
                         return r;
         }
@@ -766,7 +800,7 @@ int unit_name_mangle_with_suffix(
         if (!s)
                 return -ENOMEM;
 
-        mangled = do_escape_mangle(name, flags & UNIT_NAME_MANGLE_GLOB, s);
+        mangled = do_escape_mangle(name, FLAGS_SET(flags, UNIT_NAME_MANGLE_GLOB), s);
         if (mangled)
                 log_full(warn ? LOG_NOTICE : LOG_DEBUG,
                          "Invalid unit name \"%s\" escaped as \"%s\"%s.",
@@ -775,7 +809,7 @@ int unit_name_mangle_with_suffix(
 
         /* Append a suffix if it doesn't have any, but only if this is not a glob, so that we can allow
          * "foo.*" as a valid glob. */
-        if ((!(flags & UNIT_NAME_MANGLE_GLOB) || !string_is_glob(s)) && unit_name_to_type(s) < 0)
+        if ((!FLAGS_SET(flags, UNIT_NAME_MANGLE_GLOB) || !string_is_glob(s)) && unit_name_to_type(s) < 0)
                 strcat(s, suffix);
 
         /* Make sure mangling didn't grow this too large (but don't do this check if globbing is allowed,
@@ -907,4 +941,105 @@ bool unit_name_prefix_equal(const char *a, const char *b) {
         assert(q);
 
         return memcmp_nn(a, p - a, b, q - b) == 0;
+}
+
+bool xdg_app_id_is_valid(const char *app_id) {
+        /* App IDs are ultimately derived from the basename of the app's .desktop file, so we implement the
+         * rules specified at https://specifications.freedesktop.org/desktop-entry/latest/file-naming.html */
+
+        if (!filename_is_valid(app_id))
+                return false;
+
+        if (!in_charset(app_id, ALPHANUMERICAL ".-_"))
+                return false;
+
+        /* Apps only "should" use a D-Bus well-known-name as their ID. In practice, apps often skip that
+         * requirement and call themselves after their executable name. App IDs of this form are allowed
+         * to start with numbers */
+        if (!strchr(app_id, '.'))
+                return true;
+
+        /* Otherwise, we enforce the D-Bus well-known-name rules: sections separated by dots, and each must
+         * not be empty or start with a number */
+        const char *s = app_id;
+        for (;;) {
+                if (ascii_isdigit(*s) || IN_SET(*s, '.', '\0'))
+                        return false;
+
+                s = strchr(s, '.');
+                if (!s)
+                        return true;
+                s++;
+        }
+}
+
+int unit_name_to_app_id(const char *name, char **ret) {
+        int r;
+
+        /* Parses the app ID unit naming scheme from DESKTOP_ENVIRONMENTS.md:
+         *
+         * app[-<launcher>]-<ApplicationID>[@<RANDOM>].service
+         * app[-<launcher>]-<ApplicationID>-<RANDOM>.scope
+         */
+
+        assert(name);
+        assert(ret);
+
+        UnitType type = unit_name_to_type(name);
+        if (!IN_SET(type, UNIT_SERVICE, UNIT_SCOPE))
+                return -EINVAL;
+
+        UnitNameFlags flags = UNIT_NAME_PLAIN;
+        if (type == UNIT_SERVICE)
+                flags |= UNIT_NAME_INSTANCE;
+        if (!unit_name_is_valid(name, flags))
+                return -EINVAL;
+
+        _cleanup_free_ char *prefix = NULL;
+        r = unit_name_to_prefix(name, &prefix);
+        if (r < 0)
+                return r;
+        char *escaped = prefix;
+
+        escaped = startswith(escaped, "app-");
+        if (!escaped)
+                return -EINVAL;
+
+        char *first_sep = strchr(escaped, '-');
+        if (first_sep == escaped)
+                return -EINVAL; /* <launcher>- is present but empty! */
+        if (type == UNIT_SCOPE) {
+                if (!first_sep)
+                        return -EINVAL; /* Missing required -<RANDOM> */
+
+                char *last_sep = strrchr(escaped, '-');
+                assert(last_sep);
+
+                if (isempty(last_sep + 1))
+                        return -EINVAL; /* <RANDOM> is empty */
+
+                if (first_sep == last_sep) /* There's no <launcher>- */
+                        first_sep = NULL;
+
+                *last_sep = '\0';
+        }
+        if (first_sep)
+                escaped = first_sep + 1;
+
+        if (strchr(escaped, '-'))
+                return -EINVAL;
+
+        if (isempty(escaped))
+                return -EINVAL;
+
+        _cleanup_free_ char *unescaped = NULL;
+        r = unit_name_unescape(escaped, &unescaped);
+        if (r < 0)
+                return r;
+
+        if (!xdg_app_id_is_valid(unescaped))
+                return -EINVAL;
+
+        *ret = TAKE_PTR(unescaped);
+        return 0;
 }

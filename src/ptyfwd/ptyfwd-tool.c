@@ -1,122 +1,137 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <unistd.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
+#include "bus-util.h"
 #include "event-util.h"
 #include "fd-util.h"
 #include "log.h"
 #include "main-func.h"
 #include "parse-argument.h"
 #include "pidref.h"
-#include "pretty-print.h"
+#include "polkit-agent.h"
 #include "process-util.h"
+#include "ptybroker-client.h"
 #include "ptyfwd.h"
+#include "runtime-scope.h"
+#include "string-table.h"
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
+#include "verbs.h"
+
+typedef enum ConsoleMode {
+        CONSOLE_INTERACTIVE, /* Interactively forward the local terminal to the child (default) */
+        CONSOLE_READ_ONLY,   /* Like interactive, but don't forward any input to the child */
+        CONSOLE_BROKER,      /* Acquire a PTY from ptybrokerd, output is discarded/monitored */
+        CONSOLE_BROKER_LOG,  /* Acquire a PTY from ptybrokerd, output is written to the logs */
+        _CONSOLE_MODE_MAX,
+        _CONSOLE_MODE_INVALID = -EINVAL,
+} ConsoleMode;
+
+static const char* const console_mode_table[_CONSOLE_MODE_MAX] = {
+        [CONSOLE_INTERACTIVE] = "interactive",
+        [CONSOLE_READ_ONLY]   = "read-only",
+        [CONSOLE_BROKER]      = "broker",
+        [CONSOLE_BROKER_LOG]  = "broker-log",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(console_mode, ConsoleMode);
 
 static bool arg_quiet = false;
-static bool arg_read_only = false;
+static bool arg_ask_password = true;
+static ConsoleMode arg_console = CONSOLE_INTERACTIVE;
+static RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
 static char *arg_background = NULL;
 static char *arg_title = NULL;
+static char *arg_pty_name = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_background, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_title, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_pty_name, freep);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
+COMMAND(
+        "systemd-pty-forward\0",
+        "Run command with a custom terminal background color or title.",
+        .argspec = "COMMAND…\0",
+        .man_page = "systemd-pty-forward(1)",
+);
 
-        r = terminal_urlify_man("systemd-pty-forward", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s  [OPTIONS...] COMMAND ...\n"
-               "\n%5$sRun command with a custom terminal background color or title.%6$s\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help              Show this help\n"
-               "     --version           Print version\n"
-               "  -q --quiet             Suppress information messages during runtime\n"
-               "     --read-only         Do not accept any user input on stdin\n"
-               "     --background=COLOR  Set ANSI color for background\n"
-               "     --title=TITLE       Set terminal title\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_READ_ONLY,
-                ARG_BACKGROUND,
-                ARG_TITLE,
-        };
-
-        static const struct option options[] = {
-                { "help",               no_argument,       NULL, 'h'                    },
-                { "version",            no_argument,       NULL, ARG_VERSION            },
-                { "quiet",              no_argument,       NULL, 'q'                    },
-                { "read-only",          no_argument,       NULL, ARG_READ_ONLY          },
-                { "background",         required_argument, NULL, ARG_BACKGROUND         },
-                { "title",              required_argument, NULL, ARG_TITLE              },
-                {}
-        };
-
-        int c, r;
-
+static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         assert(argc >= 0);
         assert(argv);
+        assert(remaining_args);
 
-        optind = 0;
-        while ((c = getopt_long(argc, argv, "+hq", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv, OPTION_PARSER_STOP_AT_FIRST_NONOPTION };
+        int r;
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case 'q':
+                OPTION('q', "quiet", NULL, "Suppress information messages during runtime"):
                         arg_quiet = true;
                         break;
 
-                case ARG_READ_ONLY:
-                        arg_read_only = true;
+                OPTION_COMMON_NO_ASK_PASSWORD:
+                        arg_ask_password = false;
                         break;
 
-                case ARG_BACKGROUND:
-                        r = parse_background_argument(optarg, &arg_background);
+                OPTION_LONG("read-only", NULL, NULL):
+                        /* --read-only is kept for backwards compatibility, but is nowadays subsumed by
+                         * --console=read-only. Hence keep parsing it, but hide it from --help. */
+                        arg_console = CONSOLE_READ_ONLY;
+                        break;
+
+                OPTION_LONG("console", "MODE", "Console mode: interactive, read-only, broker, broker-log"):
+                        arg_console = console_mode_from_string(opts.arg);
+                        if (arg_console < 0)
+                                return log_error_errno(arg_console, "Failed to parse --console= mode: %s", opts.arg);
+                        break;
+
+                OPTION_LONG("system", NULL, "Talk to system PTY broker"):
+                        arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+                        break;
+
+                OPTION_LONG("user", NULL, "Talk to per-user PTY broker"):
+                        arg_runtime_scope = RUNTIME_SCOPE_USER;
+                        break;
+
+                OPTION_LONG("pty-name", "NAME", "Name to register the broker-allocated PTY under"):
+                        r = free_and_strdup_warn(&arg_pty_name, opts.arg);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_TITLE:
-                        r = free_and_strdup_warn(&arg_title, optarg);
+                OPTION_LONG("background", "COLOR", "Set ANSI color for background"):
+                        r = parse_background_argument(opts.arg, &arg_background);
                         if (r < 0)
                                 return r;
                         break;
 
-                case '?':
-                        return -EINVAL;
+                OPTION_LONG("title", "TITLE", "Set terminal title"):
+                        r = free_and_strdup_warn(&arg_title, opts.arg);
+                        if (r < 0)
+                                return r;
+                        break;
 
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind >= argc)
+        if (option_parser_get_n_args(&opts) == 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Expected command line, refusing.");
 
+        *remaining_args = option_parser_get_args(&opts);
         return 1;
 }
 
@@ -155,11 +170,12 @@ static int run(int argc, char *argv[]) {
 
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
-        _cleanup_strv_free_ char **l = strv_copy(argv + optind);
+        _cleanup_strv_free_ char **l = strv_copy(args);
         if (!l)
                 return log_oom();
 
@@ -169,18 +185,39 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to get event loop: %m");
 
-        pty_fd = openpt_allocate(O_RDWR|O_NOCTTY|O_NONBLOCK|O_CLOEXEC, /* ret_peer_path= */ NULL);
-        if (pty_fd < 0)
-                return log_error_errno(pty_fd, "Failed to acquire pseudo tty: %m");
+        if (IN_SET(arg_console, CONSOLE_BROKER, CONSOLE_BROKER_LOG)) {
+                /* In broker mode ptybrokerd owns the frontend of the PTY and takes care of its output
+                 * itself. We forward the local terminal to the upgraded monitor connection (used as PTY
+                 * forwarder "master"), and invoke the child on the acquired backend. */
 
-        peer_fd = pty_open_peer(pty_fd, O_RDWR|O_NOCTTY|O_CLOEXEC);
-        if (peer_fd < 0)
-                return log_error_errno(peer_fd, "Failed to open pty peer: %m");
+                /* The broker's operations are gated by polkit, hence make sure an authentication agent is
+                 * around in case we need to authenticate interactively. */
+                (void) polkit_agent_open_if_enabled(BUS_TRANSPORT_LOCAL, arg_ask_password);
+
+                r = pty_broker_acquire_pty(
+                                arg_runtime_scope,
+                                arg_console == CONSOLE_BROKER_LOG ? "log" : "null",
+                                arg_pty_name,
+                                arg_ask_password,
+                                &pty_fd,
+                                &peer_fd,
+                                /* ret_name= */ NULL);
+                if (r < 0)
+                        return r;
+        } else {
+                pty_fd = openpt_allocate(O_RDWR|O_NOCTTY|O_NONBLOCK, /* ret_peer_path= */ NULL);
+                if (pty_fd < 0)
+                        return log_error_errno(pty_fd, "Failed to acquire pseudo tty: %m");
+
+                peer_fd = pty_open_peer(pty_fd, O_RDWR|O_NOCTTY);
+                if (peer_fd < 0)
+                        return log_error_errno(peer_fd, "Failed to open pty peer: %m");
+        }
 
         if (!arg_quiet)
                 log_info("Press ^] three times within 1s to disconnect TTY.");
 
-        r = pty_forward_new(event, pty_fd, arg_read_only ? PTY_FORWARD_READ_ONLY : 0, &forward);
+        r = pty_forward_new(event, pty_fd, arg_console == CONSOLE_READ_ONLY ? PTY_FORWARD_READ_ONLY : 0, &forward);
         if (r < 0)
                 return log_error_errno(r, "Failed to create PTY forwarder: %m");
 
@@ -212,18 +249,21 @@ static int run(int argc, char *argv[]) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to create new session: %m");
 
-                (void) execvp(l[0], l);
-                log_error_errno(errno, "Failed to execute %s: %m", l[0]);
+                r = execvp_safe(l[0], l);
+                log_error_errno(r, "Failed to execute %s: %m", l[0]);
                 _exit(EXIT_FAILURE);
         }
 
-        peer_fd = safe_close(peer_fd);
+        /* NB: we keep the peer_fd open here: if a payload closes its stdin/stdout/stderr before exiting this
+         * might otherwise trigger an early HUP (for example, if the pty pair is managed by the ptybroker),
+         * which would kill the processes in question. Let's instead keep the pty open until the
+         * child process died, and close it only then. */
 
-        r = event_add_child_pidref(event, &child, &pidref, WEXITED, helper_on_exit, NULL);
+        r = event_add_child_pidref(event, &child, &pidref, WEXITED, helper_on_exit, /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to add child event source: %m");
 
-        r = sd_event_source_set_child_process_own(child, true);
+        r = sd_event_source_set_child_process_own(child, /* own= */ true);
         if (r < 0)
                 return log_error_errno(r, "Failed to take ownership of child process: %m");
 

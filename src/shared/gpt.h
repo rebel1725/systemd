@@ -5,7 +5,7 @@
 #include "sd-id128.h"
 
 #include "architecture.h"
-#include "shared-forward.h"
+#include "forward.h"
 #include "sparse-endian.h"
 
 /* maximum length of gpt label */
@@ -72,7 +72,7 @@ typedef struct GptPartitionType {
 
 extern const GptPartitionType gpt_partition_type_table[];
 
-int gpt_partition_label_valid(const char *s);
+bool gpt_label_is_valid(const char *s) _pure_;
 
 GptPartitionType gpt_partition_type_from_uuid(sd_id128_t id);
 int gpt_partition_type_from_string(const char *s, GptPartitionType *ret);
@@ -113,3 +113,10 @@ typedef struct {
 } _packed_ GptHeader;
 
 bool gpt_header_has_signature(const GptHeader *p) _pure_;
+
+ssize_t gpt_probe(
+                int fd,
+                GptHeader *ret_header,
+                void **ret_entries,
+                uint32_t *ret_n_entries,
+                uint32_t *ret_entry_size);

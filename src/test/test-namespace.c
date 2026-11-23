@@ -1,9 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
+#include <linux/nsfs.h>
 #include <sched.h>
 #include <stdlib.h>
-#include <sys/prctl.h>
+#include <sys/ioctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sysexits.h>
@@ -14,6 +16,7 @@
 #include "alloc-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "libmount-util.h"
 #include "namespace-util.h"
 #include "namespace.h"
@@ -99,10 +102,8 @@ static void test_shareable_ns(unsigned long nsflag) {
         int r, n = 0;
         siginfo_t si;
 
-        if (geteuid() > 0) {
-                (void) log_tests_skipped("not root");
-                return;
-        }
+        if (geteuid() > 0)
+                return (void) log_tests_skipped("not root");
 
         ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, 0, s));
 
@@ -178,10 +179,9 @@ TEST(fd_is_namespace) {
         ASSERT_OK_ZERO(fd_is_namespace(STDERR_FILENO, NAMESPACE_NET));
 
         fd = namespace_open_by_type(NAMESPACE_MOUNT);
-        if (IN_SET(fd, -ENOSYS, -ENOPKG)) {
-                log_notice("Path %s not found, skipping test", "/proc/self/ns/mnt");
-                return;
-        }
+        if (IN_SET(fd, -ENOSYS, -ENOPKG))
+                return (void) log_notice("Path %s not found, skipping test", "/proc/self/ns/mnt");
+
         ASSERT_OK(fd);
         ASSERT_OK_POSITIVE(fd_is_namespace(fd, NAMESPACE_MOUNT));
         ASSERT_OK_ZERO(fd_is_namespace(fd, NAMESPACE_NET));
@@ -202,22 +202,17 @@ TEST(protect_kernel_logs) {
         };
         int r;
 
-        if (geteuid() > 0) {
-                (void) log_tests_skipped("not root");
-                return;
-        }
+        if (geteuid() > 0)
+                return (void) log_tests_skipped("not root");
 
         /* In a container we likely don't have access to /dev/kmsg */
-        if (detect_container() > 0) {
-                (void) log_tests_skipped("in container");
-                return;
-        }
+        if (detect_container() > 0)
+                return (void) log_tests_skipped("in container");
 
-        r = dlopen_libmount();
-        if (ERRNO_IS_NEG_NOT_SUPPORTED(r)) {
-                (void) log_tests_skipped("libmount support not compiled in");
-                return;
-        }
+        r = dlopen_libmount(LOG_DEBUG);
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                return (void) log_tests_skipped("libmount support not compiled in");
+
         ASSERT_OK(r);
 
         r = ASSERT_OK(pidref_safe_fork("(protect)", FORK_WAIT|FORK_LOG|FORK_DEATHSIG_SIGKILL, /* ret= */ NULL));
@@ -225,12 +220,12 @@ TEST(protect_kernel_logs) {
         if (r == 0) {
                 _cleanup_close_ int fd = -EBADF;
 
-                ASSERT_OK_ERRNO(fd = open("/dev/kmsg", O_RDONLY | O_CLOEXEC));
+                ASSERT_OK(fd = xopenat(AT_FDCWD, "/dev/kmsg", O_RDONLY));
 
-                ASSERT_OK_ZERO(setup_namespace(&p, NULL));
+                ASSERT_OK_ZERO(setup_namespace(&p, /* reterr_path= */ NULL));
 
                 ASSERT_OK_ERRNO(setresuid(UID_NOBODY, UID_NOBODY, UID_NOBODY));
-                ASSERT_ERROR_ERRNO(open("/dev/kmsg", O_RDONLY | O_CLOEXEC), EACCES);
+                ASSERT_ERROR(xopenat(AT_FDCWD, "/dev/kmsg", O_RDONLY), EACCES);
 
                 _exit(EXIT_SUCCESS);
         }
@@ -251,6 +246,8 @@ TEST(namespace_is_init) {
                 r = namespace_is_init(t);
                 if (r == -EBADR)
                         log_info_errno(r, "In root namespace of type '%s': don't know", namespace_info[t].proc_name);
+                else if (t == NAMESPACE_NET && ERRNO_IS_NEG_PRIVILEGE(r))
+                        log_info_errno(r, "In root namespace of type '%s': no privilege: %m", namespace_info[t].proc_name);
                 else {
                         ASSERT_OK(r);
                         log_info("In root namespace of type '%s': %s", namespace_info[t].proc_name, yes_no(r));
@@ -272,7 +269,7 @@ TEST(userns_get_base_uid) {
         ASSERT_EQ(base_uid, 1U);
         ASSERT_EQ(base_gid, 2U);
 
-        ASSERT_ERROR(userns_get_base_uid(fd, &base_uid, NULL), EUCLEAN);
+        ASSERT_ERROR(userns_get_base_uid(fd, &base_uid, /* ret_gid= */ NULL), EUCLEAN);
 
         fd = safe_close(fd);
 
@@ -280,6 +277,57 @@ TEST(userns_get_base_uid) {
         ASSERT_OK(fd);
 
         ASSERT_ERROR(userns_get_base_uid(fd, &base_uid, &base_gid), ENOMSG);
+}
+
+TEST(namespace_open_by_id) {
+        /* Try our own user namespace first to see if the kernel exposes ns_id at all. */
+        _cleanup_close_ int userns_fd = ASSERT_OK(xopenat(AT_FDCWD, "/proc/self/ns/user", O_RDONLY));
+
+        uint64_t ns_id;
+        int r = RET_NERRNO(ioctl(userns_fd, NS_GET_ID, &ns_id));
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                return (void) log_tests_skipped("NS_GET_ID is not supported by this kernel");
+        ASSERT_OK(r);
+
+        /* namespace_open_by_id() refuses with -EPERM outside the initial user/pid namespace, since
+         * the kernel restricts open_by_handle_at() on nsfs to the initial userns and pidns and to
+         * CAP_SYS_ADMIN. */
+        _cleanup_close_ int opened = namespace_open_by_id(ns_id);
+        if (IN_SET(opened, -EPERM, -ESTALE))
+                return (void) log_tests_skipped("not in initial user namespace or missing CAP_SYS_ADMIN");
+        if (IN_SET(opened, -EOPNOTSUPP, -EINVAL))
+                return (void) log_tests_skipped("nsfs lookup by ns_id is not supported by this kernel");
+        ASSERT_OK(opened);
+
+        struct stat orig_st, opened_st;
+        ASSERT_OK_ERRNO(fstat(userns_fd, &orig_st));
+        ASSERT_OK_ERRNO(fstat(opened, &opened_st));
+        ASSERT_EQ(orig_st.st_ino, opened_st.st_ino);
+
+        opened = safe_close(opened);
+
+        ASSERT_ERROR(namespace_open_by_id(/* ns_id= */ 0), EINVAL);
+
+        _cleanup_close_ int transient_fd = userns_acquire_empty();
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(transient_fd) || ERRNO_IS_NEG_PRIVILEGE(transient_fd))
+                return (void) log_tests_skipped("cannot acquire userns for transient lookup test");
+        ASSERT_OK(transient_fd);
+
+        uint64_t transient_id;
+        ASSERT_OK_ERRNO(ioctl(transient_fd, NS_GET_ID, &transient_id));
+        ASSERT_NE(transient_id, ns_id);
+
+        opened = ASSERT_OK(namespace_open_by_id(transient_id));
+
+        struct stat transient_st, transient_opened_st;
+        ASSERT_OK_ERRNO(fstat(transient_fd, &transient_st));
+        ASSERT_OK_ERRNO(fstat(opened, &transient_opened_st));
+        ASSERT_EQ(transient_st.st_ino, transient_opened_st.st_ino);
+        opened = safe_close(opened);
+
+        /* Close the only reference. The namespace is now dead — lookup must fail. */
+        transient_fd = safe_close(transient_fd);
+        ASSERT_ERROR(namespace_open_by_id(transient_id), ESTALE);
 }
 
 TEST(process_is_owned_by_uid) {
@@ -307,10 +355,10 @@ TEST(process_is_owned_by_uid) {
         ASSERT_OK(r);
         if (r == 0) {
                 p[0] = safe_close(p[0]);
-                ASSERT_OK(fully_set_uid_gid(1, 1, NULL, 0));
+                ASSERT_OK(fully_set_uid_gid(1, 1, /* supplementary_gids= */ NULL, /* n_supplementary_gids= */ 0));
 
                 /* After successfully changing id/gid DEATHSIG is reset, so it has to be set again */
-                ASSERT_OK_ERRNO(prctl(PR_SET_PDEATHSIG, SIGKILL));
+                ASSERT_OK(prctl_safe(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0));
 
                 ASSERT_OK_EQ_ERRNO(write(p[1], &(const char[]) { 'x' }, 1), 1);
                 p[1] = safe_close(p[1]);
@@ -326,7 +374,7 @@ TEST(process_is_owned_by_uid) {
         ASSERT_OK_ZERO(process_is_owned_by_uid(&pid, getuid()));
 
         ASSERT_OK(pidref_kill(&pid, SIGKILL));
-        ASSERT_OK(pidref_wait_for_terminate(&pid, NULL));
+        ASSERT_OK(pidref_wait_for_terminate(&pid, /* ret_si= */ NULL));
 
         /* Test a child that runs in a userns as uid 1, but the userns is owned by us */
         ASSERT_OK_ERRNO(pipe2(p, O_CLOEXEC));
@@ -348,7 +396,7 @@ TEST(process_is_owned_by_uid) {
                 ASSERT_OK(reset_uid_gid());
 
                 /* After successfully changing id/gid DEATHSIG is reset, so it has to be set again */
-                ASSERT_OK_ERRNO(prctl(PR_SET_PDEATHSIG, SIGKILL));
+                ASSERT_OK(prctl_safe(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0));
 
                 ASSERT_OK_EQ_ERRNO(write(p[1], &(const char[]) { 'x' }, 1), 1);
                 p[1] = safe_close(p[1]);
@@ -358,9 +406,9 @@ TEST(process_is_owned_by_uid) {
         p[1] = safe_close(p[1]);
         pp[0] = safe_close(pp[0]);
 
-        ASSERT_OK(write_string_file(procfs_file_alloca(pid.pid, "uid_map"), "0 1 1\n", 0));
-        ASSERT_OK(write_string_file(procfs_file_alloca(pid.pid, "setgroups"), "deny", 0));
-        ASSERT_OK(write_string_file(procfs_file_alloca(pid.pid, "gid_map"), "0 1 1\n", 0));
+        ASSERT_OK(write_string_file(procfs_file_alloca(pid.pid, "uid_map"), "0 1 1\n", /* flags= */ 0));
+        ASSERT_OK(write_string_file(procfs_file_alloca(pid.pid, "setgroups"), "deny", /* flags= */ 0));
+        ASSERT_OK(write_string_file(procfs_file_alloca(pid.pid, "gid_map"), "0 1 1\n", /* flags= */ 0));
 
         ASSERT_OK_EQ_ERRNO(write(pp[1], &(const char[]) { 'x' }, 1), 1);
         pp[1] = safe_close(pp[1]);
@@ -373,7 +421,7 @@ TEST(process_is_owned_by_uid) {
         ASSERT_OK_POSITIVE(process_is_owned_by_uid(&pid, getuid()));
 
         ASSERT_OK(pidref_kill(&pid, SIGKILL));
-        ASSERT_OK(pidref_wait_for_terminate(&pid, NULL));
+        ASSERT_OK(pidref_wait_for_terminate(&pid, /* ret_si= */ NULL));
 }
 
 TEST(namespace_get_leader) {
@@ -440,7 +488,7 @@ TEST(detach_mount_namespace_harder) {
         if (r == 0) {
                 p[0] = safe_close(p[0]);
 
-                ASSERT_OK(detach_mount_namespace_harder(0, 0));
+                ASSERT_OK(detach_mount_namespace_harder(/* target_uid= */ 0, /* target_gid= */ 0));
 
                 ASSERT_OK_EQ_ERRNO(write(p[1], &(const char[]) { 'x' }, 1), 1);
                 freeze();
@@ -450,8 +498,8 @@ TEST(detach_mount_namespace_harder) {
         ASSERT_OK_EQ_ERRNO(read(p[0], &x, 1), 1);
         ASSERT_EQ(x, 'x');
 
-        ASSERT_OK_POSITIVE(pidref_in_same_namespace(NULL, &pid, NAMESPACE_USER));
-        ASSERT_OK_ZERO(pidref_in_same_namespace(NULL, &pid, NAMESPACE_MOUNT));
+        ASSERT_OK_POSITIVE(pidref_in_same_namespace(/* pid1= */ NULL, &pid, NAMESPACE_USER));
+        ASSERT_OK_ZERO(pidref_in_same_namespace(/* pid1= */ NULL, &pid, NAMESPACE_MOUNT));
 }
 
 static int intro(void) {

@@ -16,6 +16,7 @@
 #include "parse-util.h"
 #include "string-table.h"
 #include "string-util.h"
+#include "strv.h"
 
 bool oci_image_is_valid(const char *n) {
         bool slash = true;
@@ -51,12 +52,15 @@ bool oci_image_is_valid(const char *n) {
 int oci_registry_is_valid(const char *n) {
         int r;
 
-        if (!n)
+        if (isempty(n))
                 return false;
 
         const char *colon = strchr(n, ':');
         if (!colon)
                 return dns_name_is_valid(n);
+
+        if (colon == n)  /* empty host, e.g. ":5000" */
+                return false;
 
         _cleanup_free_ char *s = strndup(n, colon - n);
         if (!s)
@@ -67,11 +71,14 @@ int oci_registry_is_valid(const char *n) {
                 return r;
 
         uint16_t port;
-        return safe_atou16(s, &port) >= 0 && port != 0;
+        return safe_atou16_full(colon + 1,
+                                10 | SAFE_ATO_REFUSE_LEADING_WHITESPACE |
+                                SAFE_ATO_REFUSE_PLUS_MINUS | SAFE_ATO_REFUSE_LEADING_ZERO,
+                                &port) >= 0 && port != 0;
 }
 
 bool oci_tag_is_valid(const char *n) {
-        if (!n)
+        if (!n || isempty(n))
                 return false;
 
         /* As per https://github.com/opencontainers/distribution-spec/blob/main/spec.md, accept the following regex:
@@ -83,7 +90,7 @@ bool oci_tag_is_valid(const char *n) {
                 return false;
 
         size_t l = strspn(n + 1, ALPHANUMERICAL "._-");
-        if (l > 126)
+        if (l > 127)
                 return false;
         if (n[1+l] != 0)
                 return false;
@@ -102,7 +109,11 @@ int oci_ref_parse(
         assert(ref);
 
         _cleanup_free_ char *without_tag = NULL, *tag = NULL;
-        const char *t = strrchr(ref, ':');
+
+        /* Look for the tag separator only after the last "/", so that we don't mistake the port number of a
+         * registry for a tag, e.g. so that "quay.io:443/fedora/fedora" is parsed correctly. */
+        const char *slash = strrchr(ref, '/');
+        const char *t = strrchr(slash ?: ref, ':');
         if (t) {
                 tag = strdup(t + 1);
                 if (!tag)
@@ -153,7 +164,8 @@ int oci_ref_normalize(char **protocol, char **registry, char **image, char **tag
 
         assert(protocol);
         assert(registry);
-        assert(image && *image);
+        assert(image);
+        assert(*image);
         assert(tag);
 
         /* OCI container reference are supposed to have the form <registry>/<name>:<tag>. Except that it's
@@ -209,7 +221,7 @@ int oci_ref_normalize(char **protocol, char **registry, char **image, char **tag
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_free_ char *path = NULL;
         r = search_and_fopen_nulstr(fn, "re", /* root= */ NULL, CONF_PATHS_NULSTR("systemd/oci-registry"), &f, &path);
-        if (r == -ENOENT)
+        if (r == -ENOENT && isempty(*registry))
                 r = search_and_fopen_nulstr("default.oci-registry", "re", /* root= */ NULL, CONF_PATHS_NULSTR("systemd/oci-registry"), &f, &path);
         if (r < 0 && r != -ENOENT)
                 return log_debug_errno(r, "Failed to find suitable OCI registry file: %m");
@@ -315,6 +327,27 @@ char* oci_digest_string(const struct iovec *iovec) {
         return strjoin("sha256:", h);
 }
 
+/* Docker's "Image Manifest V2, Schema 2" format, which the OCI image format was standardized from, has the
+ * same structure as the OCI image index, image manifest, image configuration and gzip compressed layers,
+ * just with different media types. Many registries still serve images in that format, hence accept both.
+ * Docker's older schema 1 manifests are a different format, and are not supported. */
+
+bool oci_media_type_is_index(const char *t) {
+        return STRPTR_IN_SET(t, OCI_MEDIA_TYPES_INDEX);
+}
+
+bool oci_media_type_is_manifest(const char *t) {
+        return STRPTR_IN_SET(t, OCI_MEDIA_TYPES_MANIFEST);
+}
+
+bool oci_media_type_is_config(const char *t) {
+        return STRPTR_IN_SET(t, OCI_MEDIA_TYPES_CONFIG);
+}
+
+bool oci_media_type_is_layer(const char *t) {
+        return STRPTR_IN_SET(t, OCI_MEDIA_TYPES_LAYER);
+}
+
 int oci_make_manifest_url(
                 const char *protocol,
                 const char *repository,
@@ -379,6 +412,7 @@ static const char *const go_arch_table[_ARCHITECTURE_MAX] = {
 DEFINE_STRING_TABLE_LOOKUP_FROM_STRING(go_arch, Architecture);
 
 char* urlescape(const char *s) {
+        POINTER_MAY_BE_NULL(s);
         size_t l = strlen_ptr(s);
 
         _cleanup_free_ char *t = new(char, l * 3 + 1);

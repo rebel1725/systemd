@@ -15,7 +15,7 @@
 #include "hwdb-util.h"
 #include "label-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "nulstr-util.h"
 #include "path-util.h"
 #include "sort-util.h"
@@ -189,6 +189,8 @@ static int trie_insert(struct trie *trie, struct trie_node *node, const char *se
                        const char *key, const char *value,
                        const char *filename, uint16_t file_priority, uint32_t line_number, bool compat) {
         int r = 0;
+
+        assert(node);
 
         for (size_t i = 0;; i++) {
                 size_t p;
@@ -371,7 +373,7 @@ static int trie_store(struct trie *trie, const char *filename, bool compat) {
         /* calculate size of header, nodes, children entries, value entries */
         trie_store_nodes_size(&t, trie->root, compat);
 
-        r = fopen_tmpfile_linkable(filename, O_WRONLY|O_CLOEXEC, &filename_tmp, &f);
+        r = fopen_tmpfile_linkable(filename, O_WRONLY, &filename_tmp, &f);
         if (r < 0)
                 return r;
 
@@ -416,6 +418,7 @@ static int trie_store(struct trie *trie, const char *filename, bool compat) {
         /* write succeeded */
 
         log_debug("=== trie on-disk ===");
+        log_debug("filename:         %s", filename);
         log_debug("size:             %8"PRIi64" bytes", size);
         log_debug("header:           %8zu bytes", sizeof(struct trie_header_f));
         log_debug("nodes:            %8"PRIu64" bytes (%8"PRIu64")",
@@ -458,6 +461,21 @@ static int insert_data(struct trie *trie, char **match_list, char *line, const c
         return 0;
 }
 
+static void strip_comment(char *line) {
+        /* A '#' starts a comment that extends to the end of the line. "\#" stands for a literal '#' that
+         * does not start a comment, e.g. "ID_MODEL_FROM_DATABASE=SB200 OHCI USB Controller \#1". */
+
+        assert(line);
+
+        char *d = line;
+        for (const char *s = line; *s && *s != '#'; s++) {
+                if (s[0] == '\\' && s[1] == '#')
+                        s++;
+                *d++ = *s;
+        }
+        *d = '\0';
+}
+
 static int import_file(struct trie *trie, int fd, const char *filename, uint16_t file_priority, bool compat) {
         enum {
                 HW_NONE,
@@ -480,7 +498,6 @@ static int import_file(struct trie *trie, int fd, const char *filename, uint16_t
         for (;;) {
                 _cleanup_free_ char *line = NULL;
                 size_t len;
-                char *pos;
 
                 r = read_line_full(f, LONG_LINE_MAX, READ_LINE_NOT_A_TTY, &line);
                 if (r < 0)
@@ -494,10 +511,7 @@ static int import_file(struct trie *trie, int fd, const char *filename, uint16_t
                 if (line[0] == '#')
                         continue;
 
-                /* strip trailing comment */
-                pos = strchr(line, '#');
-                if (pos)
-                        pos[0] = '\0';
+                strip_comment(line);
 
                 /* strip trailing whitespace */
                 len = strlen(line);
@@ -575,7 +589,7 @@ static int import_file(struct trie *trie, int fd, const char *filename, uint16_t
 }
 
 int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool compat) {
-        _cleanup_free_ char *hwdb_bin = NULL;
+        _cleanup_free_ char *hwdb_bin = NULL, *root_abs = NULL;
         _cleanup_(trie_freep) struct trie *trie = NULL;
         uint16_t file_priority = 1;
         int r, ret = 0;
@@ -585,7 +599,18 @@ int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool co
          * source. If true, then hwdb.bin will be created without the information. systemd-hwdb command
          * should set the argument false, and 'udevadm hwdb' command should set it true. */
 
-        hwdb_bin = path_join(root, hwdb_bin_dir ?: "/etc/udev", "hwdb.bin");
+        r = empty_or_root_harder_to_null(&root);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine if '%s' points to the root directory: %m", strempty(root));
+
+        if (root) {
+                r = path_make_absolute_cwd(root, &root_abs);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to make '%s' absolute: %m", root);
+                path_simplify(root_abs);
+        }
+
+        hwdb_bin = path_join(root_abs, hwdb_bin_dir ?: "/etc/udev", "hwdb.bin");
         if (!hwdb_bin)
                 return -ENOMEM;
 
@@ -608,9 +633,9 @@ int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool co
         ConfFile **files = NULL;
         size_t n_files = 0;
 
-        CLEANUP_ARRAY(files, n_files, conf_file_free_many);
+        CLEANUP_ARRAY(files, n_files, conf_file_free_array);
 
-        r = conf_files_list_strv_full(".hwdb", root,
+        r = conf_files_list_strv_full(".hwdb", root_abs,
                                       CONF_FILES_REGULAR | CONF_FILES_FILTER_MASKED | CONF_FILES_WARN,
                                       conf_file_dirs, &files, &n_files);
         if (r < 0)
@@ -632,7 +657,13 @@ int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool co
                 ConfFile *c = *i;
 
                 log_debug("Reading file \"%s\" -> \"%s\"", c->original_path, c->resolved_path);
-                RET_GATHER(ret, import_file(trie, c->fd, c->original_path, file_priority++, compat));
+
+                const char *path_in_root = path_startswith_full(c->original_path,
+                                                                empty_to_root(root_abs),
+                                                                PATH_STARTSWITH_RETURN_LEADING_SLASH);
+                assert(path_in_root);
+
+                RET_GATHER(ret, import_file(trie, c->fd, path_in_root, file_priority++, compat));
         }
 
         strbuf_complete(trie->strings);
@@ -656,7 +687,7 @@ int hwdb_update(const char *root, const char *hwdb_bin_dir, bool strict, bool co
         if (r < 0)
                 return log_error_errno(r, "Failed to write database %s: %m", hwdb_bin);
 
-        r = label_fix(hwdb_bin, 0);
+        r = label_fix(hwdb_bin, /* flags= */ 0);
         if (r < 0)
                 return r;
 

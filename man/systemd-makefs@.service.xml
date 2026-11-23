@@ -3,7 +3,7 @@
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
   "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
-<refentry id="systemd-makefs_.service">
+<refentry id="systemd-makefs_.service" conditional="ENABLE_GROWFS">
 
   <refentryinfo>
     <title>systemd-makefs@.service</title>
@@ -30,8 +30,8 @@
     <para><filename>systemd-mkswap@<replaceable>device</replaceable>.service</filename></para>
     <para><filename>systemd-growfs@<replaceable>mountpoint</replaceable>.service</filename></para>
     <para><filename>systemd-growfs-root.service</filename></para>
-    <para><filename>/usr/lib/systemd/systemd-makefs</filename></para>
-    <para><filename>/usr/lib/systemd/systemd-growfs</filename></para>
+    <para><filename>/usr/lib/systemd/systemd-makefs</filename> <replaceable>FSTYPE</replaceable> <replaceable>DEVICE</replaceable></para>
+    <para><filename>/usr/lib/systemd/systemd-growfs</filename> <replaceable>MOUNTPOINT</replaceable></para>
   </refsynopsisdiv>
 
   <refsect1>

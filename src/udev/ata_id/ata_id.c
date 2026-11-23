@@ -6,7 +6,6 @@
  */
 
 #include <fcntl.h>
-#include <getopt.h>
 #include <linux/bsg.h>
 #include <linux/hdreg.h>
 #include <scsi/sg.h>
@@ -14,19 +13,30 @@
 #include <string.h>
 #include <sys/ioctl.h>
 
+#include "sd-json.h"
+
 #include "build.h"
 #include "device-nodes.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "log.h"
 #include "main-func.h"
+#include "strv.h"
 #include "udev-util.h"
 #include "unaligned.h"
+#include "verbs.h"
 
 #define COMMAND_TIMEOUT_MSEC (30 * 1000)
 
 static bool arg_export = false;
 static const char *arg_device = NULL;
+
+COMMAND(
+        "ata_id\0",
+        "Identify ATA storage devices.",
+        .argspec = "DEVICE\0",
+);
 
 static int disk_scsi_inquiry_command(
                 int fd,
@@ -357,39 +367,34 @@ static int disk_identify(int fd,
 }
 
 static int parse_argv(int argc, char *argv[]) {
-        static const struct option options[] = {
-                { "export",   no_argument, NULL, 'x' },
-                { "help",     no_argument, NULL, 'h' },
-                { "version",  no_argument, NULL, 'v' },
-                {}
-        };
-        int c;
+        assert(argc >= 0);
+        assert(argv);
 
-        while ((c = getopt_long(argc, argv, "xh", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 'x':
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION('x', "export", NULL,
+                       "Print values as environment keys"):
                         arg_export = true;
                         break;
-                case 'h':
-                        printf("%s [OPTIONS...] DEVICE\n\n"
-                               "  -x --export    Print values as environment keys\n"
-                               "  -h --help      Show this help text\n"
-                               "     --version   Show package version\n",
-                               program_invocation_short_name);
-                        return 0;
-                case 'v':
-                        return version();
-                case '?':
-                        return -EINVAL;
-                default:
-                        assert_not_reached();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (!argv[optind])
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "DEVICE argument missing.");
+        char **args = option_parser_get_args(&opts);
+        if (strv_length(args) != 1)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Need exactly one DEVICE argument.");
 
-        arg_device = argv[optind];
+        arg_device = args[0];
         return 1;
 }
 
@@ -411,13 +416,13 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        fd = open(ASSERT_PTR(arg_device), O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_NOCTTY);
+        fd = xopenat(AT_FDCWD, ASSERT_PTR(arg_device), O_RDONLY|O_NONBLOCK|O_NOCTTY);
         if (fd < 0) {
-                bool ignore = ERRNO_IS_DEVICE_ABSENT_OR_EMPTY(errno);
-                log_full_errno(ignore ? LOG_DEBUG : LOG_WARNING, errno,
+                bool ignore = ERRNO_IS_NEG_DEVICE_ABSENT_OR_EMPTY(fd);
+                log_full_errno(ignore ? LOG_DEBUG : LOG_WARNING, fd,
                                "Failed to open device node '%s'%s: %m",
                                arg_device, ignore ? ", ignoring" : "");
-                return ignore ? 0 : -errno;
+                return ignore ? 0 : fd;
         }
 
         if (disk_identify(fd, identify.byte, &peripheral_device_type) >= 0) {
@@ -428,7 +433,7 @@ static int run(int argc, char *argv[]) {
                 disk_identify_fixup_string(identify.byte,  10, 20); /* serial */
                 disk_identify_fixup_string(identify.byte,  23,  8); /* fwrev */
                 disk_identify_fixup_string(identify.byte,  27, 40); /* model */
-                disk_identify_fixup_uint16(identify.byte,  0);      /* configuration */
+                disk_identify_fixup_uint16(identify.byte,  /* offset_words= */ 0);      /* configuration */
                 disk_identify_fixup_uint16(identify.byte,  75);     /* queue depth */
                 disk_identify_fixup_uint16(identify.byte,  76);     /* SATA capabilities */
                 disk_identify_fixup_uint16(identify.byte,  82);     /* command set supported */
@@ -458,11 +463,11 @@ static int run(int argc, char *argv[]) {
         model[40] = '\0';
         encode_devnode_name(model, model_enc, sizeof(model_enc));
         udev_replace_whitespace((char *) id.model, model, 40);
-        udev_replace_chars(model, NULL);
+        udev_replace_chars(model, /* allow= */ NULL);
         udev_replace_whitespace((char *) id.serial_no, serial, 20);
-        udev_replace_chars(serial, NULL);
+        udev_replace_chars(serial, /* allow= */ NULL);
         udev_replace_whitespace((char *) id.fw_rev, revision, 8);
-        udev_replace_chars(revision, NULL);
+        udev_replace_chars(revision, /* allow= */ NULL);
 
         if (arg_export) {
                 /* Set this to convey the disk speaks the ATA protocol */

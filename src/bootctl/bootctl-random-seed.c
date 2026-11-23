@@ -71,7 +71,7 @@ static int set_system_token(void) {
                 return 0;
         }
 
-        r = efi_get_variable(EFI_LOADER_VARIABLE_STR("LoaderSystemToken"), NULL, NULL, &token_size);
+        r = efi_get_variable(EFI_LOADER_VARIABLE_STR("LoaderSystemToken"), /* ret_attribute= */ NULL, /* ret_value= */ NULL, &token_size);
         if (r == -ENODATA)
                 log_debug_errno(r, "LoaderSystemToken EFI variable is invalid (too short?), replacing.");
         else if (r < 0) {
@@ -111,8 +111,8 @@ static int set_system_token(void) {
         return 0;
 }
 
-int install_random_seed(const char *esp) {
-        _cleanup_close_ int esp_fd = -EBADF, loader_dir_fd = -EBADF, fd = -EBADF;
+int install_random_seed(const char *esp, int esp_fd) {
+        _cleanup_close_ int loader_dir_fd = -EBADF, fd = -EBADF;
         _cleanup_free_ char *tmp = NULL;
         uint8_t buffer[RANDOM_EFI_SEED_SIZE];
         struct sha256_ctx hash_state;
@@ -120,19 +120,16 @@ int install_random_seed(const char *esp) {
         int r;
 
         assert(esp);
+        assert(esp_fd >= 0);
 
         assert_cc(RANDOM_EFI_SEED_SIZE == SHA256_DIGEST_SIZE);
 
         if (!arg_install_random_seed)
                 return 0;
 
-        esp_fd = open(esp, O_DIRECTORY|O_RDONLY|O_CLOEXEC);
-        if (esp_fd < 0)
-                return log_error_errno(errno, "Failed to open ESP directory '%s': %m", esp);
-
         (void) random_seed_verify_permissions(esp_fd, S_IFDIR);
 
-        loader_dir_fd = open_mkdir_at(esp_fd, "loader", O_DIRECTORY|O_RDONLY|O_CLOEXEC|O_NOFOLLOW, 0775);
+        loader_dir_fd = open_mkdir_at(esp_fd, "loader", O_DIRECTORY|O_RDONLY|O_NOFOLLOW, 0775);
         if (loader_dir_fd < 0)
                 return log_error_errno(loader_dir_fd, "Failed to open loader directory '%s/loader': %m", esp);
 
@@ -143,10 +140,10 @@ int install_random_seed(const char *esp) {
         sha256_init_ctx(&hash_state);
         sha256_process_bytes_and_size(buffer, sizeof(buffer), &hash_state);
 
-        fd = openat(loader_dir_fd, "random-seed", O_NOFOLLOW|O_CLOEXEC|O_RDONLY|O_NOCTTY);
+        fd = xopenat(loader_dir_fd, "random-seed", O_NOFOLLOW|O_RDONLY|O_NOCTTY);
         if (fd < 0) {
-                if (errno != ENOENT)
-                        return log_error_errno(errno, "Failed to open old random seed file: %m");
+                if (fd != -ENOENT)
+                        return log_error_errno(fd, "Failed to open old random seed file: %m");
 
                 sha256_process_bytes(&(const ssize_t) { 0 }, sizeof(ssize_t), &hash_state);
                 refreshed = false;
@@ -172,7 +169,7 @@ int install_random_seed(const char *esp) {
         if (tempfn_random("random-seed", "bootctl", &tmp) < 0)
                 return log_oom();
 
-        fd = openat(loader_dir_fd, tmp, O_CREAT|O_EXCL|O_NOFOLLOW|O_NOCTTY|O_WRONLY|O_CLOEXEC, 0600);
+        fd = xopenat_full(loader_dir_fd, tmp, O_CREAT|O_EXCL|O_NOFOLLOW|O_NOCTTY|O_WRONLY, /* xopen_flags= */ 0, 0600);
         if (fd < 0)
                 return log_error_errno(fd, "Failed to open random seed file for writing: %m");
 
@@ -204,7 +201,8 @@ int install_random_seed(const char *esp) {
 int verb_random_seed(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
 
-        r = find_esp_and_warn(arg_root, arg_esp_path, /* unprivileged_mode= */ false, &arg_esp_path);
+        _cleanup_close_ int esp_fd = -EBADF;
+        r = find_esp_and_warn(arg_root, arg_esp_path, /* unprivileged_mode= */ false, &arg_esp_path, &esp_fd);
         if (r == -ENOKEY) {
                 /* find_esp_and_warn() doesn't warn about ENOKEY, so let's do that on our own */
                 if (arg_graceful() == ARG_GRACEFUL_NO)
@@ -216,7 +214,7 @@ int verb_random_seed(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (r < 0)
                 return r;
 
-        r = install_random_seed(arg_esp_path);
+        r = install_random_seed(arg_esp_path, esp_fd);
         if (r < 0)
                 return r;
 

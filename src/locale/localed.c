@@ -15,6 +15,7 @@
 #include "bus-util.h"
 #include "constants.h"
 #include "daemon-util.h"
+#include "dlopen-note.h"
 #include "hashmap.h"
 #include "label-util.h"
 #include "localed-util.h"
@@ -23,6 +24,7 @@
 #include "service-util.h"
 #include "string-util.h"
 #include "strv.h"
+#include "verbs.h"
 
 static int vconsole_reload(sd_bus *bus) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -30,7 +32,7 @@ static int vconsole_reload(sd_bus *bus) {
 
         assert(bus);
 
-        r = bus_call_method(bus, bus_systemd_mgr, "RestartUnit", &error, NULL, "ss", "systemd-vconsole-setup.service", "replace");
+        r = bus_call_method(bus, bus_systemd_mgr, "RestartUnit", &error, /* ret_reply= */ NULL, "ss", "systemd-vconsole-setup.service", "replace");
         if (r < 0)
                 return log_error_errno(r, "Failed to issue method call: %s", bus_error_message(&error, r));
         return 0;
@@ -53,7 +55,7 @@ static int property_get_locale(
         if (r < 0)
                 return r;
 
-        r = locale_context_build_env(&c->locale_context, &l, NULL);
+        r = locale_context_build_env(&c->locale_context, &l, /* ret_unset= */ NULL);
         if (r < 0)
                 return r;
 
@@ -270,7 +272,7 @@ static int method_set_locale(sd_bus_message *m, void *userdata, sd_bus_error *er
 
         if (locale_context_equal(&c->locale_context, new_locale)) {
                 log_debug("Locale settings were not modified.");
-                return sd_bus_reply_method_return(m, NULL);
+                return sd_bus_reply_method_return(m, /* types= */ NULL);
         }
 
         r = bus_verify_polkit_async_full(
@@ -280,6 +282,7 @@ static int method_set_locale(sd_bus_message *m, void *userdata, sd_bus_error *er
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -322,7 +325,7 @@ static int method_set_locale(sd_bus_message *m, void *userdata, sd_bus_error *er
                         "org.freedesktop.locale1",
                         "Locale", NULL);
 
-        return sd_bus_reply_method_return(m, NULL);
+        return sd_bus_reply_method_return(m, /* types= */ NULL);
 }
 
 static int method_set_vc_keyboard(sd_bus_message *m, void *userdata, sd_bus_error *error) {
@@ -375,7 +378,7 @@ static int method_set_vc_keyboard(sd_bus_message *m, void *userdata, sd_bus_erro
                 x_needs_update = !x11_context_equal(&c->x11_from_vc, &c->x11_from_xorg);
 
         if (vc_context_equal(&c->vc, &in) && !x_needs_update)
-                return sd_bus_reply_method_return(m, NULL);
+                return sd_bus_reply_method_return(m, /* types= */ NULL);
 
         r = bus_verify_polkit_async_full(
                         m,
@@ -384,6 +387,7 @@ static int method_set_vc_keyboard(sd_bus_message *m, void *userdata, sd_bus_erro
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -440,7 +444,7 @@ static int method_set_vc_keyboard(sd_bus_message *m, void *userdata, sd_bus_erro
                         x_needs_update ? "X11Options" : NULL,
                         NULL);
 
-        return sd_bus_reply_method_return(m, NULL);
+        return sd_bus_reply_method_return(m, /* types= */ NULL);
 }
 
 static int method_set_x11_keyboard(sd_bus_message *m, void *userdata, sd_bus_error *error) {
@@ -494,7 +498,7 @@ static int method_set_x11_keyboard(sd_bus_message *m, void *userdata, sd_bus_err
         }
 
         if (x11_context_equal(&c->x11_from_vc, &in) && x11_context_equal(&c->x11_from_xorg, &in) && !convert)
-                return sd_bus_reply_method_return(m, NULL);
+                return sd_bus_reply_method_return(m, /* types= */ NULL);
 
         r = bus_verify_polkit_async_full(
                         m,
@@ -503,6 +507,7 @@ static int method_set_x11_keyboard(sd_bus_message *m, void *userdata, sd_bus_err
                         /* good_user= */ UID_INVALID,
                         interactive ? POLKIT_ALLOW_INTERACTIVE : 0,
                         &c->polkit_registry,
+                        /* ret_admin= */ NULL,
                         error);
         if (r < 0)
                 return r;
@@ -546,7 +551,7 @@ static int method_set_x11_keyboard(sd_bus_message *m, void *userdata, sd_bus_err
         if (convert)
                 (void) vconsole_reload(sd_bus_message_get_bus(m));
 
-        return sd_bus_reply_method_return(m, NULL);
+        return sd_bus_reply_method_return(m, /* types= */ NULL);
 }
 
 static const sd_bus_vtable locale_vtable[] = {
@@ -604,11 +609,11 @@ static int connect_bus(Context *c, sd_event *event, sd_bus **_bus) {
         if (r < 0)
                 return r;
 
-        r = sd_bus_request_name_async(bus, NULL, "org.freedesktop.locale1", 0, NULL, NULL);
+        r = sd_bus_request_name_async(bus, /* ret_slot= */ NULL, "org.freedesktop.locale1", /* flags= */ 0, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request name: %m");
 
-        r = sd_bus_attach_event(bus, event, 0);
+        r = sd_bus_attach_event(bus, event, /* priority= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach bus to event loop: %m");
 
@@ -623,17 +628,27 @@ static bool context_check_idle(void *userdata) {
         return hashmap_isempty(c->polkit_registry);
 }
 
+COMMAND(
+        "systemd-localed\0",
+        "Manage system locale settings and key mappings.",
+        .man_page = "systemd-localed.service(8)",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0",
+);
+
 static int run(int argc, char *argv[]) {
         _cleanup_(context_clear) Context context = {};
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         int r;
 
+        LIBSELINUX_NOTE(recommended);
+
         log_setup();
 
-        r = service_parse_argv("systemd-localed.service",
-                               "Manage system locale settings and key mappings.",
-                               BUS_IMPLEMENTATIONS(&manager_object,
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object,
                                                    &log_control_object),
                                /* runtime_scope= */ NULL,
                                argc, argv);
@@ -660,7 +675,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return r;
 
-        r = sd_notify(false, NOTIFY_READY_MESSAGE);
+        r = sd_notify(/* unset_environment= */ false, NOTIFY_READY_MESSAGE);
         if (r < 0)
                 log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
 

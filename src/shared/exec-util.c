@@ -66,7 +66,7 @@ static int do_spawn(
                 char *_argv[2];
 
                 if (set_systemd_exec_pid) {
-                        r = setenv_systemd_exec_pid(false);
+                        r = setenv_systemd_exec_pid(/* update_only= */ false);
                         if (r < 0)
                                 log_warning_errno(r, "Failed to set $SYSTEMD_EXEC_PID, ignoring: %m");
                 }
@@ -283,7 +283,7 @@ int execute_strv(
                 _exit(r < 0 ? EXIT_FAILURE : r);
         }
 
-        r = pidref_wait_for_terminate_and_check(process_name, &executor_pidref, 0);
+        r = pidref_wait_for_terminate_and_check(process_name, &executor_pidref, /* flags= */ 0);
         if (r < 0)
                 return r;
         if (!FLAGS_SET(flags, EXEC_DIR_IGNORE_ERRORS) && r > 0)
@@ -356,7 +356,7 @@ static int gather_environment_generate(int fd, void *arg) {
                 return -errno;
         }
 
-        r = load_env_file_pairs(f, NULL, &new);
+        r = load_env_file_pairs(f, /* fname= */ NULL, &new);
         if (r < 0)
                 return r;
 
@@ -500,7 +500,7 @@ assert_cc((1 << ELEMENTSOF(exec_command_strings)) - 1 == _EXEC_COMMAND_FLAGS_ALL
 
 const char* exec_command_flags_to_string(ExecCommandFlags i) {
         for (size_t idx = 0; idx < ELEMENTSOF(exec_command_strings); idx++)
-                if (i == (1 << idx))
+                if (i == (ExecCommandFlags) (1U << idx))
                         return exec_command_strings[idx];
 
         return NULL;
@@ -516,7 +516,17 @@ ExecCommandFlags exec_command_flags_from_string(const char *s) {
         if (idx < 0)
                 return _EXEC_COMMAND_FLAGS_INVALID;
 
-        return 1 << idx;
+        return 1U << idx;
+}
+
+char* exec_command_flags_to_exec_chars(ExecCommandFlags flags) {
+        /* Returns the prefix characters that encode the flags in unit file ExecStart= lines, i.e. the
+         * inverse of the prefix parsing in load-fragment.c */
+        return strjoin(FLAGS_SET(flags, EXEC_COMMAND_IGNORE_FAILURE)   ? "-" : "",
+                       FLAGS_SET(flags, EXEC_COMMAND_NO_ENV_EXPAND)    ? ":" : "",
+                       FLAGS_SET(flags, EXEC_COMMAND_FULLY_PRIVILEGED) ? "+" : "",
+                       FLAGS_SET(flags, EXEC_COMMAND_NO_SETUID)        ? "!" : "",
+                       FLAGS_SET(flags, EXEC_COMMAND_VIA_SHELL)        ? "|" : "");
 }
 
 int fexecve_or_execve(int executable_fd, const char *executable, char *const argv[], char *const envp[]) {
@@ -557,7 +567,7 @@ int shall_fork_agent(void) {
 
         /* Check if we have a controlling terminal. If not (ENXIO here), we aren't actually invoked
          * interactively on a terminal, hence fail. */
-        r = get_ctty_devnr(0, NULL);
+        r = get_ctty_devnr(/* pid= */ 0, /* ret= */ NULL);
         if (r == -ENXIO)
                 return false;
         if (r < 0)
@@ -580,7 +590,7 @@ int _fork_agent(const char *name, char * const *argv, const int except[], size_t
                         name,
                         /* stdio_fds= */ NULL,
                         (int*) except, n_except, /* safe_fork_full only changes except if you pass in FORK_PACK_FDS, which we don't */
-                        FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG|FORK_RLIMIT_NOFILE_SAFE,
+                        FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGTERM|FORK_CLOSE_ALL_FDS|FORK_CLOEXEC_OFF|FORK_REOPEN_LOG|FORK_RLIMIT_NOFILE_SAFE,
                         ret);
         if (r < 0)
                 return r;
@@ -606,22 +616,13 @@ int _fork_agent(const char *name, char * const *argv, const int except[], size_t
                         _exit(EXIT_FAILURE);
                 }
 
-                if (!stdin_is_tty && dup2(fd, STDIN_FILENO) < 0) {
-                        log_error_errno(errno, "Failed to dup2 /dev/tty to STDIN: %m");
+                r = rearrange_stdio(stdin_is_tty ? STDIN_FILENO : fd,
+                                    stdout_is_tty ? STDOUT_FILENO : fd,
+                                    stderr_is_tty ? STDERR_FILENO : fd);
+                if (r < 0) {
+                        log_error_errno(r, "Failed to connect stdio to %s: %m", "/dev/tty");
                         _exit(EXIT_FAILURE);
                 }
-
-                if (!stdout_is_tty && dup2(fd, STDOUT_FILENO) < 0) {
-                        log_error_errno(errno, "Failed to dup2 /dev/tty to STDOUT: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                if (!stderr_is_tty && dup2(fd, STDERR_FILENO) < 0) {
-                        log_error_errno(errno, "Failed to dup2 /dev/tty to STDERR: %m");
-                        _exit(EXIT_FAILURE);
-                }
-
-                fd = safe_close_above_stdio(fd);
         }
 
         /* Count arguments */

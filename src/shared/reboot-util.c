@@ -5,6 +5,10 @@
 #include <unistd.h>
 
 #if HAVE_XENCTRL
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBXENCTRL
+#  error "missing libxenctrl_cflags in meson dependency."
+#endif
+
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
@@ -14,14 +18,18 @@
 #include <xen/xen.h>
 
 #include "errno-util.h"
-#include "fd-util.h"
+#include "fs-util.h"
 #endif
 
 #include "alloc-util.h"
+#include "fd-util.h"
 #include "fileio.h"
+#include "kernel-image.h"
 #include "log.h"
+#include "pe-binary.h"
 #include "proc-cmdline.h"
 #include "reboot-util.h"
+#include "sparse-endian.h"
 #include "string-util.h"
 #include "umask-util.h"
 #include "utf8.h"
@@ -139,12 +147,14 @@ bool shall_restore_state(void) {
         return (cached = b);
 }
 
-static int xen_kexec_loaded(void) {
 #if HAVE_XENCTRL
+static int xen_kexec_command(uint64_t cmd) {
         _cleanup_close_ int privcmd_fd = -EBADF, buf_fd = -EBADF;
-        xen_kexec_status_t *buffer;
+        void *buffer;
         size_t size;
         int r;
+
+        assert(IN_SET(cmd, KEXEC_CMD_kexec, KEXEC_CMD_kexec_status));
 
         if (access("/proc/xen", F_OK) < 0) {
                 if (errno == ENOENT)
@@ -153,40 +163,60 @@ static int xen_kexec_loaded(void) {
         }
 
         size = page_size();
-        if (sizeof(xen_kexec_status_t) > size)
+        if ((cmd == KEXEC_CMD_kexec_status && sizeof(xen_kexec_status_t) > size) ||
+            (cmd == KEXEC_CMD_kexec && sizeof(xen_kexec_exec_t) > size))
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "page_size is too small for hypercall");
 
-        privcmd_fd = open("/dev/xen/privcmd", O_RDWR|O_CLOEXEC);
+        privcmd_fd = xopenat(AT_FDCWD, "/dev/xen/privcmd", O_RDWR);
         if (privcmd_fd < 0)
-                return log_debug_errno(errno, "Cannot access /dev/xen/privcmd: %m");
+                return log_debug_errno(privcmd_fd, "Cannot access /dev/xen/privcmd: %m");
 
-        buf_fd = open("/dev/xen/hypercall", O_RDWR|O_CLOEXEC);
+        buf_fd = xopenat(AT_FDCWD, "/dev/xen/hypercall", O_RDWR);
         if (buf_fd < 0)
-                return log_debug_errno(errno, "Cannot access /dev/xen/hypercall: %m");
+                return log_debug_errno(buf_fd, "Cannot access /dev/xen/hypercall: %m");
 
         buffer = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, buf_fd, 0);
         if (buffer == MAP_FAILED)
                 return log_debug_errno(errno, "Cannot allocate buffer for hypercall: %m");
 
-        *buffer = (xen_kexec_status_t) {
-                .type = KEXEC_TYPE_DEFAULT,
-        };
+        if (cmd == KEXEC_CMD_kexec_status)
+                *(xen_kexec_status_t *)buffer = (xen_kexec_status_t) {
+                        .type = KEXEC_TYPE_DEFAULT,
+                };
+        else
+                *(xen_kexec_exec_t *)buffer = (xen_kexec_exec_t) {
+                        .type = KEXEC_TYPE_DEFAULT,
+                };
 
         privcmd_hypercall_t call = {
                 .op = __HYPERVISOR_kexec_op,
                 .arg = {
-                        KEXEC_CMD_kexec_status,
+                        cmd,
                         PTR_TO_UINT64(buffer),
                 },
         };
 
         r = RET_NERRNO(ioctl(privcmd_fd, IOCTL_PRIVCMD_HYPERCALL, &call));
         if (r < 0)
-                log_debug_errno(r, "kexec_status failed: %m");
+                log_debug_errno(r, "kexec%s failed: %m", cmd == KEXEC_CMD_kexec_status ? "_status" : "");
 
-        munmap(buffer, size);
+        munmap_safe(buffer, size);
 
         return r;
+}
+#endif
+
+static int xen_kexec(void) {
+#if HAVE_XENCTRL
+        return xen_kexec_command(KEXEC_CMD_kexec);
+#else
+        return -EOPNOTSUPP;
+#endif
+}
+
+static int xen_kexec_loaded(void) {
+#if HAVE_XENCTRL
+        return xen_kexec_command(KEXEC_CMD_kexec_status);
 #else
         return -EOPNOTSUPP;
 #endif
@@ -208,6 +238,91 @@ bool kexec_loaded(void) {
        }
 
        return s[0] == '1';
+}
+
+int kexec(void) {
+        int r;
+
+        r = xen_kexec();
+        if (r < 0 && r != -EOPNOTSUPP)
+                return log_error_errno(r, "Failed to call xen kexec: %m");
+
+        r = reboot(LINUX_REBOOT_CMD_KEXEC);
+        if (r < 0)
+                return log_error_errno(errno, "Failed to kexec: %m");
+
+        return 0;
+}
+
+static int extract_uki(const char *path, int fd, int *ret_kernel_fd, int *ret_initrd_fd) {
+        int r;
+
+        assert(fd >= 0);
+        assert(ret_kernel_fd);
+
+        _cleanup_free_ IMAGE_SECTION_HEADER *sections = NULL;
+        _cleanup_free_ PeHeader *pe_header = NULL;
+        r = pe_load_headers_and_sections(fd, &pe_header, &sections);
+        if (r < 0)
+                return log_debug_errno(r, "Not a valid PE file '%s': %m", path);
+
+        if (!pe_is_uki(pe_header, sections))
+                return 0; /* Not a UKI */
+
+        /* FIXME: we currently only extract .linux and .initrd, but sd-stub does a lot more:
+         * profiles, .cmdline, .dtb/.dtbauto, .ucode, .pcrsig/.pcrpkey, sidecar addons,
+         * credentials, sysexts/confexts, and TPM PCR measurements. */
+
+        const IMAGE_SECTION_HEADER *linux_section = pe_header_find_section(pe_header, sections, ".linux");
+        if (!linux_section)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG),
+                                       "UKI '%s' has no .linux section.", path);
+
+        log_debug("Detected UKI image '%s', extracting .linux section.", path);
+
+        _cleanup_close_ int kernel_memfd = pe_section_to_memfd(fd, linux_section, "kexec-uki-kernel");
+        if (kernel_memfd < 0)
+                return log_error_errno(kernel_memfd, "Failed to copy .linux section of UKI '%s': %m", path);
+
+        _cleanup_close_ int initrd_memfd = -EBADF;
+        if (ret_initrd_fd) {
+                const IMAGE_SECTION_HEADER *initrd_section = pe_header_find_section(pe_header, sections, ".initrd");
+                if (initrd_section) {
+                        log_debug("Extracting .initrd section from UKI '%s'.", path);
+
+                        initrd_memfd = pe_section_to_memfd(fd, initrd_section, "kexec-uki-initrd");
+                        if (initrd_memfd < 0)
+                                return log_error_errno(initrd_memfd, "Failed to copy .initrd section of UKI '%s': %m", path);
+                }
+        }
+
+        *ret_kernel_fd = TAKE_FD(kernel_memfd);
+        if (ret_initrd_fd)
+                *ret_initrd_fd = TAKE_FD(initrd_memfd);
+
+        return 1;
+}
+
+int kexec_maybe_decompress_kernel(const char *path, int fd, int *ret_kernel_fd, int *ret_initrd_fd) {
+        uint8_t magic[8];
+        ssize_t n;
+        int r;
+
+        assert(fd >= 0);
+        assert(ret_kernel_fd);
+
+        n = pread(fd, magic, sizeof(magic), 0);
+        if (n < 0)
+                return log_error_errno(errno, "Failed to read kernel magic from '%s': %m", path);
+
+        if ((size_t) n == sizeof(magic) && magic[0] == 'M' && magic[1] == 'Z' && memcmp(magic + 4, "zimg", 4) != 0)
+                return extract_uki(path, fd, ret_kernel_fd, ret_initrd_fd);
+
+        r = kernel_decompress(fd, ret_kernel_fd);
+        if (r < 0)
+                return log_error_errno(r, "Failed to decompress kernel '%s': %m", path);
+
+        return r;
 }
 
 int create_shutdown_run_nologin_or_warn(void) {

@@ -45,6 +45,24 @@
     for it yet. The latter might be useful in environments where a suitable TPM2 driver for the available
     hardware is not available.</para>
 
+    <para>The <option>systemd.tpm2_software_fallback=</option> kernel command line option (which takes a
+    boolean argument, defaulting to false) may be used to enable an automatic software TPM fallback in case a
+    hardware TPM is not detected and
+    <citerefentry><refentrytitle>swtpm</refentrytitle><manvolnum>8</manvolnum></citerefentry> is
+    available. This pulls in the
+    <citerefentry><refentrytitle>systemd-tpm2-swtpm.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    service.</para>
+
+    <para>In the initrd, the generator also orders
+    <citerefentry><refentrytitle>systemd-sysext-initrd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    and
+    <citerefentry><refentrytitle>systemd-confext-initrd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    after <filename>tpm2.target</filename> and
+    <citerefentry><refentrytitle>systemd-pcrphase-initrd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
+    so that LUKS encrypted extension images sealed to the TPM2 can be unlocked. This is not done if the
+    software TPM fallback is in use, as the software TPM only becomes available after the extension images
+    are merged, hence such images cannot be unlocked in the initrd in that case.</para>
+
     <para><command>systemd-tpm2-generator</command> implements
     <citerefentry><refentrytitle>systemd.generator</refentrytitle><manvolnum>7</manvolnum></citerefentry>.</para>
   </refsect1>
@@ -55,6 +73,7 @@
       <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>kernel-command-line</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-tpm2-swtpm.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
     </simplelist></para>
   </refsect1>
 </refentry>

@@ -104,6 +104,7 @@ static int netdev_l2tp_create_message_tunnel(NetDev *netdev, union in_addr_union
         assert(local_address);
         assert(netdev);
         assert(netdev->manager);
+        assert(ret);
 
         _cleanup_(sd_netlink_message_unrefp) sd_netlink_message *m = NULL;
         uint16_t encap_type;
@@ -200,6 +201,7 @@ static int netdev_l2tp_create_message_session(NetDev *netdev, L2tpSession *sessi
         assert(netdev->manager);
         assert(session);
         assert(session->tunnel);
+        assert(ret);
 
         r = sd_genl_message_new(netdev->manager->genl, L2TP_GENL_NAME, L2TP_CMD_SESSION_CREATE, &m);
         if (r < 0)
@@ -469,7 +471,7 @@ static int l2tp_create_tunnel(NetDev *netdev) {
 }
 
 static int netdev_l2tp_is_ready_to_create(NetDev *netdev, Link *link) {
-        return l2tp_get_local_address(netdev, NULL) >= 0;
+        return l2tp_get_local_address(netdev, /* ret= */ NULL) >= 0;
 }
 
 int config_parse_l2tp_tunnel_local_address(
@@ -506,7 +508,7 @@ int config_parse_l2tp_tunnel_local_address(
                 return 0;
         }
 
-        r = extract_first_word(&p, &addr_or_type, "@", 0);
+        r = extract_first_word(&p, &addr_or_type, "@", /* flags= */ 0);
         if (r < 0)
                 return log_oom();
         if (r == 0) {
@@ -640,7 +642,7 @@ int config_parse_l2tp_tunnel_id(
 
         return config_parse_uint32_bounded(
                         unit, filename, line, section, section_line, lvalue, rvalue,
-                        1, UINT32_MAX, true,
+                        1, UINT32_MAX, /* ignoring= */ true,
                         id);
 }
 
@@ -674,7 +676,7 @@ int config_parse_l2tp_session_id(
 
         r = config_parse_uint32_bounded(
                         unit, filename, line, section, section_line, lvalue, rvalue,
-                        1, UINT32_MAX, true,
+                        1, UINT32_MAX, /* ignoring= */ true,
                         id);
         if (r <= 0)
                 return r;
@@ -710,11 +712,8 @@ int config_parse_l2tp_session_l2spec(
                 return log_oom();
 
         spec = l2tp_l2spec_type_from_string(rvalue);
-        if (spec < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, spec,
-                           "Failed to parse layer2 specific header type. Ignoring assignment: %s", rvalue);
-                return 0;
-        }
+        if (spec < 0)
+                return log_syntax_parse_error(unit, filename, line, spec, lvalue, rvalue);
 
         session->l2tp_l2spec_type = spec;
 

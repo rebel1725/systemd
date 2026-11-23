@@ -36,8 +36,7 @@ static int normalize_and_maybe_pin_inode(
         assert(ret_tfd);
         assert(ret_opath);
 
-        if (isempty(*path))
-                *path = NULL; /* Normalize "" to NULL */
+        *path = empty_to_null(*path); /* Normalize "" to NULL */
 
         if (*fd == AT_FDCWD) {
                 if (!*path) /* Both unspecified? Then operate on current working directory */
@@ -61,9 +60,9 @@ static int normalize_and_maybe_pin_inode(
 
         /* If both have been specified, then we go via O_PATH */
 
-        int tfd = openat(*fd, *path, O_PATH|O_CLOEXEC|(FLAGS_SET(*at_flags, AT_SYMLINK_FOLLOW) ? 0 : O_NOFOLLOW));
+        int tfd = xopenat(*fd, *path, O_PATH|(FLAGS_SET(*at_flags, AT_SYMLINK_FOLLOW) ? 0 : O_NOFOLLOW));
         if (tfd < 0)
-                return -errno;
+                return tfd;
 
         *fd = *ret_tfd = tfd;
         *path = NULL;
@@ -166,7 +165,7 @@ int getxattr_at_malloc(
                 if (n != -ERANGE)
                         return (int) n;
 
-                n = getxattr_pinned_internal(fd, path, at_flags, by_procfs, name, NULL, 0);
+                n = getxattr_pinned_internal(fd, path, at_flags, by_procfs, name, /* buf= */ NULL, /* size= */ 0);
                 if (n < 0)
                         return (int) n;
 
@@ -274,7 +273,7 @@ int listxattr_at_malloc(int fd, const char *path, int at_flags, char **ret) {
                 if (r != -ERANGE)
                         return r;
 
-                r = listxattr_pinned_internal(fd, path, at_flags, by_procfs, NULL, 0);
+                r = listxattr_pinned_internal(fd, path, at_flags, by_procfs, /* buf= */ NULL, /* size= */ 0);
                 if (r < 0)
                         return r;
 
@@ -296,10 +295,22 @@ int xsetxattr_full(
         assert(fd >= 0 || fd == AT_FDCWD);
         assert((at_flags & ~(AT_SYMLINK_FOLLOW|AT_EMPTY_PATH)) == 0);
         assert(name);
-        assert(value);
+        assert(value || size == 0);
 
         if (size == SIZE_MAX)
                 size = strlen(value);
+
+        /* Skip the write if the xattr already has the correct value, to avoid
+         * unnecessary timestamp changes on the file. Only do this for plain
+         * replace mode (xattr_flags == 0) — XATTR_CREATE callers expect
+         * -EEXIST when the xattr already exists. */
+        _cleanup_free_ char *old_value = NULL;
+        size_t old_size;
+
+        if (xattr_flags == 0 &&
+            getxattr_at_malloc(fd, path, name, at_flags, &old_value, &old_size) >= 0 &&
+            memcmp_nn(old_value, old_size, value, size) == 0)
+                return 0;
 
         if (have_xattrat && !isempty(path)) {
                 struct xattr_args args = {

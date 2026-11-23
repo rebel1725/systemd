@@ -13,12 +13,13 @@ typedef enum RequestType {
         REQUEST_TYPE_ADDRESS_LABEL,
         REQUEST_TYPE_BRIDGE_FDB,
         REQUEST_TYPE_BRIDGE_MDB,
+        REQUEST_TYPE_DHCP_RELAY,
         REQUEST_TYPE_DHCP_SERVER,
         REQUEST_TYPE_DHCP4_CLIENT,
         REQUEST_TYPE_DHCP6_CLIENT,
-        REQUEST_TYPE_IPV6_PROXY_NDP,
         REQUEST_TYPE_NDISC,
         REQUEST_TYPE_NEIGHBOR,
+        REQUEST_TYPE_NEIGHBOR_PROXY,
         REQUEST_TYPE_NETDEV_INDEPENDENT,
         REQUEST_TYPE_NETDEV_STACKED,
         REQUEST_TYPE_NEXTHOP,
@@ -79,6 +80,7 @@ typedef struct Request {
          * request, and pass this request to the netlink_call_async(), and set the destroy function
          * to the slot. */
         request_netlink_handler_t netlink_handler;
+        sd_netlink_slot *netlink_slot;
 
         bool waiting_reply;
 } Request;
@@ -125,8 +127,8 @@ static inline int link_queue_request(
                 request_process_func_t process,
                 Request **ret) {
 
-        return link_queue_request_full(link, type, NULL, NULL, NULL, NULL,
-                                       process, NULL, NULL, ret);
+        return link_queue_request_full(link, type, /* userdata= */ NULL, /* free_func= */ NULL, /* hash_func= */ NULL, /* compare_func= */ NULL,
+                                       process, /* counter= */ NULL, /* netlink_handler= */ NULL, ret);
 }
 
 #define link_queue_request_safe(link, type, userdata, free_func, hash_func, compare_func, process, counter, netlink_handler, ret) \

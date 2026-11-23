@@ -2,6 +2,7 @@
 
 #include "sd-bus.h"
 #include "sd-messages.h"
+#include "sd-varlink.h"
 
 #include "alloc-util.h"
 #include "ansi-color.h"
@@ -24,6 +25,9 @@
 #include "string-util.h"
 #include "strv.h"
 #include "unit.h"
+#include "varlink.h"
+#include "varlink-serialize.h"
+#include "varlink-unit.h"
 #include "virt.h"
 
 Job* job_new_raw(Unit *unit) {
@@ -41,6 +45,8 @@ Job* job_new_raw(Unit *unit) {
                 .manager = unit->manager,
                 .unit = unit,
                 .type = _JOB_TYPE_INVALID,
+                .state = JOB_WAITING,
+                .result = _JOB_RESULT_INVALID,
         };
 
         return j;
@@ -122,6 +128,7 @@ Job* job_free(Job *j) {
         job_unlink(j);
 
         sd_bus_track_unref(j->bus_track);
+        sd_varlink_unref(j->varlink);
         strv_free(j->deserialized_clients);
 
         activation_details_unref(j->activation_details);
@@ -138,17 +145,18 @@ static void job_set_state(Job *j, JobState state) {
         if (j->state == state)
                 return;
 
+        JobState old_state = j->state;
         j->state = state;
 
         if (!j->installed)
                 return;
 
         if (j->state == JOB_RUNNING)
+                /* This job changed into running, count up */
                 j->manager->n_running_jobs++;
-        else {
-                assert(j->state == JOB_WAITING);
+        else if (old_state == JOB_RUNNING) {
+                /* This job changed away from running into another state, count down. */
                 assert(j->manager->n_running_jobs > 0);
-
                 j->manager->n_running_jobs--;
 
                 if (j->manager->n_running_jobs <= 0)
@@ -162,7 +170,7 @@ void job_uninstall(Job *j) {
         assert(j);
         assert(j->installed);
 
-        job_set_state(j, JOB_WAITING);
+        job_set_state(j, JOB_FINISHED);
 
         pj = j->type == JOB_NOP ? &j->unit->nop_job : &j->unit->job;
         assert(*pj == j);
@@ -170,8 +178,12 @@ void job_uninstall(Job *j) {
         /* Detach from next 'bigger' objects */
 
         /* daemon-reload should be transparent to job observers */
-        if (!MANAGER_IS_RELOADING(j->manager))
+        if (MANAGER_IS_RELOADING(j->manager))
+                varlink_job_stash_client(j);
+        else {
                 bus_job_send_removed_signal(j);
+                varlink_job_send_removed_signal(j);
+        }
 
         *pj = NULL;
 
@@ -243,7 +255,7 @@ Job* job_install(Job *j) {
 
         if (uj) {
                 if (job_type_is_conflicting(uj->type, j->type))
-                        job_finish_and_invalidate(uj, JOB_CANCELED, false, false);
+                        job_finish_and_invalidate(uj, JOB_CANCELED, /* recursive= */ false, /* already= */ false);
                 else {
                         /* not conflicting, i.e. mergeable */
 
@@ -310,7 +322,7 @@ int job_install_deserialized(Job *j) {
         if (j->id <= 0)
                 j->id = manager_get_new_job_id(j->manager);
 
-        r = hashmap_ensure_put(&j->manager->jobs, NULL, UINT32_TO_PTR(j->id), j);
+        r = hashmap_ensure_put(&j->manager->jobs, /* hash_ops= */ NULL, UINT32_TO_PTR(j->id), j);
         if (r == -EEXIST)
                 return log_unit_debug_errno(j->unit, r, "Job ID %" PRIu32 " already used, cannot deserialize job.", j->id);
         if (r < 0)
@@ -509,6 +521,8 @@ JobType job_type_collapse(JobType t, Unit *u) {
 
 int job_type_merge_and_collapse(JobType *a, JobType b, Unit *u) {
         JobType t;
+
+        assert(a);
 
         t = job_type_lookup_merge(*a, b);
         if (t < 0)
@@ -838,9 +852,9 @@ static void job_emit_done_message(Unit *u, uint32_t job_id, JobType t, JobResult
                 if (t == JOB_START && result == JOB_FAILED) {
                         _cleanup_free_ char *quoted = NULL;
 
-                        quoted = shell_maybe_quote(u->id, 0);
+                        quoted = shell_maybe_quote(u->id, /* flags= */ 0);
                         if (quoted)
-                                manager_status_printf(u->manager, STATUS_TYPE_NORMAL, NULL,
+                                manager_status_printf(u->manager, STATUS_TYPE_NORMAL, /* status= */ NULL,
                                                       "See 'systemctl status %s' for details.", quoted);
                 }
         }
@@ -920,7 +934,7 @@ int job_run_and_invalidate(Job *j) {
         if (!job_is_runnable(j))
                 return -EAGAIN;
 
-        job_start_timer(j, true);
+        job_start_timer(j, /* job_running= */ true);
         job_set_state(j, JOB_RUNNING);
         job_add_to_dbus_queue(j);
 
@@ -958,27 +972,27 @@ int job_run_and_invalidate(Job *j) {
                 if (r == -EAGAIN)
                         job_set_state(j, JOB_WAITING); /* Hmm, not ready after all, let's return to JOB_WAITING state */
                 else if (r == -EALREADY) /* already being executed */
-                        r = job_finish_and_invalidate(j, JOB_DONE, true, true);
+                        r = job_finish_and_invalidate(j, JOB_DONE, /* recursive= */ true, /* already= */ true);
                 else if (r == -ECOMM)
-                        r = job_finish_and_invalidate(j, JOB_DONE, true, false);
+                        r = job_finish_and_invalidate(j, JOB_DONE, /* recursive= */ true, /* already= */ false);
                 else if (r == -EBADR)
-                        r = job_finish_and_invalidate(j, JOB_SKIPPED, true, false);
+                        r = job_finish_and_invalidate(j, JOB_SKIPPED, /* recursive= */ true, /* already= */ false);
                 else if (r == -ENOEXEC)
-                        r = job_finish_and_invalidate(j, JOB_INVALID, true, false);
+                        r = job_finish_and_invalidate(j, JOB_INVALID, /* recursive= */ true, /* already= */ false);
                 else if (r == -EPROTO)
-                        r = job_finish_and_invalidate(j, JOB_ASSERT, true, false);
+                        r = job_finish_and_invalidate(j, JOB_ASSERT, /* recursive= */ true, /* already= */ false);
                 else if (r == -EOPNOTSUPP)
-                        r = job_finish_and_invalidate(j, JOB_UNSUPPORTED, true, false);
+                        r = job_finish_and_invalidate(j, JOB_UNSUPPORTED, /* recursive= */ true, /* already= */ false);
                 else if (r == -ENOLINK)
-                        r = job_finish_and_invalidate(j, JOB_DEPENDENCY, true, false);
+                        r = job_finish_and_invalidate(j, JOB_DEPENDENCY, /* recursive= */ true, /* already= */ false);
                 else if (r == -ESTALE)
-                        r = job_finish_and_invalidate(j, JOB_ONCE, true, false);
+                        r = job_finish_and_invalidate(j, JOB_ONCE, /* recursive= */ true, /* already= */ false);
                 else if (r == -EDEADLK)
-                        r = job_finish_and_invalidate(j, JOB_FROZEN, true, false);
+                        r = job_finish_and_invalidate(j, JOB_FROZEN, /* recursive= */ true, /* already= */ false);
                 else if (r == -ETOOMANYREFS)
                         r = job_finish_and_invalidate(j, JOB_CONCURRENCY, /* recursive= */ true, /* already= */ false);
                 else if (r < 0)
-                        r = job_finish_and_invalidate(j, JOB_FAILED, true, false);
+                        r = job_finish_and_invalidate(j, JOB_FAILED, /* recursive= */ true, /* already= */ false);
         }
 
         return r;
@@ -997,7 +1011,7 @@ static void job_fail_dependencies(Unit *u, UnitDependencyAtom match_atom) {
                 if (!IN_SET(j->type, JOB_START, JOB_VERIFY_ACTIVE))
                         continue;
 
-                job_finish_and_invalidate(j, JOB_DEPENDENCY, true, false);
+                job_finish_and_invalidate(j, JOB_DEPENDENCY, /* recursive= */ true, /* already= */ false);
         }
 }
 
@@ -1013,6 +1027,8 @@ int job_finish_and_invalidate(Job *j, JobResult result, bool recursive, bool alr
         t = j->type;
 
         j->result = result;
+
+        job_set_state(j, JOB_FINISHED);
 
         log_unit_debug(u, "Job %" PRIu32 " %s/%s finished, result=%s",
                        j->id, u->id, job_type_to_string(t), job_result_to_string(result));
@@ -1124,12 +1140,12 @@ static int job_dispatch_timer(sd_event_source *s, uint64_t monotonic, void *user
         log_unit_warning(j->unit, "Job %s/%s timed out.", j->unit->id, job_type_to_string(j->type));
 
         u = j->unit;
-        job_finish_and_invalidate(j, JOB_TIMEOUT, true, false);
+        job_finish_and_invalidate(j, JOB_TIMEOUT, /* recursive= */ true, /* already= */ false);
 
         emergency_action(
                         u->manager,
                         u->job_timeout_action,
-                        EMERGENCY_ACTION_IS_WATCHDOG|EMERGENCY_ACTION_WARN|EMERGENCY_ACTION_SLEEP_5S,
+                        EMERGENCY_ACTION_IS_WATCHDOG|EMERGENCY_ACTION_WARN|EMERGENCY_ACTION_SLEEP_5S|EMERGENCY_ACTION_IS_FAILURE,
                         u->job_timeout_reboot_arg,
                         /* exit_status= */ -1,
                         "job timed out");
@@ -1176,7 +1192,7 @@ int job_start_timer(Job *j, bool job_running) {
                         j->manager->event,
                         &j->timer_event_source,
                         CLOCK_MONOTONIC,
-                        timeout_time, 0,
+                        timeout_time, /* accuracy= */ 0,
                         job_dispatch_timer, j);
         if (r < 0)
                 return r;
@@ -1247,6 +1263,16 @@ int job_serialize(Job *j, FILE *f) {
                 (void) serialize_usec(f, "job-begin-running", j->begin_running_usec);
 
         bus_track_serialize(j->bus_track, f, "subscribed");
+        STRV_FOREACH(i, j->deserialized_clients)
+                (void) serialize_item(f, "subscribed", *i);
+
+        /* On reexecution the varlink server passes the connection along, hence just remember which one is
+         * ours. On reload the connection stays around anyway, see varlink_job_stash_client(). */
+        if (j->varlink && j->manager->objective != MANAGER_RELOAD) {
+                (void) varlink_serialize_connection_id(j->varlink, "job-varlink-connection", f);
+                (void) serialize_bool(f, "job-varlink-notify-job-changes", j->varlink_notify_job_changes);
+                (void) serialize_bool(f, "job-varlink-notify-unit-changes", j->unit->varlink_unit_change == j->varlink);
+        }
 
         activation_details_serialize(j->activation_details, f);
 
@@ -1256,6 +1282,8 @@ int job_serialize(Job *j, FILE *f) {
 }
 
 int job_deserialize(Job *j, FILE *f) {
+        _cleanup_free_ char *varlink_id = NULL;
+        bool varlink_notify_job_changes = false, varlink_notify_unit_changes = false;
         int r;
 
         assert(j);
@@ -1342,12 +1370,49 @@ int job_deserialize(Job *j, FILE *f) {
                         if (strv_extend(&j->deserialized_clients, v) < 0)
                                 return log_oom();
 
+                } else if (streq(l, "job-varlink-connection")) {
+                        if (free_and_strdup(&varlink_id, v) < 0)
+                                return log_oom();
+
+                } else if (streq(l, "job-varlink-notify-job-changes")) {
+                        r = parse_boolean(v);
+                        if (r < 0)
+                                log_debug("Failed to parse job varlink_notify_job_changes flag: %s", v);
+                        else
+                                varlink_notify_job_changes = r;
+
+                } else if (streq(l, "job-varlink-notify-unit-changes")) {
+                        r = parse_boolean(v);
+                        if (r < 0)
+                                log_debug("Failed to parse job varlink_notify_unit_changes flag: %s", v);
+                        else
+                                varlink_notify_unit_changes = r;
+
                 } else if (startswith(l, "activation-details")) {
                         if (activation_details_deserialize(l, v, &j->activation_details) < 0)
                                 log_debug("Failed to parse job ActivationDetails element: %s", v);
 
                 } else
                         log_debug("Unknown job serialization key: %s", l);
+        }
+
+        if (varlink_id) {
+                sd_varlink *link;
+
+                /* Stash the connection the same way as on reload, job_coldplug() picks it up again, and if
+                 * the job doesn't survive the client gets an error reply. */
+                if (manager_varlink_claim_connection(j->manager, varlink_id, /* flags= */ 0, &link) >= 0) {
+                        r = varlink_job_stash_client_full(
+                                        j->manager,
+                                        j->id,
+                                        link,
+                                        varlink_notify_job_changes,
+                                        varlink_notify_unit_changes);
+                        if (r < 0) {
+                                log_unit_warning_errno(j->unit, r, "Failed to stash varlink client of job %" PRIu32 ", sending error reply: %m", j->id);
+                                varlink_error_or_close(link, r);
+                        }
+                }
         }
 
         return 0;
@@ -1362,6 +1427,7 @@ int job_coldplug(Job *j) {
         /* After deserialization is complete and the bus connection
          * set up again, let's start watching our subscribers again */
         (void) bus_job_coldplug_bus_track(j);
+        varlink_job_unstash_client(j);
 
         if (j->state == JOB_WAITING)
                 job_add_to_run_queue(j);
@@ -1389,7 +1455,7 @@ int job_coldplug(Job *j) {
                         j->manager->event,
                         &j->timer_event_source,
                         CLOCK_MONOTONIC,
-                        timeout_time, 0,
+                        timeout_time, /* accuracy= */ 0,
                         job_dispatch_timer, j);
         if (r < 0)
                 log_debug_errno(r, "Failed to restart timeout for job: %m");
@@ -1431,7 +1497,7 @@ void job_shutdown_magic(Job *j) {
         if (detect_container() > 0)
                 return;
 
-        (void) asynchronous_sync(NULL);
+        (void) asynchronous_sync(/* ret_pid= */ NULL);
 }
 
 int job_get_timeout(Job *j, usec_t *ret) {
@@ -1479,7 +1545,7 @@ bool job_may_gc(Job *j) {
         if (j->in_dbus_queue)
                 return false;
 
-        if (sd_bus_track_count(j->bus_track) > 0)
+        if (sd_bus_track_count(j->bus_track) > 0 || !strv_isempty(j->deserialized_clients))
                 return false;
 
         /* FIXME: So this is a bit ugly: for now we don't properly track references made via private bus connections
@@ -1523,6 +1589,11 @@ void job_add_to_gc_queue(Job *j) {
 }
 
 static int job_compare_id(Job * const *a, Job * const *b) {
+        /* This is called from qsort()s inner loops. Correctly implemented qsort will never pass NULL so we
+           just suppress the check via POINTER_MAY_BE_NULL instead of assert() to avoid the runtime cost. */
+        POINTER_MAY_BE_NULL(a);
+        POINTER_MAY_BE_NULL(b);
+
         return CMP((*a)->id, (*b)->id);
 }
 
@@ -1637,8 +1708,9 @@ int job_get_after(Job *j, Job*** ret) {
 }
 
 static const char* const job_state_table[_JOB_STATE_MAX] = {
-        [JOB_WAITING] = "waiting",
-        [JOB_RUNNING] = "running",
+        [JOB_WAITING]  = "waiting",
+        [JOB_RUNNING]  = "running",
+        [JOB_FINISHED] = "finished",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(job_state, JobState);
@@ -1679,7 +1751,7 @@ const char* job_type_to_access_method(JobType t) {
         assert(t >= 0);
         assert(t < _JOB_TYPE_MAX);
 
-        if (IN_SET(t, JOB_START, JOB_RESTART, JOB_TRY_RESTART))
+        if (IN_SET(t, JOB_START, JOB_RESTART, JOB_TRY_RESTART, JOB_RELOAD_OR_START))
                 return "start";
         else if (t == JOB_STOP)
                 return "stop";

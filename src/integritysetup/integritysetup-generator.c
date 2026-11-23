@@ -13,6 +13,15 @@
 #include "specifier.h"
 #include "string-util.h"
 #include "unit-name.h"
+#include "verbs.h"
+
+COMMAND(
+        "systemd-integritysetup-generator\0",
+        "Generate units for integrity protected block devices.",
+        .argspec = GENERATOR_ARGSPEC,
+        .man_page = "systemd-integritysetup-generator(8)",
+        .option_namespace = "common",
+);
 
 static const char *arg_dest = NULL;
 static const char *arg_integritytab = NULL;
@@ -54,7 +63,7 @@ static int create_disk(
         if (r < 0)
                 return log_error_errno(r, "Failed to generate unit name: %m");
 
-        r = generator_open_unit_file(arg_dest, NULL, n, &f);
+        r = generator_open_unit_file(arg_dest, /* source= */ NULL, n, &f);
         if (r < 0)
                 return r;
 
@@ -68,7 +77,7 @@ static int create_disk(
         }
 
         if (options) {
-                r = parse_integrity_options(options, NULL, NULL, NULL, NULL, NULL);
+                r = parse_integrity_options(options, /* ret_activate_flags= */ NULL, /* ret_percent= */ NULL, /* ret_commit_time= */ NULL, /* ret_data_device= */ NULL, /* ret_integrity_alg= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -80,7 +89,11 @@ static int create_disk(
                 "SourcePath=%s\n"
                 "DefaultDependencies=no\n"
                 "IgnoreOnIsolate=true\n"
-                "After=integritysetup-pre.target systemd-udevd-kernel.socket\n"
+                /* The systemd-udevd.service ordering is mostly about shutdown, not startup: on stop the dm
+                 * device is detached via an ioctl carrying a udev cookie that blocks in dm_udev_wait() until
+                 * udev releases it (95-dm-notify.rules). Stopping before udevd keeps it around to service the
+                 * cookie; otherwise during soft-reboot/shutdown udevd may exit first and the detach hangs. */
+                "After=integritysetup-pre.target systemd-udevd-kernel.socket systemd-udevd.service\n"
                 "Before=blockdev@dev-mapper-%%i.target\n"
                 "Wants=blockdev@dev-mapper-%%i.target\n"
                 "Conflicts=umount.target\n"
@@ -134,8 +147,8 @@ static int add_integritytab_devices(void) {
 
         r = fopen_unlocked(arg_integritytab, "re", &f);
         if (r < 0) {
-                if (errno != ENOENT)
-                        log_error_errno(errno, "Failed to open %s: %m", arg_integritytab);
+                if (r != -ENOENT)
+                        log_error_errno(r, "Failed to open %s: %m", arg_integritytab);
                 return 0;
         }
 

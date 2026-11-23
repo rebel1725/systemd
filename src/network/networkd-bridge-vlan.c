@@ -108,7 +108,8 @@ static uint16_t link_get_pvid(Link *link, bool *ret_untagged) {
 static int bridge_vlan_append_set_info(Link *link, sd_netlink_message *m) {
         _cleanup_free_ char *str = NULL;
         uint16_t pvid, begin = UINT16_MAX;
-        bool untagged, pvid_is_untagged;
+        bool pvid_is_untagged, untagged = false;  /* <untagged> is always set together with <begin>.
+                                                   * Initialize to appease gcc. */
         int r;
 
         assert(link);
@@ -196,7 +197,7 @@ static int bridge_vlan_append_del_info(Link *link, sd_netlink_message *m) {
         assert(link->network);
         assert(m);
 
-        pvid = link_get_pvid(link, NULL);
+        pvid = link_get_pvid(link, /* ret_untagged= */ NULL);
 
         for (uint16_t k = 0; k < BRIDGE_VLAN_BITMAP_MAX; k++) {
 
@@ -368,12 +369,8 @@ int config_parse_bridge_vlan_id(
         }
 
         r = parse_vlanid(rvalue, &v);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse %s=, ignoring: %s",
-                           lvalue, rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         *id = v;
         return 0;
@@ -406,12 +403,8 @@ int config_parse_bridge_vlan_id_range(
         }
 
         r = parse_vid_range(rvalue, &vid, &vid_end);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse %s=, ignoring: %s",
-                           lvalue, rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         for (; vid <= vid_end; vid++)
                 set_bit(vid, bitmap);

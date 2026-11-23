@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 
 typedef enum DNSLabelFlags {
         DNS_LABEL_LDH                = 1 << 0, /* Follow the "LDH" rule — only letters, digits, and internal hyphens. */
@@ -27,7 +27,7 @@ static inline int dns_name_is_valid(const char *s) {
         int r;
 
         /* dns_name_concat() verifies as a side effect */
-        r = dns_name_concat(s, NULL, 0, NULL);
+        r = dns_name_concat(s, NULL, /* flags= */ 0, /* ret= */ NULL);
         if (r == -EINVAL)
                 return 0;
         if (r < 0)
@@ -38,7 +38,7 @@ static inline int dns_name_is_valid(const char *s) {
 static inline int dns_name_is_valid_ldh(const char *s) {
         int r;
 
-        r = dns_name_concat(s, NULL, DNS_LABEL_LDH|DNS_LABEL_NO_ESCAPES, NULL);
+        r = dns_name_concat(s, NULL, DNS_LABEL_LDH|DNS_LABEL_NO_ESCAPES, /* ret= */ NULL);
         if (r == -EINVAL)
                 return 0;
         if (r < 0)

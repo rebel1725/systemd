@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
-efi_config_h_dir = meson.current_build_dir()
 efi_addon = []
 
 libefitest = static_library(
@@ -12,8 +11,8 @@ libefitest = static_library(
         ),
         build_by_default : false,
         include_directories : [
-                basic_includes,
                 include_directories('.'),
+                basic_includes,
         ],
         implicit_include_directories : false,
         dependencies : userspace)
@@ -27,22 +26,22 @@ efitest_base = {
 efi_test_template = test_template + efitest_base
 efi_fuzz_template = fuzz_template + efitest_base
 
+test_hwids_section_c = custom_target(
+        input : ['hwids/test/device1.json', 'hwids/test/device2.json', 'hwids/test/device3.json', 'hwids/test/device4.json'],
+        output : 'test-hwids-section.c',
+        command : [python,
+                   files('generate-hwids-section.py'),
+                   relative_source_path / 'src/boot/hwids/test'],
+        capture : true,
+        build_by_default : want_tests != 'false')
+
+generated_sources += test_hwids_section_c
+
 if conf.get('ENABLE_UKIFY') == 1
-        test_hwids_section_c = custom_target(
-                input : ['hwids/test/device1.json', 'hwids/test/device2.json', 'hwids/test/device3.json', 'hwids/test/device4.json'],
-                output : 'test-hwids-section.c',
-                command : [files('generate-hwids-section.py'),
-                           meson.current_source_dir()/'hwids/test'],
-                capture : true,
-                build_by_default : want_tests != 'false')
         install_subdir('hwids',
                        install_dir : libexecdir / 'boot/',
                        exclude_directories : ['test'])
-else
-        test_hwids_section_c = []
 endif
-
-generated_sources += test_hwids_section_c
 
 executables += [
         efi_test_template + {
@@ -57,10 +56,13 @@ executables += [
         efi_test_template + {
                 'sources' : files('test-chid-match.c') +
                             test_hwids_section_c,
-                'conditions' : ['ENABLE_BOOTLOADER', 'ENABLE_UKIFY'],
+                'conditions' : ['ENABLE_BOOTLOADER'],
         },
         efi_fuzz_template + {
                 'sources' : files('fuzz-bcd.c'),
+        },
+        efi_fuzz_template + {
+                'sources' : files('fuzz-bmp.c'),
         },
         efi_fuzz_template + {
                 'sources' : files('fuzz-efi-string.c'),
@@ -80,10 +82,13 @@ endif
 efi_conf = configuration_data()
 
 # import several configs from userspace
-foreach name : ['HAVE_ATTRIBUTE_RETAIN',
-                'HAVE_WARNING_ZERO_AS_NULL_POINTER_CONSTANT',
-                'HAVE_WARNING_ZERO_LENGTH_BOUNDS',
-               ]
+foreach name : ['HAVE_WARNING_ZERO_LENGTH_BOUNDS',
+                'HAVE_WARNING_ZERO_AS_NULL_POINTER_CONSTANT']
+        efi_conf.set(name, conf.get(name))
+endforeach
+
+foreach attr : possible_c_attributes
+        name = 'HAVE_ATTRIBUTE_' + attr.to_upper()
         efi_conf.set(name, conf.get(name))
 endforeach
 
@@ -161,8 +166,8 @@ configure_file(
 ############################################################
 
 efi_includes = [
-        fundamental_include,
         include_directories('.'),
+        fundamental_include,
         version_include,
 ]
 
@@ -263,10 +268,13 @@ if cc.get_id() == 'clang'
 endif
 
 efi_arch_c_args = {
-        'aarch64'     : ['-mgeneral-regs-only'],
+        'aarch64'     : ['-mgeneral-regs-only', '-ffixed-x18'],
         'arm'         : ['-mgeneral-regs-only'],
         # Until -mgeneral-regs-only is supported in LoongArch, use the following option instead:
         'loongarch64' : ['-mno-lsx', '-mno-lasx'],
+        # Assume F/D is usable on RISC-V because they're difficult to disable
+        'riscv32'     : ['-march=rv32imafdc_zicsr_zifencei'],
+        'riscv64'     : ['-march=rv64imafdc_zicsr_zifencei'],
         # Pass -m64/32 explicitly to make building on x32 work.
         'x86_64'      : ['-m64', '-march=x86-64', '-mno-red-zone', '-mgeneral-regs-only'],
         'x86'         : ['-m32', '-march=i686', '-mgeneral-regs-only', '-malign-double'],
@@ -304,8 +312,10 @@ endif
 ############################################################
 
 libefi_sources = files(
+        'addon-media.c',
         'chid.c',
         'console.c',
+        'cpio.c',
         'device-path-util.c',
         'devicetree.c',
         'drivers.c',
@@ -314,10 +324,13 @@ libefi_sources = files(
         'efi-firmware.c',
         'efi-log.c',
         'efi-string.c',
+        'efivar-erase.c',
         'export-vars.c',
         'graphics.c',
+        'hii.c',
         'initrd.c',
         'measure.c',
+        'measure-smbios.c',
         'part-discovery.c',
         'pe.c',
         'random-seed.c',
@@ -333,14 +346,16 @@ libefi_sources = files(
 
 systemd_boot_sources = files(
         'boot.c',
+        'fwupdate.c',
         'line-edit.c',
 )
 
 stub_sources = files(
-        'cpio.c',
+        'boot-secret.c',
         'linux.c',
         'splash.c',
         'stub.c',
+        'tofu.c',
 )
 
 addon_sources = files(
@@ -461,6 +476,7 @@ foreach efi_elf_binary : efi_elf_binaries
                 install_dir : bootlibdir,
                 install_tag : 'systemd-boot',
                 command : [
+                        pyelftools,
                         elf2efi_py,
                         f'--version-major=@project_major_version@',
                         f'--version-minor=@project_minor_version@',

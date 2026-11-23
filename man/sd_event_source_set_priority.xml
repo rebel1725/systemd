@@ -147,12 +147,12 @@
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
 
   <refsect1>
     <title>History</title>
     <para><function>sd_event_source_set_priority()</function> and
-    <function>sd_event_source_get_priority()</function> were added in version 229.</para>
+    <function>sd_event_source_get_priority()</function> were added in version 221.</para>
   </refsect1>
 
   <refsect1>

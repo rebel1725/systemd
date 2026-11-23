@@ -33,9 +33,9 @@ static int get_acl(int fd, const char *name, acl_type_t type, acl_t *ret) {
         if (name) {
                 _cleanup_close_ int child_fd = -EBADF;
 
-                child_fd = openat(fd, name, O_PATH|O_CLOEXEC|O_NOFOLLOW);
+                child_fd = xopenat(fd, name, O_PATH|O_NOFOLLOW);
                 if (child_fd < 0)
-                        return -errno;
+                        return child_fd;
 
                 acl = sym_acl_get_file(FORMAT_PROC_FD_PATH(child_fd), type);
         } else if (type == ACL_TYPE_ACCESS)
@@ -58,9 +58,9 @@ static int set_acl(int fd, const char *name, acl_type_t type, acl_t acl) {
         if (name) {
                 _cleanup_close_ int child_fd = -EBADF;
 
-                child_fd = openat(fd, name, O_PATH|O_CLOEXEC|O_NOFOLLOW);
+                child_fd = xopenat(fd, name, O_PATH|O_NOFOLLOW);
                 if (child_fd < 0)
-                        return -errno;
+                        return child_fd;
 
                 r = sym_acl_set_file(FORMAT_PROC_FD_PATH(child_fd), type, acl);
         } else if (type == ACL_TYPE_ACCESS)
@@ -165,7 +165,7 @@ static int patch_acls(int fd, const char *name, const struct stat *st, uid_t shi
         if (!inode_type_can_acl(st->st_mode))
                 return 0;
 
-        r = dlopen_libacl();
+        r = dlopen_libacl(LOG_DEBUG);
         if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
                 return 0;
         if (r < 0)
@@ -295,8 +295,9 @@ static int is_fs_fully_userns_compatible(const struct statfs *sfs) {
                F_TYPE_EQUAL(sfs->f_type, SYSFS_MAGIC);
 }
 
-static int recurse_fd(int fd, const struct stat *st, uid_t shift, bool is_toplevel) {
+static int recurse_fd(int input_fd, const struct stat *st, uid_t shift, bool is_toplevel) {
         _cleanup_closedir_ DIR *d = NULL;
+        _cleanup_close_ int fd = TAKE_FD(input_fd);
         bool changed = false;
         struct statfs sfs;
         int r;
@@ -340,11 +341,11 @@ static int recurse_fd(int fd, const struct stat *st, uid_t shift, bool is_toplev
                         if (S_ISDIR(fst.st_mode)) {
                                 int subdir_fd;
 
-                                subdir_fd = openat(dirfd(d), de->d_name, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW|O_NOATIME);
+                                subdir_fd = xopenat(dirfd(d), de->d_name, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_NOFOLLOW|O_NOATIME);
                                 if (subdir_fd < 0)
-                                        return -errno;
+                                        return subdir_fd;
 
-                                r = recurse_fd(subdir_fd, &fst, shift, false);
+                                r = recurse_fd(subdir_fd, &fst, shift, /* is_toplevel= */ false);
                                 if (r < 0)
                                         return r;
                                 if (r > 0)
@@ -363,7 +364,7 @@ static int recurse_fd(int fd, const struct stat *st, uid_t shift, bool is_toplev
         /* After we descended, also patch the directory itself. It's key to do this in this order so that the top-level
          * directory is patched as very last object in the tree, so that we can use it as quick indicator whether the
          * tree is properly chown()ed already. */
-        r = patch_fd(d ? dirfd(d) : fd, NULL, st, shift);
+        r = patch_fd(d ? dirfd(d) : fd, /* name= */ NULL, st, shift);
         if (r == -EROFS)
                 goto read_only;
         if (r > 0)
@@ -391,9 +392,9 @@ int path_patch_uid(const char *path, uid_t shift, uid_t range) {
 
         assert(path);
 
-        fd = open(path, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW|O_NOATIME);
+        fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NONBLOCK|O_DIRECTORY|O_NOFOLLOW|O_NOATIME);
         if (fd < 0)
-                return log_debug_errno(errno, "Failed to open '%s': %m", path);
+                return log_debug_errno(fd, "Failed to open '%s': %m", path);
 
         /* Recursively adjusts the UID/GIDs of all files of a directory tree. This is used to automatically fix up an
          * OS tree to the used user namespace UID range. Note that this automatic adjustment only works for UID ranges

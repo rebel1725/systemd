@@ -4,7 +4,7 @@
 /* Include here so consumers have LOCK_{EX,SH,NB} available. */
 #include <sys/file.h> /* IWYU pragma: export */
 
-#include "basic-forward.h"
+#include "forward.h"
 
 typedef struct LockFile {
         int dir_fd;
@@ -44,5 +44,3 @@ typedef enum LockType {
 } LockType;
 
 int lock_generic(int fd, LockType type, int operation);
-
-int lock_generic_with_timeout(int fd, LockType type, int operation, usec_t timeout);

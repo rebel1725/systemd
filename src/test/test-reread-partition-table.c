@@ -7,6 +7,7 @@
 #include "capability-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "loop-util.h"
 #include "memfd-util.h"
 #include "path-util.h"
@@ -82,7 +83,7 @@ TEST(rereadpt) {
         ASSERT_ERROR_ERRNO(access(p, F_OK), ENOENT);
 
         /* No change */
-        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0));
+        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0, /* args= */ NULL));
         ASSERT_ERROR_ERRNO(access(p, F_OK), ENOENT);
 
         /* Create */
@@ -93,23 +94,23 @@ TEST(rereadpt) {
                "start=, size=20M, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7\n");
 
         ASSERT_ERROR_ERRNO(access(p, F_OK), ENOENT);
-        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0));
+        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0, /* args= */ NULL));
 
         ASSERT_OK_ZERO_ERRNO(access(p, F_OK));
 
         _cleanup_close_ int pfd = -EBADF;
-        ASSERT_OK_ERRNO(pfd = open(p, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY));
+        ASSERT_OK(pfd = xopenat(AT_FDCWD, p, O_RDONLY|O_NONBLOCK|O_NOCTTY));
         uint64_t size;
         ASSERT_OK(blockdev_get_device_size(pfd, &size));
         ASSERT_EQ(size, 20U*1024U*1024U);
         pfd = safe_close(pfd);
 
         /* No change */
-        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0));
+        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0, /* args= */ NULL));
         ASSERT_OK_ZERO_ERRNO(access(p, F_OK));
 
         /* No change, but synthesize change anyway */
-        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ REREADPT_FORCE_UEVENT));
+        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ REREADPT_FORCE_UEVENT, /* args= */ NULL));
         ASSERT_OK_ZERO_ERRNO(access(p, F_OK));
 
         /* Resize */
@@ -120,17 +121,17 @@ TEST(rereadpt) {
                "start=, size=30M, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7\n");
 
         ASSERT_OK_ZERO_ERRNO(access(p, F_OK));
-        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0));
+        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0, /* args= */ NULL));
         ASSERT_OK_ZERO_ERRNO(access(p, F_OK));
 
-        ASSERT_OK_ERRNO(pfd = open(p, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY));
+        ASSERT_OK(pfd = xopenat(AT_FDCWD, p, O_RDONLY|O_NONBLOCK|O_NOCTTY));
         ASSERT_OK(blockdev_get_device_size(pfd, &size));
         ASSERT_EQ(size, 30U*1024U*1024U);
         pfd = safe_close(pfd);
 
         /* No change */
-        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0));
-        ASSERT_OK_ERRNO(pfd = open(p, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY));
+        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0, /* args= */ NULL));
+        ASSERT_OK(pfd = xopenat(AT_FDCWD, p, O_RDONLY|O_NONBLOCK|O_NOCTTY));
 
         /* Move */
         log_notice("MOVING BY 50M");
@@ -140,20 +141,20 @@ TEST(rereadpt) {
                "start=50M, size=15M, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7\n");
 
         ASSERT_OK_ZERO_ERRNO(access(p, F_OK));
-        ASSERT_ERROR(reread_partition_table_fd(loop->fd, /* flags= */ 0), EBUSY);
+        ASSERT_ERROR(reread_partition_table_fd(loop->fd, /* flags= */ 0, /* args= */ NULL), EBUSY);
         pfd = safe_close(pfd);
 
         ASSERT_OK_ZERO_ERRNO(access(p, F_OK));
-        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0));
+        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0, /* args= */ NULL));
 
-        pfd = ASSERT_OK_ERRNO(open(p, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY));
+        pfd = ASSERT_OK(xopenat(AT_FDCWD, p, O_RDONLY|O_NONBLOCK|O_NOCTTY));
         ASSERT_OK(blockdev_get_device_size(pfd, &size));
         ASSERT_EQ(size, 15U*1024U*1024U);
         pfd = safe_close(pfd);
 
         /* No change */
-        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0));
-        pfd = ASSERT_OK_ERRNO(open(p, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY));
+        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0, /* args= */ NULL));
+        pfd = ASSERT_OK(xopenat(AT_FDCWD, p, O_RDONLY|O_NONBLOCK|O_NOCTTY));
 
         /* Remove */
         log_notice("REMOVING");
@@ -162,11 +163,11 @@ TEST(rereadpt) {
                "label: gpt\n");
 
         ASSERT_OK_ZERO_ERRNO(access(p, F_OK));
-        ASSERT_ERROR(reread_partition_table_fd(loop->fd, /* flags= */ 0), EBUSY);
+        ASSERT_ERROR(reread_partition_table_fd(loop->fd, /* flags= */ 0, /* args= */ NULL), EBUSY);
         pfd = safe_close(pfd);
 
         ASSERT_OK_ZERO_ERRNO(access(p, F_OK));
-        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0));
+        ASSERT_OK(reread_partition_table_fd(loop->fd, /* flags= */ 0, /* args= */ NULL));
         ASSERT_ERROR_ERRNO(access(p, F_OK), ENOENT);
 }
 

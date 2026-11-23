@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <locale.h>
 #include <unistd.h>
 
 #include "sd-bus.h"
 #include "sd-event.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
@@ -15,6 +15,7 @@
 #include "discover-image.h"
 #include "fd-util.h"
 #include "format-table.h"
+#include "fs-util.h"
 #include "import-common.h"
 #include "import-util.h"
 #include "log.h"
@@ -47,6 +48,13 @@ static const char* arg_format = NULL;
 static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 static ImageClass arg_image_class = _IMAGE_CLASS_INVALID;
 static RuntimeScope arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+
+COMMAND(
+        "importctl\0",
+        "Download, import or export disk images.",
+        .man_page = "importctl(1)",
+        .pager_flags = &arg_pager_flags,
+);
 
 #define PROGRESS_PREFIX "Total:"
 
@@ -196,7 +204,7 @@ static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to get event loop: %m");
 
-        r = sd_bus_attach_event(bus, event, 0);
+        r = sd_bus_attach_event(bus, event, /* priority= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach bus to event loop: %m");
 
@@ -237,7 +245,7 @@ static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to request match: %m");
 
-        r = sd_bus_call(bus, m, 0, &error, &reply);
+        r = sd_bus_call(bus, m, /* usec= */ 0, &error, &reply);
         if (r < 0)
                 return log_error_errno(r, "Failed to transfer image: %s", bus_error_message(&error, r));
 
@@ -251,8 +259,8 @@ static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
                 draw_progress_bar(PROGRESS_PREFIX, c.progress);
         }
 
-        (void) sd_event_add_signal(event, NULL, SIGINT|SD_EVENT_SIGNAL_PROCMASK, transfer_signal_handler, UINT32_TO_PTR(id));
-        (void) sd_event_add_signal(event, NULL, SIGTERM|SD_EVENT_SIGNAL_PROCMASK, transfer_signal_handler, UINT32_TO_PTR(id));
+        (void) sd_event_add_signal(event, /* ret= */ NULL, SIGINT|SD_EVENT_SIGNAL_PROCMASK, transfer_signal_handler, UINT32_TO_PTR(id));
+        (void) sd_event_add_signal(event, /* ret= */ NULL, SIGTERM|SD_EVENT_SIGNAL_PROCMASK, transfer_signal_handler, UINT32_TO_PTR(id));
 
         r = sd_event_loop(event);
         if (r < 0)
@@ -261,369 +269,7 @@ static int transfer_image_common(sd_bus *bus, sd_bus_message *m) {
         return -r;
 }
 
-static int verb_import_tar(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-        _cleanup_free_ char *ll = NULL, *fn = NULL;
-        const char *local = NULL, *path = NULL;
-        _cleanup_close_ int fd = -EBADF;
-        sd_bus *bus = ASSERT_PTR(userdata);
-        int r;
-
-        r = settle_image_class();
-        if (r < 0)
-                return r;
-
-        if (argc >= 2)
-                path = empty_or_dash_to_null(argv[1]);
-
-        if (argc >= 3)
-                local = empty_or_dash_to_null(argv[2]);
-        else if (path) {
-                r = path_extract_filename(path, &fn);
-                if (r < 0)
-                        return log_error_errno(r, "Cannot extract container name from filename: %m");
-                if (r == O_DIRECTORY)
-                        return log_error_errno(SYNTHETIC_ERRNO(EISDIR),
-                                               "Path '%s' refers to directory, but we need a regular file.", path);
-
-                local = fn;
-        }
-        if (!local)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Need either path or local name.");
-
-        r = tar_strip_suffixes(local, &ll);
-        if (r < 0)
-                return log_oom();
-
-        local = ll;
-
-        if (!image_name_is_valid(local))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Local name %s is not a suitable image name.",
-                                       local);
-
-        if (path) {
-                fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY);
-                if (fd < 0)
-                        return log_error_errno(errno, "Failed to open %s: %m", path);
-        }
-
-        if (arg_image_class == IMAGE_MACHINE && (arg_import_flags & ~(IMPORT_FORCE|IMPORT_READ_ONLY)) == 0) {
-                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportTar");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(
-                                m,
-                                "hsbb",
-                                fd >= 0 ? fd : STDIN_FILENO,
-                                local,
-                                FLAGS_SET(arg_import_flags, IMPORT_FORCE),
-                                FLAGS_SET(arg_import_flags, IMPORT_READ_ONLY));
-        } else {
-                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportTarEx");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(
-                                m,
-                                "hsst",
-                                fd >= 0 ? fd : STDIN_FILENO,
-                                local,
-                                image_class_to_string(arg_image_class),
-                                (uint64_t) arg_import_flags & (IMPORT_FORCE|IMPORT_READ_ONLY));
-        }
-        if (r < 0)
-                return bus_log_create_error(r);
-
-        return transfer_image_common(bus, m);
-}
-
-static int verb_import_raw(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-        _cleanup_free_ char *ll = NULL, *fn = NULL;
-        const char *local = NULL, *path = NULL;
-        _cleanup_close_ int fd = -EBADF;
-        sd_bus *bus = ASSERT_PTR(userdata);
-        int r;
-
-        r = settle_image_class();
-        if (r < 0)
-                return r;
-
-        if (argc >= 2)
-                path = empty_or_dash_to_null(argv[1]);
-
-        if (argc >= 3)
-                local = empty_or_dash_to_null(argv[2]);
-        else if (path) {
-                r = path_extract_filename(path, &fn);
-                if (r < 0)
-                        return log_error_errno(r, "Cannot extract container name from filename: %m");
-                if (r == O_DIRECTORY)
-                        return log_error_errno(SYNTHETIC_ERRNO(EISDIR),
-                                               "Path '%s' refers to directory, but we need a regular file.", path);
-
-                local = fn;
-        }
-        if (!local)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Need either path or local name.");
-
-        r = raw_strip_suffixes(local, &ll);
-        if (r < 0)
-                return log_oom();
-
-        local = ll;
-
-        if (!image_name_is_valid(local))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Local name %s is not a suitable image name.",
-                                       local);
-
-        if (path) {
-                fd = open(path, O_RDONLY|O_CLOEXEC|O_NOCTTY);
-                if (fd < 0)
-                        return log_error_errno(errno, "Failed to open %s: %m", path);
-        }
-
-        if (arg_image_class == IMAGE_MACHINE && (arg_import_flags & ~(IMPORT_FORCE|IMPORT_READ_ONLY)) == 0) {
-                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportRaw");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(
-                                m,
-                                "hsbb",
-                                fd >= 0 ? fd : STDIN_FILENO,
-                                local,
-                                FLAGS_SET(arg_import_flags, IMPORT_FORCE),
-                                FLAGS_SET(arg_import_flags, IMPORT_READ_ONLY));
-        } else {
-                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportRawEx");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(
-                                m,
-                                "hsst",
-                                fd >= 0 ? fd : STDIN_FILENO,
-                                local,
-                                image_class_to_string(arg_image_class),
-                                (uint64_t) arg_import_flags & (IMPORT_FORCE|IMPORT_READ_ONLY));
-        }
-        if (r < 0)
-                return bus_log_create_error(r);
-
-        return transfer_image_common(bus, m);
-}
-
-static int verb_import_fs(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-        const char *local = NULL, *path = NULL;
-        _cleanup_free_ char *fn = NULL;
-        _cleanup_close_ int fd = -EBADF;
-        sd_bus *bus = ASSERT_PTR(userdata);
-        int r;
-
-        r = settle_image_class();
-        if (r < 0)
-                return r;
-
-        if (argc >= 2)
-                path = empty_or_dash_to_null(argv[1]);
-
-        if (argc >= 3)
-                local = empty_or_dash_to_null(argv[2]);
-        else if (path) {
-                r = path_extract_filename(path, &fn);
-                if (r < 0)
-                        return log_error_errno(r, "Cannot extract container name from filename: %m");
-
-                local = fn;
-        }
-        if (!local)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Need either path or local name.");
-
-        if (!image_name_is_valid(local))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Local name %s is not a suitable image name.",
-                                       local);
-
-        if (path) {
-                fd = open(path, O_DIRECTORY|O_RDONLY|O_CLOEXEC);
-                if (fd < 0)
-                        return log_error_errno(errno, "Failed to open directory '%s': %m", path);
-        }
-
-        if (arg_image_class == IMAGE_MACHINE && (arg_import_flags & ~(IMPORT_FORCE|IMPORT_READ_ONLY)) == 0) {
-                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportFileSystem");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(
-                                m,
-                                "hsbb",
-                                fd >= 0 ? fd : STDIN_FILENO,
-                                local,
-                                FLAGS_SET(arg_import_flags, IMPORT_FORCE),
-                                FLAGS_SET(arg_import_flags, IMPORT_READ_ONLY));
-        } else {
-                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportFileSystemEx");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(
-                                m,
-                                "hsst",
-                                fd >= 0 ? fd : STDIN_FILENO,
-                                local,
-                                image_class_to_string(arg_image_class),
-                                (uint64_t) arg_import_flags & (IMPORT_FORCE|IMPORT_READ_ONLY));
-        }
-        if (r < 0)
-                return bus_log_create_error(r);
-
-        return transfer_image_common(bus, m);
-}
-
-static void determine_compression_from_filename(const char *p) {
-        if (arg_format)
-                return;
-
-        if (!p)
-                return;
-
-        if (endswith(p, ".xz"))
-                arg_format = "xz";
-        else if (endswith(p, ".gz"))
-                arg_format = "gzip";
-        else if (endswith(p, ".bz2"))
-                arg_format = "bzip2";
-        else if (endswith(p, ".zst"))
-                arg_format = "zstd";
-}
-
-static int verb_export_tar(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-        _cleanup_close_ int fd = -EBADF;
-        const char *local = NULL, *path = NULL;
-        sd_bus *bus = ASSERT_PTR(userdata);
-        int r;
-
-        r = settle_image_class();
-        if (r < 0)
-                return r;
-
-        local = argv[1];
-        if (!image_name_is_valid(local))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Image name %s is not valid.", local);
-
-        if (argc >= 3)
-                path = argv[2];
-        path = empty_or_dash_to_null(path);
-
-        if (path) {
-                determine_compression_from_filename(path);
-
-                fd = open(path, O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC|O_NOCTTY, 0666);
-                if (fd < 0)
-                        return log_error_errno(errno, "Failed to open %s: %m", path);
-        }
-
-        if (arg_image_class == IMAGE_MACHINE && arg_import_flags == 0) {
-                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ExportTar");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(
-                                m,
-                                "shs",
-                                local,
-                                fd >= 0 ? fd : STDOUT_FILENO,
-                                arg_format);
-        } else {
-                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ExportTarEx");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(
-                                m,
-                                "sshst",
-                                local,
-                                image_class_to_string(arg_image_class),
-                                fd >= 0 ? fd : STDOUT_FILENO,
-                                arg_format,
-                                /* flags= */ UINT64_C(0));
-        }
-        if (r < 0)
-                return bus_log_create_error(r);
-
-        return transfer_image_common(bus, m);
-}
-
-static int verb_export_raw(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
-        _cleanup_close_ int fd = -EBADF;
-        const char *local = NULL, *path = NULL;
-        sd_bus *bus = ASSERT_PTR(userdata);
-        int r;
-
-        r = settle_image_class();
-        if (r < 0)
-                return r;
-
-        local = argv[1];
-        if (!image_name_is_valid(local))
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Image name %s is not valid.", local);
-
-        if (argc >= 3)
-                path = argv[2];
-        path = empty_or_dash_to_null(path);
-
-        if (path) {
-                determine_compression_from_filename(path);
-
-                fd = open(path, O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC|O_NOCTTY, 0666);
-                if (fd < 0)
-                        return log_error_errno(errno, "Failed to open %s: %m", path);
-        }
-
-        if (arg_image_class == IMAGE_MACHINE && arg_import_flags == 0) {
-                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ExportRaw");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(
-                                m,
-                                "shs",
-                                local,
-                                fd >= 0 ? fd : STDOUT_FILENO,
-                                arg_format);
-        } else {
-                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ExportRawEx");
-                if (r < 0)
-                        return bus_log_create_error(r);
-
-                r = sd_bus_message_append(
-                                m,
-                                "sshst",
-                                local,
-                                image_class_to_string(arg_image_class),
-                                fd >= 0 ? fd : STDOUT_FILENO,
-                                arg_format,
-                                /* flags= */ UINT64_C(0));
-        }
-        if (r < 0)
-                return bus_log_create_error(r);
-
-        return transfer_image_common(bus, m);
-}
-
+VERB(verb_pull_tar, "pull-tar", "URL [NAME]\0", 2, 3, 0, "Download a TAR container image");
 static int verb_pull_tar(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_free_ char *l = NULL, *ll = NULL;
@@ -636,7 +282,7 @@ static int verb_pull_tar(int argc, char *argv[], uintptr_t _data, void *userdata
                 return r;
 
         remote = argv[1];
-        if (!http_url_is_valid(remote) && !file_url_is_valid(remote))
+        if (!http_url_is_valid(remote) && !file_url_is_valid(remote) && !provider_url_is_valid(remote))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "URL '%s' is not valid.", remote);
 
@@ -655,7 +301,7 @@ static int verb_pull_tar(int argc, char *argv[], uintptr_t _data, void *userdata
         if (local) {
                 r = tar_strip_suffixes(local, &ll);
                 if (r < 0)
-                        return log_oom();
+                        return log_error_errno(r, "Failed to strip suffixes from '%s': %m", local);
 
                 local = ll;
 
@@ -697,6 +343,7 @@ static int verb_pull_tar(int argc, char *argv[], uintptr_t _data, void *userdata
         return transfer_image_common(bus, m);
 }
 
+VERB(verb_pull_raw, "pull-raw", "URL [NAME]\0", 2, 3, 0, "Download a RAW container or VM image");
 static int verb_pull_raw(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_free_ char *l = NULL, *ll = NULL;
@@ -709,7 +356,7 @@ static int verb_pull_raw(int argc, char *argv[], uintptr_t _data, void *userdata
                 return r;
 
         remote = argv[1];
-        if (!http_url_is_valid(remote) && !file_url_is_valid(remote))
+        if (!http_url_is_valid(remote) && !file_url_is_valid(remote) && !provider_url_is_valid(remote))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "URL '%s' is not valid.", remote);
 
@@ -770,6 +417,7 @@ static int verb_pull_raw(int argc, char *argv[], uintptr_t _data, void *userdata
         return transfer_image_common(bus, m);
 }
 
+VERB(verb_pull_oci, "pull-oci", "REF [NAME]\0", 2, 3, 0, "Download an OCI container image");
 static int verb_pull_oci(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_free_ char *l = NULL;
@@ -825,6 +473,375 @@ static int verb_pull_oci(int argc, char *argv[], uintptr_t _data, void *userdata
         return transfer_image_common(bus, m);
 }
 
+VERB(verb_import_tar, "import-tar", "FILE [NAME]\0", 2, 3, 0, "Import a local TAR container image");
+static int verb_import_tar(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_free_ char *ll = NULL, *fn = NULL;
+        const char *local = NULL, *path = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        sd_bus *bus = ASSERT_PTR(userdata);
+        int r;
+
+        r = settle_image_class();
+        if (r < 0)
+                return r;
+
+        if (argc >= 2)
+                path = empty_or_dash_to_null(argv[1]);
+
+        if (argc >= 3)
+                local = empty_or_dash_to_null(argv[2]);
+        else if (path) {
+                r = path_extract_filename(path, &fn);
+                if (r < 0)
+                        return log_error_errno(r, "Cannot extract container name from filename: %m");
+                if (r == O_DIRECTORY)
+                        return log_error_errno(SYNTHETIC_ERRNO(EISDIR),
+                                               "Path '%s' refers to directory, but we need a regular file.", path);
+
+                local = fn;
+        }
+        if (!local)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Need either path or local name.");
+
+        r = tar_strip_suffixes(local, &ll);
+        if (r < 0)
+                return log_error_errno(r, "Failed to strip suffixes from '%s': %m", local);
+
+        local = ll;
+
+        if (!image_name_is_valid(local))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Local name %s is not a suitable image name.",
+                                       local);
+
+        if (path) {
+                fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NOCTTY);
+                if (fd < 0)
+                        return log_error_errno(fd, "Failed to open %s: %m", path);
+        }
+
+        if (arg_image_class == IMAGE_MACHINE && (arg_import_flags & ~(IMPORT_FORCE|IMPORT_READ_ONLY)) == 0) {
+                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportTar");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(
+                                m,
+                                "hsbb",
+                                fd >= 0 ? fd : STDIN_FILENO,
+                                local,
+                                FLAGS_SET(arg_import_flags, IMPORT_FORCE),
+                                FLAGS_SET(arg_import_flags, IMPORT_READ_ONLY));
+        } else {
+                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportTarEx");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(
+                                m,
+                                "hsst",
+                                fd >= 0 ? fd : STDIN_FILENO,
+                                local,
+                                image_class_to_string(arg_image_class),
+                                (uint64_t) arg_import_flags & (IMPORT_FORCE|IMPORT_READ_ONLY));
+        }
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        return transfer_image_common(bus, m);
+}
+
+VERB(verb_import_raw, "import-raw", "FILE [NAME]\0", 2, 3, 0, "Import a local RAW container or VM image");
+static int verb_import_raw(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_free_ char *ll = NULL, *fn = NULL;
+        const char *local = NULL, *path = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        sd_bus *bus = ASSERT_PTR(userdata);
+        int r;
+
+        r = settle_image_class();
+        if (r < 0)
+                return r;
+
+        if (argc >= 2)
+                path = empty_or_dash_to_null(argv[1]);
+
+        if (argc >= 3)
+                local = empty_or_dash_to_null(argv[2]);
+        else if (path) {
+                r = path_extract_filename(path, &fn);
+                if (r < 0)
+                        return log_error_errno(r, "Cannot extract container name from filename: %m");
+                if (r == O_DIRECTORY)
+                        return log_error_errno(SYNTHETIC_ERRNO(EISDIR),
+                                               "Path '%s' refers to directory, but we need a regular file.", path);
+
+                local = fn;
+        }
+        if (!local)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Need either path or local name.");
+
+        r = raw_strip_suffixes(local, &ll);
+        if (r < 0)
+                return log_oom();
+
+        local = ll;
+
+        if (!image_name_is_valid(local))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Local name %s is not a suitable image name.",
+                                       local);
+
+        if (path) {
+                fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NOCTTY);
+                if (fd < 0)
+                        return log_error_errno(fd, "Failed to open %s: %m", path);
+        }
+
+        if (arg_image_class == IMAGE_MACHINE && (arg_import_flags & ~(IMPORT_FORCE|IMPORT_READ_ONLY)) == 0) {
+                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportRaw");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(
+                                m,
+                                "hsbb",
+                                fd >= 0 ? fd : STDIN_FILENO,
+                                local,
+                                FLAGS_SET(arg_import_flags, IMPORT_FORCE),
+                                FLAGS_SET(arg_import_flags, IMPORT_READ_ONLY));
+        } else {
+                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportRawEx");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(
+                                m,
+                                "hsst",
+                                fd >= 0 ? fd : STDIN_FILENO,
+                                local,
+                                image_class_to_string(arg_image_class),
+                                (uint64_t) arg_import_flags & (IMPORT_FORCE|IMPORT_READ_ONLY));
+        }
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        return transfer_image_common(bus, m);
+}
+
+VERB(verb_import_fs, "import-fs", "DIRECTORY [NAME]\0", 2, 3, 0, "Import a local directory container image");
+static int verb_import_fs(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        const char *local = NULL, *path = NULL;
+        _cleanup_free_ char *fn = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        sd_bus *bus = ASSERT_PTR(userdata);
+        int r;
+
+        r = settle_image_class();
+        if (r < 0)
+                return r;
+
+        if (argc >= 2)
+                path = empty_or_dash_to_null(argv[1]);
+
+        if (argc >= 3)
+                local = empty_or_dash_to_null(argv[2]);
+        else if (path) {
+                r = path_extract_filename(path, &fn);
+                if (r < 0)
+                        return log_error_errno(r, "Cannot extract container name from filename: %m");
+
+                local = fn;
+        }
+        if (!local)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Need either path or local name.");
+
+        if (!image_name_is_valid(local))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Local name %s is not a suitable image name.",
+                                       local);
+
+        if (path) {
+                fd = xopenat(AT_FDCWD, path, O_DIRECTORY|O_RDONLY);
+                if (fd < 0)
+                        return log_error_errno(fd, "Failed to open directory '%s': %m", path);
+        }
+
+        if (arg_image_class == IMAGE_MACHINE && (arg_import_flags & ~(IMPORT_FORCE|IMPORT_READ_ONLY)) == 0) {
+                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportFileSystem");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(
+                                m,
+                                "hsbb",
+                                fd >= 0 ? fd : STDIN_FILENO,
+                                local,
+                                FLAGS_SET(arg_import_flags, IMPORT_FORCE),
+                                FLAGS_SET(arg_import_flags, IMPORT_READ_ONLY));
+        } else {
+                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ImportFileSystemEx");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(
+                                m,
+                                "hsst",
+                                fd >= 0 ? fd : STDIN_FILENO,
+                                local,
+                                image_class_to_string(arg_image_class),
+                                (uint64_t) arg_import_flags & (IMPORT_FORCE|IMPORT_READ_ONLY));
+        }
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        return transfer_image_common(bus, m);
+}
+
+static void determine_compression_from_filename(const char *p) {
+        if (arg_format)
+                return;
+
+        if (!p)
+                return;
+
+        if (endswith(p, ".xz"))
+                arg_format = "xz";
+        else if (endswith(p, ".gz"))
+                arg_format = "gzip";
+        else if (endswith(p, ".bz2"))
+                arg_format = "bzip2";
+        else if (endswith(p, ".zst"))
+                arg_format = "zstd";
+}
+
+VERB(verb_export_tar, "export-tar", "NAME [FILE]\0", 2, 3, 0, "Export a TAR container image locally");
+static int verb_export_tar(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        const char *local = NULL, *path = NULL;
+        sd_bus *bus = ASSERT_PTR(userdata);
+        int r;
+
+        r = settle_image_class();
+        if (r < 0)
+                return r;
+
+        local = argv[1];
+        if (!image_name_is_valid(local))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Image name %s is not valid.", local);
+
+        if (argc >= 3)
+                path = argv[2];
+        path = empty_or_dash_to_null(path);
+
+        if (path) {
+                determine_compression_from_filename(path);
+
+                fd = xopenat_full(AT_FDCWD, path, O_WRONLY|O_CREAT|O_TRUNC|O_NOCTTY, /* xopen_flags= */ 0, 0666);
+                if (fd < 0)
+                        return log_error_errno(fd, "Failed to open %s: %m", path);
+        }
+
+        if (arg_image_class == IMAGE_MACHINE && arg_import_flags == 0) {
+                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ExportTar");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(
+                                m,
+                                "shs",
+                                local,
+                                fd >= 0 ? fd : STDOUT_FILENO,
+                                arg_format);
+        } else {
+                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ExportTarEx");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(
+                                m,
+                                "sshst",
+                                local,
+                                image_class_to_string(arg_image_class),
+                                fd >= 0 ? fd : STDOUT_FILENO,
+                                arg_format,
+                                /* flags= */ UINT64_C(0));
+        }
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        return transfer_image_common(bus, m);
+}
+
+VERB(verb_export_raw, "export-raw", "NAME [FILE]\0", 2, 3, 0, "Export a RAW container or VM image locally");
+static int verb_export_raw(int argc, char *argv[], uintptr_t _data, void *userdata) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
+        _cleanup_close_ int fd = -EBADF;
+        const char *local = NULL, *path = NULL;
+        sd_bus *bus = ASSERT_PTR(userdata);
+        int r;
+
+        r = settle_image_class();
+        if (r < 0)
+                return r;
+
+        local = argv[1];
+        if (!image_name_is_valid(local))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Image name %s is not valid.", local);
+
+        if (argc >= 3)
+                path = argv[2];
+        path = empty_or_dash_to_null(path);
+
+        if (path) {
+                determine_compression_from_filename(path);
+
+                fd = xopenat_full(AT_FDCWD, path, O_WRONLY|O_CREAT|O_TRUNC|O_NOCTTY, /* xopen_flags= */ 0, 0666);
+                if (fd < 0)
+                        return log_error_errno(fd, "Failed to open %s: %m", path);
+        }
+
+        if (arg_image_class == IMAGE_MACHINE && arg_import_flags == 0) {
+                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ExportRaw");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(
+                                m,
+                                "shs",
+                                local,
+                                fd >= 0 ? fd : STDOUT_FILENO,
+                                arg_format);
+        } else {
+                r = bus_message_new_method_call(bus, &m, bus_import_mgr, "ExportRawEx");
+                if (r < 0)
+                        return bus_log_create_error(r);
+
+                r = sd_bus_message_append(
+                                m,
+                                "sshst",
+                                local,
+                                image_class_to_string(arg_image_class),
+                                fd >= 0 ? fd : STDOUT_FILENO,
+                                arg_format,
+                                /* flags= */ UINT64_C(0));
+        }
+        if (r < 0)
+                return bus_log_create_error(r);
+
+        return transfer_image_common(bus, m);
+}
+
+VERB_DEFAULT_NOARG(verb_list_transfers, "list-transfers", "Show list of transfers in progress");
 static int verb_list_transfers(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
@@ -840,7 +857,7 @@ static int verb_list_transfers(int argc, char *argv[], uintptr_t _data, void *us
                 if (sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_METHOD)) {
                         sd_bus_error_free(&error);
 
-                        r = bus_call_method(bus, bus_import_mgr, "ListTransfers", &error, &reply, NULL);
+                        r = bus_call_method(bus, bus_import_mgr, "ListTransfers", &error, &reply, /* types= */ NULL);
                 }
                 if (r < 0)
                         return log_error_errno(r, "Could not get transfers: %s", bus_error_message(&error, r));
@@ -929,6 +946,7 @@ static int verb_list_transfers(int argc, char *argv[], uintptr_t _data, void *us
         return 0;
 }
 
+VERB(verb_cancel_transfer, "cancel-transfer", "[ID...]\0", 2, VERB_ANY, 0, "Cancel a transfer");
 static int verb_cancel_transfer(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         sd_bus *bus = ASSERT_PTR(userdata);
@@ -943,7 +961,7 @@ static int verb_cancel_transfer(int argc, char *argv[], uintptr_t _data, void *u
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse transfer id: %s", argv[i]);
 
-                r = bus_call_method(bus, bus_import_mgr, "CancelTransfer", &error, NULL, "u", id);
+                r = bus_call_method(bus, bus_import_mgr, "CancelTransfer", &error, /* ret_reply= */ NULL, "u", id);
                 if (r < 0)
                         return log_error_errno(r, "Could not cancel transfer: %s", bus_error_message(&error, r));
         }
@@ -951,6 +969,7 @@ static int verb_cancel_transfer(int argc, char *argv[], uintptr_t _data, void *u
         return 0;
 }
 
+VERB_NOARG(verb_list_images, "list-images", "Show list of installed images");
 static int verb_list_images(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
@@ -1048,273 +1067,144 @@ static int verb_list_images(int argc, char *argv[], uintptr_t _data, void *userd
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
+VERB_COMMON_HELP_AUTO();
+
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
         int r;
-
-        pager_open(arg_pager_flags);
-
-        r = terminal_urlify_man("importctl", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...] COMMAND ...\n\n"
-               "%5$sDownload, import or export disk images%6$s\n"
-               "\n%3$sCommands:%4$s\n"
-               "  pull-tar URL [NAME]         Download a TAR container image\n"
-               "  pull-raw URL [NAME]         Download a RAW container or VM image\n"
-               "  pull-oci REF [NAME]         Download an OCI container image\n"
-               "  import-tar FILE [NAME]      Import a local TAR container image\n"
-               "  import-raw FILE [NAME]      Import a local RAW container or VM image\n"
-               "  import-fs DIRECTORY [NAME]  Import a local directory container image\n"
-               "  export-tar NAME [FILE]      Export a TAR container image locally\n"
-               "  export-raw NAME [FILE]      Export a RAW container or VM image locally\n"
-               "  list-transfers              Show list of transfers in progress\n"
-               "  cancel-transfer [ID...]     Cancel a transfer\n"
-               "  list-images                 Show list of installed images\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help                   Show this help\n"
-               "     --version                Show package version\n"
-               "     --no-pager               Do not pipe output into a pager\n"
-               "     --no-legend              Do not show the headers and footers\n"
-               "     --no-ask-password        Do not ask for system passwords\n"
-               "  -H --host=[USER@]HOST       Operate on remote host\n"
-               "  -M --machine=CONTAINER      Operate on local container\n"
-               "     --system                 Connect to system machine manager\n"
-               "     --user                   Connect to user machine manager\n"
-               "     --read-only              Create read-only image\n"
-               "  -q --quiet                  Suppress output\n"
-               "     --json=pretty|short|off  Generate JSON output\n"
-               "  -j                          Equvilant to --json=pretty on TTY, --json=short\n"
-               "                              otherwise\n"
-               "     --verify=MODE            Verification mode for downloaded images (no,\n"
-               "                               checksum, signature)\n"
-               "     --format=xz|gzip|bzip2|zstd\n"
-               "                              Desired output format for export\n"
-               "     --force                  Install image even if already exists\n"
-               "     --class=TYPE             Install as the specified TYPE\n"
-               "  -m                          Install as --class=machine, machine image\n"
-               "  -P                          Install as --class=portable,\n"
-               "                              portable service image\n"
-               "  -S                          Install as --class=sysext, system extension image\n"
-               "  -C                          Install as --class=confext,\n"
-               "                              configuration extension image\n"
-               "     --keep-download=BOOL     Control whether to keep pristine copy of download\n"
-               "  -N                          Same as --keep-download=no\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
-
-        return 0;
-}
-
-static int verb_help(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        return help();
-}
-
-static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_NO_PAGER,
-                ARG_NO_LEGEND,
-                ARG_NO_ASK_PASSWORD,
-                ARG_READ_ONLY,
-                ARG_JSON,
-                ARG_VERIFY,
-                ARG_FORCE,
-                ARG_FORMAT,
-                ARG_CLASS,
-                ARG_KEEP_DOWNLOAD,
-                ARG_SYSTEM,
-                ARG_USER,
-        };
-
-        static const struct option options[] = {
-                { "help",            no_argument,       NULL, 'h'                 },
-                { "version",         no_argument,       NULL, ARG_VERSION         },
-                { "no-pager",        no_argument,       NULL, ARG_NO_PAGER        },
-                { "no-legend",       no_argument,       NULL, ARG_NO_LEGEND       },
-                { "no-ask-password", no_argument,       NULL, ARG_NO_ASK_PASSWORD },
-                { "host",            required_argument, NULL, 'H'                 },
-                { "machine",         required_argument, NULL, 'M'                 },
-                { "read-only",       no_argument,       NULL, ARG_READ_ONLY       },
-                { "json",            required_argument, NULL, ARG_JSON            },
-                { "quiet",           no_argument,       NULL, 'q'                 },
-                { "verify",          required_argument, NULL, ARG_VERIFY          },
-                { "force",           no_argument,       NULL, ARG_FORCE           },
-                { "format",          required_argument, NULL, ARG_FORMAT          },
-                { "class",           required_argument, NULL, ARG_CLASS           },
-                { "keep-download",   required_argument, NULL, ARG_KEEP_DOWNLOAD   },
-                { "system",          no_argument,       NULL, ARG_SYSTEM          },
-                { "user",            no_argument,       NULL, ARG_USER            },
-                {}
-        };
-
-        int c, r;
 
         assert(argc >= 0);
         assert(argv);
 
-        for (;;) {
-                c = getopt_long(argc, argv, "hH:M:jqmPSCN", options, NULL);
-                if (c < 0)
-                        break;
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_NO_PAGER:
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case ARG_NO_LEGEND:
+                OPTION_COMMON_NO_LEGEND:
                         arg_legend = false;
                         break;
 
-                case ARG_NO_ASK_PASSWORD:
+                OPTION_COMMON_NO_ASK_PASSWORD:
                         arg_ask_password = false;
                         break;
 
-                case 'H':
+                OPTION_COMMON_HOST:
                         arg_transport = BUS_TRANSPORT_REMOTE;
-                        arg_host = optarg;
+                        arg_host = opts.arg;
                         break;
 
-                case 'M':
-                        r = parse_machine_argument(optarg, &arg_host, &arg_transport);
+                OPTION_COMMON_MACHINE:
+                        r = parse_machine_argument(opts.arg, &arg_host, &arg_transport);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_READ_ONLY:
+                OPTION_LONG("system", NULL, "Connect to system machine manager"):
+                        arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
+                        break;
+
+                OPTION_LONG("user", NULL, "Connect to user machine manager"):
+                        arg_runtime_scope = RUNTIME_SCOPE_USER;
+                        break;
+
+                OPTION_LONG("read-only", NULL, "Create read-only image"):
                         arg_import_flags |= IMPORT_READ_ONLY;
                         arg_import_flags_mask |= IMPORT_READ_ONLY;
                         break;
 
-                case 'q':
+                OPTION('q', "quiet", NULL, "Suppress output"):
                         arg_quiet = true;
                         break;
 
-                case ARG_VERIFY:
-                        if (streq(optarg, "help"))
-                                return DUMP_STRING_TABLE(import_verify, ImportVerify, _IMPORT_VERIFY_MAX);
-
-                        r = import_verify_from_string(optarg);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to parse --verify= setting: %s", optarg);
-                        arg_verify = r;
-                        break;
-
-                case ARG_FORCE:
-                        arg_import_flags |= IMPORT_FORCE;
-                        arg_import_flags_mask |= IMPORT_FORCE;
-                        break;
-
-                case ARG_FORMAT:
-                        if (!STR_IN_SET(optarg, "uncompressed", "xz", "gzip", "bzip2", "zstd"))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Unknown format: %s", optarg);
-
-                        arg_format = optarg;
-                        break;
-
-                case ARG_JSON:
-                        r = parse_json_argument(optarg, &arg_json_format_flags);
+                OPTION_COMMON_JSON:
+                        r = parse_json_argument(opts.arg, &arg_json_format_flags);
                         if (r <= 0)
                                 return r;
-
                         arg_legend = false;
                         break;
 
-                case 'j':
+                OPTION_COMMON_LOWERCASE_J:
                         arg_json_format_flags = SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO;
                         arg_legend = false;
                         break;
 
-                case ARG_CLASS:
-                        arg_image_class = image_class_from_string(optarg);
-                        if (arg_image_class < 0)
-                                return log_error_errno(arg_image_class, "Failed to parse --class= parameter: %s", optarg);
+                OPTION_LONG("verify", "MODE",
+                            "Verification mode for downloaded images (no, checksum, signature)"):
+                        if (streq(opts.arg, "help"))
+                                return DUMP_STRING_TABLE(import_verify, ImportVerify, _IMPORT_VERIFY_MAX);
+
+                        r = import_verify_from_string(opts.arg);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --verify= setting: %s", opts.arg);
+                        arg_verify = r;
                         break;
 
-                case 'm':
+                OPTION_LONG("format", "FORMAT",
+                            "Desired output format for export (zstd, xz, gzip, bzip2)"):
+                        if (!STR_IN_SET(opts.arg, "uncompressed", "xz", "gzip", "bzip2", "zstd"))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Unknown format: %s", opts.arg);
+                        arg_format = opts.arg;
+                        break;
+
+                OPTION_LONG("force", NULL, "Install image even if already exists"):
+                        arg_import_flags |= IMPORT_FORCE;
+                        arg_import_flags_mask |= IMPORT_FORCE;
+                        break;
+
+                OPTION_LONG("class", "TYPE", "Install as the specified TYPE"):
+                        arg_image_class = image_class_from_string(opts.arg);
+                        if (arg_image_class < 0)
+                                return log_error_errno(arg_image_class, "Failed to parse --class= parameter: %s", opts.arg);
+                        break;
+
+                OPTION_SHORT('m', NULL, "Install as --class=machine, machine image"):
                         arg_image_class = IMAGE_MACHINE;
                         break;
 
-                case 'P':
+                OPTION_SHORT('P', NULL, "Install as --class=portable, portable service image"):
                         arg_image_class = IMAGE_PORTABLE;
                         break;
 
-                case 'S':
+                OPTION_SHORT('S', NULL, "Install as --class=sysext, system extension image"):
                         arg_image_class = IMAGE_SYSEXT;
                         break;
 
-                case 'C':
+                OPTION_SHORT('C', NULL, "Install as --class=confext, configuration extension image"):
                         arg_image_class = IMAGE_CONFEXT;
                         break;
 
-                case ARG_KEEP_DOWNLOAD:
-                        r = parse_boolean(optarg);
+                OPTION_LONG("keep-download", "BOOL",
+                            "Control whether to keep pristine copy of download"):
+                        r = parse_boolean(opts.arg);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --keep-download= value: %s", optarg);
+                                return log_error_errno(r, "Failed to parse --keep-download= value: %s", opts.arg);
 
                         SET_FLAG(arg_import_flags, IMPORT_PULL_KEEP_DOWNLOAD, r);
                         arg_import_flags_mask |= IMPORT_PULL_KEEP_DOWNLOAD;
                         break;
 
-                case 'N':
-                        arg_import_flags_mask &= ~IMPORT_PULL_KEEP_DOWNLOAD;
+                OPTION_SHORT('N', NULL, "Same as --keep-download=no"):
+                        arg_import_flags &= ~IMPORT_PULL_KEEP_DOWNLOAD;
                         arg_import_flags_mask |= IMPORT_PULL_KEEP_DOWNLOAD;
                         break;
 
-                case ARG_USER:
-                        arg_runtime_scope = RUNTIME_SCOPE_USER;
-                        break;
-
-                case ARG_SYSTEM:
-                        arg_runtime_scope = RUNTIME_SCOPE_SYSTEM;
-                        break;
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(arg_json_format_flags);
                 }
-        }
 
+        *ret_args = option_parser_get_args(&opts);
         return 1;
-}
-
-static int importctl_main(int argc, char *argv[], sd_bus *bus) {
-
-        static const Verb verbs[] = {
-                { "help",            VERB_ANY, VERB_ANY, 0,            verb_help            },
-                { "import-tar",      2,        3,        0,            verb_import_tar      },
-                { "import-raw",      2,        3,        0,            verb_import_raw      },
-                { "import-fs",       2,        3,        0,            verb_import_fs       },
-                { "export-tar",      2,        3,        0,            verb_export_tar      },
-                { "export-raw",      2,        3,        0,            verb_export_raw      },
-                { "pull-tar",        2,        3,        0,            verb_pull_tar        },
-                { "pull-oci",        2,        3,        0,            verb_pull_oci        },
-                { "pull-raw",        2,        3,        0,            verb_pull_raw        },
-                { "list-transfers",  VERB_ANY, 1,        VERB_DEFAULT, verb_list_transfers  },
-                { "cancel-transfer", 2,        VERB_ANY, 0,            verb_cancel_transfer },
-                { "list-images",     VERB_ANY, 1,        0,            verb_list_images     },
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, bus);
 }
 
 static int run(int argc, char *argv[]) {
@@ -1324,7 +1214,8 @@ static int run(int argc, char *argv[]) {
         setlocale(LC_ALL, "");
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
@@ -1334,7 +1225,7 @@ static int run(int argc, char *argv[]) {
 
         (void) sd_bus_set_allow_interactive_authorization(bus, arg_ask_password);
 
-        return importctl_main(argc, argv, bus);
+        return dispatch_verb(args, bus);
 }
 
 DEFINE_MAIN_FUNCTION(run);

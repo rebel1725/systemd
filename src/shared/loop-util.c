@@ -6,6 +6,7 @@
 
 #include <fcntl.h>
 #include <linux/loop.h>
+#include <linux/major.h>
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
@@ -15,6 +16,7 @@
 #include "alloc-util.h"
 #include "blockdev-util.h"
 #include "data-fd-util.h"
+#include "device-private.h"
 #include "device-util.h"
 #include "devnum-util.h"
 #include "dissect-image.h"
@@ -30,9 +32,12 @@
 #include "stat-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
+#include "strv.h"
 #include "time-util.h"
 
 static void cleanup_clear_loop_close(int *fd) {
+        assert(fd);
+
         if (*fd < 0)
                 return;
 
@@ -58,7 +63,7 @@ static int open_lock_fd(int primary_fd, int operation) {
 
         assert(IN_SET(operation & ~LOCK_NB, LOCK_SH, LOCK_EX));
 
-        lock_fd = fd_reopen(ASSERT_FD(primary_fd), O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+        lock_fd = fd_reopen(ASSERT_FD(primary_fd), O_RDONLY|O_NONBLOCK|O_NOCTTY);
         if (lock_fd < 0)
                 return lock_fd;
 
@@ -251,7 +256,7 @@ static int loop_configure(
         if (r < 0)
                 return log_device_debug_errno(dev, r, "Failed to get devnum: %m");
 
-        fd = sd_device_open(dev, O_CLOEXEC|O_NONBLOCK|O_NOCTTY|open_flags);
+        fd = device_open(dev, O_NONBLOCK|O_NOCTTY|open_flags);
         if (fd < 0)
                 return log_device_debug_errno(dev, fd, "Failed to open device: %m");
 
@@ -376,9 +381,9 @@ static int loop_configure(
 }
 
 static int fd_get_max_discard(int fd, uint64_t *ret) {
-        struct stat st;
         char sysfs_path[STRLEN("/sys/dev/block/" ":" "/queue/discard_max_bytes") + DECIMAL_STR_MAX(dev_t) * 2 + 1];
         _cleanup_free_ char *buffer = NULL;
+        struct stat st;
         int r;
 
         assert(ret);
@@ -386,8 +391,9 @@ static int fd_get_max_discard(int fd, uint64_t *ret) {
         if (fstat(ASSERT_FD(fd), &st) < 0)
                 return -errno;
 
-        if (!S_ISBLK(st.st_mode))
-                return -ENOTBLK;
+        r = stat_verify_block(&st);
+        if (r < 0)
+                return r;
 
         xsprintf(sysfs_path, "/sys/dev/block/" DEVNUM_FORMAT_STR "/queue/discard_max_bytes", DEVNUM_FORMAT_VAL(st.st_rdev));
 
@@ -399,18 +405,119 @@ static int fd_get_max_discard(int fd, uint64_t *ret) {
 }
 
 static int fd_set_max_discard(int fd, uint64_t max_discard) {
-        struct stat st;
         char sysfs_path[STRLEN("/sys/dev/block/" ":" "/queue/discard_max_bytes") + DECIMAL_STR_MAX(dev_t) * 2 + 1];
+        struct stat st;
+        int r;
 
         if (fstat(ASSERT_FD(fd), &st) < 0)
                 return -errno;
 
-        if (!S_ISBLK(st.st_mode))
-                return -ENOTBLK;
+        r = stat_verify_block(&st);
+        if (r < 0)
+                return r;
 
         xsprintf(sysfs_path, "/sys/dev/block/" DEVNUM_FORMAT_STR "/queue/discard_max_bytes", DEVNUM_FORMAT_VAL(st.st_rdev));
 
         return write_string_filef(sysfs_path, WRITE_STRING_FILE_DISABLE_BUFFER, "%" PRIu64, max_discard);
+}
+
+static int probe_fd_open(int fd, int f_flags, int *ret_to_close) {
+        int r;
+
+        assert(fd >= 0);
+        assert(ret_to_close);
+
+        /* blkid- and pread-based probing has no special handling for the strict alignment requirements of
+         * O_DIRECT, so if fd was opened with O_DIRECT we reopen it without for the probing logic. Returns the
+         * fd to use for probing; when a new fd had to be opened it is also stored in *ret_to_close for the
+         * caller to close, otherwise *ret_to_close is set to -EBADF and the original fd is returned. */
+
+        if (!FLAGS_SET(f_flags, O_DIRECT)) {
+                *ret_to_close = -EBADF;
+                return fd;
+        }
+
+        r = fd_reopen(fd, O_RDONLY|O_NONBLOCK);
+        if (r < 0)
+                return r;
+
+        return (*ret_to_close = r);
+}
+
+static int fd_has_partition_table(int fd) {
+        _cleanup_free_ char *pttype = NULL;
+        int r;
+
+        assert(fd >= 0);
+
+        /* Checks whether the device carries a partition table the image dissection logic acts upon. We use
+         * this to decide whether wrapping the device in a loopback device with partition scanning enabled
+         * actually serves a purpose: if there are no partitions to expose we can hand back the original fd
+         * instead. Expects an fd suitable for probing, i.e. opened without O_DIRECT (see probe_fd_open()). */
+
+        r = probe_partition_table(fd, &pttype); /* already logs on error */
+        if (r < 0)
+                return r;
+
+        /* Only GPT and MBR ("dos") tables are understood by the dissection logic and require partition
+         * scanning to expose their partitions; anything else it treats as unpartitioned, so a loopback
+         * device wouldn't help (and STRPTR_IN_SET() handles a NULL pttype, i.e. no table, as false). */
+        return STRPTR_IN_SET(pttype, "gpt", "dos");
+}
+
+static int loop_device_can_shortcut(
+                int fd,
+                uint64_t offset,
+                uint64_t size,
+                uint32_t sector_size,
+                uint32_t device_ssz,
+                uint32_t loop_flags) {
+
+        int r;
+
+        /* Returns whether we can hand back the original block device fd instead of allocating a real
+         * loopback device for it: it must cover the whole device, the requested sector size must match the
+         * device's sector size, and if partscan was requested the device must either already have it enabled
+         * or — unless the caller declared it may populate the image via LOOP_DEVICE_MAY_POPULATE_PARTITION_TABLE
+         * — carry no partition table at all (in which case there are no partitions to scan and the loopback
+         * would serve no purpose). */
+
+        assert(fd >= 0);
+
+        if (offset != 0)
+                return false;
+        if (!IN_SET(size, 0, UINT64_MAX))
+                return false;
+        if (sector_size != device_ssz)
+                return false;
+
+        if (FLAGS_SET(loop_flags, LO_FLAGS_PARTSCAN)) {
+                r = blockdev_partscan_enabled_fd(fd);
+                if (r < 0)
+                        return r;
+                if (r == 0) {
+                        /* Partition scanning was requested but cannot be enabled on this device (e.g. it's a
+                         * partition itself). If the caller might write a (nested) partition table into the
+                         * device, it must get a real loopback device so scanning works once the table is
+                         * there. */
+                        if (FLAGS_SET(loop_flags, LOOP_DEVICE_MAY_POPULATE_PARTITION_TABLE))
+                                return false;
+
+                        /* Otherwise we shortcut when the device carries no partition table: there are then no
+                         * partitions to scan, and routing e.g. a multi-device btrfs member through a loop
+                         * device breaks it, see https://github.com/systemd/systemd/issues/42520.
+                         *
+                         * If we can't probe the device, fall back to allocating a real loop device rather than
+                         * failing the whole operation: we can't prove there's no partition table, and the
+                         * image is potentially untrusted (a crafted or corrupt partition table can make the
+                         * probe fail, e.g. with -EUCLEAN), so failing here would be a fail-unsafe DoS. */
+                        r = fd_has_partition_table(fd);
+                        if (r != 0)
+                                return false;
+                }
+        }
+
+        return true;
 }
 
 static int loop_device_make_internal(
@@ -425,15 +532,20 @@ static int loop_device_make_internal(
                 LoopDevice **ret) {
 
         _cleanup_(loop_device_unrefp) LoopDevice *d = NULL;
-        _cleanup_close_ int reopened_fd = -EBADF, control = -EBADF;
+        _cleanup_close_ int reopened_fd = -EBADF, control = -EBADF, probe_close_fd = -EBADF;
         _cleanup_free_ char *backing_file = NULL;
         struct loop_config config;
-        int r, f_flags;
+        int r, f_flags, probe_fd = -EBADF;
         struct stat st;
 
         assert(fd >= 0);
         assert(open_flags < 0 || IN_SET(open_flags, O_RDWR, O_RDONLY));
         assert(ret);
+
+        /* sector_size interpretation:
+         *   0          → use device sector size for block devices, 512 for regular files
+         *   UINT32_MAX → probe GPT header to find the right sector size, fall back to 0 behavior
+         *   other      → use the specified sector size explicitly */
 
         f_flags = fcntl(fd, F_GETFL);
         if (f_flags < 0)
@@ -449,19 +561,54 @@ static int loop_device_make_internal(
                         return log_debug_errno(SYNTHETIC_ERRNO(EBADFD), "Access mode of image file is write only (?)");
         }
 
+        if (sector_size == UINT32_MAX) {
+                /* If sector size is specified as UINT32_MAX, we'll try to probe the right sector size
+                 * by looking for the GPT partition header at various offsets. This of course only works
+                 * if the image already has a disk label. */
+
+                if (probe_fd < 0) {
+                        probe_fd = probe_fd_open(fd, f_flags, &probe_close_fd);
+                        if (probe_fd < 0)
+                                return probe_fd;
+                }
+
+                r = probe_sector_size(probe_fd, &sector_size);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        sector_size = 0; /* If we can't probe anything, use default sector size. */
+        }
+
         if (fstat(fd, &st) < 0)
                 return -errno;
 
         if (S_ISBLK(st.st_mode)) {
-                if (offset == 0 && IN_SET(size, 0, UINT64_MAX))
-                        /* If this is already a block device and we are supposed to cover the whole of it
-                         * then store an fd to the original open device node — and do not actually create an
-                         * unnecessary loopback device for it. */
+                uint32_t device_ssz;
+                r = blockdev_get_sector_size(fd, &device_ssz);
+                if (r < 0)
+                        return r;
+
+                if (sector_size == 0)
+                        sector_size = device_ssz;
+
+                if (probe_fd < 0) {
+                        probe_fd = probe_fd_open(fd, f_flags, &probe_close_fd);
+                        if (probe_fd < 0)
+                                return probe_fd;
+                }
+
+                r = loop_device_can_shortcut(probe_fd, offset, size, sector_size, device_ssz, loop_flags);
+                if (r < 0)
+                        return r;
+                if (r > 0)
                         return loop_device_open_from_fd(fd, open_flags, lock_op, ret);
         } else {
                 r = stat_verify_regular(&st);
                 if (r < 0)
                         return r;
+
+                if (sector_size == 0)
+                        sector_size = 512;
         }
 
         if (path) {
@@ -484,7 +631,7 @@ static int loop_device_make_internal(
                  * Our intention here is that LO_FLAGS_DIRECT_IO is the primary knob, and O_DIRECT derived
                  * from that automatically. */
 
-                reopened_fd = fd_reopen(fd, (FLAGS_SET(loop_flags, LO_FLAGS_DIRECT_IO) ? O_DIRECT : 0)|O_CLOEXEC|O_NONBLOCK|open_flags);
+                reopened_fd = fd_reopen(fd, (FLAGS_SET(loop_flags, LO_FLAGS_DIRECT_IO) ? O_DIRECT : 0)|O_NONBLOCK|open_flags);
                 if (reopened_fd < 0) {
                         if (!FLAGS_SET(loop_flags, LO_FLAGS_DIRECT_IO))
                                 return log_debug_errno(reopened_fd, "Failed to reopen file descriptor without O_DIRECT: %m");
@@ -496,57 +643,31 @@ static int loop_device_make_internal(
                         fd = reopened_fd; /* From now on, operate on our new O_DIRECT fd */
         }
 
-        control = open("/dev/loop-control", O_RDWR|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+        control = xopenat(AT_FDCWD, "/dev/loop-control", O_RDWR|O_NOCTTY|O_NONBLOCK);
         if (control < 0)
-                return -errno;
+                return control;
 
-        if (sector_size == 0)
-                /* If no sector size is specified, default to the classic default */
-                sector_size = 512;
-        else if (sector_size == UINT32_MAX) {
-
-                if (S_ISBLK(st.st_mode))
-                        /* If the sector size is specified as UINT32_MAX we'll propagate the sector size of
-                         * the underlying block device. */
-                        r = blockdev_get_sector_size(fd, &sector_size);
-                else {
-                        _cleanup_close_ int non_direct_io_fd = -EBADF;
-                        int probe_fd;
-
-                        assert(S_ISREG(st.st_mode));
-
-                        /* If sector size is specified as UINT32_MAX, we'll try to probe the right sector
-                         * size of the image in question by looking for the GPT partition header at various
-                         * offsets. This of course only works if the image already has a disk label.
-                         *
-                         * So here we actually want to read the file contents ourselves. This is quite likely
-                         * not going to work if we managed to enable O_DIRECT, because in such a case there
-                         * are some pretty strict alignment requirements to offset, size and target, but
-                         * there's no way to query what alignment specifically is actually required. Hence,
-                         * let's avoid the mess, and temporarily open an fd without O_DIRECT for the probing
-                         * logic. */
-
-                        if (FLAGS_SET(loop_flags, LO_FLAGS_DIRECT_IO)) {
-                                non_direct_io_fd = fd_reopen(fd, O_RDONLY|O_CLOEXEC|O_NONBLOCK);
-                                if (non_direct_io_fd < 0)
-                                        return non_direct_io_fd;
-
-                                probe_fd = non_direct_io_fd;
-                        } else
-                                probe_fd = fd;
-
-                        r = probe_sector_size(probe_fd, &sector_size);
-                }
-                if (r < 0)
-                        return r;
-        }
+        /* Strip LO_FLAGS_PARTSCAN from LOOP_CONFIGURE and enable it afterwards via
+         * LOOP_SET_STATUS64 to work around a kernel race: LOOP_CONFIGURE sends a uevent with
+         * GD_NEED_PART_SCAN set before calling loop_reread_partitions(). If udev opens the device in
+         * response, blkdev_get_whole() triggers a first scan, then loop_reread_partitions() does a
+         * second scan that briefly drops all partitions. By configuring without partscan,
+         * GD_SUPPRESS_PART_SCAN stays set, making any concurrent open harmless. LOOP_SET_STATUS64
+         * doesn't call disk_force_media_change() so it doesn't set GD_NEED_PART_SCAN.
+         *
+         * See: https://lore.kernel.org/linux-block/20260330081819.652890-1-daan@amutable.com/T/#u
+         * Drop this workaround once the kernel fix is widely available. */
+        bool deferred_partscan = FLAGS_SET(loop_flags, LO_FLAGS_PARTSCAN);
 
         config = (struct loop_config) {
                 .fd = fd,
                 .block_size = sector_size,
                 .info = {
-                        /* Use the specified flags, but configure the read-only flag from the open flags, and force autoclear */
-                        .lo_flags = (loop_flags & ~LO_FLAGS_READ_ONLY) | ((open_flags & O_ACCMODE_STRICT) == O_RDONLY ? LO_FLAGS_READ_ONLY : 0) | LO_FLAGS_AUTOCLEAR,
+                        /* Use the specified flags, but strip our systemd-internal flags and the read-only and
+                         * partscan flags (the latter handled separately below/above), and force autoclear */
+                        .lo_flags = ((loop_flags & ~(LOOP_DEVICE_MAY_POPULATE_PARTITION_TABLE|LO_FLAGS_READ_ONLY|LO_FLAGS_PARTSCAN)) |
+                                     ((open_flags & O_ACCMODE_STRICT) == O_RDONLY ? LO_FLAGS_READ_ONLY : 0) |
+                                     LO_FLAGS_AUTOCLEAR),
                         .lo_offset = offset,
                         .lo_sizelimit = size == UINT64_MAX ? 0 : size,
                 },
@@ -603,7 +724,7 @@ static int loop_device_make_internal(
                         config.info.lo_flags &= ~LO_FLAGS_DIRECT_IO;
                         open_flags &= ~O_DIRECT;
 
-                        int non_direct_io_fd = fd_reopen(config.fd, O_CLOEXEC|O_NONBLOCK|open_flags);
+                        int non_direct_io_fd = fd_reopen(config.fd, O_NONBLOCK|open_flags);
                         if (non_direct_io_fd < 0)
                                 return log_debug_errno(
                                                 non_direct_io_fd,
@@ -636,6 +757,24 @@ static int loop_device_make_internal(
                         if (r < 0)
                                 log_debug_errno(r, "Failed to write 'discard_max_bytes' of loop device, ignoring: %m");
                 }
+        }
+
+        if (deferred_partscan) {
+                /* Open+close to drain GD_NEED_PART_SCAN harmlessly (GD_SUPPRESS_PART_SCAN is still
+                 * set so no partitions appear). Then enable partscan via LOOP_SET_STATUS64. */
+                int tmp_fd = fd_reopen(d->fd, O_RDONLY|O_NONBLOCK);
+                if (tmp_fd < 0)
+                        return log_debug_errno(tmp_fd, "Failed to reopen loop device to drain partscan flag: %m");
+                safe_close(tmp_fd);
+
+                struct loop_info64 info;
+                if (ioctl(d->fd, LOOP_GET_STATUS64, &info) < 0)
+                        return log_debug_errno(errno, "Failed to get loop device status: %m");
+
+                info.lo_flags |= LO_FLAGS_PARTSCAN;
+
+                if (ioctl(d->fd, LOOP_SET_STATUS64, &info) < 0)
+                        return log_debug_errno(errno, "Failed to enable partscan on loop device: %m");
         }
 
         d->backing_file = TAKE_PTR(backing_file);
@@ -676,7 +815,7 @@ int loop_device_make(
         assert(ret);
 
         return loop_device_make_internal(
-                        NULL,
+                        /* path= */ NULL,
                         fd,
                         open_flags,
                         offset,
@@ -712,13 +851,14 @@ int loop_device_make_by_path_at(
         /* Let's open with O_DIRECT if we can. But not all file systems support that, hence fall back to
          * non-O_DIRECT mode automatically, if it fails. */
 
-        basic_flags = O_CLOEXEC|O_NONBLOCK|O_NOCTTY;
+        basic_flags = O_NONBLOCK|O_NOCTTY;
         direct_flags = FLAGS_SET(loop_flags, LO_FLAGS_DIRECT_IO) ? O_DIRECT : 0;
         rdwr_flags = open_flags >= 0 ? open_flags : O_RDWR;
 
-        fd = xopenat(dir_fd, path, basic_flags|direct_flags|rdwr_flags);
+        /* path may be NULL */
+        fd = xopenat_full(dir_fd, path, basic_flags|direct_flags|rdwr_flags, XO_EMPTY_PATH, MODE_INVALID);
         if (fd < 0 && direct_flags != 0) /* If we had O_DIRECT on, and things failed with that, let's immediately try again without */
-                fd = xopenat(dir_fd, path, basic_flags|rdwr_flags);
+                fd = xopenat_full(dir_fd, path, basic_flags|rdwr_flags, XO_EMPTY_PATH, MODE_INVALID);
         else
                 direct = direct_flags != 0;
         if (fd < 0) {
@@ -728,9 +868,10 @@ int loop_device_make_by_path_at(
                 if (open_flags >= 0 || !ERRNO_IS_NEG_FS_WRITE_REFUSED(r))
                         return r;
 
-                fd = xopenat(dir_fd, path, basic_flags|direct_flags|O_RDONLY);
+                fd = xopenat_full(dir_fd, path, basic_flags|direct_flags|O_RDONLY,
+                                  XO_EMPTY_PATH, MODE_INVALID);
                 if (fd < 0 && direct_flags != 0) /* as above */
-                        fd = xopenat(dir_fd, path, basic_flags|O_RDONLY);
+                        fd = xopenat_full(dir_fd, path, basic_flags|O_RDONLY, XO_EMPTY_PATH, MODE_INVALID);
                 else
                         direct = direct_flags != 0;
                 if (fd < 0)
@@ -769,36 +910,37 @@ int loop_device_make_by_path_memory(
 
         _cleanup_close_ int fd = -EBADF, mfd = -EBADF;
         _cleanup_free_ char *fn = NULL;
-        struct stat st;
         int r;
 
         assert(path);
-        assert(IN_SET(open_flags, O_RDWR, O_RDONLY));
+        assert(open_flags < 0 || IN_SET(open_flags, O_RDWR, O_RDONLY));
         assert(ret);
+
+        /* memfds are always writable, so default to O_RDWR when auto-detecting. */
+        if (open_flags < 0)
+                open_flags = O_RDWR;
 
         loop_flags &= ~LO_FLAGS_DIRECT_IO; /* memfds don't support O_DIRECT, hence LO_FLAGS_DIRECT_IO can't be used either */
 
-        fd = open(path, O_CLOEXEC|O_NONBLOCK|O_NOCTTY|O_RDONLY);
+        fd = xopenat(AT_FDCWD, path, O_NONBLOCK|O_NOCTTY|O_RDONLY);
         if (fd < 0)
-                return -errno;
+                return fd;
 
-        if (fstat(fd, &st) < 0)
-                return -errno;
-
-        if (!S_ISREG(st.st_mode) && !S_ISBLK(st.st_mode))
-                return -EBADF;
+        r = fd_verify_regular_or_block(fd);
+        if (r < 0)
+                return r;
 
         r = path_extract_filename(path, &fn);
         if (r < 0)
                 return r;
 
-        mfd = memfd_clone_fd(fd, fn, open_flags|O_CLOEXEC);
+        mfd = memfd_clone_fd(fd, fn, open_flags);
         if (mfd < 0)
                 return mfd;
 
         fd = safe_close(fd); /* Let's close the original early */
 
-        return loop_device_make_internal(NULL, mfd, open_flags, 0, 0, sector_size, loop_flags, lock_op, ret);
+        return loop_device_make_internal(/* path= */ NULL, mfd, open_flags, /* offset= */ 0, /* size= */ 0, sector_size, loop_flags, lock_op, ret);
 }
 
 static LoopDevice* loop_device_free(LoopDevice *d) {
@@ -819,9 +961,9 @@ static LoopDevice* loop_device_free(LoopDevice *d) {
          * delete it in a synchronized fashion, and allocators won't needlessly see the block device as free
          * while we are about to delete it. */
         if (!LOOP_DEVICE_IS_FOREIGN(d) && !d->relinquished) {
-                control = open("/dev/loop-control", O_RDWR|O_CLOEXEC|O_NOCTTY|O_NONBLOCK);
+                control = xopenat(AT_FDCWD, "/dev/loop-control", O_RDWR|O_NOCTTY|O_NONBLOCK);
                 if (control < 0)
-                        log_debug_errno(errno, "Failed to open loop control device, cannot remove loop device '%s', ignoring: %m", strna(d->node));
+                        log_debug_errno(control, "Failed to open loop control device, cannot remove loop device '%s', ignoring: %m", strna(d->node));
                 else if (flock(control, LOCK_EX) < 0)
                         log_debug_errno(errno, "Failed to lock loop control device, ignoring: %m");
         }
@@ -906,7 +1048,7 @@ int loop_device_open(
 
         _cleanup_close_ int fd = -EBADF, lock_fd = -EBADF;
         _cleanup_free_ char *node = NULL, *backing_file = NULL;
-        dev_t devnum, backing_devno = 0;
+        dev_t devnum, whole_devnum, backing_devno = 0;
         struct loop_info64 info;
         ino_t backing_inode = 0;
         uint64_t diskseq = 0;
@@ -922,7 +1064,7 @@ int loop_device_open(
          * here, instead of keeping just a dup() clone of it around, since we want to ensure that the
          * O_DIRECT flag of the handle we keep is off, we have our own file index, and have the right
          * read/write mode in effect. */
-        fd = sd_device_open(dev, O_CLOEXEC|O_NONBLOCK|O_NOCTTY|open_flags);
+        fd = device_open(dev, O_NONBLOCK|O_NOCTTY|open_flags);
         if (fd < 0)
                 return fd;
 
@@ -932,14 +1074,28 @@ int loop_device_open(
                         return lock_fd;
         }
 
-        if (ioctl(fd, LOOP_GET_STATUS64, &info) >= 0) {
+        r = sd_device_get_devnum(dev, &devnum);
+        if (r < 0)
+                return r;
+
+        /* Device-mapper forwards ioctls to the underlying device for targets such as dm-verity. On a verity
+         * device that maps a loop device, LOOP_GET_STATUS64 returns the status of that loop device. LOOP_CLR_FD
+         * on the verity device clears the loop device, although the verity device still uses it. So we only
+         * query the loop status of loop devices and their partitions. The partitions of a loop device don't
+         * have the loop major number, they have the extended major number 259. So we check the major number of
+         * the whole disk. */
+        r = block_get_whole_disk(devnum, &whole_devnum);
+        if (r < 0)
+                return r;
+
+        if (major(whole_devnum) == LOOP_MAJOR && ioctl(fd, LOOP_GET_STATUS64, &info) >= 0) {
 #if HAVE_VALGRIND_MEMCHECK_H
                 /* Valgrind currently doesn't know LOOP_GET_STATUS64. Remove this once it does */
                 VALGRIND_MAKE_MEM_DEFINED(&info, sizeof(info));
 #endif
                 nr = info.lo_number;
 
-                if (sd_device_get_sysattr_value(dev, "loop/backing_file", &s) >= 0) {
+                if (device_get_sysattr_safe_string(dev, "loop/backing_file", &s) >= 0) {
                         backing_file = strdup(s);
                         if (!backing_file)
                                 return -ENOMEM;
@@ -960,10 +1116,6 @@ int loop_device_open(
 
         uint64_t device_size;
         r = blockdev_get_device_size(fd, &device_size);
-        if (r < 0)
-                return r;
-
-        r = sd_device_get_devnum(dev, &devnum);
         if (r < 0)
                 return r;
 
@@ -1010,7 +1162,7 @@ int loop_device_open_from_fd(
         _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
         int r;
 
-        r = block_device_new_from_fd(ASSERT_FD(fd), 0, &dev);
+        r = block_device_new_from_fd(ASSERT_FD(fd), /* flags= */ 0, &dev);
         if (r < 0)
                 return r;
 
@@ -1028,7 +1180,7 @@ int loop_device_open_from_path(
 
         assert(path);
 
-        r = block_device_new_from_path(path, 0, &dev);
+        r = block_device_new_from_path(path, /* flags= */ 0, &dev);
         if (r < 0)
                 return r;
 
@@ -1095,7 +1247,7 @@ static int resize_partition(int partition_fd, uint64_t offset, uint64_t size) {
         if (r < 0)
                 return r;
 
-        whole_fd = r = device_open_from_devnum(S_IFBLK, devno, O_RDWR|O_CLOEXEC|O_NONBLOCK|O_NOCTTY, NULL);
+        whole_fd = r = device_open_from_devnum(S_IFBLK, devno, O_RDWR|O_NONBLOCK|O_NOCTTY, /* ret_devname= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1177,6 +1329,9 @@ int loop_device_set_autoclear(LoopDevice *d, bool autoclear) {
         struct loop_info64 info;
 
         assert(d);
+
+        if (LOOP_DEVICE_IS_FOREIGN(d))
+                return 0;
 
         if (ioctl(ASSERT_FD(d->fd), LOOP_GET_STATUS64, &info) < 0)
                 return -errno;

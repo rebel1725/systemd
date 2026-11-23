@@ -80,23 +80,28 @@ int verb_unit_shell(int argc, char *argv[], uintptr_t _data, void *userdata) {
         }
 
         _cleanup_(pidref_done) PidRef child = PIDREF_NULL;
-        r = namespace_fork(
+        r = namespace_fork_full(
                         "(unit-shell-ns)",
                         "(unit-shell)",
+                        /* except_fds= */ NULL, /* n_except_fds= */ 0,
                         FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL,
                         pidns_fd,
                         mntns_fd,
                         netns_fd,
                         userns_fd,
                         root_fd,
+                        /* We usually become root in the unit's user namespace. If it doesn't map root,
+                         * e.g. for user units or with UserNamespacePath=, still provide a shell, as
+                         * ourselves. */
+                        NAMESPACE_ENTER_KEEP_UID_GID_IF_ROOT_UNMAPPED,
                         &child);
         if (r < 0)
                 return log_error_errno(r, "Failed to fork and enter the namespace of %s: %m", unit);
 
         if (r == 0) {
                 if (args) {
-                        (void) execvp(args[0], args);
-                        log_error_errno(errno, "Failed to execute '%s': %m", *args);
+                        r = execvp_safe(args[0], args);
+                        log_error_errno(r, "Failed to execute '%s': %m", *args);
                 } else {
                         (void) execl(DEFAULT_USER_SHELL, "-" DEFAULT_USER_SHELL_NAME, NULL);
                         log_debug_errno(errno, "Failed to execute '" DEFAULT_USER_SHELL "', ignoring: %m");

@@ -4,7 +4,7 @@
 #include "sd-id128.h"
 
 #include "errno-util.h"
-#include "sd-forward.h"
+#include "forward.h"
 
 bool id128_is_valid(const char *s) _pure_;
 
@@ -42,6 +42,10 @@ extern const struct hash_ops id128_hash_ops_free;
 sd_id128_t id128_make_v4_uuid(sd_id128_t id);
 
 int id128_get_product(sd_id128_t *ret);
+
+int id128_get_fs_uuid_fd(int fd, sd_id128_t *ret);
+int id128_get_fs_uuid(const char *path, sd_id128_t *ret);
+int id128_get_var_fs_uuid(sd_id128_t *ret);
 
 sd_id128_t id128_digest(const void *data, size_t size);
 

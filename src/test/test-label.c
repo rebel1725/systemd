@@ -7,7 +7,7 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
-#include "label.h"
+#include "label-util.h"
 #include "path-util.h"
 #include "string-util.h"
 #include "tests.h"
@@ -30,7 +30,7 @@ static int check_path(int dir_fd, const char *path) {
         return 0;
 }
 
-static int pre_labelling_func(int dir_fd, const char *path, mode_t mode) {
+static int pre_labelling_func(int dir_fd, const char *path, mode_t mode, LabelContext *label_context) {
         int r;
 
         assert(mode != MODE_INVALID);
@@ -41,7 +41,7 @@ static int pre_labelling_func(int dir_fd, const char *path, mode_t mode) {
         return 0;
 }
 
-static int post_labelling_func(int dir_fd, const char *path, bool created) {
+static int post_labelling_func(int dir_fd, const char *path, bool created, LabelContext *label_context) {
        int r;
 
         /* assume label policies that restrict certain labels */
@@ -62,7 +62,7 @@ static int get_dir_fd(const char *dir_path, mode_t mode) {
         int dir_fd = -EBADF;
 
         assert(dir_path);
-        dir_fd = RET_NERRNO(open_mkdir_at(AT_FDCWD, dir_path, O_CLOEXEC, mode));
+        dir_fd = open_mkdir_at(AT_FDCWD, dir_path, /* flags= */ 0, mode);
         if (dir_fd < 0)
                 return log_error_errno(dir_fd, "Error occurred while opening directory =>: %m");
 
@@ -82,7 +82,7 @@ static int labelling_op(int dir_fd, const char *text, const char *path, mode_t m
                 return log_error_errno(r, "Error in pathname =>: %m");
 
         /* Open the file within the directory for writing */
-        write_fd = RET_NERRNO(openat(dir_fd, path, O_CLOEXEC|O_WRONLY|O_TRUNC|O_CREAT, 0644));
+        write_fd = xopenat_full(dir_fd, path, O_WRONLY|O_TRUNC|O_CREAT, /* xopen_flags= */ 0, 0644);
         if (write_fd < 0)
                 return log_error_errno(write_fd, "Error in opening directory for writing =>: %m");
 
@@ -100,9 +100,9 @@ TEST(label_ops_set) {
         };
 
         label_ops_reset();
-        assert_se(label_ops_set(&test_label_ops) == 0);
+        ASSERT_OK_ZERO(label_ops_set(&test_label_ops));
         /* attempt to reset label_ops when already set */
-        assert_se(label_ops_set(&test_label_ops) == -EBUSY);
+        ASSERT_ERROR(label_ops_set(&test_label_ops), EBUSY);
 }
 
 TEST(label_ops_pre) {
@@ -115,11 +115,11 @@ TEST(label_ops_pre) {
         label_ops_reset();
         label_ops_set(&test_label_ops);
         fd = get_dir_fd("file1.txt", 0755);
-        assert_se(label_ops_pre(fd, "file1.txt", 0644) == 0);
-        assert_se(label_ops_pre(fd, "/restricted_directory", 0644) == -EACCES);
-        assert_se(label_ops_pre(fd, "", 0700) == -EINVAL);
-        assert_se(label_ops_pre(fd, "/tmp", 0700) == 0);
-        assert_se(label_ops_pre(fd, "wekrgoierhgoierhqgherhgwklegnlweehgorwfkryrit", 0644) == -ENAMETOOLONG);
+        ASSERT_OK_ZERO(label_ops_pre(fd, "file1.txt", 0644, /* label_context= */ NULL));
+        ASSERT_ERROR(label_ops_pre(fd, "/restricted_directory", 0644, /* label_context= */ NULL), EACCES);
+        ASSERT_ERROR(label_ops_pre(fd, "", 0700, /* label_context= */ NULL), EINVAL);
+        ASSERT_OK_ZERO(label_ops_pre(fd, "/tmp", 0700, /* label_context= */ NULL));
+        ASSERT_ERROR(label_ops_pre(fd, "wekrgoierhgoierhqgherhgwklegnlweehgorwfkryrit", 0644, /* label_context= */ NULL), ENAMETOOLONG);
 }
 
 TEST(label_ops_post) {
@@ -137,18 +137,18 @@ TEST(label_ops_post) {
         fd = RET_NERRNO(get_dir_fd("label_test_dir", 0755));
         text1 = "Add initial texts to file for testing label operations to file1\n";
 
-        assert_se(labelling_op(fd, text1, "file1.txt", 0644) == 0);
-        assert_se(label_ops_post(fd, "file1.txt", true) == 0);
-        assert_se(strlen(text1) == (size_t)buf.st_size);
+        ASSERT_OK_ZERO(labelling_op(fd, text1, "file1.txt", 0644));
+        ASSERT_OK_ZERO(label_ops_post(fd, "file1.txt", /* created= */ true, /* label_context= */ NULL));
+        ASSERT_EQ(strlen(text1), (size_t) buf.st_size);
         text2 = "Add text2 data to file2\n";
 
-        assert_se(labelling_op(fd, text2, "file2.txt", 0644) == 0);
-        assert_se(label_ops_post(fd, "file2.txt", true) == 0);
-        assert_se(strlen(text2) == (size_t)buf.st_size);
-        assert_se(label_ops_post(fd, "file3.txt", true) == -ENOENT);
-        assert_se(label_ops_post(fd, "/abcd", true) == -ENOENT);
-        assert_se(label_ops_post(fd, "/restricted_directory", true) == -EACCES);
-        assert_se(label_ops_post(fd, "", true) == -EINVAL);
+        ASSERT_OK_ZERO(labelling_op(fd, text2, "file2.txt", 0644));
+        ASSERT_OK_ZERO(label_ops_post(fd, "file2.txt", /* created= */ true, /* label_context= */ NULL));
+        ASSERT_EQ(strlen(text2), (size_t) buf.st_size);
+        ASSERT_ERROR(label_ops_post(fd, "file3.txt", /* created= */ true, /* label_context= */ NULL), ENOENT);
+        ASSERT_ERROR(label_ops_post(fd, "/abcd", /* created= */ true, /* label_context= */ NULL), ENOENT);
+        ASSERT_ERROR(label_ops_post(fd, "/restricted_directory", /* created= */ true, /* label_context= */ NULL), EACCES);
+        ASSERT_ERROR(label_ops_post(fd, "", /* created= */ true, /* label_context= */ NULL), EINVAL);
 }
 
 DEFINE_TEST_MAIN(LOG_INFO)

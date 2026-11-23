@@ -22,6 +22,7 @@
 #LogColor=yes
 #LogLocation=no
 #LogTime=no
+#SecureBits=
 #SystemCallArchitectures=
 #TimerSlackNSec=
 #StatusUnitFormat={{STATUS_UNIT_FORMAT_DEFAULT_STR}}
@@ -54,7 +55,13 @@
 #DefaultLimitRTTIME=
 #DefaultMemoryPressureThresholdSec=200ms
 #DefaultMemoryPressureWatch=auto
+#DefaultCPUPressureThresholdSec=200ms
+#DefaultCPUPressureWatch=auto
+#DefaultIOPressureThresholdSec=200ms
+#DefaultIOPressureWatch=auto
 #DefaultSmackProcessLabel=
 #DefaultRestrictSUIDSGID=
 #ReloadLimitIntervalSec=
-#ReloadLimitBurst
+#ReloadLimitBurst=
+#EventLoopRateLimitIntervalSec=1s
+#EventLoopRateLimitBurst=50000

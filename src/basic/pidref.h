@@ -3,7 +3,7 @@
 
 #include <signal.h>
 
-#include "basic-forward.h"
+#include "forward.h"
 
 /* An embeddable structure carrying a reference to a process. Supposed to be used when tracking processes
  * continuously. This combines a PID, a modern Linux pidfd and the 64bit inode number of the pidfd into one
@@ -70,21 +70,28 @@ bool pidref_equal(PidRef *a, PidRef *b);
 
 /* This turns a pid_t into a PidRef structure, and acquires a pidfd for it, if possible. (As opposed to
  * PIDREF_MAKE_FROM_PID() above, which does not acquire a pidfd.) */
-int pidref_set_pid(PidRef *pidref, pid_t pid);
-int pidref_set_pidstr(PidRef *pidref, const char *pid);
+int pidref_set_pid_full(PidRef *pidref, pid_t pid, unsigned flags);
+static inline int pidref_set_pid(PidRef *pidref, pid_t pid) {
+        return pidref_set_pid_full(pidref, pid, /* flags= */ 0);
+}
+int pidref_set_pidstr_full(PidRef *pidref, const char *pid, unsigned flags);
+static inline int pidref_set_pidstr(PidRef *pidref, const char *pid) {
+        return pidref_set_pidstr_full(pidref, pid, /* flags= */ 0);
+}
 int pidref_set_pid_and_pidfd_id(PidRef *pidref, pid_t pid, uint64_t pidfd_id);
 int pidref_set_pidfd(PidRef *pidref, int fd);
 int pidref_set_pidfd_take(PidRef *pidref, int fd); /* takes ownership of the passed pidfd on success */
 int pidref_set_pidfd_consume(PidRef *pidref, int fd); /* takes ownership of the passed pidfd in both success and failure */
 int pidref_set_parent(PidRef *ret);
 static inline int pidref_set_self(PidRef *pidref) {
-        return pidref_set_pid(pidref, 0);
+        return pidref_set_pid(pidref, /* pid= */ 0);
 }
 
 bool pidref_is_self(PidRef *pidref);
 
 void pidref_done(PidRef *pidref);
 PidRef* pidref_free(PidRef *pidref);
+void pidref_array_free(PidRef *array, size_t n);
 DEFINE_TRIVIAL_CLEANUP_FUNC(PidRef*, pidref_free);
 
 int pidref_copy(const PidRef *pidref, PidRef *ret);
@@ -106,7 +113,7 @@ static inline void pidref_done_sigterm_wait(PidRef *pidref) {
                 return;
 
         (void) pidref_kill(pidref, SIGTERM);
-        (void) pidref_wait_for_terminate(pidref, NULL);
+        (void) pidref_wait_for_terminate(pidref, /* ret_si= */ NULL);
         pidref_done(pidref);
 }
 
@@ -115,7 +122,7 @@ static inline void pidref_done_sigkill_wait(PidRef *pidref) {
                 return;
 
         (void) pidref_kill(pidref, SIGKILL);
-        (void) pidref_wait_for_terminate(pidref, NULL);
+        (void) pidref_wait_for_terminate(pidref, /* ret_si= */ NULL);
         pidref_done(pidref);
 }
 

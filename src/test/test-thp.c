@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 
+#include "process-util.h"
 #include "tests.h"
 
 #define PR_THP_DISABLE_NOT_SET 0
@@ -12,11 +13,11 @@ static const char *arg_mode = NULL;
 static int intro(void) {
         int r;
 
-        r = prctl(PR_GET_THP_DISABLE, 0, 0, 0, 0);
+        r = prctl_safe(PR_GET_THP_DISABLE, 0, 0, 0, 0);
         if (streq_ptr(arg_mode, "no-disable")) {
                 /* Test case: THPs should not be disabled */
                 if (r != PR_THP_DISABLE_NOT_SET) {
-                        log_error("THPs disabled for the process r = %d: %m", r);
+                        log_error("THPs disabled for the process r = %d", r);
                         return EXIT_FAILURE;
                 }
         } else if (streq_ptr(arg_mode, "disable")) {
@@ -25,7 +26,7 @@ static int intro(void) {
                         return log_tests_skipped("Disabling THPs completely for the process not supported");
 
                 if (r != PR_THP_DISABLE) {
-                        log_error("THPs not completely disabled for the process r = %d: %m", r);
+                        log_error("THPs not completely disabled for the process r = %d", r);
                         return EXIT_FAILURE;
                 }
         } else if (streq_ptr(arg_mode, "madvise")) {
@@ -34,7 +35,7 @@ static int intro(void) {
                         return log_tests_skipped("Disabling THPs except for madvise not supported");
 
                 if (r != (PR_THP_DISABLE | PR_THP_DISABLE_EXCEPT_ADVISED)) {
-                        log_error("THPs (except madvise) not completely disabled for the process r = %d: %m", r);
+                        log_error("THPs (except madvise) not completely disabled for the process r = %d", r);
                         return EXIT_FAILURE;
                 }
         } else {

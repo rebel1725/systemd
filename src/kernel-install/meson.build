@@ -5,7 +5,6 @@ want_kernel_install = conf.get('ENABLE_KERNEL_INSTALL') == 1
 executables += [
         executable_template + {
                 'name' : 'kernel-install',
-                'public' : true,
                 'conditions' : ['ENABLE_KERNEL_INSTALL'],
                 'sources' : files('kernel-install.c'),
         },
@@ -52,3 +51,4 @@ if want_kernel_install
 endif
 
 test_kernel_install_sh = files('test-kernel-install.sh')
+test_ukify_install_py = files('test-ukify-install.py')

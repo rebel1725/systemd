@@ -22,6 +22,7 @@
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
+#include "user-util.h"
 
 /* TODO:
  * OCI runtime tool implementation
@@ -55,7 +56,6 @@
  * /bin/mount regarding NFS and FUSE required?
  * what does terminal=false mean?
  * sysctl inside or outside? allow-listing?
- * swapiness typo -> swappiness
  *
  * Unsupported:
  *
@@ -411,7 +411,7 @@ static int oci_hostname(const char *name, sd_json_variant *v, sd_json_dispatch_f
 
         assert_se(n = sd_json_variant_string(v));
 
-        if (!hostname_is_valid(n, 0))
+        if (!hostname_is_valid(n, /* flags= */ 0))
                 return json_log(v, flags, SYNTHETIC_ERRNO(EINVAL),
                                 "Hostname string is not a valid hostname: %s", n);
 
@@ -679,11 +679,15 @@ static int oci_uid_gid_mappings(const char *name, sd_json_variant *v, sd_json_di
                 return json_log(v, flags, SYNTHETIC_ERRNO(EOPNOTSUPP),
                                 "UID/GID mappings with more than one entry are not supported.");
 
-        assert_se(e = sd_json_variant_by_index(v, 0));
+        assert_se(e = sd_json_variant_by_index(v, /* index= */ 0));
 
         r = oci_dispatch(e, table, flags, &data);
         if (r < 0)
                 return r;
+
+        /* Silence static analyzers, sd_json_dispatch_uid_gid() already validates */
+        assert(uid_is_valid(data.host_id));
+        assert(uid_is_valid(data.container_id));
 
         if (data.range > UINT32_MAX - data.host_id ||
             data.range > UINT32_MAX - data.container_id)
@@ -870,8 +874,7 @@ static int oci_cgroups_path(const char *name, sd_json_variant *v, sd_json_dispat
                 return json_log(v, flags, SYNTHETIC_ERRNO(EINVAL),
                                 "Control group path '%s' does not refer to slice unit, refusing.", p);
 
-        free_and_replace(s->slice, slice);
-        return 0;
+        return free_and_replace(s->slice, slice);
 }
 
 static int oci_cgroup_device_type(const char *name, sd_json_variant *v, sd_json_dispatch_flags_t flags, void *userdata) {
@@ -1119,7 +1122,8 @@ static int oci_cgroup_memory(const char *name, sd_json_variant *v, sd_json_dispa
                 { "swap",             SD_JSON_VARIANT_NUMBER,  oci_cgroup_memory_limit, offsetof(struct memory_data, swap),        0                  },
                 { "kernel",           SD_JSON_VARIANT_NUMBER,  oci_unsupported,         0,                                         SD_JSON_PERMISSIVE },
                 { "kernelTCP",        SD_JSON_VARIANT_NUMBER,  oci_unsupported,         0,                                         SD_JSON_PERMISSIVE },
-                { "swapiness",        SD_JSON_VARIANT_NUMBER,  oci_unsupported,         0,                                         SD_JSON_PERMISSIVE },
+                { "swapiness",        SD_JSON_VARIANT_NUMBER,  oci_unsupported,         0,                                         SD_JSON_PERMISSIVE }, /* compat name, misspelt */
+                { "swappiness",       SD_JSON_VARIANT_NUMBER,  oci_unsupported,         0,                                         SD_JSON_PERMISSIVE }, /* spec-correct name */
                 { "disableOOMKiller", SD_JSON_VARIANT_BOOLEAN, oci_unsupported,         0,                                         SD_JSON_PERMISSIVE },
                 {}
         };
@@ -1174,6 +1178,7 @@ struct cpu_data {
         uint64_t weight;
         uint64_t quota;
         uint64_t period;
+        bool quota_unlimited;
         CPUSet cpu_set;
 };
 
@@ -1191,13 +1196,40 @@ static int oci_cgroup_cpu_shares(const char *name, sd_json_variant *v, sd_json_d
 }
 
 static int oci_cgroup_cpu_quota(const char *name, sd_json_variant *v, sd_json_dispatch_flags_t flags, void *userdata) {
-        uint64_t k, *u = ASSERT_PTR(userdata);
+        struct cpu_data *data = ASSERT_PTR(userdata);
+        uint64_t k;
+        int r;
 
-        k = sd_json_variant_unsigned(v);
-        if (k <= 0 || k >= UINT64_MAX)
-                return json_log(v, flags, SYNTHETIC_ERRNO(ERANGE), "period/quota value out of range.");
+        if (sd_json_variant_is_negative(v)) {
+                data->quota_unlimited = true;
+                return 0;
+        }
 
-        *u = k;
+        r = sd_json_dispatch_uint64(name, v, flags, &k);
+        if (r < 0)
+                return r;
+
+        if (k == 0 || k > UINT64_MAX / USEC_PER_SEC)
+                return json_log(v, flags, SYNTHETIC_ERRNO(ERANGE), "quota value out of range.");
+
+        data->quota_unlimited = false;
+        data->quota = k;
+        return 0;
+}
+
+static int oci_cgroup_cpu_period(const char *name, sd_json_variant *v, sd_json_dispatch_flags_t flags, void *userdata) {
+        uint64_t *p = ASSERT_PTR(userdata);
+        uint64_t k;
+        int r;
+
+        r = sd_json_dispatch_uint64(name, v, flags, &k);
+        if (r < 0)
+                return r;
+
+        if (k == 0 || k >= UINT64_MAX)
+                return json_log(v, flags, SYNTHETIC_ERRNO(ERANGE), "period value out of range.");
+
+        *p = k;
         return 0;
 }
 
@@ -1220,8 +1252,8 @@ static int oci_cgroup_cpu(const char *name, sd_json_variant *v, sd_json_dispatch
 
         static const sd_json_dispatch_field table[] = {
                 { "shares",          SD_JSON_VARIANT_UNSIGNED, oci_cgroup_cpu_shares, offsetof(struct cpu_data, weight), 0 },
-                { "quota",           SD_JSON_VARIANT_UNSIGNED, oci_cgroup_cpu_quota,  offsetof(struct cpu_data, quota),  0 },
-                { "period",          SD_JSON_VARIANT_UNSIGNED, oci_cgroup_cpu_quota,  offsetof(struct cpu_data, period), 0 },
+                { "quota",           SD_JSON_VARIANT_INTEGER,  oci_cgroup_cpu_quota,  0,                                 0 },
+                { "period",          SD_JSON_VARIANT_UNSIGNED, oci_cgroup_cpu_period, offsetof(struct cpu_data, period), 0 },
                 { "realtimeRuntime", SD_JSON_VARIANT_UNSIGNED, oci_unsupported,       0,                                 0 },
                 { "realtimePeriod",  SD_JSON_VARIANT_UNSIGNED, oci_unsupported,       0,                                 0 },
                 { "cpus",            SD_JSON_VARIANT_STRING,   oci_cgroup_cpu_cpus,   0,                                 0 },
@@ -1269,7 +1301,7 @@ static int oci_cgroup_cpu(const char *name, sd_json_variant *v, sd_json_dispatch
                 if (r < 0)
                         return bus_log_create_error(r);
 
-        } else if ((data.quota != UINT64_MAX) != (data.period != UINT64_MAX))
+        } else if (!data.quota_unlimited && (data.quota != UINT64_MAX) != (data.period != UINT64_MAX))
                 return json_log(v, flags, SYNTHETIC_ERRNO(EINVAL),
                                 "CPU quota and period not used together.");
 
@@ -1489,6 +1521,8 @@ static int oci_resources(const char *name, sd_json_variant *v, sd_json_dispatch_
 static bool sysctl_key_valid(const char *s) {
         bool dot = true;
 
+        POINTER_MAY_BE_NULL(s);
+
         /* Note that we are a bit stricter here than in systemd-sysctl, as that inherited semantics from the old sysctl
          * tool, which were really weird (as it swaps / and . in both ways) */
 
@@ -1546,7 +1580,6 @@ static int oci_sysctl(const char *name, sd_json_variant *v, sd_json_dispatch_fla
 
 #if HAVE_SECCOMP
 static int oci_seccomp_action_from_string(const char *name, uint32_t *ret) {
-
         static const struct {
                 const char *name;
                 uint32_t action;
@@ -1563,6 +1596,8 @@ static int oci_seccomp_action_from_string(const char *name, uint32_t *ret) {
                  * here */
         };
 
+        assert(ret);
+
         FOREACH_ELEMENT(i, table)
                 if (streq_ptr(name, i->name)) {
                         *ret = i->action;
@@ -1573,7 +1608,6 @@ static int oci_seccomp_action_from_string(const char *name, uint32_t *ret) {
 }
 
 static int oci_seccomp_arch_from_string(const char *name, uint32_t *ret) {
-
         static const struct {
                 const char *name;
                 uint32_t arch;
@@ -1605,6 +1639,8 @@ static int oci_seccomp_arch_from_string(const char *name, uint32_t *ret) {
                 { "SCMP_ARCH_X86_64",      SCMP_ARCH_X86_64      },
         };
 
+        assert(ret);
+
         FOREACH_ELEMENT(i, table)
                 if (streq_ptr(i->name, name)) {
                         *ret = i->arch;
@@ -1615,7 +1651,6 @@ static int oci_seccomp_arch_from_string(const char *name, uint32_t *ret) {
 }
 
 static int oci_seccomp_compare_from_string(const char *name, enum scmp_compare *ret) {
-
         static const struct {
                 const char *name;
                 enum scmp_compare op;
@@ -1628,6 +1663,8 @@ static int oci_seccomp_compare_from_string(const char *name, enum scmp_compare *
                 { "SCMP_CMP_GT",        SCMP_CMP_GT        },
                 { "SCMP_CMP_MASKED_EQ", SCMP_CMP_MASKED_EQ },
         };
+
+        assert(ret);
 
         FOREACH_ELEMENT(i, table)
                 if (streq_ptr(i->name, name)) {
@@ -1816,7 +1853,7 @@ static int oci_seccomp(const char *name, sd_json_variant *v, sd_json_dispatch_fl
         if (r < 0)
                 return json_log(def, flags, r, "Unknown default action: %s", sd_json_variant_string(def));
 
-        r = dlopen_libseccomp();
+        r = dlopen_libseccomp(LOG_DEBUG);
         if (r < 0)
                 return json_log(def, flags, r, "No support for libseccomp: %m");
 
@@ -2072,10 +2109,11 @@ int oci_load(FILE *f, const char *bundle, Settings **ret) {
         int r;
 
         assert_se(bundle);
+        assert(ret);
 
         path = strjoina(bundle, "/config.json");
 
-        r = sd_json_parse_file(f, path, 0, &oci, &line, &column);
+        r = sd_json_parse_file(f, path, /* flags= */ 0, &oci, &line, &column);
         if (r < 0) {
                 if (line != 0 && column != 0)
                         return log_error_errno(r, "Failed to parse '%s' at %u:%u: %m", path, line, column);
@@ -2112,12 +2150,12 @@ int oci_load(FILE *f, const char *bundle, Settings **ret) {
         if (!s->bundle)
                 return log_oom();
 
-        r = oci_dispatch(oci, table, 0, s);
+        r = oci_dispatch(oci, table, /* flags= */ 0, s);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to parse OCI bundle configuration file '%s': %m", path);
 
         if (s->properties) {
-                r = sd_bus_message_seal(s->properties, 0, 0);
+                r = sd_bus_message_seal(s->properties, /* cookie= */ 0, /* timeout_usec= */ 0);
                 if (r < 0)
                         return log_error_errno(r, "Cannot seal properties bus message: %m");
         }

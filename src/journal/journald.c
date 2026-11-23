@@ -6,6 +6,7 @@
 #include "sd-event.h"
 #include "sd-messages.h"
 
+#include "dlopen-note.h"
 #include "format-util.h"
 #include "journal-authenticate.h"
 #include "journald-kmsg.h"
@@ -18,6 +19,15 @@
 #include "string-util.h"
 #include "terminal-util.h"
 #include "time-util.h"
+#include "verbs.h"
+
+COMMAND(
+        "systemd-journald\0",
+        "Collect and store log messages.",
+        .argspec = "[NAMESPACE]\0",
+        .man_page = "systemd-journald.service(8)",
+        .option_namespace = "common",
+);
 
 static int run(int argc, char *argv[]) {
         _cleanup_(manager_freep) Manager *m = NULL;
@@ -25,10 +35,18 @@ static int run(int argc, char *argv[]) {
         LogTarget log_target;
         int r;
 
-        if (argc > 2)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes one or no arguments.");
+        COMPRESS_JOURNAL_NOTE;
+        LIBACL_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBPCRE2_NOTE(suggested);
+        LIBSELINUX_NOTE(recommended);
 
-        namespace = argc > 1 ? empty_to_null(argv[1]) : NULL;
+        char **args = NULL;
+        r = common_parse_argv_full(argc, argv, /* min_args= */ 0, /* max_args= */ 1, &args);
+        if (r <= 0)
+                return r;
+
+        namespace = empty_to_null(args[0]);
 
         log_set_facility(LOG_SYSLOG);
 
@@ -51,6 +69,8 @@ static int run(int argc, char *argv[]) {
         umask(0022);
 
         sigbus_install();
+
+        journal_auth_init();
 
         r = manager_new(&m);
         if (r < 0)
@@ -82,7 +102,7 @@ static int run(int argc, char *argv[]) {
         /* Make sure to send the usage message *after* flushing the
          * journal so entries from the runtime journals are ordered
          * before this message. See #4190 for some details. */
-        manager_space_usage_message(m, NULL);
+        manager_space_usage_message(m, /* storage= */ NULL);
 
         for (;;) {
                 usec_t t, n;
@@ -110,14 +130,12 @@ static int run(int argc, char *argv[]) {
                 } else
                         t = USEC_INFINITY;
 
-#if HAVE_GCRYPT
                 if (m->system_journal) {
                         usec_t u;
 
-                        if (journal_file_next_evolve_usec(m->system_journal, &u))
+                        if (journal_file_auth_next_evolve_usec(m->system_journal, &u) >= 0)
                                 t = MIN(t, usec_sub_unsigned(u, n));
                 }
-#endif
 
                 r = sd_event_run(m->event, t);
                 if (r < 0)

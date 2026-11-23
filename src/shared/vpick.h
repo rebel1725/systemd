@@ -4,12 +4,13 @@
 #include <sys/stat.h>
 
 #include "architecture.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 typedef enum PickFlags {
-        PICK_ARCHITECTURE = 1 << 0,   /* Look for an architecture suffix */
-        PICK_TRIES        = 1 << 1,   /* Look for tries left/tries done counters */
-        PICK_RESOLVE      = 1 << 2,   /* Return the fully resolved (chased) path, rather than the path to the entry */
+        PICK_ARCHITECTURE       = 1 << 0, /* Look for an architecture suffix */
+        PICK_TRIES              = 1 << 1, /* Look for tries left/tries done counters */
+        PICK_RESOLVE            = 1 << 2, /* Return the fully resolved (chased) path, rather than the path to the entry */
+        PICK_IGNORE_XATTR_MATCH = 1 << 3, /* Don't skip entries whose "user.uapi.match_…" xattrs don't match the system */
 } PickFlags;
 
 typedef struct PickFilter {
@@ -45,11 +46,13 @@ void pick_result_done(PickResult *p);
 
 int pick_result_compare(const PickResult *a, const PickResult *b, PickFlags flags);
 
-int path_pick(const char *toplevel_path,
-              int toplevel_fd,
+int path_pick(const char *root_path,
+              int root_fd,
+              int dir_fd,
               const char *path,
               const PickFilter filters[],
               size_t n_filters,
+              const char *match_root,
               PickFlags flags,
               PickResult *ret);
 

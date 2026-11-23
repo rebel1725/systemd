@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <fcntl.h>
-#include <getopt.h>
-#include <microhttpd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -11,6 +9,7 @@
 #include "sd-bus.h"
 #include "sd-daemon.h"
 #include "sd-journal.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "build.h"
@@ -18,6 +17,7 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "glob-util.h"
 #include "hostname-setup.h"
 #include "hostname-util.h"
@@ -31,11 +31,11 @@
 #include "os-util.h"
 #include "output-mode.h"
 #include "parse-util.h"
-#include "pretty-print.h"
 #include "signal-util.h"
 #include "string-util.h"
 #include "time-util.h"
 #include "tmpfile-util.h"
+#include "verbs.h"
 
 #define JOURNAL_WAIT_TIMEOUT (10*USEC_PER_SEC)
 
@@ -52,6 +52,12 @@ STATIC_DESTRUCTOR_REGISTER(arg_cert_pem, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_trust_pem, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_directory, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_file, strv_freep);
+
+COMMAND(
+        "systemd-journal-gatewayd\0",
+        "Serve journal events over HTTP.",
+        .man_page = "systemd-journal-gatewayd.service(8)",
+);
 
 typedef struct RequestMeta {
         sd_journal *journal;
@@ -104,8 +110,10 @@ static void request_meta_free(
                 struct MHD_Connection *connection,
                 void **connection_cls,
                 enum MHD_RequestTerminationCode toe) {
+        RequestMeta *m;
 
-        RequestMeta *m = *connection_cls;
+        assert(connection_cls);
+        m = *connection_cls;
 
         if (!m)
                 return;
@@ -127,7 +135,7 @@ static int open_journal(RequestMeta *m) {
         if (arg_directory)
                 return sd_journal_open_directory(&m->journal, arg_directory, arg_journal_type);
         else if (arg_file)
-                return sd_journal_open_files(&m->journal, (const char**) arg_file, 0);
+                return sd_journal_open_files(&m->journal, (const char**) arg_file, /* flags= */ 0);
         else
                 return sd_journal_open(&m->journal, (arg_merge ? 0 : SD_JOURNAL_LOCAL_ONLY) | arg_journal_type);
 }
@@ -140,7 +148,7 @@ static int request_meta_ensure_tmp(RequestMeta *m) {
         else {
                 _cleanup_close_ int fd = -EBADF;
 
-                fd = open_tmpfile_unlinkable("/tmp", O_RDWR|O_CLOEXEC);
+                fd = open_tmpfile_unlinkable("/tmp", O_RDWR);
                 if (fd < 0)
                         return fd;
 
@@ -181,9 +189,12 @@ static ssize_t request_reader_entries(
                     m->n_entries <= 0)
                         return MHD_CONTENT_READER_END_OF_STREAM;
 
-                if (m->n_skip < 0)
+                if (m->n_skip < 0) {
+                        /* request_parse_range_skip_and_n_entries() rejects INT64_MIN, so the negation
+                         * below cannot overflow. */
+                        assert(m->n_skip >= -INT64_MAX);
                         r = sd_journal_previous_skip(m->journal, (uint64_t) -m->n_skip + 1);
-                else if (m->n_skip > 0) {
+                } else if (m->n_skip > 0) {
                         r = sd_journal_next_skip(m->journal, (uint64_t) m->n_skip + 1);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to skip journal entries: %m");
@@ -191,7 +202,7 @@ static ssize_t request_reader_entries(
                         }
                         /* We skipped beyond the end, make sure entries between the cursor and n_skip offset
                          * from it are not returned. */
-                        if (r < m->n_skip + 1) {
+                        if ((uint64_t) r < (uint64_t) m->n_skip + 1) {
                                 m->n_skip -= r;
 
                                 if (!m->follow)
@@ -260,8 +271,8 @@ static ssize_t request_reader_entries(
                         return MHD_CONTENT_READER_END_WITH_ERROR;
                 }
 
-                r = show_journal_entry(m->tmp, m->journal, m->mode, 0, OUTPUT_FULL_WIDTH,
-                                   NULL, NULL, NULL, &previous_ts, &previous_boot_id);
+                r = show_journal_entry(m->tmp, m->journal, m->mode, /* n_columns= */ 0, OUTPUT_FULL_WIDTH,
+                                   /* output_fields= */ NULL, /* highlight= */ NULL, /* ellipsized= */ NULL, &previous_ts, &previous_boot_id);
                 if (r < 0) {
                         log_error_errno(r, "Failed to serialize item: %m");
                         return MHD_CONTENT_READER_END_WITH_ERROR;
@@ -309,7 +320,7 @@ static int request_parse_accept(
         assert(m);
         assert(connection);
 
-        header = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Accept");
+        header = sym_MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Accept");
         if (!header)
                 return 0;
 
@@ -345,6 +356,11 @@ static int request_parse_range_skip_and_n_entries(
                 r = safe_atoi64(t, &m->n_skip);
                 if (r < 0)
                         return r;
+
+                /* The consumer negates n_skip, and negating INT64_MIN in signed arithmetic is undefined
+                 * behaviour, so reject it up front. */
+                if (m->n_skip == INT64_MIN)
+                        return -ERANGE;
         }
 
         p = (colon2 ?: colon) + 1;
@@ -457,7 +473,7 @@ static int request_parse_range(
         assert(m);
         assert(connection);
 
-        range = MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Range");
+        range = sym_MHD_lookup_connection_value(connection, MHD_HEADER_KIND, "Range");
         if (!range)
                 return 0;
 
@@ -564,7 +580,7 @@ static int request_parse_arguments(
         assert(connection);
 
         m->argument_parse_error = 0;
-        MHD_get_connection_values(connection, MHD_GET_ARGUMENT_KIND, request_parse_arguments_iterator, m);
+        sym_MHD_get_connection_values(connection, MHD_GET_ARGUMENT_KIND, request_parse_arguments_iterator, m);
 
         return m->argument_parse_error;
 }
@@ -614,14 +630,14 @@ static int request_handler_entries(
         if (r < 0)
                 return mhd_respond(connection, MHD_HTTP_BAD_REQUEST, "Failed to seek in journal.");
 
-        response = MHD_create_response_from_callback(MHD_SIZE_UNKNOWN, 4*1024, request_reader_entries, m, NULL);
+        response = sym_MHD_create_response_from_callback(MHD_SIZE_UNKNOWN, 4*1024, request_reader_entries, m, /* crfc= */ NULL);
         if (!response)
                 return respond_oom(connection);
 
-        if (MHD_add_response_header(response, "Content-Type", mime_types[m->mode]) == MHD_NO)
+        if (sym_MHD_add_response_header(response, "Content-Type", mime_types[m->mode]) == MHD_NO)
                 return respond_oom(connection);
 
-        return MHD_queue_response(connection, MHD_HTTP_OK, response);
+        return sym_MHD_queue_response(connection, MHD_HTTP_OK, response);
 }
 
 static int output_field(FILE *f, OutputMode m, const char *d, size_t l) {
@@ -742,14 +758,14 @@ static int request_handler_fields(
         if (r < 0)
                 return mhd_respond(connection, MHD_HTTP_BAD_REQUEST, "Failed to query unique fields.");
 
-        response = MHD_create_response_from_callback(MHD_SIZE_UNKNOWN, 4*1024, request_reader_fields, m, NULL);
+        response = sym_MHD_create_response_from_callback(MHD_SIZE_UNKNOWN, 4*1024, request_reader_fields, m, /* crfc= */ NULL);
         if (!response)
                 return respond_oom(connection);
 
-        if (MHD_add_response_header(response, "Content-Type", mime_types[m->mode == OUTPUT_JSON ? OUTPUT_JSON : OUTPUT_SHORT]) == MHD_NO)
+        if (sym_MHD_add_response_header(response, "Content-Type", mime_types[m->mode == OUTPUT_JSON ? OUTPUT_JSON : OUTPUT_SHORT]) == MHD_NO)
                 return respond_oom(connection);
 
-        return MHD_queue_response(connection, MHD_HTTP_OK, response);
+        return sym_MHD_queue_response(connection, MHD_HTTP_OK, response);
 }
 
 static int request_handler_redirect(
@@ -765,16 +781,16 @@ static int request_handler_redirect(
         if (asprintf(&page, "<html><body>Please continue to the <a href=\"%s\">journal browser</a>.</body></html>", target) < 0)
                 return respond_oom(connection);
 
-        response = MHD_create_response_from_buffer(strlen(page), page, MHD_RESPMEM_MUST_FREE);
+        response = sym_MHD_create_response_from_buffer(strlen(page), page, MHD_RESPMEM_MUST_FREE);
         if (!response)
                 return respond_oom(connection);
         TAKE_PTR(page);
 
-        if (MHD_add_response_header(response, "Content-Type", "text/html") == MHD_NO ||
-            MHD_add_response_header(response, "Location", target) == MHD_NO)
+        if (sym_MHD_add_response_header(response, "Content-Type", "text/html") == MHD_NO ||
+            sym_MHD_add_response_header(response, "Location", target) == MHD_NO)
                 return respond_oom(connection);
 
-        return MHD_queue_response(connection, MHD_HTTP_MOVED_PERMANENTLY, response);
+        return sym_MHD_queue_response(connection, MHD_HTTP_MOVED_PERMANENTLY, response);
 }
 
 static int request_handler_file(
@@ -790,22 +806,22 @@ static int request_handler_file(
         assert(path);
         assert(mime_type);
 
-        fd = open(path, O_RDONLY|O_CLOEXEC);
+        fd = xopenat(AT_FDCWD, path, O_RDONLY);
         if (fd < 0)
-                return mhd_respondf(connection, errno, MHD_HTTP_NOT_FOUND, "Failed to open file %s: %m", path);
+                return mhd_respondf(connection, fd, MHD_HTTP_NOT_FOUND, "Failed to open file %s: %m", path);
 
         if (fstat(fd, &st) < 0)
                 return mhd_respondf(connection, errno, MHD_HTTP_INTERNAL_SERVER_ERROR, "Failed to stat file: %m");
 
-        response = MHD_create_response_from_fd_at_offset64(st.st_size, fd, 0);
+        response = sym_MHD_create_response_from_fd_at_offset64(st.st_size, fd, /* offset= */ 0);
         if (!response)
                 return respond_oom(connection);
         TAKE_FD(fd);
 
-        if (MHD_add_response_header(response, "Content-Type", mime_type) == MHD_NO)
+        if (sym_MHD_add_response_header(response, "Content-Type", mime_type) == MHD_NO)
                 return respond_oom(connection);
 
-        return MHD_queue_response(connection, MHD_HTTP_OK, response);
+        return sym_MHD_queue_response(connection, MHD_HTTP_OK, response);
 }
 
 static int get_virtualization(char **v) {
@@ -813,11 +829,13 @@ static int get_virtualization(char **v) {
         char *b = NULL;
         int r;
 
+        assert(v);
+
         r = sd_bus_default_system(&bus);
         if (r < 0)
                 return r;
 
-        r = bus_get_property_string(bus, bus_systemd_mgr, "Virtualization", NULL, &b);
+        r = bus_get_property_string(bus, bus_systemd_mgr, "Virtualization", /* reterr_error= */ NULL, &b);
         if (r < 0)
                 return r;
 
@@ -895,15 +913,15 @@ static int request_handler_machine(
         if (r < 0)
                 return respond_oom(connection);
 
-        response = MHD_create_response_from_buffer(strlen(json), json, MHD_RESPMEM_MUST_FREE);
+        response = sym_MHD_create_response_from_buffer(strlen(json), json, MHD_RESPMEM_MUST_FREE);
         if (!response)
                 return respond_oom(connection);
         TAKE_PTR(json);
 
-        if (MHD_add_response_header(response, "Content-Type", "application/json") == MHD_NO)
+        if (sym_MHD_add_response_header(response, "Content-Type", "application/json") == MHD_NO)
                 return respond_oom(connection);
 
-        return MHD_queue_response(connection, MHD_HTTP_OK, response);
+        return sym_MHD_queue_response(connection, MHD_HTTP_OK, response);
 }
 
 static int output_boot(FILE *f, LogId boot, int boot_display_index) {
@@ -1022,14 +1040,14 @@ static int request_handler_boots(
         if (r < 0)
                 return mhd_respondf(connection, r, MHD_HTTP_INTERNAL_SERVER_ERROR, "Failed to seek in journal: %m");
 
-        response = MHD_create_response_from_callback(MHD_SIZE_UNKNOWN, 4*1024, request_reader_boots, m, NULL);
+        response = sym_MHD_create_response_from_callback(MHD_SIZE_UNKNOWN, 4*1024, request_reader_boots, m, /* crfc= */ NULL);
         if (!response)
                 return respond_oom(connection);
 
-        if (MHD_add_response_header(response, "Content-Type", "application/json-seq") == MHD_NO)
+        if (sym_MHD_add_response_header(response, "Content-Type", "application/json-seq") == MHD_NO)
                 return respond_oom(connection);
 
-        return MHD_queue_response(connection, MHD_HTTP_OK, response);
+        return sym_MHD_queue_response(connection, MHD_HTTP_OK, response);
 }
 
 static mhd_result request_handler(
@@ -1058,7 +1076,7 @@ static mhd_result request_handler(
         }
 
         if (arg_trust_pem) {
-                r = check_permissions(connection, &code, NULL);
+                r = check_permissions(connection, &code, /* hostname= */ NULL);
                 if (r < 0)
                         return code;
         }
@@ -1084,112 +1102,60 @@ static mhd_result request_handler(
         return mhd_respond(connection, MHD_HTTP_NOT_FOUND, "Not found.");
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-journal-gatewayd.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] ...\n\n"
-               "HTTP server for journal events.\n\n"
-               "  -h --help           Show this help\n"
-               "     --version        Show package version\n"
-               "     --cert=CERT.PEM  Server certificate in PEM format\n"
-               "     --key=KEY.PEM    Server key in PEM format\n"
-               "     --trust=CERT.PEM Certificate authority certificate in PEM format\n"
-               "     --system         Serve system journal\n"
-               "     --user           Serve the user journal for the current user\n"
-               "  -m --merge          Serve all available journals\n"
-               "  -D --directory=PATH Serve journal files in directory\n"
-               "     --file=PATH      Serve this journal file\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               link);
-
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_KEY,
-                ARG_CERT,
-                ARG_TRUST,
-                ARG_USER,
-                ARG_SYSTEM,
-                ARG_MERGE,
-                ARG_FILE,
-        };
-
-        int r, c;
-
-        static const struct option options[] = {
-                { "help",      no_argument,       NULL, 'h'           },
-                { "version",   no_argument,       NULL, ARG_VERSION   },
-                { "key",       required_argument, NULL, ARG_KEY       },
-                { "cert",      required_argument, NULL, ARG_CERT      },
-                { "trust",     required_argument, NULL, ARG_TRUST     },
-                { "user",      no_argument,       NULL, ARG_USER      },
-                { "system",    no_argument,       NULL, ARG_SYSTEM    },
-                { "merge",     no_argument,       NULL, 'm'           },
-                { "directory", required_argument, NULL, 'D'           },
-                { "file",      required_argument, NULL, ARG_FILE      },
-                {}
-        };
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hD:", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_KEY:
-                        if (arg_key_pem)
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                                       "Key file specified twice");
-                        r = read_full_file_full(
-                                        AT_FDCWD, optarg, UINT64_MAX, SIZE_MAX,
-                                        READ_FULL_FILE_SECURE|READ_FULL_FILE_WARN_WORLD_READABLE|READ_FULL_FILE_CONNECT_SOCKET,
-                                        NULL,
-                                        &arg_key_pem, NULL);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to read key file: %m");
-                        assert(arg_key_pem);
-                        break;
-
-                case ARG_CERT:
+                OPTION_LONG("cert", "CERT.PEM", "Server certificate in PEM format"):
                         if (arg_cert_pem)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "Certificate file specified twice");
                         r = read_full_file_full(
-                                        AT_FDCWD, optarg, UINT64_MAX, SIZE_MAX,
+                                        AT_FDCWD, opts.arg, UINT64_MAX, SIZE_MAX,
                                         READ_FULL_FILE_CONNECT_SOCKET,
-                                        NULL,
-                                        &arg_cert_pem, NULL);
+                                        /* bind_name= */ NULL,
+                                        &arg_cert_pem, /* ret_size= */ NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read certificate file: %m");
                         assert(arg_cert_pem);
                         break;
 
-                case ARG_TRUST:
+                OPTION_LONG("key", "KEY.PEM", "Server key in PEM format"):
+                        if (arg_key_pem)
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                                       "Key file specified twice");
+                        r = read_full_file_full(
+                                        AT_FDCWD, opts.arg, UINT64_MAX, SIZE_MAX,
+                                        READ_FULL_FILE_SECURE|READ_FULL_FILE_WARN_WORLD_READABLE|READ_FULL_FILE_CONNECT_SOCKET,
+                                        /* bind_name= */ NULL,
+                                        &arg_key_pem, /* ret_size= */ NULL);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to read key file: %m");
+                        assert(arg_key_pem);
+                        break;
+
+                OPTION_LONG("trust", "CERT.PEM", "Certificate authority certificate in PEM format"):
 #if HAVE_GNUTLS
                         if (arg_trust_pem)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "CA certificate file specified twice");
                         r = read_full_file_full(
-                                        AT_FDCWD, optarg, UINT64_MAX, SIZE_MAX,
+                                        AT_FDCWD, opts.arg, UINT64_MAX, SIZE_MAX,
                                         READ_FULL_FILE_CONNECT_SOCKET,
-                                        NULL,
-                                        &arg_trust_pem, NULL);
+                                        /* bind_name= */ NULL,
+                                        &arg_trust_pem, /* ret_size= */ NULL);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to read CA certificate file: %m");
                         assert(arg_trust_pem);
@@ -1199,38 +1165,35 @@ static int parse_argv(int argc, char *argv[]) {
                                                "Option --trust= is not available.");
 #endif
 
-                case ARG_SYSTEM:
+                OPTION_LONG("system", NULL, "Serve system journal"):
                         arg_journal_type |= SD_JOURNAL_SYSTEM;
                         break;
 
-                case ARG_USER:
+                OPTION_LONG("user", NULL, "Serve the user journal for the current user"):
                         arg_journal_type |= SD_JOURNAL_CURRENT_USER;
                         break;
 
-                case 'm':
+                OPTION('m', "merge", NULL, "Serve all available journals"):
                         arg_merge = true;
                         break;
 
-                case 'D':
-                        r = free_and_strdup_warn(&arg_directory, optarg);
+                OPTION('D', "directory", "PATH", "Serve journal files in directory"):
+                        r = free_and_strdup_warn(&arg_directory, opts.arg);
                         if (r < 0)
                                 return r;
                         break;
 
-                case ARG_FILE:
-                        r = glob_extend(&arg_file, optarg, GLOB_NOCHECK);
+                OPTION_LONG("file", "PATH", "Serve this journal file"):
+                        r = glob_extend(&arg_file, opts.arg, GLOB_NOCHECK);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to add paths: %m");
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind < argc)
+        if (option_parser_get_n_args(&opts) > 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "This program does not take arguments.");
 
@@ -1280,17 +1243,25 @@ static int run(int argc, char *argv[]) {
                 MHD_USE_THREAD_PER_CONNECTION;
         int r, n;
 
+        COMPRESS_JOURNAL_NOTE;
+        LIBGNUTLS_NOTE(suggested);
+        LIBMICROHTTPD_NOTE(required);
+
         log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
 
+        r = dlopen_microhttpd(LOG_ERR);
+        if (r < 0)
+                return r;
+
         journal_browse_prepare();
 
         assert_se(sigaction(SIGTERM, &sigterm, NULL) >= 0);
 
-        r = setup_gnutls_logger(NULL);
+        r = setup_gnutls_logger(/* categories= */ NULL);
         if (r < 0)
                 return r;
 
@@ -1319,11 +1290,16 @@ static int run(int argc, char *argv[]) {
                         { MHD_OPTION_HTTPS_MEM_TRUST, 0, arg_trust_pem };
         }
 
-        d = MHD_start_daemon(flags, 19531,
-                             NULL, NULL,
-                             request_handler, NULL,
-                             MHD_OPTION_ARRAY, opts,
-                             MHD_OPTION_END);
+        d = sym_MHD_start_daemon(
+                        flags,
+                        /* port= */ 19531,
+                        /* apc= */ NULL,
+                        /* apc_cls= */ NULL,
+                        request_handler,
+                        /* dh_cls= */ NULL,
+                        MHD_OPTION_ARRAY,
+                        opts,
+                        MHD_OPTION_END);
         if (!d)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to start daemon!");
 

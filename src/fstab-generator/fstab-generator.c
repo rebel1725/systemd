@@ -14,6 +14,7 @@
 #include "bus-util.h"
 #include "chase.h"
 #include "creds-util.h"
+#include "dlopen-note.h"
 #include "efi-loader.h"
 #include "env-util.h"
 #include "errno-util.h"
@@ -38,6 +39,7 @@
 #include "string-util.h"
 #include "strv.h"
 #include "unit-name.h"
+#include "verbs.h"
 #include "virt.h"
 #include "volatile-util.h"
 
@@ -91,6 +93,20 @@ STATIC_DESTRUCTOR_REGISTER(arg_usr_fstype, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_usr_options, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_usr_hash, freep);
 STATIC_ARRAY_DESTRUCTOR_REGISTER(arg_mounts, arg_n_mounts, mount_array_free);
+
+COMMAND(
+        "systemd-fstab-generator\0",
+        "Generate mount, swap, and automount units from /etc/fstab.",
+        .argspec = GENERATOR_ARGSPEC,
+        .man_page = "systemd-fstab-generator(8)",
+        .option_namespace = "common",
+);
+COMMAND(
+        "systemd-sysroot-fstab-check\0",
+        "Optionally call daemon-reload based on contents of /sysroot/etc/fstab.",
+        .man_page = "systemd-fstab-generator(8)",
+        .option_namespace = "common",
+);
 
 static void mount_done(Mount *m) {
         assert(m);
@@ -177,7 +193,7 @@ static int mount_array_add_swap(bool for_initrd, const char *str) {
         if (!isempty(str))
                 return -EINVAL;
 
-        return mount_array_add_internal(for_initrd, TAKE_PTR(what), NULL, "swap", TAKE_PTR(options));
+        return mount_array_add_internal(for_initrd, TAKE_PTR(what), /* in_where= */ NULL, "swap", TAKE_PTR(options));
 }
 
 static int write_options(FILE *f, const char *options) {
@@ -221,6 +237,7 @@ static int add_swap(
 
         _cleanup_free_ char *name = NULL;
         _cleanup_fclose_ FILE *f = NULL;
+        bool is_network;
         int r;
 
         assert(what);
@@ -240,11 +257,14 @@ static int add_swap(
                 return true;
         }
 
-        log_debug("Found swap entry what=%s makefs=%s growfs=%s pcrfs=%s validatefs=%s noauto=%s nofail=%s",
+        is_network = fstab_test_option(options, "_netdev\0");
+
+        log_debug("Found swap entry what=%s makefs=%s growfs=%s pcrfs=%s validatefs=%s noauto=%s nofail=%s netdev=%s",
                   what,
                   yes_no(flags & MOUNT_MAKEFS), yes_no(flags & MOUNT_GROWFS),
                   yes_no(flags & MOUNT_PCRFS), yes_no(flags & MOUNT_VALIDATEFS),
-                  yes_no(flags & MOUNT_NOAUTO), yes_no(flags & MOUNT_NOFAIL));
+                  yes_no(flags & MOUNT_NOAUTO), yes_no(flags & MOUNT_NOFAIL),
+                  yes_no(is_network));
 
         r = unit_name_from_path(what, ".swap", &name);
         if (r < 0)
@@ -281,9 +301,15 @@ static int add_swap(
                 return log_error_errno(r, "Failed to write unit file %s: %m", name);
 
         /* use what as where, to have a nicer error message */
-        r = generator_write_device_timeout(arg_dest, what, options, NULL);
+        r = generator_write_device_timeout(arg_dest, what, options, /* filtered= */ NULL);
         if (r < 0)
                 return r;
+
+        if (is_network) {
+                r = generator_write_network_device_deps(arg_dest, what, /* where= */ NULL, options);
+                if (r < 0)
+                        return r;
+        }
 
         if (flags & MOUNT_MAKEFS) {
                 r = generator_hook_up_mkswap(arg_dest, what);
@@ -300,7 +326,8 @@ static int add_swap(
                 log_warning("%s: validating swap devices is currently unsupported.", what);
 
         if (!(flags & MOUNT_NOAUTO)) {
-                r = generator_add_symlink(arg_dest, SPECIAL_SWAP_TARGET,
+                const char *target = is_network ? SPECIAL_REMOTE_FS_TARGET : SPECIAL_SWAP_TARGET;
+                r = generator_add_symlink(arg_dest, target,
                                           (flags & MOUNT_NOFAIL) ? "wants" : "requires", name);
                 if (r < 0)
                         return r;
@@ -329,6 +356,7 @@ static int write_dependency(
                 const char *where,
                 const char *opts,
                 const char *filter,
+                const char *suffix,
                 const char* const *unit_settings) {
 
         _cleanup_strv_free_ char **unit_names = NULL;
@@ -339,7 +367,7 @@ static int write_dependency(
         assert(filter);
         assert(unit_settings);
 
-        r = fstab_filter_options(opts, filter, NULL, NULL, &unit_names, NULL);
+        r = fstab_filter_options(opts, filter, /* ret_namefound= */ NULL, /* ret_value= */ NULL, &unit_names, /* ret_filtered= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse options for '%s': %m", where);
         if (r == 0)
@@ -348,7 +376,9 @@ static int write_dependency(
         STRV_FOREACH(s, unit_names) {
                 _cleanup_free_ char *mangled = NULL;
 
-                r = unit_name_mangle_with_suffix(*s, "as dependency", 0, ".mount", &mangled);
+                r = suffix ?
+                        unit_name_mangle_with_suffix(*s, "as dependency", /* flags= */ 0, suffix, &mangled) :
+                        unit_name_mangle(*s, /* flags= */ 0, &mangled);
                 if (r < 0)
                         return log_error_errno(r, "Failed to generate dependency unit name for '%s': %m", where);
 
@@ -364,22 +394,24 @@ static int write_dependency(
 
 static int write_after(FILE *f, const char *where, const char *opts) {
         return write_dependency(f, where, opts,
-                                "x-systemd.after\0", STRV_MAKE_CONST("After"));
+                                "x-systemd.after\0", /* suffix= */ ".mount", STRV_MAKE_CONST("After"));
 }
 
 static int write_requires_after(FILE *f, const char *where, const char *opts) {
         return write_dependency(f, where, opts,
-                                "x-systemd.requires\0", STRV_MAKE_CONST("Requires", "After"));
+                                "x-systemd.requires\0", /* suffix= */ ".mount",
+                                STRV_MAKE_CONST("Requires", "After"));
 }
 
 static int write_wants_after(FILE *f, const char *where, const char *opts) {
         return write_dependency(f, where, opts,
-                                "x-systemd.wants\0", STRV_MAKE_CONST("Wants", "After"));
+                                "x-systemd.wants\0", /* suffix= */ ".mount",
+                                STRV_MAKE_CONST("Wants", "After"));
 }
 
 static int write_before(FILE *f, const char *where, const char *opts) {
         return write_dependency(f, where, opts,
-                                "x-systemd.before\0", STRV_MAKE_CONST("Before"));
+                                "x-systemd.before\0", /* suffix= */ ".mount", STRV_MAKE_CONST("Before"));
 }
 
 static int write_mounts_for(
@@ -397,7 +429,7 @@ static int write_mounts_for(
         assert(filter);
         assert(unit_setting);
 
-        r = fstab_filter_options(opts, filter, NULL, NULL, &paths, NULL);
+        r = fstab_filter_options(opts, filter, /* ret_namefound= */ NULL, /* ret_value= */ NULL, &paths, /* ret_filtered= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse options for '%s': %m", where);
         if (r == 0)
@@ -408,10 +440,15 @@ static int write_mounts_for(
                 return log_error_errno(r, "Failed to escape paths for '%s': %m", where);
 
         fprintf(f, "%s=", unit_setting);
-        fputstrv(f, paths_escaped, NULL, NULL);
+        fputstrv(f, paths_escaped, /* separator= */ NULL, /* space= */ NULL);
         fputc('\n', f);
 
         return 0;
+}
+
+static int write_on_failure(FILE *f, const char *where, const char *opts) {
+        return write_dependency(f, where, opts,
+                                "x-systemd.onfailure\0", /* suffix= */ NULL, STRV_MAKE_CONST("OnFailure"));
 }
 
 static int write_extra_dependencies(FILE *f, const char *where, const char *opts) {
@@ -448,6 +485,10 @@ static int write_extra_dependencies(FILE *f, const char *where, const char *opts
         if (r < 0)
                 return r;
 
+        r = write_on_failure(f, where, opts);
+        if (r < 0)
+                return r;
+
         return 0;
 }
 
@@ -471,7 +512,7 @@ static int mandatory_mount_drop_unapplicable_options(
 
         *flags &= ~(MOUNT_NOAUTO|MOUNT_NOFAIL|MOUNT_AUTOMOUNT);
 
-        r = fstab_filter_options(options, "noauto\0nofail\0x-systemd.automount\0", NULL, NULL, NULL, ret_options);
+        r = fstab_filter_options(options, "noauto\0nofail\0x-systemd.automount\0", /* ret_namefound= */ NULL, /* ret_value= */ NULL, /* ret_values= */ NULL, ret_options);
         if (r < 0)
                 return r;
 
@@ -519,11 +560,11 @@ static int add_mount(
                 return true;
         }
 
-        r = fstab_filter_options(opts, "x-systemd.wanted-by\0", NULL, NULL, &wanted_by, NULL);
+        r = fstab_filter_options(opts, "x-systemd.wanted-by\0", /* ret_namefound= */ NULL, /* ret_value= */ NULL, &wanted_by, /* ret_filtered= */ NULL);
         if (r < 0)
                 return r;
 
-        r = fstab_filter_options(opts, "x-systemd.required-by\0", NULL, NULL, &required_by, NULL);
+        r = fstab_filter_options(opts, "x-systemd.required-by\0", /* ret_namefound= */ NULL, /* ret_value= */ NULL, &required_by, /* ret_filtered= */ NULL);
         if (r < 0)
                 return r;
 
@@ -665,16 +706,19 @@ static int add_mount(
                         return r;
         }
 
+        /* validatefs and pcrfs are integrity checks, so they keep the target ordering.
+         * growfs and quota are not, so nofail mounts don't wait for them. */
+        const char *hook_up_target = FLAGS_SET(flags, MOUNT_NOFAIL) ? NULL : target_unit;
         if (flags & MOUNT_GROWFS) {
-                r = generator_hook_up_growfs(dest, where, target_unit);
+                r = generator_hook_up_growfs(dest, where, hook_up_target);
                 if (r < 0)
                         return r;
         }
 
         if (flags & MOUNT_PCRFS) {
-                r = efi_measured_uki(LOG_WARNING);
+                r = efi_measured_os(LOG_WARNING);
                 if (r == 0)
-                        log_debug("Kernel stub did not measure kernel image into PCR, skipping userspace measurement, too.");
+                        log_debug("OS measurements not explicitly requested and kernel stub did not measure kernel image into PCR, skipping userspace measurement, too.");
                 else if (r > 0) {
                         r = generator_hook_up_pcrfs(dest, where, target_unit);
                         if (r < 0)
@@ -689,12 +733,12 @@ static int add_mount(
         }
 
         if (flags & MOUNT_QUOTA) {
-                r = generator_hook_up_quotacheck(dest, what, where, target_unit, fstype);
+                r = generator_hook_up_quotacheck(dest, what, where, hook_up_target, fstype);
                 if (r < 0) {
                         if (r != -EOPNOTSUPP)
                                 return r;
-                } else {
-                        r = generator_hook_up_quotaon(dest, where, target_unit);
+                } else if (r > 0) {
+                        r = generator_hook_up_quotaon(dest, where, hook_up_target);
                         if (r < 0)
                                 return r;
                 }
@@ -788,9 +832,9 @@ static int do_daemon_reload(void) {
         FOREACH_STRING(unit, SPECIAL_INITRD_FS_TARGET, SPECIAL_SWAP_TARGET) {
                 log_info("Requesting %s/start/replace...", unit);
 
-                k = bus_call_method(bus, bus_systemd_mgr, "StartUnit", &error, NULL, "ss", unit, "replace");
+                k = bus_call_method(bus, bus_systemd_mgr, "StartUnit", &error, /* ret_reply= */ NULL, "ss", unit, "replace");
                 if (k < 0) {
-                        log_error_errno(k, "Failed to (re)start %s: %s", unit, bus_error_message(&error, r));
+                        log_error_errno(k, "Failed to (re)start %s: %s", unit, bus_error_message(&error, k));
                         RET_GATHER(r, k);
                 }
         }
@@ -877,7 +921,9 @@ static int canonicalize_mount_path(const char *path, const char *type, bool pref
 
         // FIXME: when chase() learns to chase non-existent paths, use this here and drop the prefixing with
         // /sysroot on error below.
-        r = chase(path, prefix_sysroot ? "/sysroot" : NULL, CHASE_PREFIX_ROOT | CHASE_NONEXISTENT, &p, NULL);
+        r = chase(path, prefix_sysroot ? "/sysroot" : NULL,
+                  CHASE_PREFIX_ROOT | CHASE_NONEXISTENT | CHASE_NO_SYNC,
+                  &p, /* ret_fd= */ NULL);
         if (r < 0) {
                 log_debug_errno(r, "Failed to chase '%s', using as-is: %m", path);
 
@@ -1228,6 +1274,26 @@ static int add_sysroot_mount(void) {
         if (extra_opts)
                 if (!strextend_with_separator(&combined_options, ",", extra_opts))
                         return log_oom();
+
+        /* A bind mount inherits the mount flags (nosuid, nodev, noexec, …) of the file system the source
+         * directory is located on. The source typically lives below /run/ (e.g. a freshly unpacked tar image
+         * in /run/machines/), which is mounted nosuid,nodev, and these flags would then propagate to our root
+         * file system, breaking suid binaries (e.g. sudo) and device nodes. Since this is supposed to become a
+         * regular OS root file system, default to dev,suid,exec instead, unless the user explicitly requested
+         * otherwise. */
+        if (bind) {
+                static const char* const defaults[] = {
+                        "suid", "suid\0" "nosuid\0",
+                        "dev",  "dev\0"  "nodev\0",
+                        "exec", "exec\0" "noexec\0",
+                        NULL,
+                };
+
+                STRV_FOREACH_PAIR(add, test, defaults)
+                        if (!fstab_test_option(combined_options, *test))
+                                if (!strextend_with_separator(&combined_options, ",", *add))
+                                        return log_oom();
+        }
 
         log_debug("Found entry what=%s where=/sysroot type=%s opts=%s", what, strna(fstype), strempty(combined_options));
 
@@ -1632,36 +1698,26 @@ static int determine_device(
 }
 
 static int determine_root(void) {
-        return determine_device(&arg_root_what, &arg_root_rw, NULL, arg_root_hash, "root");
+        return determine_device(&arg_root_what, &arg_root_rw, /* options= */ NULL, arg_root_hash, "root");
 }
 
 static int determine_usr(void) {
-        return determine_device(&arg_usr_what, NULL, &arg_usr_options, arg_usr_hash, "usr");
+        return determine_device(&arg_usr_what, /* rw= */ NULL, &arg_usr_options, arg_usr_hash, "usr");
 }
 
-/* If arg_sysroot_check is false, run as generator in the usual fashion.
- * If it is true, check /sysroot/etc/fstab for any units that we'd want to mount
- * in the initrd, and call daemon-reload. We will get reinvoked as a generator,
- * with /sysroot/etc/fstab available, and then we can write additional units based
- * on that file. */
-static int run_generator(void) {
+/* Run as generator in the usual fashion. Executed when arg_sysroot_check is false. */
+static int generator_impl(const char *dest, const char *dest_early, const char *dest_late) {
         int r;
 
-        r = proc_cmdline_parse(parse_proc_cmdline_item, NULL, 0);
+        arg_dest = dest;
+        arg_dest_late = dest_late;
+
+        r = proc_cmdline_parse(parse_proc_cmdline_item, /* userdata= */ NULL, /* flags= */ 0);
         if (r < 0)
                 log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
 
         (void) determine_root();
         (void) determine_usr();
-
-        if (arg_sysroot_check) {
-                r = parse_fstab(/* prefix_sysroot= */ true);
-                if (r == 0)
-                        log_debug("Nothing interesting found, not doing daemon-reload.");
-                if (r > 0)
-                        r = do_daemon_reload();
-                return r;
-        }
 
         r = 0;
 
@@ -1697,32 +1753,51 @@ static int run_generator(void) {
         return r;
 }
 
+/* Check /sysroot/etc/fstab for any units that we'd want to mount in the initrd, and call
+ * daemon-reload. We will get reinvoked as a generator, with /sysroot/etc/fstab available,
+ * and then we can write additional units based on that file. */
+static int run_check(int argc, char **argv) {
+        int r;
+
+        log_setup();
+
+        r = common_parse_argv_full(argc, argv, /* min_args= */ 0, /* max_args= */ 0, /* ret_args= */ NULL);
+        if (r <= 0)
+                return r;
+
+        if (!in_initrd())
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "This program is only useful in the initrd.");
+
+        r = proc_cmdline_parse(parse_proc_cmdline_item, /* userdata= */ NULL, /* flags= */ 0);
+        if (r < 0)
+                log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
+
+        (void) determine_root();
+        (void) determine_usr();
+
+        r = parse_fstab(/* prefix_sysroot= */ true);
+        if (r == 0)
+                log_debug("Nothing interesting found, not doing daemon-reload.");
+        if (r > 0)
+                r = do_daemon_reload();
+        return r;
+}
+
 static int run(int argc, char **argv) {
+        LIBCRYPTO_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+        TPM2_NOTE(suggested);
+
         arg_sysroot_check = invoked_as(argv, "systemd-sysroot-fstab-check");
+        if (arg_sysroot_check)
+                /* Run in systemd-sysroot-fstab-check mode */
+                return run_check(argc, argv);
 
-        if (arg_sysroot_check) {
-                /* Run as in systemd-sysroot-fstab-check mode */
-                log_setup();
-
-                if (strv_length(argv) > 1)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "This program takes no arguments.");
-                if (!in_initrd())
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "This program is only useful in the initrd.");
-        } else {
-                /* Run in generator mode */
-                log_setup_generator();
-
-                if (!IN_SET(strv_length(argv), 2, 4))
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "This program takes one or three arguments.");
-
-                arg_dest = ASSERT_PTR(argv[1]);
-                arg_dest_late = ASSERT_PTR(argv[argc > 3 ? 3 : 1]);
-        }
-
-        return run_generator();
+        /* Run in generator mode */
+        log_setup_generator();
+        return generator_main(argc, argv, generator_impl);
 }
 
 DEFINE_MAIN_FUNCTION(run);

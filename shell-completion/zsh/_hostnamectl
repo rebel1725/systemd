@@ -47,6 +47,11 @@ _hostnamectl_location() {
     fi
 }
 
+(( $+functions[_hostnamectl_tags] )) ||
+_hostnamectl_tags() {
+    _message "machine tag"
+}
+
 (( $+functions[_hostnamectl_commands] )) ||
 _hostnamectl_commands() {
     local -a _hostnamectl_cmds
@@ -57,6 +62,7 @@ _hostnamectl_commands() {
         "chassis:Get/set chassis type for host"
         "deployment:Get/set deployment environment for host"
         "location:Get/set location for host"
+        "tags:Get/set machine tags for host"
     )
     if (( CURRENT == 1 )); then
         _describe -t commands 'hostnamectl commands' _hostnamectl_cmds || compadd "$@"
@@ -88,6 +94,7 @@ _arguments -s \
     '--transient[Only set transient hostname]' \
     '--static[Only set static hostname]' \
     '--pretty[Only set pretty hostname]' \
+    '--apply[Apply machine-tags.d/ configuration to machine tags]' \
     '--no-ask-password[Do not prompt for password]' \
     '(-H --host)'{-H+,--host=}'[Operate on remote host]:userathost:_sd_hosts_or_user_at_host' \
     '(-M --machine)'{-M+,--machine=}'[Operate on local container]:machines:_sd_machines' \

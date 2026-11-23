@@ -6,6 +6,7 @@
 
 #include "device-nodes.h"
 #include "path-util.h"
+#include "stat-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
 #include "utf8.h"
@@ -21,8 +22,11 @@ int allow_listed_char_for_devnode(char c, const char *additional) {
 int encode_devnode_name(const char *str, char *str_enc, size_t len) {
         size_t i, j;
 
-        if (!str || !str_enc)
+        if (!str || !str_enc || len == 0)
                 return -EINVAL;
+
+        /* Always leave room for the trailing NUL, so that the output is terminated even if it is
+         * truncated. Callers in udev ignore the return value and use the buffer as is. */
 
         for (i = 0, j = 0; str[i] != '\0'; i++) {
                 int seqlen;
@@ -30,39 +34,41 @@ int encode_devnode_name(const char *str, char *str_enc, size_t len) {
                 seqlen = utf8_encoded_valid_unichar(str + i, SIZE_MAX);
                 if (seqlen > 1) {
 
-                        if (len-j < (size_t) seqlen)
-                                return -EINVAL;
+                        if (len-j <= (size_t) seqlen)
+                                goto truncated;
 
                         memcpy(&str_enc[j], &str[i], seqlen);
                         j += seqlen;
                         i += (seqlen-1);
 
-                } else if (str[i] == '\\' || !allow_listed_char_for_devnode(str[i], NULL)) {
+                } else if (str[i] == '\\' || !allow_listed_char_for_devnode(str[i], /* additional= */ NULL)) {
 
                         if (len-j < 5)
-                                return -EINVAL;
+                                goto truncated;
 
                         assert_se(snprintf_ok(&str_enc[j], 5, "\\x%02x", (unsigned char) str[i]));
                         j += 4;
 
                 } else {
-                        if (len-j < 1)
-                                return -EINVAL;
+                        if (len-j < 2)
+                                goto truncated;
 
                         str_enc[j] = str[i];
                         j++;
                 }
         }
 
-        if (len-j < 1)
-                return -EINVAL;
-
         str_enc[j] = '\0';
         return 0;
+
+truncated:
+        str_enc[j] = '\0';
+        return -EINVAL;
 }
 
 int devnode_same(const char *a, const char *b) {
         struct stat sa, sb;
+        int r;
 
         assert(a);
         assert(b);
@@ -72,13 +78,15 @@ int devnode_same(const char *a, const char *b) {
 
         if (stat(a, &sa) < 0)
                 return -errno;
+        r = stat_verify_device_node(&sa);
+        if (r < 0)
+                return r;
+
         if (stat(b, &sb) < 0)
                 return -errno;
-
-        if (!S_ISBLK(sa.st_mode) && !S_ISCHR(sa.st_mode))
-                return -ENODEV;
-        if (!S_ISBLK(sb.st_mode) && !S_ISCHR(sb.st_mode))
-                return -ENODEV;
+        r = stat_verify_device_node(&sb);
+        if (r < 0)
+                return r;
 
         if (((sa.st_mode ^ sb.st_mode) & S_IFMT) != 0) /* both inode same device node type? */
                 return false;

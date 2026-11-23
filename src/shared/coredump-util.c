@@ -1,15 +1,15 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <elf.h>
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 
 #include "alloc-util.h"
 #include "coredump-util.h"
-#include "errno-util.h"
 #include "extract-word.h"
 #include "fileio.h"
 #include "log.h"
 #include "parse-util.h"
+#include "process-util.h"
 #include "stdio-util.h"
 #include "string-table.h"
 #include "string-util.h"
@@ -18,7 +18,7 @@
 
 int set_dumpable(SuidDumpMode mode) {
         /* Cast mode explicitly to long, because prctl wants longs but is varargs. */
-        return RET_NERRNO(prctl(PR_SET_DUMPABLE, (long) mode));
+        return prctl_safe(PR_SET_DUMPABLE, mode, 0, 0, 0);
 }
 
 static const char *const coredump_filter_table[_COREDUMP_FILTER_MAX] = {
@@ -46,7 +46,7 @@ int coredump_filter_mask_from_string(const char *s, uint64_t *ret) {
                 CoredumpFilter v;
                 int r;
 
-                r = extract_first_word(&s, &n, NULL, 0);
+                r = extract_first_word(&s, &n, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return r;
                 if (r == 0)

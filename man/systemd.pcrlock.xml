@@ -1,6 +1,8 @@
 <?xml version='1.0'?>
 <!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
   "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
+
 <refentry id="systemd.pcrlock"
           xmlns:xi="http://www.w3.org/2001/XInclude">
 
@@ -65,6 +67,11 @@
     component, that contains one or more pcrlock files each covering one <emphasis>variant</emphasis> of the
     component. Example: <filename>650-kernel.pcrlock.d/6.5.5-200.fc38.x86_64.pcrlock</filename> and
     <filename>650-kernel.pcrlock.d/6.5.7-100.fc38.x86_64.pcrlock</filename></para>
+
+    <para>Components may have any number of variants. If a PCR ends up with more than eight alternative
+    values, <command>systemd-pcrlock</command> expresses them in the TPM2 access policy as a balanced tree of
+    nested <function>PolicyOR</function> statements. Up to 8^5 = 32768 alternative values per PCR are
+    supported.</para>
 
     <para>Use <command>systemd-pcrlock list-components</command> to list all pcrlock files currently
     installed.</para>

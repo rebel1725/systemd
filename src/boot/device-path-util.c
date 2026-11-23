@@ -2,7 +2,7 @@
 
 #include "device-path-util.h"
 #include "efi-string.h"
-#include "string-util-fundamental.h"
+#include "string-util.h"
 #include "util.h"
 
 static const EFI_DEVICE_PATH *device_path_find_end_node(const EFI_DEVICE_PATH *dp) {
@@ -25,6 +25,10 @@ EFI_STATUS make_file_device_path(EFI_HANDLE device, const char16_t *file, EFI_DE
         const EFI_DEVICE_PATH *end_node = device_path_find_end_node(dp);
 
         size_t file_size = strsize16(file);
+        /* The node Length is a uint16_t, so refuse a path that would not fit. */
+        if (file_size > UINT16_MAX - sizeof(FILEPATH_DEVICE_PATH))
+                return EFI_INVALID_PARAMETER;
+
         size_t dp_size = (uint8_t *) end_node - (uint8_t *) dp;
 
         /* Make a copy that can also hold a file media device path. */
@@ -55,6 +59,9 @@ EFI_STATUS make_url_device_path(const char16_t *url, EFI_DEVICE_PATH **ret) {
                 return EFI_INVALID_PARAMETER;
 
         size_t l = strlen8(u);
+        /* The node Length is a uint16_t, so refuse a URL that would not fit. */
+        if (l > UINT16_MAX - offsetof(URI_DEVICE_PATH, Uri))
+                return EFI_INVALID_PARAMETER;
 
         size_t t = offsetof(URI_DEVICE_PATH, Uri) + l + sizeof(EFI_DEVICE_PATH);
         EFI_DEVICE_PATH *dp = xmalloc(t);
@@ -101,7 +108,7 @@ static char16_t *device_path_to_str_internal(const EFI_DEVICE_PATH *dp) {
                  * provide the EFI_DEVICE_PATH_TO_TEXT_PROTOCOL after all. */
 
                 size_t size = node->Length - sizeof(EFI_DEVICE_PATH);
-                _cleanup_free_ char16_t *hex_data = hexdump((uint8_t *) node + sizeof(EFI_DEVICE_PATH), size);
+                _cleanup_free_ char16_t *hex_data = hexdump16((uint8_t *) node + sizeof(EFI_DEVICE_PATH), size);
                 str = xasprintf("%ls%sPath(%u,%u%s%ls)",
                                 strempty(old),
                                 old ? "/" : "",
@@ -177,6 +184,23 @@ EFI_DEVICE_PATH *device_path_replace_node(
         return ret;
 }
 
+bool device_path_is_valid(const EFI_DEVICE_PATH *dp, size_t size) {
+        if (!dp)
+                return false;
+
+        /* Validate against the known size so a truncated/corrupt path can't make us read out of bounds. */
+        for (;;) {
+                if (size < sizeof(EFI_DEVICE_PATH))
+                        return false;
+                if (dp->Length < sizeof(EFI_DEVICE_PATH) || dp->Length > size)
+                        return false;
+                if (device_path_is_end(dp))
+                        return true;
+                size -= dp->Length;
+                dp = (const EFI_DEVICE_PATH *) ((const uint8_t *) dp + dp->Length);
+        }
+}
+
 size_t device_path_size(const EFI_DEVICE_PATH *dp) {
         const EFI_DEVICE_PATH *i = ASSERT_PTR(dp);
 
@@ -188,4 +212,26 @@ size_t device_path_size(const EFI_DEVICE_PATH *dp) {
 
 EFI_DEVICE_PATH *device_path_dup(const EFI_DEVICE_PATH *dp) {
         return xmemdup(ASSERT_PTR(dp), device_path_size(dp));
+}
+
+EFI_STATUS device_path_split_file_path(
+                const EFI_DEVICE_PATH *dp,
+                EFI_DEVICE_PATH **ret_device_path,
+                const EFI_DEVICE_PATH **ret_file_path) {
+
+        assert(dp);
+        assert(ret_device_path);
+        assert(ret_file_path);
+
+        /* Return an owned, terminated copy of the device prefix and a borrowed pointer to the file suffix. */
+        for (const EFI_DEVICE_PATH *node = dp; !device_path_is_end(node); node = device_path_next_node(node)) {
+                if (node->Type != MEDIA_DEVICE_PATH || node->SubType != MEDIA_FILEPATH_DP)
+                        continue;
+
+                *ret_device_path = device_path_replace_node(dp, node, /* new_node= */ NULL);
+                *ret_file_path = node;
+                return EFI_SUCCESS;
+        }
+
+        return EFI_NOT_FOUND;
 }

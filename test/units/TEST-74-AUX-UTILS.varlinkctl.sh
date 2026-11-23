@@ -36,6 +36,9 @@ varlinkctl introspect -j /run/systemd/journal/io.systemd.journal | jq --seq .
 
 varlinkctl introspect /run/systemd/journal/io.systemd.journal io.systemd.Journal
 varlinkctl introspect -j /run/systemd/journal/io.systemd.journal io.systemd.Journal | jq .
+# The JSON rendering carries the interface name and keeps methods, not only the raw reply.
+varlinkctl introspect -j /run/systemd/journal/io.systemd.journal io.systemd.Journal |
+    jq -e '.name == "io.systemd.Journal" and any(.symbols[]; .kind == "method")'
 
 varlinkctl list-registry
 varlinkctl list-registry -j | jq .
@@ -52,6 +55,22 @@ if command -v userdbctl >/dev/null; then
     varlinkctl call --more -j /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetMemberships '{ "service" : "io.systemd.Multiplexer" }' --graceful=io.systemd.UserDatabase.NoRecordFound | jq --seq .
     varlinkctl call --oneway /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetMemberships '{ "service" : "io.systemd.Multiplexer" }'
     (! varlinkctl call --oneway /run/systemd/userdb/io.systemd.Multiplexer io.systemd.UserDatabase.GetMemberships '{ "service" : "io.systemd.Multiplexer" }' | grep .)
+
+    mkdir -p /run/userdb
+    membership=/run/userdb/test-74-member:test-74-group.membership
+    touch "$membership"
+    trap 'rm -f "$membership"' EXIT
+    member_reply="$(varlinkctl call -j /run/systemd/userdb/io.systemd.Multiplexer \
+        io.systemd.UserDatabase.GetMemberships \
+        '{"userName":"test-74-member","groupName":"test-74-group","service":"io.systemd.Multiplexer"}')"
+    test "$(jq -r .userName <<<"$member_reply")" = test-74-member
+    test "$(jq -r .groupName <<<"$member_reply")" = test-74-group
+    nonmember_reply="$(varlinkctl call --graceful=io.systemd.UserDatabase.NoRecordFound -j \
+        /run/systemd/userdb/io.systemd.Multiplexer \
+        io.systemd.UserDatabase.GetMemberships \
+        '{"userName":"test-74-nonmember","groupName":"test-74-group","service":"io.systemd.Multiplexer"}' 2>&1)"
+    grep "returned expected error: io.systemd.UserDatabase.NoRecordFound" <<<"$nonmember_reply" >/dev/null
+    rm "$membership"
 
     if command -v openssl >/dev/null && command -v groupadd >/dev/null; then
         group=haldo
@@ -103,10 +122,10 @@ rm_rf_sshbindir() {
     rm -rf "$SSHBINDIR"
 }
 
-trap rm_rf_sshbindir EXIT
+trap 'rm -f "${membership:-}"; rm_rf_sshbindir' EXIT
 
 # Create a fake "ssh" binary that validates everything works as expected if invoked for the "ssh-unix:" Varlink transport
-cat > "$SSHBINDIR"/ssh <<'EOF'
+cat >"$SSHBINDIR"/ssh <<'EOF'
 #!/usr/bin/env bash
 
 set -xe
@@ -122,7 +141,7 @@ chmod +x "$SSHBINDIR"/ssh
 SYSTEMD_SSH="$SSHBINDIR/ssh" varlinkctl info ssh-unix:foobar:/run/systemd/journal/io.systemd.journal
 
 # Now build another fake "ssh" binary that does the same for "ssh-exec:"
-cat > "$SSHBINDIR"/ssh <<'EOF'
+cat >"$SSHBINDIR"/ssh <<'EOF'
 #!/usr/bin/env bash
 
 set -xe
@@ -202,46 +221,8 @@ varlinkctl info /run/systemd/io.systemd.Manager
 varlinkctl introspect /run/systemd/io.systemd.Manager io.systemd.Manager
 varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Manager.Describe '{}'
 varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Manager.Reload '{}'
-# This will disconnect and fail, as the manager reexec and drops connections
-varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Manager.Reexecute '{}' ||:
-
-# test io.systemd.Network
-varlinkctl info /run/systemd/netif/io.systemd.Network
-varlinkctl introspect /run/systemd/netif/io.systemd.Network io.systemd.Network
-varlinkctl call /run/systemd/netif/io.systemd.Network io.systemd.Network.Describe '{}'
-
-# test io.systemd.Unit
-varlinkctl info /run/systemd/io.systemd.Manager
-varlinkctl introspect /run/systemd/io.systemd.Manager io.systemd.Unit
-varlinkctl --more call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{}'
-varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"name": "multi-user.target"}'
-varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"pid": {"pid": 1}}'
-(! varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{}' |& grep "called without 'more' flag" >/dev/null)
-varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"name": "init.scope", "pid": {"pid": 1}}'
-(! varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"name": ""}')
-(! varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"name": "non-existent.service"}')
-(! varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"pid": {"pid": -1}}' )
-(! varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"name": "multi-user.target", "pid": {"pid": 1}}')
-set +o pipefail
-varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties '{"runtime": true, "name": "non-existent.service", "properties": {"Markers": ["needs-restart"]}}' |& grep "io.systemd.Unit.NoSuchUnit"
-varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.SetProperties '{"runtime": true, "name": "systemd-journald.service", "properties": {"LoadState": "foobar"}}' |& grep "io.systemd.Unit.PropertyNotSupported"
-set -o pipefail
-
-varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List '{"cgroup": "/init.scope"}'
-invocation_id="$(systemctl show -P InvocationID systemd-journald.service)"
-varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Unit.List "{\"invocationID\": \"$invocation_id\"}"
-
-# test io.systemd.Metrics
-varlinkctl info /run/systemd/report/io.systemd.Manager
-
-varlinkctl list-methods /run/systemd/report/io.systemd.Manager
-varlinkctl list-methods -j /run/systemd/report/io.systemd.Manager io.systemd.Metrics | jq .
-
-varlinkctl introspect /run/systemd/report/io.systemd.Manager
-varlinkctl introspect -j /run/systemd/report/io.systemd.Manager io.systemd.Metrics | jq .
-
-varlinkctl --more call /run/systemd/report/io.systemd.Manager io.systemd.Metrics.List {}
-varlinkctl --more call /run/systemd/report/io.systemd.Manager io.systemd.Metrics.Describe {}
+# The connection is passed across reexecution, and the reply is sent once the manager is back
+varlinkctl call /run/systemd/io.systemd.Manager io.systemd.Manager.Reexecute '{}'
 
 # test io.systemd.Manager in user manager
 testuser_uid=$(id -u testuser)
@@ -252,6 +233,242 @@ systemd-run --wait --pipe --user --machine testuser@ \
 systemd-run --wait --pipe --user --machine testuser@ \
         varlinkctl call "/run/user/$testuser_uid/systemd/io.systemd.Manager" io.systemd.Manager.Describe '{}'
 
-# test io.systemd.Unit in user manager
-systemd-run --wait --pipe --user --machine testuser@ \
-        varlinkctl --more call "/run/user/$testuser_uid/systemd/io.systemd.Manager" io.systemd.Unit.List '{}'
+# test --upgrade (protocol upgrade)
+# The basic --upgrade proxy test is covered by the "varlinkctl serve" tests below (which use
+# serve+rev/gunzip as the server). The tests here exercise features that need the Python
+# server: file-input (defer fallback), ssh-exec transport (pipe pairs) and --exec mode.
+UPGRADE_SOCKET="$(mktemp -d)/upgrade.sock"
+UPGRADE_SERVER="$(mktemp)"
+cat >"$UPGRADE_SERVER" <<'PYEOF'
+#!/usr/bin/env python3
+"""Varlink upgrade test server. With a socket path argument, listens on a unix socket.
+Without arguments, speaks over stdin/stdout (for ssh-exec: transport testing)."""
+import json, os, socket, sys
+
+def sd_notify_ready():
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr[0] == "@":
+        addr = "\0" + addr[1:]
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    s.connect(addr)
+    s.sendall(b"READY=1")
+    s.close()
+
+if len(sys.argv) > 1:
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.bind(sys.argv[1])
+    sock.listen(1)
+    sd_notify_ready()
+    conn, _ = sock.accept()
+    inp = conn.makefile("rb")
+    out = conn.makefile("wb")
+else:
+    inp = sys.stdin.buffer
+    out = sys.stdout.buffer
+    conn = sock = None
+
+# Read the varlink request (NUL-terminated JSON)
+data = b""
+while True:
+    chunk = inp.read(1)
+    assert chunk, "Connection closed before receiving full varlink request"
+    data += chunk
+    if b"\0" in data:
+        break
+
+msg = json.loads(data.split(b"\0")[0])
+received_parameters = msg.get("parameters", {})
+out.write(b'{"parameters": {}}\0')
+out.flush()
+
+# Upgraded protocol: send a non-JSON banner first to prove we're truly in raw mode,
+# then echo the received parameters, then reverse lines from the client
+out.write(b"<<< UPGRADED >>>\n")
+out.write((json.dumps(received_parameters) + "\n").encode())
+out.flush()
+for line in inp:
+    text = line.decode().rstrip("\n")
+    out.write((text[::-1] + "\n").encode())
+    out.flush()
+
+if conn:
+    conn.close()
+if sock:
+    sock.close()
+PYEOF
+chmod +x "$UPGRADE_SERVER"
+
+# Test --upgrade with stdin redirected from a regular file (epoll can't poll regular files,
+# so this exercises the sd_event_add_defer fallback path)
+UPGRADE_SOCKET2="$(mktemp -d)/upgrade.sock"
+systemd-notify --fork -q -- python3 "$UPGRADE_SERVER" "$UPGRADE_SOCKET2"
+
+echo "file input test" >/tmp/test-upgrade-input
+result="$(varlinkctl call --upgrade "unix:$UPGRADE_SOCKET2" io.systemd.test.Reverse '{"foo":"file"}' </tmp/test-upgrade-input)"
+echo "$result" | grep "<<< UPGRADED >>>" >/dev/null
+echo "$result" | grep '"foo": "file"' >/dev/null
+echo "$result" | grep "tset tupni elif" >/dev/null
+
+# Test --upgrade over ssh-exec: transport (pipe pair, not a bidirectional socket).
+# This exercises the input_fd != output_fd path in sd_varlink_call_and_upgrade().
+# Reuse the same server script without a socket argument - it speaks over stdin/stdout.
+cat >"$SSHBINDIR"/ssh <<EOF
+#!/usr/bin/env bash
+exec python3 "$UPGRADE_SERVER"
+EOF
+chmod +x "$SSHBINDIR"/ssh
+
+result="$(echo "ssh pipe test" | SYSTEMD_SSH="$SSHBINDIR/ssh" varlinkctl call --upgrade ssh-exec:foobar:test-upgrade io.systemd.test.Reverse '{"foo":"ssh"}')"
+echo "$result" | grep "<<< UPGRADED >>>" >/dev/null
+echo "$result" | grep '"foo": "ssh"' >/dev/null
+echo "$result" | grep "tset epip hss" >/dev/null
+
+# Start another server for --exec test
+rm -f "$UPGRADE_SOCKET"
+systemd-notify --fork -q -- python3 "$UPGRADE_SERVER" "$UPGRADE_SOCKET"
+
+# Test --exec mode: the upgraded socket becomes stdin/stdout of the child.
+# Since stdout goes to the socket (not the terminal), write results to a file for verification.
+EXEC_RESULT="$(mktemp)"
+varlinkctl call --upgrade --exec "unix:$UPGRADE_SOCKET" io.systemd.test.Reverse '{"foo":"bar"}' -- \
+        bash -c "head -2 >'$EXEC_RESULT'; echo 'hello world'; head -1 >>'$EXEC_RESULT'"
+grep "<<< UPGRADED >>>" "$EXEC_RESULT" >/dev/null
+grep '"foo": "bar"' "$EXEC_RESULT" >/dev/null
+grep "dlrow olleh" "$EXEC_RESULT" >/dev/null
+rm -f "$EXEC_RESULT"
+
+rm -f "$UPGRADE_SOCKET" "$UPGRADE_SOCKET2" "$UPGRADE_SERVER" /tmp/test-upgrade-input
+rm -rf "$(dirname "$UPGRADE_SOCKET")" "$(dirname "$UPGRADE_SOCKET2")"
+
+# Test varlinkctl serve: expose a stdio command via varlink protocol upgrade with socket activation.
+# This is the "inetd for varlink" pattern: any stdio tool becomes a varlink service.
+SERVE_SOCKET="$(mktemp -d)/serve.sock"
+
+# Test 1: serve rev: proves bidirectional data flow through the upgrade
+SERVE_PID=$(systemd-notify --fork -- \
+                           systemd-socket-activate -l "$SERVE_SOCKET" -- \
+                                   varlinkctl serve io.systemd.test.Reverse rev)
+
+# Verify introspection works on the serve endpoint and shows the upgrade annotation
+varlinkctl introspect "unix:$SERVE_SOCKET" io.systemd.test | grep "method Reverse" >/dev/null
+varlinkctl introspect "unix:$SERVE_SOCKET" io.systemd.test | grep "Requires 'upgrade' flag" >/dev/null
+
+result="$(echo "hello world" | varlinkctl call --upgrade "unix:$SERVE_SOCKET" io.systemd.test.Reverse '{}')"
+echo "$result" | grep "dlrow olleh" >/dev/null
+kill "$SERVE_PID" 2>/dev/null || true
+wait "$SERVE_PID" 2>/dev/null || true
+rm -f "$SERVE_SOCKET"
+
+# Test 2: decompress via serve: the "sandboxed decompressor" use-case (the real thing would be a proper
+# unit with real sandboxing).
+# Pipe gzip-compressed data through a varlinkctl serve + gunzip endpoint and verify round-trip.
+SERVE_PID=$(systemd-notify --fork -- \
+                           systemd-socket-activate -l "$SERVE_SOCKET" -- \
+                                   varlinkctl serve io.systemd.Compress.Decompress gunzip)
+
+SERVE_TMPDIR="$(mktemp -d)"
+echo "untrusted data decompressed safely via varlink serve" | gzip >"$SERVE_TMPDIR/compressed.gz"
+result="$(varlinkctl call --upgrade "unix:$SERVE_SOCKET" io.systemd.Compress.Decompress '{}' <"$SERVE_TMPDIR/compressed.gz")"
+echo "$result" | grep "untrusted data decompressed safely" >/dev/null
+
+# The shared file offset keeps "trailer" from clobbering our output
+{ echo header; varlinkctl call --upgrade "unix:$SERVE_SOCKET" io.systemd.Compress.Decompress '{}' <"$SERVE_TMPDIR/compressed.gz"; echo trailer; } >"$SERVE_TMPDIR/out"
+[[ "$(cat "$SERVE_TMPDIR/out")" == "$(printf 'header\nuntrusted data decompressed safely via varlink serve\ntrailer')" ]]
+kill "$SERVE_PID" 2>/dev/null || true
+wait "$SERVE_PID" 2>/dev/null || true
+rm -f "$SERVE_SOCKET"
+
+# Test 3: interactive use with a (blocking) tty as stdin. The reply has to arrive while stdin is still
+# open, i.e. forwarding must not get stuck reading from the tty after the first line. Only then is stdin
+# closed, which ends the session.
+SERVE_PID=$(systemd-notify --fork -- \
+                           systemd-socket-activate -l "$SERVE_SOCKET" -- \
+                                   varlinkctl serve io.systemd.test.Reverse -- sh -c 'head -n1 | rev')
+TTY_INPUT="$(dirname "$SERVE_SOCKET")/tty-input"
+TTY_OUTPUT="$(dirname "$SERVE_SOCKET")/tty-output"
+mkfifo "$TTY_INPUT"
+timeout 30 script -qec "varlinkctl call --upgrade unix:$SERVE_SOCKET io.systemd.test.Reverse {}" /dev/null \
+        <"$TTY_INPUT" >"$TTY_OUTPUT" &
+CALL_PID=$!
+exec 3>"$TTY_INPUT"
+echo "via tty" >&3
+timeout 30 bash -c "until grep 'ytt aiv' '$TTY_OUTPUT' >/dev/null; do sleep .1; done"
+exec 3>&-
+wait "$CALL_PID"
+kill "$SERVE_PID" 2>/dev/null || true
+wait "$SERVE_PID" 2>/dev/null || true
+rm -f "$SERVE_SOCKET" "$TTY_INPUT" "$TTY_OUTPUT"
+
+# Test 3: --polkit-action=: root passes without a polkit round trip, an unprivileged user is denied
+# because no policy grants the (nonexistent) action.
+chmod 755 "$(dirname "$SERVE_SOCKET")"
+SERVE_PID=$(systemd-notify --fork -- \
+                           systemd-socket-activate -l "$SERVE_SOCKET" -- \
+                                   varlinkctl serve --polkit-action=io.systemd.test.serve io.systemd.test.Reverse rev)
+chmod 666 "$SERVE_SOCKET"
+result="$(echo "hello world" | varlinkctl call --upgrade "unix:$SERVE_SOCKET" io.systemd.test.Reverse '{}')"
+echo "$result" | grep "dlrow olleh" >/dev/null
+result="$( (! echo "hello world" | run0 -u testuser varlinkctl call --upgrade "unix:$SERVE_SOCKET" io.systemd.test.Reverse '{}' 2>&1) )"
+echo "$result" | grep "PermissionDenied" >/dev/null
+(! echo "$result" | grep "dlrow olleh" >/dev/null)
+# --polkit-action= is rejected for verbs other than serve (introspect would otherwise succeed here)
+varlinkctl introspect "unix:$SERVE_SOCKET" io.systemd.test >/dev/null
+(! varlinkctl introspect --polkit-action=io.systemd.test.serve "unix:$SERVE_SOCKET" io.systemd.test)
+kill "$SERVE_PID" 2>/dev/null || true
+wait "$SERVE_PID" 2>/dev/null || true
+
+# Test 4: --polkit-action= with an action that a polkit rule grants to testuser: the unprivileged client
+# is authorized asynchronously (polkit reply, re-dispatch) and the connection is upgraded. Polkit only
+# evaluates registered action IDs, so borrow one from hostnamed; the rule is scoped to testuser.
+# Varlink polkit checks only send a pidfd subject, which needs kernel >= 6.5 and polkit >= 124.
+if [[ -f /usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service ]] &&
+   [[ -f /usr/share/polkit-1/actions/org.freedesktop.hostname1.policy ]] &&
+   systemd-analyze compare-versions "$(uname -r)" ge 6.5 &&
+   systemd-analyze compare-versions "$(pkcheck --version | awk '{print $3}')" ge 124; then
+    POLKIT_TEST_ACTION=org.freedesktop.hostname1.get-hardware-serial
+    mkdir -p /etc/polkit-1/rules.d
+    cat >/etc/polkit-1/rules.d/varlinkctl-serve-test.rules <<EOF
+polkit.addRule(function(action, subject) {
+    if (action.id == "$POLKIT_TEST_ACTION" && subject.user == "testuser") {
+        return polkit.Result.YES;
+    }
+});
+EOF
+    systemctl try-reload-or-restart polkit.service
+
+    SERVE_PID=$(systemd-notify --fork -- \
+                               systemd-socket-activate -l "$SERVE_SOCKET" -- \
+                                       varlinkctl serve --polkit-action="$POLKIT_TEST_ACTION" io.systemd.test.Reverse rev)
+    chmod 666 "$SERVE_SOCKET"
+    result="$(echo "hello world" | run0 -u testuser varlinkctl call --upgrade "unix:$SERVE_SOCKET" io.systemd.test.Reverse '{}')"
+    echo "$result" | grep "dlrow olleh" >/dev/null
+    kill "$SERVE_PID" 2>/dev/null || true
+    wait "$SERVE_PID" 2>/dev/null || true
+
+    rm -f /etc/polkit-1/rules.d/varlinkctl-serve-test.rules
+    systemctl try-reload-or-restart polkit.service
+fi
+
+# Verify consistent handling of omitted/null/empty parameters
+check_output_is_empty_object() {
+    REPLY="$1"
+    # This is a "Varlink server" that reads the incoming call, discards it, and
+    # directly sends the contents of $REPLY as the reply. This lets us exercise
+    # sd-varlink's client-side parsing of the Varlink call/reply framing
+    # shellcheck disable=SC2016
+    SERVE_PID=$(systemd-notify --fork -- \
+        systemd-socket-activate -l "$SERVE_SOCKET" --inetd -a -- \
+            bash -c 'read -r -d "" _; printf "%s\0" "$0"' "$REPLY")
+    varlinkctl call "unix:$SERVE_SOCKET" com.example.Test '{}' | grep "^{}$"
+    varlinkctl --exec call "unix:$SERVE_SOCKET" com.example.Test '{}' -- grep "^{}$"
+    kill "$SERVE_PID" 2>/dev/null || true
+    wait "$SERVE_PID" 2>/dev/null || true
+}
+check_output_is_empty_object '{}'
+check_output_is_empty_object '{"parameters": null}'
+check_output_is_empty_object '{"parameters": {}}'
+
+rm -f "$SERVE_SOCKET"
+rm -rf "$(dirname "$SERVE_SOCKET")" "$SERVE_TMPDIR"

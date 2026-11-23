@@ -3,10 +3,12 @@
 #include <stdlib.h>
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "chase.h"
 #include "dirent-util.h"
 #include "env-file.h"
 #include "errno-util.h"
+#include "escape.h"
 #include "fd-util.h"
 #include "fs-util.h"
 #include "glyph-util.h"
@@ -49,7 +51,7 @@ bool image_name_is_valid(const char *s) {
         if (!filename_is_valid(s))
                 return false;
 
-        if (string_has_cc(s, NULL))
+        if (string_has_cc(s, /* ok= */ NULL))
                 return false;
 
         if (!utf8_is_valid(s))
@@ -105,7 +107,7 @@ int path_is_extension_tree(ImageClass image_class, const char *path, const char 
         /* We use /usr/lib/extension-release.d/extension-release[.NAME] as flag for something being a system extension,
          * /etc/extension-release.d/extension-release[.NAME] as flag for something being a system configuration, and finally,
          * and {/etc|/usr/lib}/os-release as a flag for something being an OS (when not an extension). */
-        r = open_extension_release(path, image_class, extension, relax_extension_release_check, NULL, NULL);
+        r = open_extension_release(path, image_class, extension, relax_extension_release_check, /* ret_path= */ NULL, /* ret_fd= */ NULL);
         if (r == -ENOENT) /* We got nothing */
                 return 0;
         if (r < 0)
@@ -168,14 +170,14 @@ int open_os_release_at(int rfd, char **ret_path, int *ret_fd) {
         const char *e;
         int r;
 
-        assert(rfd >= 0 || IN_SET(rfd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(rfd));
 
         e = secure_getenv("SYSTEMD_OS_RELEASE");
         if (e)
-                return chaseat(rfd, e, CHASE_AT_RESOLVE_IN_ROOT, ret_path, ret_fd);
+                return chaseat(rfd, rfd, e, /* flags= */ 0, ret_path, ret_fd);
 
         FOREACH_STRING(path, "/etc/os-release", "/usr/lib/os-release") {
-                r = chaseat(rfd, path, CHASE_AT_RESOLVE_IN_ROOT, ret_path, ret_fd);
+                r = chaseat(rfd, rfd, path, /* flags= */ 0, ret_path, ret_fd);
                 if (r != -ENOENT)
                         return r;
         }
@@ -189,9 +191,9 @@ int open_os_release(const char *root, char **ret_path, int *ret_fd) {
         int r;
 
         if (!empty_or_root(root)) {
-                rfd = open(root, O_CLOEXEC | O_DIRECTORY | O_PATH);
+                rfd = xopenat(AT_FDCWD, root, O_DIRECTORY | O_PATH);
                 if (rfd < 0)
-                        return -errno;
+                        return rfd;
         }
 
         r = open_os_release_at(rfd, ret_path ? &p : NULL, ret_fd ? &fd : NULL);
@@ -199,7 +201,7 @@ int open_os_release(const char *root, char **ret_path, int *ret_fd) {
                 return r;
 
         if (ret_path) {
-                r = chaseat_prefix_root(p, root, ret_path);
+                r = chaseat_make_absolute(p, root, ret_path);
                 if (r < 0)
                         return r;
         }
@@ -225,7 +227,7 @@ int open_extension_release_at(
         const char *p;
         int r;
 
-        assert(rfd >= 0 || IN_SET(rfd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(rfd));
         assert(!extension || (image_class >= 0 && image_class < _IMAGE_CLASS_MAX));
 
         if (!extension)
@@ -238,7 +240,7 @@ int open_extension_release_at(
                 return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "The extension name %s is invalid.", extension);
 
         p = strjoina(image_class_release_info[image_class].release_file_path_prefix, extension);
-        r = chaseat(rfd, p, CHASE_AT_RESOLVE_IN_ROOT, ret_path, ret_fd);
+        r = chaseat(rfd, rfd, p, /* flags= */ 0, ret_path, ret_fd);
         log_full_errno_zerook(LOG_DEBUG, MIN(r, 0), "Checking for %s: %m", p);
         if (r != -ENOENT)
                 return r;
@@ -249,7 +251,7 @@ int open_extension_release_at(
          * xattr is checked to ensure the author of the image considers it OK if names do not match. */
 
         p = image_class_release_info[image_class].release_file_directory;
-        r = chase_and_opendirat(rfd, p, CHASE_AT_RESOLVE_IN_ROOT, &dir_path, &dir);
+        r = chase_and_opendirat(rfd, rfd, p, /* chase_flags= */ 0, &dir_path, &dir);
         if (r < 0)
                 return log_debug_errno(r, "Cannot open %s, ignoring: %m", p);
 
@@ -271,9 +273,9 @@ int open_extension_release_at(
 
                 /* We already chased the directory, and checked that this is a real file, so we shouldn't
                  * fail to open it. */
-                fd = openat(dirfd(dir), de->d_name, O_PATH|O_CLOEXEC|O_NOFOLLOW);
+                fd = xopenat(dirfd(dir), de->d_name, O_PATH|O_NOFOLLOW);
                 if (fd < 0)
-                        return log_debug_errno(errno, "Failed to open release file %s/%s: %m", dir_path, de->d_name);
+                        return log_debug_errno(fd, "Failed to open release file %s/%s: %m", dir_path, de->d_name);
 
                 /* Really ensure it is a regular file after we open it. */
                 r = fd_verify_regular(fd);
@@ -337,9 +339,9 @@ int open_extension_release(
         int r;
 
         if (!empty_or_root(root)) {
-                rfd = open(root, O_CLOEXEC | O_DIRECTORY | O_PATH);
+                rfd = xopenat(AT_FDCWD, root, O_DIRECTORY | O_PATH);
                 if (rfd < 0)
-                        return -errno;
+                        return rfd;
         }
 
         r = open_extension_release_at(rfd, image_class, extension, relax_extension_release_check,
@@ -348,7 +350,7 @@ int open_extension_release(
                 return r;
 
         if (ret_path) {
-                r = chaseat_prefix_root(p, root, ret_path);
+                r = chaseat_make_absolute(p, root, ret_path);
                 if (r < 0)
                         return r;
         }
@@ -370,7 +372,7 @@ static int parse_extension_release_atv(
         _cleanup_free_ char *p = NULL;
         int r;
 
-        assert(rfd >= 0 || IN_SET(rfd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(rfd));
 
         r = open_extension_release_at(rfd, image_class, extension, relax_extension_release_check, &p, &fd);
         if (r < 0)
@@ -389,7 +391,7 @@ int parse_extension_release_at_sentinel(
         va_list ap;
         int r;
 
-        assert(rfd >= 0 || IN_SET(rfd, AT_FDCWD, XAT_FDROOT));
+        assert(wildcard_fd_is_valid(rfd));
 
         va_start(ap, extension);
         r = parse_extension_release_atv(rfd, image_class, extension, relax_extension_release_check, ap);
@@ -409,9 +411,9 @@ int parse_extension_release_sentinel(
         int r;
 
         if (!empty_or_root(root)) {
-                rfd = open(root, O_CLOEXEC | O_DIRECTORY | O_PATH);
+                rfd = xopenat(AT_FDCWD, root, O_DIRECTORY | O_PATH);
                 if (rfd < 0)
-                        return -errno;
+                        return rfd;
         }
 
         va_start(ap, extension);
@@ -424,6 +426,8 @@ int parse_extension_release_sentinel(
 int load_os_release_pairs_with_prefix(const char *root, const char *prefix, char ***ret) {
         _cleanup_strv_free_ char **os_release_pairs = NULL, **os_release_pairs_prefixed = NULL;
         int r;
+
+        assert(ret);
 
         r = load_os_release_pairs(root, &os_release_pairs);
         if (r < 0)
@@ -511,4 +515,47 @@ const char* os_release_pretty_name(const char *pretty_name, const char *name) {
 
         return empty_to_null(pretty_name) ?:
                 empty_to_null(name) ?: "Linux";
+}
+
+char *unescape_fancy_name(char **fancy_name) {
+        assert(fancy_name);
+
+        /* Checks if the fancy name is valid, unescapes if it is, nullifies it if not */
+
+        _cleanup_free_ char *unescaped_fancy_name = NULL;
+
+        if (isempty(*fancy_name))
+                goto clear;
+
+        /* We undo one level of C escapes on this */
+        ssize_t n = cunescape(*fancy_name, /* flags= */ 0, &unescaped_fancy_name);
+        if (n < 0) {
+                log_debug_errno((int) n, "Failed to unescape FANCY_NAME= string, suppressing: %m");
+                goto clear;
+        }
+
+        if (!utf8_is_valid(unescaped_fancy_name)) {
+                log_debug("Unescaped FANCY_NAME= string is not valid UTF-8, suppressing.");
+                goto clear;
+        }
+
+        free_and_replace(*fancy_name, unescaped_fancy_name);
+        return *fancy_name;
+
+clear:
+        *fancy_name = mfree(*fancy_name);
+        return NULL;
+}
+
+bool use_fancy_name(const char *fancy_name) {
+
+        /* Decides whether to show the specified fancy name */
+
+        if (isempty(fancy_name))
+                return false;
+
+        if (!colors_enabled())
+                return false;
+
+        return emoji_enabled() || ascii_is_valid(fancy_name);
 }

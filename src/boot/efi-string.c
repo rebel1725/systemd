@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include "efi-string.h"
-#include "string-util-fundamental.h"
+#include "string-util.h"
 
 #if SD_BOOT
 #  include "proto/simple-text-io.h"
@@ -120,6 +120,39 @@ DEFINE_STRCPY(char16_t, strcpy16);
 
 DEFINE_STRCHR(char, strchr8);
 DEFINE_STRCHR(char16_t, strchr16);
+
+const char16_t* path_filename16(const char16_t *path) {
+        assert(path);
+
+        /* Returns the part of an EFI path after the last backslash, or the whole path if there is none */
+
+        const char16_t *filename = path;
+        for (const char16_t *p = path; *p; p++)
+                if (*p == '\\')
+                        filename = p + 1;
+
+        return filename;
+}
+
+#define DEFINE_STRSTR(type, name, len_func)                                     \
+        type *name(const type *haystack, const type *needle) {                  \
+                if (!haystack || !needle)                                       \
+                        return NULL;                                            \
+                                                                                \
+                size_t n = len_func(needle);                                    \
+                for (const type *p = haystack; ; p++) {                         \
+                        size_t i = 0;                                           \
+                        for (; i < n && p[i] == needle[i]; i++)                 \
+                                ;                                               \
+                        if (i == n)                                             \
+                                return (type *) p;                              \
+                        if (p[i] == 0)                                          \
+                                return NULL;                                    \
+                }                                                               \
+        }
+
+DEFINE_STRSTR(char, strstr8, strlen8);
+DEFINE_STRSTR(char16_t, strstr16, strlen16);
 
 #define DEFINE_STRNDUP(type, name, len_func)              \
         type *name(const type *s, size_t n) {             \
@@ -349,6 +382,8 @@ static bool efi_fnmatch_prefix(const char16_t *p, const char16_t *h, const char1
 
 /* Patterns are fnmatch-compatible (with reduced feature support). */
 bool efi_fnmatch(const char16_t *pattern, const char16_t *haystack) {
+        assert(haystack);
+
         /* Patterns can be considered as simple patterns (without '*') concatenated by '*'. By doing so we
          * simply have to make sure the very first simple pattern matches the start of haystack. Then we just
          * look for the remaining simple patterns *somewhere* within the haystack (in order) as any extra
@@ -498,7 +533,7 @@ char* line_get_key_value(char *s, const char *sep, size_t *pos, char **ret_key, 
                         value++;
 
                 /* unquote */
-                if (strchr8(QUOTES, value[0]) && line[linelen - 1] == value[0]) {
+                if (value[0] != '\0' && strchr8(QUOTES, value[0]) && line[linelen - 1] == value[0]) {
                         value++;
                         line[linelen - 1] = '\0';
                 }
@@ -509,7 +544,7 @@ char* line_get_key_value(char *s, const char *sep, size_t *pos, char **ret_key, 
         }
 }
 
-char16_t *hexdump(const void *data, size_t size) {
+char16_t *hexdump16(const void *data, size_t size) {
         const char *hex = LOWERCASE_HEXDIGITS;
         const uint8_t *d = data;
 
@@ -1024,24 +1059,24 @@ _printf_(2, 0) static char16_t *printf_internal(EFI_STATUS status, const char *f
 void printf_status(EFI_STATUS status, const char *format, ...) {
         va_list ap;
         va_start(ap, format);
-        printf_internal(status, format, ap, false);
+        printf_internal(status, format, ap, /* ret= */ false);
         va_end(ap);
 }
 
 void vprintf_status(EFI_STATUS status, const char *format, va_list ap) {
-        printf_internal(status, format, ap, false);
+        printf_internal(status, format, ap, /* ret= */ false);
 }
 
 char16_t *xasprintf_status(EFI_STATUS status, const char *format, ...) {
         va_list ap;
         va_start(ap, format);
-        char16_t *ret = printf_internal(status, format, ap, true);
+        char16_t *ret = printf_internal(status, format, ap, /* ret= */ true);
         va_end(ap);
         return ret;
 }
 
 char16_t *xvasprintf_status(EFI_STATUS status, const char *format, va_list ap) {
-        return printf_internal(status, format, ap, true);
+        return printf_internal(status, format, ap, /* ret= */ true);
 }
 
 #if SD_BOOT

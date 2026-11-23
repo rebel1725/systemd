@@ -17,7 +17,8 @@ run_with_cred_compare() (
     trap "rm -f '$log_file'" RETURN
 
     set -o pipefail
-    systemd-run -p SetCredential="$cred" --wait --pipe -- systemd-creds "$@" | tee "$log_file"
+    # This has been observed to get stuck under ASAN, so add a timeout as precaution
+    timeout 120 systemd-run -p SetCredential="$cred" --wait --pipe -- systemd-creds "$@" | tee "$log_file"
     diff "$log_file" <(echo -ne "$exp")
 )
 
@@ -114,10 +115,9 @@ run_with_cred_compare "mycred:" "" cat mycred
 run_with_cred_compare "mycred:\n" "\n" cat mycred
 run_with_cred_compare "mycred:foo" "foo" cat mycred
 run_with_cred_compare "mycred:foo" "foofoofoo" cat mycred mycred mycred
-# Note: --newline= does nothing when stdout is not a tty, which is the case here
-run_with_cred_compare "mycred:foo" "foo" --newline=yes cat mycred
-run_with_cred_compare "mycred:foo" "foo" --newline=no cat mycred
 run_with_cred_compare "mycred:foo" "foo" --newline=auto cat mycred
+run_with_cred_compare "mycred:foo" "foo" --newline=no cat mycred
+run_with_cred_compare "mycred:foo" "foo\n" --newline=yes cat mycred
 run_with_cred_compare "mycred:foo" "foo" --transcode=no cat mycred
 run_with_cred_compare "mycred:foo" "foo" --transcode=0 cat mycred
 run_with_cred_compare "mycred:foo" "foo" --transcode=false cat mycred
@@ -165,6 +165,50 @@ rm -f /tmp/cred.{enc,dec}
 systemd-creds --not-after="+1d" encrypt /tmp/cred.orig /tmp/cred.enc
 (! systemd-creds --timestamp="+2d" decrypt /tmp/cred.enc /tmp/cred.dec)
 systemd-creds decrypt /tmp/cred.enc /tmp/cred.dec
+diff /tmp/cred.orig /tmp/cred.dec
+rm -f /tmp/cred.{enc,dec}
+ts="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+(! systemd-creds --with-key=null --timestamp="$ts" --not-after="$ts" encrypt /tmp/cred.orig /tmp/cred.enc)
+
+# Null-key credentials and the systemd.credentials_boot_policy= setting.
+#
+# A null-key credential ("--with-key=null") is wrapped in the normal systemd-creds
+# envelope but offers neither confidentiality nor authenticity, so whether it is
+# accepted at decrypt time is governed by systemd.credentials_boot_policy= and the system
+# state. We only assert the branches that are deterministic regardless of the test
+# bed's TPM2/SecureBoot state (which is fixed and has no test override here); the
+# full accepts_null() truth table for all states is covered by test-creds.c.
+systemd-creds --name=nullcred --with-key=null encrypt /tmp/cred.orig /tmp/cred.enc
+
+# --allow-null bypasses the policy, even under the strictest setting.
+SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=strict" \
+    systemd-creds --name=nullcred --allow-null decrypt /tmp/cred.enc /tmp/cred.dec
+diff /tmp/cred.orig /tmp/cred.dec
+rm -f /tmp/cred.dec
+
+# --refuse-null always refuses, even under the most permissive setting.
+(! SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=off" \
+    systemd-creds --name=nullcred --refuse-null decrypt /tmp/cred.enc /tmp/cred.dec)
+
+# strict never accepts a null key, regardless of system state.
+(! SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=strict" \
+    systemd-creds --name=nullcred decrypt /tmp/cred.enc /tmp/cred.dec)
+
+# off always accepts a null key, regardless of system state.
+SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=off" \
+    systemd-creds --name=nullcred decrypt /tmp/cred.enc /tmp/cred.dec
+diff /tmp/cred.orig /tmp/cred.dec
+rm -f /tmp/cred.dec
+
+# An invalid policy value falls back to the default (relaxed), which accepts during first boot.
+SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=bogus" SYSTEMD_FIRST_BOOT=1 \
+    systemd-creds --name=nullcred decrypt /tmp/cred.enc /tmp/cred.dec
+diff /tmp/cred.orig /tmp/cred.dec
+rm -f /tmp/cred.dec
+
+# tofu accepts during first boot, independent of TPM2/SecureBoot.
+SYSTEMD_PROC_CMDLINE="systemd.credentials_boot_policy=tofu" SYSTEMD_FIRST_BOOT=1 \
+    systemd-creds --name=nullcred decrypt /tmp/cred.enc /tmp/cred.dec
 diff /tmp/cred.orig /tmp/cred.dec
 rm -f /tmp/cred.{enc,dec}
 
@@ -230,6 +274,11 @@ elif [ -d /sys/firmware/qemu_fw_cfg/by_name ]; then
     # Verify that passing creds through kernel cmdline works
     [ "$(systemd-creds --system cat kernelcmdlinecred)" = "uff" ]
     [ "$(systemd-creds --system cat waldi)" = "woooofffwufffwuff" ]
+    # Kernel command line credentials are not subject to systemd.import_credentials_filter=…
+    [ "$(systemd-creds --system cat zcmdlinecred)" = "yes" ]
+    # …but SMBIOS and qemu fw_cfg ones are
+    (! systemd-creds --system cat zfilteredcred)
+    (! systemd-creds --system cat zfilteredqemucred)
 
     # And that it also works via SMBIOS
     [ "$(systemd-creds --system cat smbioscredential)" = "magicdata" ]
@@ -324,6 +373,12 @@ echo -n b >/etc/credstore/test.creds.second
 echo -n c >/etc/credstore/test.creds.third
 # Credential name cannot contain ':'
 echo -n hoge >/etc/credstore/test.creds.hoge:invalid
+
+# Conditions and asserts consider the credential stores, too
+systemd-run -p AssertCredential=test.creds.first -p Type=oneshot true
+systemd-run -p AssertCredential=test.creds.third -p Type=oneshot true
+(! systemd-run -p AssertCredential=!test.creds.first -p Type=oneshot true)
+(! systemd-run -p AssertCredential=test.creds.undefined -p Type=oneshot true)
 
 # Check if credentials with invalid names are not imported.
 systemd-run -p "ImportCredential=test.creds.*" \
@@ -557,6 +612,14 @@ run0 -u testuser --pipe systemd-run --user --pipe -p ImportCredential=brummbaer 
 # https://github.com/systemd/systemd/pull/40108
 run0 -u testuser --pipe systemd-run --user --wait -p ImportCredential=brummbaer -p ExecStartPre='ls -l $CREDENTIALS_DIRECTORY' bash -c 'systemd-creds cat brummbaer | cmp /tmp/brummbaer.data'
 
+# https://github.com/systemd/systemd/issues/44728
+# Leftover temporary credential workspaces must be removed when the unit is destroyed.
+STALE_WORKSPACE="/run/user/$(id -u testuser)/systemd/temporary-credentials/stale-creds.service"
+run0 -u testuser --pipe mkdir -p "$STALE_WORKSPACE"
+assert_rc 243 systemd-run -M testuser@ --user --wait --collect --unit=stale-creds.service -p LoadCredential=brummbaer:/tmp/brummbaer.data /bin/true
+timeout 10 bash -c 'until [[ ! -e "$1" ]]; do sleep .1; done' _ "$STALE_WORKSPACE"
+systemd-run -M testuser@ --user --wait --collect --unit=stale-creds.service -p LoadCredential=brummbaer:/tmp/brummbaer.data /bin/true
+
 # https://github.com/systemd/systemd/pull/39651
 TESTUSER_CRED_DIR="/run/user/$(id -u testuser)/credentials"
 
@@ -650,6 +713,9 @@ diff "$OUTPUT_FILE" <(grep . /run/credentials/"$UNIT_NAME"/*)
 [[ ! -e "$POST_FLAG_FILE" ]]
 
 OUTPUT_FILE_USER="/tmp/TEST-54-CREDS-refreshing-user.out"
+USER_REFRESH_SOURCE="/tmp/TEST-54-CREDS-refreshing-user.cred"
+echo "initial" >"$USER_REFRESH_SOURCE"
+chmod 0644 "$USER_REFRESH_SOURCE"
 
 systemd-notify --fork -- \
     systemd-run -M testuser@ --user --wait \
@@ -657,7 +723,9 @@ systemd-notify --fork -- \
         --service-type=notify-reload \
         -p NotifyAccess=all \
         -p 'ImportCredential=brummbaer*' \
+        -p "LoadCredential=reload-timeout:$USER_REFRESH_SOURCE" \
         -p RefreshOnReload=credentials \
+        -p TimeoutStartSec=10s \
         -p ProtectSystem=strict \
         -p ReadWritePaths=/tmp \
         /usr/lib/systemd/tests/testdata/TEST-54-CREDS.units/refresh.sh "$OUTPUT_FILE_USER"
@@ -672,5 +740,20 @@ run0 -u testuser --pipe -i \
 systemctl -M testuser@ --user reload brummbaer-refresh.service
 assert_eq "$(cat "$TESTUSER_CRED_DIR"/brummbaer-refresh.service/brummbaer.refreshed)" "refreshed"
 diff "$OUTPUT_FILE_USER" <(grep . "$TESTUSER_CRED_DIR"/brummbaer-refresh.service/*)
+
+# A stale workspace left by a timed-out credential refresh must not break the next refresh.
+rm "$USER_REFRESH_SOURCE"
+mkfifo "$USER_REFRESH_SOURCE"
+chmod 0644 "$USER_REFRESH_SOURCE"
+(! systemctl -M testuser@ --user reload brummbaer-refresh.service)
+assert_eq "$(systemctl -M testuser@ --user show brummbaer-refresh.service -P ReloadResult)" "timeout"
+[[ -d "/run/user/$(id -u testuser)/systemd/temporary-credentials/brummbaer-refresh.service" ]]
+
+rm "$USER_REFRESH_SOURCE"
+echo "after-timeout" >"$USER_REFRESH_SOURCE"
+chmod 0644 "$USER_REFRESH_SOURCE"
+systemctl -M testuser@ --user reload brummbaer-refresh.service
+assert_eq "$(cat "$TESTUSER_CRED_DIR"/brummbaer-refresh.service/reload-timeout)" "after-timeout"
+[[ ! -e "/run/user/$(id -u testuser)/systemd/temporary-credentials/brummbaer-refresh.service" ]]
 
 touch /testok

@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 
 const char* watchdog_get_device(void);
 usec_t watchdog_get_last_ping(clockid_t clock);
@@ -17,5 +17,5 @@ void watchdog_close(bool disarm);
 usec_t watchdog_runtime_wait(unsigned divisor);
 
 static inline void watchdog_free_device(void) {
-        (void) watchdog_set_device(NULL);
+        (void) watchdog_set_device(/* path= */ NULL);
 }

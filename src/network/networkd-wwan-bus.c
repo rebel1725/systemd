@@ -399,7 +399,7 @@ static int bearer_get_all_handler(sd_bus_message *message, void *userdata, sd_bu
         if (r == 0)
                 return 0;
 
-        r = sd_bus_message_rewind(message, true);
+        r = sd_bus_message_rewind(message, /* complete= */ true);
         if (r < 0)
                 return log_warning_errno(r, "Failed to rewind properties of bearer \"%s\"", b->path);
         /* skip name: string "org.freedesktop.ModemManager1.Bearer" */
@@ -581,7 +581,7 @@ static int bus_call_method_async_props(
         if (r < 0)
                 return bus_log_create_error(r);
 
-        return sd_bus_call_async(bus, slot, m, callback, userdata, 0);
+        return sd_bus_call_async(bus, slot, m, callback, userdata, /* usec= */ 0);
 }
 
 static void modem_simple_connect(Modem *modem) {
@@ -604,9 +604,9 @@ static void modem_simple_connect(Modem *modem) {
         if (!modem->port_name)
                 return;
 
-        (void) link_get_by_name(modem->manager, modem->port_name, &link);
-        if (!link)
-                return (void) log_debug("ModemManager: cannot find link for %s", modem->port_name);
+        r = link_get_by_name(modem->manager, modem->port_name, &link);
+        if (r < 0)
+                return (void) log_debug_errno(r, "ModemManager: cannot find link for %s: %m", modem->port_name);
 
         /* Check if .network file found at all */
         if (!link->network)
@@ -807,15 +807,10 @@ static int bearer_properties_changed_handler(
         if (!path)
                 return 0;
 
-        if (bearer_get_by_path(manager, path, &modem, &b) < 0) {
-                /*
-                 * Have new bearer: check if we have the corresponding modem
-                 * for it which we might not during initialization.
-                 */
-                if (modem)
-                        (void) bearer_new_and_initialize(modem, path);
+        if (bearer_get_by_path(manager, path, &modem, &b) < 0)
+                /* Unknown bearer, nothing to do. Modem-bearer association is handled
+                 * by modem_map_bearers() during modem property initialization. */
                 return 0;
-        }
 
         if (b->slot_getall) {
                 /* Not initialized yet. Re-initialize it. */
@@ -862,7 +857,7 @@ static int modem_map_ports(
         uint32_t port_type;
         int r;
 
-        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, NULL);
+        r = sd_bus_message_enter_container(m, SD_BUS_TYPE_ARRAY, /* contents= */ NULL);
         if (r < 0)
                 return bus_log_parse_error_debug(r);
 
@@ -887,12 +882,12 @@ static int modem_properties_changed_signal(
                 sd_bus_error *ret_error) {
 
         static const struct bus_properties_map map[] = {
-                { "Bearers",       "a{sv}", modem_map_bearers, 0,                                 },
+                { "Bearers",          "ao", modem_map_bearers, 0,                                 },
                 { "State",             "i", NULL,              offsetof(Modem, state)             },
                 { "StateFailedReason", "u", NULL,              offsetof(Modem, state_fail_reason) },
                 { "Manufacturer",      "s", NULL,              offsetof(Modem, manufacturer)      },
                 { "Model",             "s", NULL,              offsetof(Modem, model)             },
-                { "Ports",         "a{su}", modem_map_ports,   0,                                 },
+                { "Ports",         "a(su)", modem_map_ports,   0,                                 },
                 {}
         };
         Modem *modem = ASSERT_PTR(userdata);
@@ -914,7 +909,7 @@ static int modem_properties_changed_signal(
         if (r == 0)
                 return 0;
 
-        r = sd_bus_message_rewind(message, true);
+        r = sd_bus_message_rewind(message, /* complete= */ true);
         if (r < 0)
                 return log_warning_errno(r, "Failed to rewind properties of modem %s", modem->path);
         old_state = modem->state;
@@ -974,7 +969,7 @@ static int modem_add(Manager *m, const char *path, sd_bus_message *message, sd_b
                 { "StateFailedReason", "u",     NULL,              offsetof(Modem, state_fail_reason) },
                 { "Manufacturer",      "s",     NULL,              offsetof(Modem, manufacturer)      },
                 { "Model",             "s",     NULL,              offsetof(Modem, model)             },
-                { "Ports",             "a{su}", modem_map_ports,   0,                                 },
+                { "Ports",             "a(su)", modem_map_ports,   0,                                 },
                 {}
         };
         Modem *modem;
@@ -1187,7 +1182,7 @@ int manager_match_mm_signals(Manager *manager) {
                         /* install_callback= */ NULL,
                         manager);
         if (r < 0)
-                return log_error_errno(r, "Failed to request signal for IntefaceAdded");
+                return log_error_errno(r, "Failed to request signal for InterfaceAdded");
 
         r = sd_bus_match_signal_async(
                         manager->bus,
@@ -1200,7 +1195,7 @@ int manager_match_mm_signals(Manager *manager) {
                         /* install_callback= */ NULL,
                         manager);
         if (r < 0)
-                return log_error_errno(r, "Failed to request signal for IntefaceRemoved");
+                return log_error_errno(r, "Failed to request signal for InterfaceRemoved");
 
         /* N.B. We need "path_namespace" for bearers, not "path", */
         r = sd_bus_add_match_async(

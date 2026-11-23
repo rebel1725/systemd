@@ -74,6 +74,11 @@
         One or both of the <varname>host=</varname> and <varname>port=</varname> keys must be present, while
         the rest is optional. <replaceable>family</replaceable> may be either <option>ipv4</option> or
         <option>ipv6</option>.</para>
+
+        <para>Note: <emphasis>connections over TCP are made without encryption</emphasis>. Thus, this mode
+        should only be used in specific situations where integrity and confidentiality of the connection is
+        not necessary or is ensured through some other means. For local connections, <literal>unix:</literal>
+        connections should be used instead.</para>
       </listitem>
 
       <listitem>
@@ -136,7 +141,7 @@
           <listitem><para>The input parameters <parameter>bus</parameter> or <parameter>address</parameter> are <constant>NULL</constant>.
           </para>
 
-          <xi:include href="version-info.xml" xpointer="v246"/></listitem>
+          <xi:include href="version-info.xml" xpointer="v221"/></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -144,7 +149,7 @@
 
           <listitem><para>The bus object <parameter>bus</parameter> could not be resolved.</para>
 
-          <xi:include href="version-info.xml" xpointer="v246"/>
+          <xi:include href="version-info.xml" xpointer="v237"/>
           </listitem>
         </varlistentry>
 
@@ -154,7 +159,7 @@
           <listitem><para>The input parameter <parameter>bus</parameter> is in a wrong state
           (<function>sd_bus_set_address()</function> may only be called once on a newly-created bus object).</para>
 
-          <xi:include href="version-info.xml" xpointer="v246"/>
+          <xi:include href="version-info.xml" xpointer="v221"/>
           </listitem>
         </varlistentry>
 
@@ -164,7 +169,7 @@
           <listitem><para>The bus object <parameter>bus</parameter> was created in a different
           process.</para>
 
-          <xi:include href="version-info.xml" xpointer="v246"/>
+          <xi:include href="version-info.xml" xpointer="v221"/>
           </listitem>
         </varlistentry>
 
@@ -173,20 +178,20 @@
 
           <listitem><para>The bus object <parameter>bus</parameter> has no address configured.</para>
 
-          <xi:include href="version-info.xml" xpointer="v246"/>
+          <xi:include href="version-info.xml" xpointer="v221"/>
           </listitem>
         </varlistentry>
       </variablelist>
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
 
   <refsect1>
     <title>History</title>
     <para><function>sd_bus_set_address()</function>,
     <function>sd_bus_get_address()</function>, and
-    <function>sd_bus_set_exec()</function> were added in version 246.</para>
+    <function>sd_bus_set_exec()</function> were added in version 221.</para>
   </refsect1>
 
   <refsect1>

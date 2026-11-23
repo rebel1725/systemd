@@ -157,7 +157,7 @@ static int bus_creds_new_from_pidref(sd_bus_creds **ret, PidRef *pidref, uint64_
         if (!c)
                 return -ENOMEM;
 
-        r = bus_creds_add_more(c, mask | SD_BUS_CREDS_AUGMENT, pidref, 0);
+        r = bus_creds_add_more(c, mask | SD_BUS_CREDS_AUGMENT, pidref, /* tid= */ 0);
         if (r < 0)
                 return r;
 
@@ -358,6 +358,7 @@ _public_ int sd_bus_creds_get_tid(sd_bus_creds *c, pid_t *ret) {
 
 _public_ int sd_bus_creds_get_selinux_context(sd_bus_creds *c, const char **ret) {
         assert_return(c, -EINVAL);
+        assert_return(ret, -EINVAL);
 
         if (!(c->mask & SD_BUS_CREDS_SELINUX_CONTEXT))
                 return -ENODATA;
@@ -1138,7 +1139,7 @@ int bus_creds_add_more(sd_bus_creds *c, uint64_t mask, PidRef *pidref, pid_t tid
         }
 
         if (missing & SD_BUS_CREDS_TTY) {
-                r = get_ctty(pidref->pid, NULL, &c->tty);
+                r = get_ctty(pidref->pid, /* ret_devnr= */ NULL, &c->tty);
                 if (r == -ENXIO) {
                         /* ENXIO means: process has no controlling TTY */
                         c->tty = NULL;

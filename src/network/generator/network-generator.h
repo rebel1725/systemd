@@ -52,8 +52,14 @@ struct Route {
 };
 
 struct Network {
+        /* What the network was specified by on the kernel command line. Key in Context.networks_by_name,
+         * and the generated file is named after it. */
+        char *key;
+
         /* [Match] */
         char *ifname;
+        /* From BOOTIF=, or a MAC address given in place of an interface name. */
+        struct hw_addr_data match_mac;
 
         /* [Link] */
         struct ether_addr mac;
@@ -98,16 +104,23 @@ struct Link {
 };
 
 typedef struct Context {
+        char *network_dir;
+        char *networkd_conf_dropin_dir;
+
         Hashmap *networks_by_name;
         Hashmap *netdevs_by_name;
         Hashmap *links_by_filename;
+
+        /* If rd.bootif=0, ignore BOOTIF= parsing */
+        bool skip_bootif;
 } Context;
 
 int parse_cmdline_item(const char *key, const char *value, void *data);
 int context_merge_networks(Context *context);
 void context_clear(Context *context);
+void context_finalize_bootif(Context *context);
 
-Network *network_get(Context *context, const char *ifname);
+Network *network_get(Context *context, const char *key);
 void network_dump(Network *network, FILE *f);
 int network_format(Network *network, char **ret);
 

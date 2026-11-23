@@ -3,26 +3,42 @@
 
 #include "sd-device.h" /* IWYU pragma: export */
 
-#include "sd-forward.h"
+#include "forward.h"
 
 int device_new_from_mode_and_devnum(sd_device **ret, mode_t mode, dev_t devnum);
 int device_new_from_nulstr(sd_device **ret, char *nulstr, size_t len);
 int device_new_from_strv(sd_device **ret, char **strv);
 
+int device_open(sd_device *device, int flags);
 int device_opendir(sd_device *device, const char *subdir, DIR **ret);
+
+bool device_property_name_is_valid(const char *name);
 
 int device_get_sysnum_unsigned(sd_device *device, unsigned *ret);
 int device_get_property_bool(sd_device *device, const char *key);
 int device_get_property_int(sd_device *device, const char *key, int *ret);
 int device_get_property_uint(sd_device *device, const char *key, unsigned *ret);
 int device_get_ifname(sd_device *device, const char **ret);
-int device_get_sysattr_int(sd_device *device, const char *sysattr, int *ret_value);
-int device_get_sysattr_unsigned_full(sd_device *device, const char *sysattr, unsigned base, unsigned *ret_value);
-static inline int device_get_sysattr_unsigned(sd_device *device, const char *sysattr, unsigned *ret_value) {
-        return device_get_sysattr_unsigned_full(device, sysattr, 0, ret_value);
+int device_get_sysattr_streq(sd_device *device, const char *sysattr, const char *expected);
+int device_get_sysattr_safe_string(sd_device *device, const char *sysattr, const char **ret);
+int device_get_sysattr_int(sd_device *device, const char *sysattr, int *ret);
+int device_get_sysattr_unsigned_full(sd_device *device, const char *sysattr, unsigned base, unsigned *ret);
+static inline int device_get_sysattr_unsigned(sd_device *device, const char *sysattr, unsigned *ret) {
+        return device_get_sysattr_unsigned_full(device, sysattr, /* base= */ 0, ret);
 }
-int device_get_sysattr_u32(sd_device *device, const char *sysattr, uint32_t *ret_value);
-int device_get_sysattr_u64(sd_device *device, const char *sysattr, uint64_t *ret_value);
+int device_get_sysattr_u8_full(sd_device *device, const char *sysattr, unsigned base, uint8_t *ret);
+static inline int device_get_sysattr_u8(sd_device *device, const char *sysattr, uint8_t *ret) {
+        return device_get_sysattr_u8_full(device, sysattr, /* base= */ 0, ret);
+}
+int device_get_sysattr_u16_full(sd_device *device, const char *sysattr, unsigned base, uint16_t *ret);
+static inline int device_get_sysattr_u16(sd_device *device, const char *sysattr, uint16_t *ret) {
+        return device_get_sysattr_u16_full(device, sysattr, /* base= */ 0, ret);
+}
+int device_get_sysattr_u32_full(sd_device *device, const char *sysattr, unsigned base, uint32_t *ret);
+static inline int device_get_sysattr_u32(sd_device *device, const char *sysattr, uint32_t *ret) {
+        return device_get_sysattr_u32_full(device, sysattr, /* base= */ 0, ret);
+}
+int device_get_sysattr_u64(sd_device *device, const char *sysattr, uint64_t *ret);
 int device_get_sysattr_bool(sd_device *device, const char *sysattr);
 int device_get_devlink_priority(sd_device *device, int *ret);
 int device_get_devnode_mode(sd_device *device, mode_t *ret);
@@ -67,7 +83,7 @@ int device_delete_db(sd_device *device);
 int device_read_db_internal_filename(sd_device *device, const char *filename); /* For fuzzer */
 int device_read_db_internal(sd_device *device, bool force);
 static inline int device_read_db(sd_device *device) {
-        return device_read_db_internal(device, false);
+        return device_read_db_internal(device, /* force= */ false);
 }
 
 int device_read_uevent_file(sd_device *device);

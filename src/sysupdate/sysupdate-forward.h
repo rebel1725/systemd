@@ -3,10 +3,15 @@
 
 /* IWYU pragma: always_keep */
 
-#include "shared-forward.h" /* IWYU pragma: export */
+#include "forward.h" /* IWYU pragma: export */
 
+typedef enum ComponentFailureAction ComponentFailureAction;
+typedef enum ComponentSuccessAction ComponentSuccessAction;
+typedef struct Component Component;
 typedef struct Context Context;
-typedef struct PartitionInfo PartitionInfo;
-typedef struct Resource Resource;
 typedef struct Instance Instance;
 typedef struct InstanceMetadata InstanceMetadata;
+typedef struct PartitionInfo PartitionInfo;
+typedef struct Resource Resource;
+typedef struct Transfer Transfer;
+typedef struct UpdateSet UpdateSet;

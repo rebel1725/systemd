@@ -1,0 +1,3419 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <fcntl.h>
+#include <poll.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
+
+#include "sd-event.h"
+#include "sd-future.h"
+#include "sd-json.h"
+#include "sd-varlink.h"
+
+#include "dirent-util.h"
+#include "fd-util.h"
+#include "io-util.h"
+#include "json-util.h"
+#include "memfd-util.h"
+#include "path-util.h"
+#include "pidfd-util.h"
+#include "process-util.h"
+#include "rm-rf.h"
+#include "socket-util.h"
+#include "string-util.h"
+#include "strv.h"
+#include "tests.h"
+#include "time-util.h"
+#include "tmpfile-util.h"
+#include "varlink-future.h"
+#include "varlink-internal.h"
+#include "varlink-util.h"
+#include "xattr-util.h"
+
+/* Let's pick some high value, that is higher than the largest listen() backlog, but leaves enough room below
+   the typical RLIMIT_NOFILE value of 1024 so that we can process both sides of each socket in our
+   process. Or in other words: "OVERLOAD_CONNECTIONS * 2 + x < 1024" should hold, for some small x that
+   should cover any auxiliary fds, the listener server fds, stdin/stdout/stderr and whatever else. */
+#define OVERLOAD_CONNECTIONS 333
+
+static int n_done = 0;
+static int block_write_fd = -EBADF;
+
+static int method_something(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *ret = NULL;
+        sd_json_variant *a, *b;
+        int64_t x, y;
+        int r;
+
+        a = sd_json_variant_by_key(parameters, "a");
+        if (!a)
+                return ASSERT_ERROR(sd_varlink_error(link, "io.test.BadParameters", /* parameters= */ NULL), EBADR);
+
+        x = sd_json_variant_integer(a);
+
+        b = sd_json_variant_by_key(parameters, "b");
+        if (!b)
+                return ASSERT_ERROR(sd_varlink_error(link, "io.test.BadParameters", /* parameters= */ NULL), EBADR);
+
+        y = sd_json_variant_integer(b);
+
+        r = sd_json_build(&ret, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_INTEGER("sum", x + y)));
+        if (r < 0)
+                return r;
+
+        return sd_varlink_reply(link, ret);
+}
+
+static int method_something_more(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *ret = NULL;
+        int r;
+
+        struct Something {
+                int x;
+                int y;
+        };
+
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "a", SD_JSON_VARIANT_INTEGER, sd_json_dispatch_int, offsetof(struct Something, x), SD_JSON_MANDATORY },
+                { "b", SD_JSON_VARIANT_INTEGER, sd_json_dispatch_int, offsetof(struct Something, y), SD_JSON_MANDATORY},
+                {}
+        };
+        struct Something s = {};
+
+        r = sd_varlink_dispatch(link, parameters, dispatch_table, &s);
+        if (r != 0)
+                return r;
+
+        for (int i = 0; i < 5; i++) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *w = NULL;
+
+                r = sd_json_build(&w, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_INTEGER("sum", s.x + (s.y * i))));
+                if (r < 0)
+                        return r;
+
+                r = sd_varlink_notify(link, w);
+                if (r < 0)
+                        return r;
+        }
+
+        r = sd_json_build(&ret, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_INTEGER("sum", s.x + (s.y * 5))));
+        if (r < 0)
+                return r;
+
+        return sd_varlink_reply(link, ret);
+}
+
+static void test_fd(int fd, const void *buf, size_t n) {
+        char rbuf[n + 1];
+        ssize_t m;
+
+        ASSERT_OK_ERRNO(m = read(fd, rbuf, n + 1));
+        ASSERT_MEMEQ_NN(buf, n, rbuf, m);
+}
+
+static int method_passfd(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *ret = NULL;
+        sd_json_variant *a;
+        int r;
+
+        a = sd_json_variant_by_key(parameters, "fd");
+        if (!a)
+                return ASSERT_ERROR(sd_varlink_error_invalid_parameter_name(link, "fd"), EINVAL);
+
+        ASSERT_STREQ(sd_json_variant_string(a), "whoop");
+
+        int xx, yy, zz;
+        ASSERT_OK(xx = sd_varlink_peek_fd(link, 0));
+        ASSERT_OK(yy = sd_varlink_peek_fd(link, 1));
+        ASSERT_OK(zz = sd_varlink_peek_fd(link, 2));
+
+        log_info("%i %i %i", xx, yy, zz);
+
+        test_fd(xx, "foo", 3);
+        test_fd(yy, "bar", 3);
+        test_fd(zz, "quux", 4);
+
+        _cleanup_close_ int vv = -EBADF, ww = -EBADF;
+        ASSERT_OK(vv = memfd_new_and_seal_string("data", "miau"));
+        ASSERT_OK(ww = memfd_new_and_seal_string("data", "wuff"));
+
+        r = sd_json_build(&ret, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_INTEGER("yo", 88)));
+        if (r < 0)
+                return r;
+
+        ASSERT_OK_EQ(sd_varlink_push_fd(link, vv), 0);
+        ASSERT_OK_EQ(sd_varlink_push_fd(link, ww), 1);
+
+        TAKE_FD(vv);
+        TAKE_FD(ww);
+
+        return sd_varlink_reply(link, ret);
+}
+
+static int method_fail_with_errno(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        int r;
+
+        r = sd_varlink_dispatch(link, parameters, /* dispatch_table= */ NULL, /* userdata= */ NULL);
+        if (r != 0)
+                return r;
+
+        return sd_varlink_error_errno(link, EHWPOISON);
+}
+
+static int method_done(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+
+        if (++n_done == 2)
+                sd_event_exit(sd_varlink_get_event(link), EXIT_FAILURE);
+
+        return 0;
+}
+
+static int reply(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        sd_json_variant *sum;
+
+        sum = sd_json_variant_by_key(parameters, "sum");
+
+        ASSERT_EQ(sd_json_variant_integer(sum), 7+22);
+
+        if (++n_done == 2)
+                sd_event_exit(sd_varlink_get_event(link), EXIT_FAILURE);
+
+        return 0;
+}
+
+static int on_connect(sd_varlink_server *s, sd_varlink *link, void *userdata) {
+        uid_t uid = UID_INVALID;
+
+        ASSERT_NOT_NULL(s);
+        ASSERT_NOT_NULL(link);
+
+        ASSERT_OK(sd_varlink_get_peer_uid(link, &uid));
+        ASSERT_EQ(getuid(), uid);
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_input(link, true));
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_output(link, true));
+
+        return 0;
+}
+
+static int overload_reply(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+
+        /* This method call reply should always be called with a disconnection, since the method call should
+         * be talking to an overloaded server */
+
+        log_debug("Over reply triggered with error: %s", strna(error_id));
+        ASSERT_STREQ(error_id, SD_VARLINK_ERROR_DISCONNECTED);
+        /* Local disconnect errors carry empty parameters. Ensure we propagate
+         * a consistent empty object for API reliability. */
+        ASSERT_TRUE(sd_json_variant_is_blank_object(parameters));
+        sd_event_exit(sd_varlink_get_event(link), /* code= */ 0);
+
+        return 0;
+}
+
+static void flood_test(const char *address) {
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *c = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_free_ sd_varlink **connections = NULL;
+        size_t k;
+        char x = 'x';
+
+        log_debug("Flooding server...");
+
+        /* Block the main event loop while we flood */
+        ASSERT_OK_EQ_ERRNO(write(block_write_fd, &x, sizeof(x)), (ssize_t) sizeof(x));
+
+        /* Create a fresh event loop for the flood test — we can't reuse the default event because the
+         * main test (and the fiber we're running in) is already running it, and sd_event_loop() asserts
+         * the event is in the INITIAL state. Exit-on-idle so the nested loop terminates once the
+         * overload reply has been received and all other work is quiesced. */
+        ASSERT_OK(sd_event_new(&e));
+        ASSERT_OK(sd_event_set_exit_on_idle(e, true));
+
+        /* Flood the server with connections */
+        ASSERT_NOT_NULL(connections = new0(sd_varlink*, OVERLOAD_CONNECTIONS));
+        for (k = 0; k < OVERLOAD_CONNECTIONS; k++) {
+                _cleanup_free_ char *t = NULL;
+                log_debug("connection %zu", k);
+                ASSERT_OK(sd_varlink_connect_address(connections + k, address));
+
+                ASSERT_OK(asprintf(&t, "flood-%zu", k));
+                ASSERT_OK(sd_varlink_set_description(connections[k], t));
+                ASSERT_OK(sd_varlink_attach_event(connections[k], e, k));
+                ASSERT_OK(sd_varlink_sendb(connections[k], "io.test.Rubbish", SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_INTEGER("id", k))));
+        }
+
+        /* Then, create one more, which should fail */
+        log_debug("Creating overload connection...");
+        ASSERT_OK(sd_varlink_connect_address(&c, address));
+        ASSERT_OK(sd_varlink_set_description(c, "overload-client"));
+        ASSERT_OK(sd_varlink_attach_event(c, e, k));
+        ASSERT_OK(sd_varlink_bind_reply(c, overload_reply));
+        ASSERT_OK(sd_varlink_invokeb(c, "io.test.Overload", SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("foo", JSON_BUILD_CONST_STRING("bar")))));
+
+        /* Unblock it */
+        log_debug("Unblocking server...");
+        block_write_fd = safe_close(block_write_fd);
+
+        /* This loop will terminate as soon as the overload reply callback is called */
+        ASSERT_OK(sd_event_loop(e));
+
+        /* And close all connections again */
+        for (k = 0; k < OVERLOAD_CONNECTIONS; k++)
+                connections[k] = sd_varlink_unref(connections[k]);
+}
+
+static int client_fiber(void *arg) {
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *c = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *i = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *wrong = NULL;
+        sd_json_variant *o = NULL, *k = NULL, *j = NULL;
+        const char *error_id, *e;
+        int x = 0;
+
+        ASSERT_OK(sd_json_build(&i, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_INTEGER("a", 88),
+                                                   SD_JSON_BUILD_PAIR_INTEGER("b", 99))));
+
+        ASSERT_OK(sd_varlink_connect_address(&c, arg));
+        ASSERT_OK(sd_varlink_set_description(c, "fiber-client"));
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_input(c, true));
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_output(c, true));
+
+        /* Test that client is able to perform two sequential sd_varlink_collect calls if first resulted in an error */
+        ASSERT_OK(sd_json_build(&wrong, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_INTEGER("a", 88),
+                                                       SD_JSON_BUILD_PAIR_INTEGER("c", 99))));
+        ASSERT_OK(sd_varlink_collect(c, "io.test.DoSomethingMore", wrong, &j, &error_id));
+        ASSERT_STREQ(error_id, "org.varlink.service.InvalidParameter");
+
+        ASSERT_OK(sd_varlink_collect(c, "io.test.DoSomethingMore", i, &j, &error_id));
+
+        ASSERT_NULL(error_id);
+        ASSERT_TRUE(sd_json_variant_is_array(j));
+        ASSERT_FALSE(sd_json_variant_is_blank_array(j));
+
+        JSON_VARIANT_ARRAY_FOREACH(k, j) {
+                ASSERT_EQ(sd_json_variant_integer(sd_json_variant_by_key(k, "sum")), 88 + (99 * x));
+                x++;
+        }
+        ASSERT_EQ(x, 6);
+
+        ASSERT_OK(sd_varlink_call(c, "io.test.DoSomething", i, &o, &e));
+        ASSERT_EQ(sd_json_variant_integer(sd_json_variant_by_key(o, "sum")), 88 + 99);
+        ASSERT_NULL(e);
+
+        int fd1, fd2, fd3;
+        ASSERT_OK(fd1 = memfd_new_and_seal_string("data", "foo"));
+        ASSERT_OK(fd2 = memfd_new_and_seal_string("data", "bar"));
+        ASSERT_OK(fd3 = memfd_new_and_seal_string("data", "quux"));
+
+        ASSERT_OK_EQ(sd_varlink_push_fd(c, fd1), 0);
+        ASSERT_OK_EQ(sd_varlink_push_fd(c, fd2), 1);
+        ASSERT_OK_EQ(sd_varlink_push_fd(c, fd3), 2);
+
+        ASSERT_OK(sd_varlink_callb(c, "io.test.PassFD", &o, &e, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_STRING("fd", "whoop"))));
+        ASSERT_NULL(e);
+
+        int fd4, fd5;
+        ASSERT_OK(fd4 = sd_varlink_peek_fd(c, 0));
+        ASSERT_OK(fd5 = sd_varlink_peek_fd(c, 1));
+
+        test_fd(fd4, "miau", 4);
+        test_fd(fd5, "wuff", 4);
+
+        ASSERT_OK(sd_varlink_callb(c, "io.test.PassFD", &o, &e, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_STRING("fdx", "whoopx"))));
+        ASSERT_TRUE(sd_varlink_error_is_invalid_parameter(e, o, "fd"));
+
+        ASSERT_OK(sd_varlink_callb(c, "io.test.IDontExist", &o, &e, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("x", SD_JSON_BUILD_REAL(5.5)))));
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(o, "method")), "io.test.IDontExist");
+        ASSERT_STREQ(e, SD_VARLINK_ERROR_METHOD_NOT_FOUND);
+
+        ASSERT_OK(sd_varlink_call(c, "io.test.FailWithErrno", /* parameters= */ NULL, &o, &e));
+        ASSERT_ERROR(sd_varlink_error_to_errno(e, o), EHWPOISON);
+        flood_test(arg);
+
+        ASSERT_OK(sd_varlink_send(c, "io.test.Done", /* parameters= */ NULL));
+
+        return 0;
+}
+
+static int block_fd_handler(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
+        char c;
+
+        ASSERT_OK(fd_nonblock(fd, /* nonblock= */ false));
+
+        ASSERT_OK_EQ_ERRNO(read(fd, &c, sizeof(c)), (ssize_t) sizeof(c));
+        /* When a character is written to this pipe we'll block until the pipe is closed. */
+
+        ASSERT_OK_ZERO_ERRNO(read(fd, &c, sizeof(c)));
+
+        ASSERT_OK(fd_nonblock(fd, /* nonblock= */ true));
+
+        ASSERT_OK(sd_event_source_set_enabled(s, SD_EVENT_OFF));
+
+        return 0;
+}
+
+TEST(chat) {
+        _cleanup_(sd_event_source_unrefp) sd_event_source *block_event = NULL;
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *c = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmpdir = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_future_unrefp) sd_future *f = NULL;
+        _cleanup_close_pair_ int block_fds[2] = EBADF_PAIR;
+        const char *sp;
+
+        ASSERT_OK(mkdtemp_malloc("/tmp/varlink-test-XXXXXX", &tmpdir));
+        sp = strjoina(tmpdir, "/socket");
+
+        ASSERT_OK(sd_event_default(&e));
+
+        ASSERT_OK_ERRNO(pipe2(block_fds, O_NONBLOCK|O_CLOEXEC));
+        ASSERT_OK(sd_event_add_io(e, &block_event, block_fds[0], EPOLLIN, block_fd_handler, /* userdata= */ NULL));
+        ASSERT_OK(sd_event_source_set_priority(block_event, SD_EVENT_PRIORITY_IMPORTANT));
+        block_write_fd = TAKE_FD(block_fds[1]);
+
+        ASSERT_OK(varlink_server_new(&s, SD_VARLINK_SERVER_ACCOUNT_UID, /* userdata= */ NULL));
+        ASSERT_OK(sd_varlink_server_set_info(s, "Vendor", "Product", "Version", "URL"));
+        ASSERT_OK(varlink_set_info_systemd(s));
+        ASSERT_OK(sd_varlink_server_set_description(s, "our-server"));
+
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.PassFD", method_passfd));
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.DoSomething", method_something));
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.DoSomethingMore", method_something_more));
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.FailWithErrno", method_fail_with_errno));
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.Done", method_done));
+        ASSERT_OK(sd_varlink_server_bind_connect(s, on_connect));
+        ASSERT_OK(sd_varlink_server_listen_address(s, sp, 0600));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_server_set_connections_max(s, OVERLOAD_CONNECTIONS));
+
+        ASSERT_OK(sd_json_build(&v, SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR_INTEGER("a", 7),
+                                                   SD_JSON_BUILD_PAIR_INTEGER("b", 22))));
+
+        ASSERT_OK(sd_varlink_connect_address(&c, sp));
+        ASSERT_OK(sd_varlink_set_description(c, "main-client"));
+        ASSERT_OK(sd_varlink_bind_reply(c, reply));
+
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.DoSomething", v));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_fiber_new(e, "client", client_fiber, (void*) sp, &f));
+
+        ASSERT_OK(sd_event_loop(e));
+
+        ASSERT_OK(sd_future_result(f));
+}
+
+static int method_invalid(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        int r;
+
+        sd_json_dispatch_field table[] = {
+                { "iexist", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, 0, SD_JSON_MANDATORY },
+                {}
+        };
+
+        const char *p = NULL;
+
+        r = sd_varlink_dispatch(link, parameters, table, &p);
+        if (r != 0)
+                return r;
+
+        assert_not_reached();
+}
+
+static int reply_invalid(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        ASSERT_TRUE(sd_varlink_error_is_invalid_parameter(error_id, parameters, "idontexist"));
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(sync_call_disconnect) {
+        /* Regression test for https://github.com/systemd/systemd/issues/41883: after a synchronous call
+         * failed due to a connection error the connection must end up fully disconnected, so that
+         * subsequent calls fail with ENOTCONN rather than EBUSY. */
+
+        FOREACH_STRING(method, "call", "collect") {
+                _cleanup_close_pair_ int connfd[2] = EBADF_PAIR;
+                _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+
+                ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+                ASSERT_OK(sd_varlink_connect_fd(&c, TAKE_FD(connfd[1])));
+
+                /* Close the server side, so that the call fails */
+                connfd[0] = safe_close(connfd[0]);
+
+                if (streq(method, "call")) {
+                        ASSERT_ERROR(sd_varlink_call(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL), ECONNRESET);
+                        ASSERT_ERROR(sd_varlink_call(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL), ENOTCONN);
+                } else {
+                        ASSERT_ERROR(sd_varlink_collect(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL), ECONNRESET);
+                        ASSERT_ERROR(sd_varlink_collect(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL), ENOTCONN);
+                }
+
+                ASSERT_FALSE(sd_varlink_is_connected(c));
+                ASSERT_TRUE(sd_varlink_is_idle(c));
+        }
+}
+
+TEST(sync_call_bad_message) {
+        /* Same as above, but for a call that fails because the server sends us garbage, i.e. where
+         * sd_varlink_process() itself fails */
+
+        FOREACH_STRING(method, "call", "collect") {
+                _cleanup_close_pair_ int connfd[2] = EBADF_PAIR;
+                _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+
+                ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+                ASSERT_OK(sd_varlink_connect_fd(&c, TAKE_FD(connfd[1])));
+
+                /* Send an unparsable message from the server side */
+                ASSERT_OK_EQ_ERRNO(write(connfd[0], "x", 2), 2);
+
+                if (streq(method, "call")) {
+                        ASSERT_FAIL(sd_varlink_call(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL));
+                        ASSERT_ERROR(sd_varlink_call(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL), ENOTCONN);
+                } else {
+                        ASSERT_FAIL(sd_varlink_collect(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL));
+                        ASSERT_ERROR(sd_varlink_collect(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL), ENOTCONN);
+                }
+
+                ASSERT_FALSE(sd_varlink_is_connected(c));
+                ASSERT_TRUE(sd_varlink_is_idle(c));
+        }
+}
+
+TEST(sync_call_timeout) {
+        /* Same as above, but for a call that times out because the server never replies */
+
+        FOREACH_STRING(method, "call", "collect") {
+                _cleanup_close_pair_ int connfd[2] = EBADF_PAIR;
+                _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+
+                ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+                ASSERT_OK(sd_varlink_connect_fd(&c, TAKE_FD(connfd[1])));
+                ASSERT_OK(sd_varlink_set_relative_timeout(c, 50 * USEC_PER_MSEC));
+
+                if (streq(method, "call")) {
+                        ASSERT_ERROR(sd_varlink_call(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL), ETIME);
+                        ASSERT_ERROR(sd_varlink_call(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL), ENOTCONN);
+                } else {
+                        ASSERT_ERROR(sd_varlink_collect(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL), ETIME);
+                        ASSERT_ERROR(sd_varlink_collect(c, "io.test.DoSomething", /* parameters= */ NULL, /* ret_parameters= */ NULL, /* ret_error_id= */ NULL), ENOTCONN);
+                }
+
+                ASSERT_FALSE(sd_varlink_is_connected(c));
+                ASSERT_TRUE(sd_varlink_is_idle(c));
+        }
+}
+
+TEST(invalid_parameter) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_server_bind_method(s, "foo.mytest.Invalid", method_invalid));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_invalid));
+
+        ASSERT_OK(sd_varlink_invokebo(c, "foo.mytest.Invalid",
+                                      SD_JSON_BUILD_PAIR_STRING("iexist", "foo"),
+                                      SD_JSON_BUILD_PAIR_STRING("idontexist", "bar")));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+typedef struct MandatoryTypeWithOptionalField {
+        const char *mandatory;
+        const char *optional;
+} MandatoryTypeWithOptionalField;
+
+static int dispatch_mandatory_type_with_optional_field(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        MandatoryTypeWithOptionalField *m = ASSERT_PTR(userdata);
+        static const sd_json_dispatch_field dispatch[] = {
+                { "mandatory", SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, voffsetof(*m, mandatory), SD_JSON_MANDATORY },
+                { "optional",  SD_JSON_VARIANT_STRING, sd_json_dispatch_const_string, voffsetof(*m, optional), 0 },
+                {}
+        };
+
+        return sd_json_dispatch(variant, dispatch, flags, m);
+}
+
+static int method_mandatory_type_with_optional_field(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        MandatoryTypeWithOptionalField m = { NULL, NULL };
+        int r;
+
+        sd_json_dispatch_field table[] = {
+                { "mandatoryField", SD_JSON_VARIANT_OBJECT, dispatch_mandatory_type_with_optional_field, 0, SD_JSON_MANDATORY },
+                {}
+        };
+
+        r = sd_varlink_dispatch(link, parameters, table, &m);
+        if (r != 0)
+                return r;
+
+        _cleanup_free_ char *sum = strjoin(m.mandatory, "+", m.optional);
+        if (!sum)
+                return log_oom();
+
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("result", sum));
+}
+
+static int reply_valid_hi(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        ASSERT_NULL(error_id);
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(parameters, "result")), "hi+");
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(mandatory_type_with_optional_field) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_server_bind_method(s, "foo.mytest.MandatoryTypeWithOptionalField", method_mandatory_type_with_optional_field));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_valid_hi));
+
+        ASSERT_OK(sd_varlink_invokebo(c, "foo.mytest.MandatoryTypeWithOptionalField",
+                                      SD_JSON_BUILD_PAIR_OBJECT("mandatoryField",
+                                                                SD_JSON_BUILD_PAIR_STRING("mandatory", "hi"))));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+static int method_with_error_sentinel(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* Set an error sentinel and return without sending a reply. The sentinel error should be sent automatically. */
+        ASSERT_OK(sd_varlink_set_sentinel(link, "io.test.SentinelError"));
+        return 0;
+}
+
+static int reply_sentinel_error(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        ASSERT_STREQ(error_id, "io.test.SentinelError");
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(sentinel_error) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.ErrorSentinel", method_with_error_sentinel));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_sentinel_error));
+
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.ErrorSentinel", /* parameters= */ NULL));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+static int method_with_empty_sentinel(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* Set an empty sentinel and return without sending a reply. An empty reply should be sent automatically. */
+        ASSERT_OK(sd_varlink_set_sentinel(link, /* error_id= */ NULL));
+        return 0;
+}
+
+static int reply_sentinel_empty(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        ASSERT_NULL(error_id);
+        ASSERT_TRUE(sd_json_variant_is_blank_object(parameters));
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(sentinel_empty) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.EmptySentinel", method_with_empty_sentinel));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_sentinel_empty));
+
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.EmptySentinel", /* parameters= */ NULL));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+static int method_with_sentinel_but_reply(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* Set a sentinel but also send a reply. The sentinel should not be used. */
+        ASSERT_OK(sd_varlink_set_sentinel(link, "io.test.SentinelError"));
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("result", "explicit-reply"));
+}
+
+static int reply_sentinel_explicit(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        ASSERT_NULL(error_id);
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(parameters, "result")), "explicit-reply");
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(sentinel_with_explicit_reply) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.SentinelButReply", method_with_sentinel_but_reply));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_sentinel_explicit));
+
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.SentinelButReply", /* parameters= */ NULL));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+static int method_with_oneway_sentinel(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* The method was called oneway, so sd_varlink_set_sentinel() should be a no-op and the server should
+         * transition back to idle without sending any reply. */
+        ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_METHOD_ONEWAY));
+        ASSERT_OK_ZERO(sd_varlink_wants_reply(link));
+        ASSERT_OK(sd_varlink_set_sentinel(link, "io.test.SentinelError"));
+        ASSERT_OK_ZERO(sd_varlink_wants_reply(link));
+        return 0;
+}
+
+static int method_oneway_sentinel_pong(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* A regular method call expects a reply, until we sent one */
+        ASSERT_OK_POSITIVE(sd_varlink_wants_reply(link));
+        ASSERT_OK(sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("result", "pong")));
+        ASSERT_OK_ZERO(sd_varlink_wants_reply(link));
+        return 0;
+}
+
+static int reply_oneway_sentinel_pong(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        /* If we get here, it means the oneway sentinel call didn't break the connection and the server
+         * properly handled a subsequent regular method call. */
+        ASSERT_NULL(error_id);
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(parameters, "result")), "pong");
+        ASSERT_OK_ZERO(sd_varlink_wants_reply(link)); /* Client side never wants to reply */
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(sentinel_oneway) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.OnewaySentinel", method_with_oneway_sentinel));
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.Pong", method_oneway_sentinel_pong));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        /* Send a oneway call with a sentinel — the sentinel should be silently ignored. */
+        ASSERT_OK(sd_varlink_send(c, "io.test.OnewaySentinel", /* parameters= */ NULL));
+
+        /* Follow up with a regular call to verify the server is still functional. */
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_oneway_sentinel_pong));
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.Pong", /* parameters= */ NULL));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+typedef struct FdAssociationState {
+        int first_fd;
+        int second_fd;
+        unsigned n_messages;
+} FdAssociationState;
+
+static int method_fd_association_oneway(
+                sd_varlink *link,
+                sd_json_variant *parameters,
+                sd_varlink_method_flags_t flags,
+                void *userdata) {
+
+        FdAssociationState *state = ASSERT_PTR(userdata);
+
+        ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_METHOD_ONEWAY));
+        state->first_fd = sd_varlink_peek_fd(link, 0);
+        state->n_messages++;
+        return 0;
+}
+
+static int method_fd_association_receive(
+                sd_varlink *link,
+                sd_json_variant *parameters,
+                sd_varlink_method_flags_t flags,
+                void *userdata) {
+
+        FdAssociationState *state = ASSERT_PTR(userdata);
+
+        state->second_fd = sd_varlink_peek_fd(link, 0);
+        if (state->second_fd >= 0)
+                test_fd(state->second_fd, "second-message", STRLEN("second-message"));
+        state->n_messages++;
+
+        /* Reply even when the FD is missing, so the assertions below report the association failure. */
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_BOOLEAN("received", state->second_fd >= 0));
+}
+
+static int reply_fd_association_done(
+                sd_varlink *link,
+                sd_json_variant *parameters,
+                const char *error_id,
+                sd_varlink_reply_flags_t flags,
+                void *userdata) {
+
+        ASSERT_NULL(error_id);
+        return sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS);
+}
+
+static void run_fd_association_after_oneway(bool bounded) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *client = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_close_pair_ int sockets[2] = EBADF_PAIR;
+        _cleanup_close_ int fd = -EBADF;
+        FdAssociationState state = { .first_fd = -EBADF, .second_fd = -EBADF };
+
+        ASSERT_OK(sd_event_new(&event));
+        ASSERT_OK(sd_varlink_server_new(
+                        &server,
+                        SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT|SD_VARLINK_SERVER_INHERIT_USERDATA|
+                        (bounded ? SD_VARLINK_SERVER_UPGRADABLE : 0)));
+        sd_varlink_server_set_userdata(server, &state);
+        ASSERT_OK(sd_varlink_server_attach_event(server, event, 1));
+        ASSERT_OK(sd_varlink_server_bind_method_many(
+                        server,
+                        "io.test.OnewayPulse", method_fd_association_oneway,
+                        "io.test.DeliverFD", method_fd_association_receive));
+
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, sockets));
+        ASSERT_OK(sd_varlink_server_add_connection(server, sockets[0], /* ret= */ NULL));
+        TAKE_FD(sockets[0]);
+        ASSERT_OK(sd_varlink_connect_fd(&client, sockets[1]));
+        TAKE_FD(sockets[1]);
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_output(client, true));
+        ASSERT_OK(sd_varlink_set_relative_timeout(client, 5 * USEC_PER_SEC));
+        ASSERT_OK(sd_varlink_attach_event(client, event, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_bind_reply(client, reply_fd_association_done));
+
+        /* Queue both messages before the server runs: only the second message owns the descriptor. */
+        ASSERT_OK(sd_varlink_send(client, "io.test.OnewayPulse", /* parameters= */ NULL));
+        ASSERT_OK(fd = memfd_new_and_seal_string("association", "second-message"));
+        ASSERT_OK_EQ(sd_varlink_push_dup_fd(client, fd), 0);
+        ASSERT_OK(sd_varlink_invoke(client, "io.test.DeliverFD", /* parameters= */ NULL));
+        ASSERT_OK(sd_varlink_flush(client));
+        ASSERT_OK(sd_event_loop(event));
+
+        log_info("Request FD association (bounded=%s): first=%d second=%d messages=%u",
+                 yes_no(bounded), state.first_fd, state.second_fd, state.n_messages);
+        ASSERT_EQ(state.n_messages, 2U);
+        ASSERT_ERROR(state.first_fd, ENXIO);
+        ASSERT_OK(state.second_fd);
+}
+
+TEST(fd_association_after_oneway_bounded) {
+        /* An upgradable server already uses boundary-limited reads; keep this as a diagnostic control. */
+        run_fd_association_after_oneway(/* bounded= */ true);
+}
+
+TEST(fd_association_after_oneway) {
+        run_fd_association_after_oneway(/* bounded= */ false);
+}
+
+static int method_fd_association_reply(
+                sd_varlink *link,
+                sd_json_variant *parameters,
+                sd_varlink_method_flags_t flags,
+                void *userdata) {
+
+        _cleanup_close_ int fd = -EBADF;
+
+        ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_METHOD_MORE));
+        ASSERT_OK(sd_varlink_notifybo(link, SD_JSON_BUILD_PAIR_UNSIGNED("sequence", 0)));
+        ASSERT_OK(fd = memfd_new_and_seal_string("association", "second-message"));
+        ASSERT_OK_EQ(sd_varlink_push_dup_fd(link, fd), 0);
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_UNSIGNED("sequence", 1));
+}
+
+static int reply_fd_association_more(
+                sd_varlink *link,
+                sd_json_variant *parameters,
+                const char *error_id,
+                sd_varlink_reply_flags_t flags,
+                void *userdata) {
+
+        FdAssociationState *state = ASSERT_PTR(userdata);
+
+        ASSERT_NULL(error_id);
+        if (FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES)) {
+                ASSERT_EQ(state->n_messages, 0U);
+                state->first_fd = sd_varlink_peek_fd(link, 0);
+                state->n_messages++;
+                return 0;
+        }
+
+        ASSERT_EQ(state->n_messages, 1U);
+        state->second_fd = sd_varlink_peek_fd(link, 0);
+        if (state->second_fd >= 0)
+                test_fd(state->second_fd, "second-message", STRLEN("second-message"));
+        state->n_messages++;
+        return sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS);
+}
+
+TEST(fd_association_after_continued_reply) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *client = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+        _cleanup_close_pair_ int sockets[2] = EBADF_PAIR;
+        FdAssociationState state = { .first_fd = -EBADF, .second_fd = -EBADF };
+
+        ASSERT_OK(sd_event_new(&event));
+        ASSERT_OK(sd_varlink_server_new(&server, SD_VARLINK_SERVER_ALLOW_FD_PASSING_OUTPUT));
+        ASSERT_OK(sd_varlink_server_attach_event(server, event, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_server_bind_method(
+                        server, "io.test.DeliverReplies", method_fd_association_reply));
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, sockets));
+        ASSERT_OK(sd_varlink_server_add_connection(server, sockets[0], /* ret= */ NULL));
+        TAKE_FD(sockets[0]);
+        ASSERT_OK(sd_varlink_connect_fd(&client, sockets[1]));
+        TAKE_FD(sockets[1]);
+        sd_varlink_set_userdata(client, &state);
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_input(client, true));
+        ASSERT_OK(sd_varlink_set_relative_timeout(client, 5 * USEC_PER_SEC));
+        ASSERT_OK(sd_varlink_attach_event(client, event, 1));
+        ASSERT_OK(sd_varlink_bind_reply(client, reply_fd_association_more));
+        ASSERT_OK(sd_varlink_observe(client, "io.test.DeliverReplies", /* parameters= */ NULL));
+        ASSERT_OK(sd_varlink_flush(client));
+        ASSERT_OK(sd_event_loop(event));
+
+        log_info("Reply FD association: first=%d second=%d messages=%u",
+                 state.first_fd, state.second_fd, state.n_messages);
+        ASSERT_EQ(state.n_messages, 2U);
+        ASSERT_ERROR(state.first_fd, ENXIO);
+        ASSERT_OK(state.second_fd);
+}
+
+static int method_fiber_sentinel_error(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* Set an error sentinel from a fiber callback and return without sending a reply. The sentinel
+         * error should still be propagated by the fiber's post-callback logic, even though the varlink
+         * state has already been transitioned to VARLINK_PENDING_METHOD by the time the fiber runs. */
+        ASSERT_OK_POSITIVE(sd_varlink_wants_reply(link));
+        ASSERT_OK(sd_varlink_set_sentinel(link, "io.test.SentinelError"));
+        return 0;
+}
+
+TEST(fiber_sentinel_error) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(varlink_server_bind_fiber(s, "io.test.FiberSentinelError", method_fiber_sentinel_error));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_sentinel_error));
+
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.FiberSentinelError", /* parameters= */ NULL));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+static int method_fiber_errno(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* Return a negative errno without sending a reply. The fiber's post-callback logic should
+         * convert this into a SD_VARLINK_ERROR_SYSTEM reply. */
+        return -ENOSYS;
+}
+
+static int reply_fiber_errno(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        ASSERT_STREQ(error_id, SD_VARLINK_ERROR_SYSTEM);
+        ASSERT_EQ(sd_json_variant_integer(sd_json_variant_by_key(parameters, "errno")), ENOSYS);
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(fiber_errno) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(varlink_server_bind_fiber(s, "io.test.FiberErrno", method_fiber_errno));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_fiber_errno));
+
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.FiberErrno", /* parameters= */ NULL));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+static int method_fiber_no_reply(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* Return success without replying and without stashing a ref. The fiber's post-callback
+         * logic should detect this and fail the connection. */
+        return 0;
+}
+
+static int reply_fiber_no_reply(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        ASSERT_STREQ(error_id, SD_VARLINK_ERROR_DISCONNECTED);
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(fiber_no_reply) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(varlink_server_bind_fiber(s, "io.test.FiberNoReply", method_fiber_no_reply));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_fiber_no_reply));
+
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.FiberNoReply", /* parameters= */ NULL));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+static int fiber_stashed_deferred_reply(sd_event_source *s, void *userdata) {
+        _cleanup_(sd_varlink_unrefp) sd_varlink *link = ASSERT_PTR(userdata);
+
+        sd_event_source_disable_unref(s);
+        ASSERT_OK_POSITIVE(sd_varlink_wants_reply(link));
+        ASSERT_OK(sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("result", "stashed")));
+        ASSERT_OK_ZERO(sd_varlink_wants_reply(link));
+        return 0;
+}
+
+static int method_fiber_stash(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* Stash a ref on the connection so n_ref > 2 when the fiber returns, and reply later from a
+         * deferred event source. The fiber's post-callback logic should see the extra ref and treat
+         * this as a valid deferred-reply case instead of failing the connection. */
+        sd_event_source *source;
+
+        ASSERT_OK_POSITIVE(sd_varlink_wants_reply(link));
+        ASSERT_OK(sd_event_add_defer(sd_varlink_get_event(link), &source, fiber_stashed_deferred_reply, sd_varlink_ref(link)));
+        ASSERT_OK(sd_event_source_set_enabled(source, SD_EVENT_ONESHOT));
+        return 0;
+}
+
+static int reply_fiber_stash(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        ASSERT_NULL(error_id);
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(parameters, "result")), "stashed");
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(fiber_stash) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(varlink_server_bind_fiber(s, "io.test.FiberStash", method_fiber_stash));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_fiber_stash));
+
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.FiberStash", /* parameters= */ NULL));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+static sd_future *disconnect_fiber = NULL;
+static int disconnect_fiber_result = 1;
+
+static int method_fiber_suspend(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        disconnect_fiber = sd_fiber_get_current();
+        disconnect_fiber_result = sd_fiber_suspend();
+        disconnect_fiber = NULL;
+
+        /* The connection is closed at this point and has no event loop anymore. If the test times out,
+         * on_fiber_disconnect_timeout() calls sd_event_exit() with EXIT_FAILURE. The exit event source of
+         * the fiber then cancels the fiber, and sd_fiber_suspend() returns. Overwriting the exit code with
+         * EXIT_SUCCESS would make the test pass. */
+        sd_event *e = sd_fiber_get_event();
+        if (sd_event_get_exit_code(e, /* ret= */ NULL) == -ENODATA)
+                ASSERT_OK(sd_event_exit(e, EXIT_SUCCESS));
+        return disconnect_fiber_result;
+}
+
+static int on_fiber_disconnect_timeout(sd_event_source *s, uint64_t usec, void *userdata) {
+        return sd_event_exit(sd_event_source_get_event(s), EXIT_FAILURE);
+}
+
+TEST(fiber_cancel_on_disconnect) {
+        /* When the client disconnects while a fiber method waits without having replied, the server can't
+         * answer the call anymore and has to cancel the fiber. Suspend the fiber, close the client
+         * connection, and check that the fiber resumes with -ECANCELED. */
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        ASSERT_OK(sd_event_add_time_relative(e, /* ret= */ NULL, CLOCK_MONOTONIC, 5 * USEC_PER_SEC, /* accuracy= */ 0,
+                                             on_fiber_disconnect_timeout, /* userdata= */ NULL));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+        ASSERT_OK(varlink_server_bind_fiber(s, "io.test.FiberSuspend", method_fiber_suspend));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        /* Run the event loop until the method fiber is suspended. */
+        disconnect_fiber_result = 1;
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.FiberSuspend", /* parameters= */ NULL));
+        while (!disconnect_fiber)
+                ASSERT_OK(sd_event_run(e, UINT64_MAX));
+
+        /* Close the client connection. The server sees the hangup while the call is still pending. */
+        c = sd_varlink_close_unref(c);
+
+        ASSERT_OK_ZERO(sd_event_loop(e));
+        ASSERT_ERROR(disconnect_fiber_result, ECANCELED);
+}
+
+static void on_fiber_disconnect_resume(sd_varlink_server *s, sd_varlink *link, void *userdata) {
+        if (disconnect_fiber)
+                ASSERT_OK(sd_fiber_resume(disconnect_fiber, /* result= */ 0));
+}
+
+static int method_fiber_reply_then_suspend(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        ASSERT_OK(sd_varlink_reply(link, /* parameters= */ NULL));
+
+        return method_fiber_suspend(link, parameters, flags, userdata);
+}
+
+static int reply_fiber_reply_then_suspend(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        ASSERT_NULL(error_id);
+        ASSERT_OK(sd_varlink_close(link));
+        return 0;
+}
+
+TEST(fiber_no_cancel_after_reply) {
+        /* A fiber method that already replied doesn't depend on the connection anymore, so a disconnect
+         * must not cancel it. The fiber replies and suspends, and the client closes the connection once it
+         * gets the reply. The disconnect callback resumes the fiber, which has to see 0 and not
+         * -ECANCELED. */
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        ASSERT_OK(sd_event_add_time_relative(e, /* ret= */ NULL, CLOCK_MONOTONIC, 5 * USEC_PER_SEC, /* accuracy= */ 0,
+                                             on_fiber_disconnect_timeout, /* userdata= */ NULL));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_server_bind_disconnect(s, on_fiber_disconnect_resume));
+        ASSERT_OK(varlink_server_bind_fiber(s, "io.test.FiberReplyThenSuspend", method_fiber_reply_then_suspend));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_fiber_reply_then_suspend));
+
+        disconnect_fiber_result = 1;
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.FiberReplyThenSuspend", /* parameters= */ NULL));
+
+        ASSERT_OK_ZERO(sd_event_loop(e));
+        ASSERT_OK_ZERO(disconnect_fiber_result);
+}
+
+TEST(fiber_no_cancel_oneway) {
+        /* A oneway call never gets a reply, so a client may disconnect right after sending it. The disconnect
+         * must not cancel the fiber that runs the oneway call. Suspend the fiber, close the client
+         * connection, and let the disconnect callback resume the fiber. The fiber has to see 0 and not
+         * -ECANCELED. */
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        ASSERT_OK(sd_event_add_time_relative(e, /* ret= */ NULL, CLOCK_MONOTONIC, 5 * USEC_PER_SEC, /* accuracy= */ 0,
+                                             on_fiber_disconnect_timeout, /* userdata= */ NULL));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_server_bind_disconnect(s, on_fiber_disconnect_resume));
+        ASSERT_OK(varlink_server_bind_fiber(s, "io.test.FiberSuspend", method_fiber_suspend));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        /* Run the event loop until the method fiber is suspended. */
+        disconnect_fiber_result = 1;
+        ASSERT_OK(sd_varlink_send(c, "io.test.FiberSuspend", /* parameters= */ NULL));
+        while (!disconnect_fiber)
+                ASSERT_OK(sd_event_run(e, UINT64_MAX));
+
+        c = sd_varlink_close_unref(c);
+
+        ASSERT_OK_ZERO(sd_event_loop(e));
+        ASSERT_OK_ZERO(disconnect_fiber_result);
+}
+
+static sd_varlink *idle_server_link = NULL;
+
+static int method_notify_and_wait(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        ASSERT_OK(sd_varlink_notify(link, /* parameters= */ NULL));
+        idle_server_link = sd_varlink_ref(link);
+        return 0;
+}
+
+static int reply_notify_and_wait(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        bool *got_reply = ASSERT_PTR(userdata);
+
+        ASSERT_NULL(error_id);
+        ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES));
+        *got_reply = true;
+        return 0;
+}
+
+TEST(idle_connection_frees_input_buffer) {
+        /* A connection that keeps a "more" call open without any traffic must not keep its read buffer.
+         * The server answers the call with one notification and leaves the call pending. Once the event
+         * loop has nothing left to do, the read buffers of the server and the client connection have to be
+         * freed. */
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.NotifyAndWait", method_notify_and_wait));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        bool got_reply = false;
+        sd_varlink_set_userdata(c, &got_reply);
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_notify_and_wait));
+        ASSERT_OK(sd_varlink_observe(c, "io.test.NotifyAndWait", /* parameters= */ NULL));
+
+        /* Run the event loop until the client got the notification. Then run it until the server and the
+         * client connection have nothing left to process. */
+        while (!got_reply)
+                ASSERT_OK(sd_event_run(e, UINT64_MAX));
+        while (ASSERT_OK(sd_event_run(e, /* timeout= */ 0)) > 0)
+                ;
+
+        ASSERT_NOT_NULL(idle_server_link);
+        ASSERT_NULL(idle_server_link->stream.input_buffer);
+        ASSERT_NULL(c->stream.input_buffer);
+
+        idle_server_link = sd_varlink_close_unref(idle_server_link);
+}
+
+static int method_count(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_METHOD_MORE));
+
+        ASSERT_OK(sd_varlink_notifybo(link, SD_JSON_BUILD_PAIR_UNSIGNED("n", 1)));
+        ASSERT_OK(sd_varlink_notifybo(link, SD_JSON_BUILD_PAIR_UNSIGNED("n", 2)));
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_UNSIGNED("n", 3));
+}
+
+static int method_count_fail(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        ASSERT_OK(sd_varlink_notifybo(link, SD_JSON_BUILD_PAIR_UNSIGNED("n", 1)));
+        return sd_varlink_error(link, "io.test.Failed", /* parameters= */ NULL);
+}
+
+static sd_varlink *notify_once_link = NULL;
+
+static int method_notify_once(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        ASSERT_OK(sd_varlink_notifybo(link, SD_JSON_BUILD_PAIR_UNSIGNED("n", 1)));
+
+        /* sd-varlink fails a method call that returns without a reply, unless the callback keeps a
+         * reference to the link. */
+        notify_once_link = sd_varlink_ref(link);
+        return 0;
+}
+
+static void on_observe_channel_disconnect(sd_varlink_server *s, sd_varlink *link, void *userdata) {
+        bool *disconnected = ASSERT_PTR(userdata);
+        *disconnected = true;
+}
+
+static int observe_channel_pop(sd_event *e, sd_channel *ch, VarlinkReply **ret) {
+        void *p;
+        int r;
+
+        assert(ret);
+
+        while ((r = sd_channel_try_pop(ch, &p)) == -ENODATA)
+                ASSERT_OK(sd_event_run(e, UINT64_MAX));
+        if (r < 0)
+                return r;
+
+        *ret = p;
+        return 0;
+}
+
+static void observe_channel_disconnect(sd_event *e, sd_varlink_server *s, sd_varlink **c) {
+        assert(c);
+
+        /* Each server connection keeps a reference to the server. The server connection only drops the
+         * reference after it sees the client disconnect. Without the disconnect, the server is leaked. */
+        *c = sd_varlink_close_unref(*c);
+        while (sd_varlink_server_current_connections(s) > 0)
+                ASSERT_OK(sd_event_run(e, UINT64_MAX));
+}
+
+static void observe_channel_setup(sd_event *e, sd_varlink_server **ret_server, sd_varlink **ret_client) {
+        assert(ret_server);
+        assert(ret_client);
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_server_bind_method_many(
+                        s,
+                        "io.test.Count",      method_count,
+                        "io.test.CountFail",  method_count_fail,
+                        "io.test.NotifyOnce", method_notify_once));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        *ret_server = TAKE_PTR(s);
+        *ret_client = TAKE_PTR(c);
+}
+
+TEST(observe_channel_replies) {
+        /* The channel has to deliver every reply of a "more" call in order, with the flags of the reply.
+         * After the final reply, a receive has to fail with -EPIPE. The link has to stay open with its old
+         * userdata, and a second channel on the same link has to receive the replies of a second call. */
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_new(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        observe_channel_setup(e, &s, &c);
+
+        int userdata = 0;
+        sd_varlink_set_userdata(c, &userdata);
+
+        _cleanup_(sd_channel_unrefp) sd_channel *ch = NULL;
+        ASSERT_OK(varlink_observe_channel_new(c, "io.test.Count", /* parameters= */ NULL, /* capacity= */ 8, &ch));
+
+        for (unsigned i = 1; i <= 3; i++) {
+                _cleanup_(varlink_reply_freep) VarlinkReply *reply = NULL;
+                ASSERT_OK(observe_channel_pop(e, ch, &reply));
+                ASSERT_NULL(reply->error_id);
+                ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(reply->parameters, "n")), i);
+                ASSERT_EQ(FLAGS_SET(reply->flags, SD_VARLINK_REPLY_CONTINUES), i < 3);
+        }
+
+        VarlinkReply *reply;
+        ASSERT_ERROR(observe_channel_pop(e, ch, &reply), EPIPE);
+        ASSERT_OK_POSITIVE(sd_varlink_is_connected(c));
+        ASSERT_OK_POSITIVE(sd_varlink_is_idle(c));
+        ASSERT_PTR_EQ(sd_varlink_get_userdata(c), &userdata);
+
+        /* Start a second call on the same link. */
+        ch = sd_channel_unref(ch);
+        ASSERT_OK(varlink_observe_channel_new(c, "io.test.Count", /* parameters= */ NULL, /* capacity= */ 8, &ch));
+
+        for (unsigned i = 1; i <= 3; i++) {
+                _cleanup_(varlink_reply_freep) VarlinkReply *second = NULL;
+                ASSERT_OK(observe_channel_pop(e, ch, &second));
+                ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(second->parameters, "n")), i);
+        }
+
+        observe_channel_disconnect(e, s, &c);
+}
+
+TEST(observe_channel_busy) {
+        /* A second channel on a link with a running call has to fail with -EBUSY. The first channel has to
+         * keep receiving the replies of its call afterwards. */
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_new(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        observe_channel_setup(e, &s, &c);
+
+        _cleanup_(sd_channel_unrefp) sd_channel *ch = NULL, *other = NULL;
+        ASSERT_OK(varlink_observe_channel_new(c, "io.test.Count", /* parameters= */ NULL, /* capacity= */ 8, &ch));
+        ASSERT_ERROR(varlink_observe_channel_new(c, "io.test.Count", /* parameters= */ NULL, /* capacity= */ 8, &other), EBUSY);
+        ASSERT_NULL(other);
+
+        for (unsigned i = 1; i <= 3; i++) {
+                _cleanup_(varlink_reply_freep) VarlinkReply *reply = NULL;
+                ASSERT_OK(observe_channel_pop(e, ch, &reply));
+                ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(reply->parameters, "n")), i);
+        }
+
+        observe_channel_disconnect(e, s, &c);
+}
+
+TEST(observe_channel_full) {
+        /* A full channel drops notifications, but it has to keep the final reply. The server sends two
+         * notifications and a final reply into a channel with capacity 1. The test runs the event loop
+         * until the call is over without receiving anything. The final reply has to replace the first
+         * notification, so the channel has to contain only the final reply. */
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_new(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        observe_channel_setup(e, &s, &c);
+
+        _cleanup_(sd_channel_unrefp) sd_channel *ch = NULL;
+        ASSERT_OK(varlink_observe_channel_new(c, "io.test.Count", /* parameters= */ NULL, /* capacity= */ 1, &ch));
+
+        while (ASSERT_OK(sd_varlink_is_idle(c)) == 0)
+                ASSERT_OK(sd_event_run(e, UINT64_MAX));
+
+        _cleanup_(varlink_reply_freep) VarlinkReply *reply = NULL;
+        ASSERT_OK(observe_channel_pop(e, ch, &reply));
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(reply->parameters, "n")), 3u);
+        ASSERT_FALSE(FLAGS_SET(reply->flags, SD_VARLINK_REPLY_CONTINUES));
+
+        VarlinkReply *last;
+        ASSERT_ERROR(observe_channel_pop(e, ch, &last), EPIPE);
+
+        observe_channel_disconnect(e, s, &c);
+}
+
+TEST(observe_channel_conflated) {
+        /* A conflated channel only keeps the most recent reply. The server sends two notifications and a
+         * final reply. The test runs the event loop until the call is over without receiving anything,
+         * and checks that only the final reply is left in the channel. */
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_new(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        observe_channel_setup(e, &s, &c);
+
+        _cleanup_(sd_channel_unrefp) sd_channel *ch = NULL;
+        ASSERT_OK(varlink_observe_channel_new_conflated(c, "io.test.Count", /* parameters= */ NULL, &ch));
+
+        while (ASSERT_OK(sd_varlink_is_idle(c)) == 0)
+                ASSERT_OK(sd_event_run(e, UINT64_MAX));
+
+        _cleanup_(varlink_reply_freep) VarlinkReply *reply = NULL;
+        ASSERT_OK(observe_channel_pop(e, ch, &reply));
+        ASSERT_NULL(reply->error_id);
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(reply->parameters, "n")), 3u);
+        ASSERT_FALSE(FLAGS_SET(reply->flags, SD_VARLINK_REPLY_CONTINUES));
+
+        VarlinkReply *last;
+        ASSERT_ERROR(observe_channel_pop(e, ch, &last), EPIPE);
+
+        observe_channel_disconnect(e, s, &c);
+}
+
+TEST(observe_channel_error) {
+        /* An error reply ends the call. The channel has to deliver the notification before the error and
+         * then the error itself. A receive after the error has to fail with -EPIPE. */
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_new(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        observe_channel_setup(e, &s, &c);
+
+        _cleanup_(sd_channel_unrefp) sd_channel *ch = NULL;
+        ASSERT_OK(varlink_observe_channel_new(c, "io.test.CountFail", /* parameters= */ NULL, /* capacity= */ 8, &ch));
+
+        _cleanup_(varlink_reply_freep) VarlinkReply *first = NULL, *error = NULL;
+        ASSERT_OK(observe_channel_pop(e, ch, &first));
+        ASSERT_NULL(first->error_id);
+        ASSERT_TRUE(FLAGS_SET(first->flags, SD_VARLINK_REPLY_CONTINUES));
+
+        ASSERT_OK(observe_channel_pop(e, ch, &error));
+        ASSERT_STREQ(error->error_id, "io.test.Failed");
+
+        VarlinkReply *reply;
+        ASSERT_ERROR(observe_channel_pop(e, ch, &reply), EPIPE);
+
+        observe_channel_disconnect(e, s, &c);
+}
+
+TEST(observe_channel_close_ends_call) {
+        /* Freeing the channel has to close the link. The server has to see the closed link as a
+         * disconnect. The server notifies once and leaves the call pending. After the client got the
+         * notification, the test frees the channel and checks that the server sees the disconnect. */
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_new(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        observe_channel_setup(e, &s, &c);
+
+        bool disconnected = false;
+        sd_varlink_server_set_userdata(s, &disconnected);
+        ASSERT_OK(sd_varlink_server_bind_disconnect(s, on_observe_channel_disconnect));
+
+        _cleanup_(sd_channel_unrefp) sd_channel *ch = NULL;
+        ASSERT_OK(varlink_observe_channel_new(c, "io.test.NotifyOnce", /* parameters= */ NULL, /* capacity= */ 8, &ch));
+
+        _cleanup_(varlink_reply_freep) VarlinkReply *reply = NULL;
+        ASSERT_OK(observe_channel_pop(e, ch, &reply));
+        ASSERT_TRUE(FLAGS_SET(reply->flags, SD_VARLINK_REPLY_CONTINUES));
+
+        ch = sd_channel_unref(ch);
+        ASSERT_OK_ZERO(sd_varlink_is_connected(c));
+
+        while (!disconnected)
+                ASSERT_OK(sd_event_run(e, UINT64_MAX));
+
+        notify_once_link = sd_varlink_unref(notify_once_link);
+}
+
+TEST(observe_channel_no_event) {
+        /* The channel needs the event loop of the link, so a link without one has to be refused with
+         * -ENOPKG. The link has to stay usable after the failure. */
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        safe_close(connfd[0]);
+
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        sd_channel *ch = NULL;
+        ASSERT_ERROR(varlink_observe_channel_new(c, "io.test.Count", /* parameters= */ NULL, /* capacity= */ 8, &ch), ENOPKG);
+        ASSERT_NULL(ch);
+        ASSERT_OK_POSITIVE(sd_varlink_is_idle(c));
+}
+
+static int method_with_fd_sentinel(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        _cleanup_close_ int fd1 = -EBADF, fd2 = -EBADF;
+
+        ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_METHOD_MORE));
+        ASSERT_OK_POSITIVE(sd_varlink_wants_reply(link));
+
+        /* Set a sentinel so sd_varlink_reply() defers sending: each reply and its pushed fds are captured in
+         * the queue, and the last one is sent as the final reply when the callback returns. */
+        ASSERT_OK(sd_varlink_set_sentinel(link, /* error_id= */ NULL));
+
+        /* First reply: push one fd with "alpha" content */
+        ASSERT_OK(fd1 = memfd_new_and_seal_string("data", "alpha"));
+        ASSERT_OK_EQ(sd_varlink_push_fd(link, fd1), 0);
+        TAKE_FD(fd1);
+        ASSERT_OK(sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_INTEGER("index", 0)));
+        ASSERT_OK_POSITIVE(sd_varlink_wants_reply(link));
+
+        /* Second reply: push one fd with "beta" content */
+        ASSERT_OK(fd2 = memfd_new_and_seal_string("data", "beta"));
+        ASSERT_OK_EQ(sd_varlink_push_fd(link, fd2), 0);
+        TAKE_FD(fd2);
+        ASSERT_OK(sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_INTEGER("index", 1)));
+        ASSERT_OK_POSITIVE(sd_varlink_wants_reply(link));
+
+        return 0;
+}
+
+static int reply_sentinel_fd(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        int *state = ASSERT_PTR(sd_varlink_get_userdata(link));
+
+        if (*state == 0) {
+                /* First reply: should carry "continues" flag and fd with "alpha" */
+                ASSERT_NULL(error_id);
+                ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES));
+                ASSERT_EQ(sd_json_variant_integer(sd_json_variant_by_key(parameters, "index")), 0);
+
+                int fd;
+                ASSERT_OK(fd = sd_varlink_peek_fd(link, 0));
+                test_fd(fd, "alpha", STRLEN("alpha"));
+                (*state)++;
+        } else if (*state == 1) {
+                /* Second (final) reply: no "continues" flag, fd with "beta" */
+                ASSERT_NULL(error_id);
+                ASSERT_FALSE(FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES));
+                ASSERT_EQ(sd_json_variant_integer(sd_json_variant_by_key(parameters, "index")), 1);
+
+                int fd;
+                ASSERT_OK(fd = sd_varlink_peek_fd(link, 0));
+                test_fd(fd, "beta", STRLEN("beta"));
+
+                ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        } else
+                assert_not_reached();
+
+        return 0;
+}
+
+static void run_sentinel_with_fds(bool use_fiber) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT|SD_VARLINK_SERVER_ALLOW_FD_PASSING_OUTPUT));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        if (use_fiber)
+                ASSERT_OK(varlink_server_bind_fiber(s, "io.test.FDSentinel", method_with_fd_sentinel));
+        else
+                ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.FDSentinel", method_with_fd_sentinel));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_input(c, true));
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_output(c, true));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        int state = 0;
+        sd_varlink_set_userdata(c, &state);
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_sentinel_fd));
+
+        ASSERT_OK(sd_varlink_observe(c, "io.test.FDSentinel", /* parameters= */ NULL));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+TEST(sentinel_with_fds) {
+        run_sentinel_with_fds(/* use_fiber= */ false);
+}
+
+TEST(fiber_sentinel_with_fds) {
+        run_sentinel_with_fds(/* use_fiber= */ true);
+}
+
+static int method_with_notify_then_error(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* Send a notify first, then return an error. The notify should be received before the error. */
+        ASSERT_OK(sd_varlink_notifybo(link, SD_JSON_BUILD_PAIR_STRING("status", "in-progress")));
+        ASSERT_OK_POSITIVE(sd_varlink_wants_reply(link));
+
+        int r = sd_varlink_error(link, "io.test.OperationFailed", /* parameters= */ NULL);
+        ASSERT_OK_ZERO(sd_varlink_wants_reply(link));
+        return r;
+}
+
+static int reply_notify_then_error(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        int *state = ASSERT_PTR(sd_varlink_get_userdata(link));
+
+        if (*state == 0) {
+                /* First callback: should be the notify (no error, has "more" flag) */
+                ASSERT_NULL(error_id);
+                ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES));
+                ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(parameters, "status")), "in-progress");
+                (*state)++;
+        } else if (*state == 1) {
+                /* Second callback: should be the error */
+                ASSERT_STREQ(error_id, "io.test.OperationFailed");
+                ASSERT_FALSE(FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES));
+                ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        } else
+                assert_not_reached();
+
+        return 0;
+}
+
+TEST(notify_then_error) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_new(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.NotifyThenError", method_with_notify_then_error));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+
+        int state = 0;
+        sd_varlink_set_userdata(c, &state);
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_notify_then_error));
+
+        ASSERT_OK(sd_varlink_observe(c, "io.test.NotifyThenError", /* parameters= */ NULL));
+
+        ASSERT_OK(sd_event_loop(e));
+}
+
+static void assert_varlink_xattr(int fd, const char *expected) {
+        _cleanup_free_ char *role = NULL;
+
+        if (socket_xattr_supported() <= 0)
+                return;
+
+        if (expected) {
+                ASSERT_OK(fgetxattr_malloc(fd, "user.varlink", &role, /* ret_size= */ NULL));
+                ASSERT_STREQ(role, expected);
+        } else
+                ASSERT_ERROR(fgetxattr_malloc(fd, "user.varlink", &role, /* ret_size= */ NULL), ENODATA);
+}
+
+static int method_upgrade(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        _cleanup_close_ int input_fd = -EBADF, output_fd = -EBADF;
+        int r;
+
+        ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_METHOD_UPGRADE));
+        ASSERT_OK_POSITIVE(sd_varlink_wants_reply(link));
+        assert_varlink_xattr(ASSERT_OK(sd_varlink_get_input_fd(link)), "server");
+
+        r = sd_varlink_reply_and_upgrade(link, /* parameters= */ NULL, &input_fd, &output_fd);
+        if (r < 0)
+                return r;
+
+        ASSERT_OK_ZERO(sd_varlink_wants_reply(link));
+
+        /* The connection doesn't speak Varlink anymore, hence the marker must be gone */
+        assert_varlink_xattr(input_fd, /* expected= */ NULL);
+        assert_varlink_xattr(output_fd, /* expected= */ NULL);
+
+        /* After upgrade, do raw I/O: read until the client shuts down its write side (giving us a clean
+         * EOF), reverse what we got, and write it back. Use suspending I/O so other fibers (the client)
+         * can make progress while we're waiting on the socket. */
+        char buf[64] = {};
+        ssize_t n = ASSERT_OK(loop_read(input_fd, buf, sizeof(buf) - 1, /* do_poll= */ true));
+        ASSERT_GT(n, 0);
+
+        /* Reverse the received bytes */
+        for (ssize_t i = 0; i < n / 2; i++)
+                SWAP_TWO(buf[i], buf[n - 1 - i]);
+
+        ASSERT_OK(loop_write(output_fd, buf, n));
+
+        return 0;
+}
+
+static int method_upgrade_without_flag(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        int input_fd = -EBADF, output_fd = -EBADF;
+
+        /* Calling reply_and_upgrade without the client requesting it should fail with -EPROTO */
+        ASSERT_ERROR(sd_varlink_reply_and_upgrade(link, /* parameters= */ NULL, &input_fd, &output_fd), EPROTO);
+
+        return sd_varlink_reply(link, /* parameters= */ NULL);
+}
+
+static int upgrade_client_fiber(void *arg) {
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *c = NULL;
+        _cleanup_close_ int input_fd = -EBADF, output_fd = -EBADF;
+        sd_json_variant *o = NULL;
+        const char *error_id = NULL;
+
+        ASSERT_OK(sd_varlink_connect_address(&c, arg));
+        ASSERT_OK(sd_varlink_set_description(c, "upgrade-client"));
+        assert_varlink_xattr(ASSERT_OK(sd_varlink_get_input_fd(c)), "client");
+
+        ASSERT_OK(sd_varlink_call_and_upgrade(c, "io.test.Upgrade", /* parameters= */ NULL, &o, &error_id, &input_fd, &output_fd));
+        ASSERT_NULL(error_id);
+        ASSERT_GE(input_fd, 0);
+        ASSERT_GE(output_fd, 0);
+        ASSERT_NE(input_fd, output_fd); /* library dups for bidirectional sockets */
+        assert_varlink_xattr(input_fd, /* expected= */ NULL);
+        assert_varlink_xattr(output_fd, /* expected= */ NULL);
+
+        /* Send a test string, shut down write side so server sees EOF, then read the reversed reply */
+        static const char msg[] = "Hello!";
+        ASSERT_OK(loop_write(output_fd, msg, strlen(msg)));
+        ASSERT_OK_ERRNO(shutdown(output_fd, SHUT_WR));
+
+        char buf[64] = {};
+        ssize_t n = ASSERT_OK(loop_read(input_fd, buf, strlen(msg), /* do_poll= */ true));
+        ASSERT_EQ((size_t) n, strlen(msg));
+        ASSERT_STREQ(buf, "!olleH");
+
+        /* Also test that a regular call (without upgrade flag) correctly rejects reply_and_upgrade on
+         * the server side, and still works as a normal call */
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *c2 = NULL;
+        ASSERT_OK(sd_varlink_connect_address(&c2, arg));
+        ASSERT_OK(sd_varlink_set_description(c2, "no-upgrade-client"));
+        ASSERT_OK(sd_varlink_call(c2, "io.test.UpgradeWithoutFlag", /* parameters= */ NULL, &o, &error_id));
+        ASSERT_NULL(error_id);
+
+        ASSERT_OK(sd_event_exit(sd_fiber_get_event(), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(upgrade) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmpdir = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_future_unrefp) sd_future *f = NULL;
+        const char *sp;
+
+        ASSERT_OK(mkdtemp_malloc("/tmp/varlink-test-XXXXXX", &tmpdir));
+        sp = strjoina(tmpdir, "/socket");
+
+        ASSERT_OK(sd_event_new(&e));
+
+        ASSERT_OK(sd_varlink_server_new(&s, SD_VARLINK_SERVER_UPGRADABLE));
+        ASSERT_OK(sd_varlink_server_set_description(s, "upgrade-server"));
+        /* The method does raw I/O on the upgraded socket — bind it as a fiber method so it can
+         * suspend on loop_read()/loop_write() and the client fiber can make progress concurrently. */
+        ASSERT_OK(varlink_server_bind_fiber(s, "io.test.Upgrade", method_upgrade));
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.UpgradeWithoutFlag", method_upgrade_without_flag));
+        ASSERT_OK(sd_varlink_server_listen_address(s, sp, 0600));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_fiber_new(e, "upgrade-client", upgrade_client_fiber, (void*) sp, &f));
+
+        /* Run the event loop. Exits on idle once the client fiber completes and all server connections
+         * have been torn down. */
+        ASSERT_OK(sd_event_loop(e));
+
+        ASSERT_OK(sd_future_result(f));
+}
+
+typedef struct AsyncUpgradeTest {
+        sd_event *event;
+        bool got_reply, got_upgrade, echo_done, got_error;
+        int input_fd, output_fd;
+} AsyncUpgradeTest;
+
+static int async_upgrade_echo_fiber(void *arg) {
+        AsyncUpgradeTest *t = ASSERT_PTR(arg);
+
+        /* Same exchange as in upgrade_client_fiber(), over the fds donated to the upgrade callback */
+        static const char msg[] = "Hello!";
+        ASSERT_OK(loop_write(t->output_fd, msg, strlen(msg)));
+        ASSERT_OK_ERRNO(shutdown(t->output_fd, SHUT_WR));
+
+        char buf[64] = {};
+        ssize_t n = ASSERT_OK(loop_read(t->input_fd, buf, strlen(msg), /* do_poll= */ true));
+        ASSERT_EQ((size_t) n, strlen(msg));
+        ASSERT_STREQ(buf, "!olleH");
+
+        t->input_fd = safe_close(t->input_fd);
+        t->output_fd = safe_close(t->output_fd);
+        t->echo_done = true;
+
+        ASSERT_OK(sd_event_exit(t->event, EXIT_SUCCESS));
+        return 0;
+}
+
+static int async_upgrade_on_reply(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        AsyncUpgradeTest *t = ASSERT_PTR(userdata);
+
+        ASSERT_FALSE(t->got_upgrade); /* the reply callback must run before the upgrade callback */
+        ASSERT_NULL(error_id);
+        ASSERT_FALSE(FLAGS_SET(flags, SD_VARLINK_REPLY_ERROR));
+        t->got_reply = true;
+        return 0;
+}
+
+static int async_upgrade_on_upgrade(sd_varlink *link, int input_fd, int output_fd, void *userdata) {
+        AsyncUpgradeTest *t = ASSERT_PTR(userdata);
+
+        ASSERT_TRUE(t->got_reply);
+        ASSERT_GE(input_fd, 0);
+        ASSERT_GE(output_fd, 0);
+        ASSERT_NE(input_fd, output_fd);
+        ASSERT_FALSE(sd_varlink_is_connected(link));
+        assert_varlink_xattr(input_fd, /* expected= */ NULL);
+        assert_varlink_xattr(output_fd, /* expected= */ NULL);
+
+        t->got_upgrade = true;
+        t->input_fd = input_fd;
+        t->output_fd = output_fd;
+
+        /* The raw I/O blocks, hence do it in a fiber so that the server can make progress */
+        _cleanup_(sd_future_unrefp) sd_future *f = NULL;
+        ASSERT_OK(sd_fiber_new(t->event, "async-upgrade-echo", async_upgrade_echo_fiber, t, &f));
+        ASSERT_OK(sd_fiber_set_floating(f, true));
+        return 0;
+}
+
+static int async_upgrade_on_error_reply(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        AsyncUpgradeTest *t = ASSERT_PTR(userdata);
+
+        ASSERT_STREQ(error_id, SD_VARLINK_ERROR_METHOD_NOT_FOUND);
+        ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_REPLY_ERROR));
+        t->got_error = true;
+        return 0;
+}
+
+static int async_upgrade_on_unexpected_upgrade(sd_varlink *link, int input_fd, int output_fd, void *userdata) {
+        safe_close(input_fd);
+        safe_close(output_fd);
+        assert_not_reached();
+}
+
+TEST(upgrade_async) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmpdir = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        const char *sp;
+
+        ASSERT_OK(mkdtemp_malloc("/tmp/varlink-test-XXXXXX", &tmpdir));
+        sp = strjoina(tmpdir, "/socket");
+
+        ASSERT_OK(sd_event_new(&e));
+
+        ASSERT_OK(sd_varlink_server_new(&s, SD_VARLINK_SERVER_UPGRADABLE));
+        ASSERT_OK(sd_varlink_server_set_description(s, "upgrade-server"));
+        ASSERT_OK(varlink_server_bind_fiber(s, "io.test.Upgrade", method_upgrade));
+        ASSERT_OK(sd_varlink_server_listen_address(s, sp, 0600));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        /* First a client whose upgrade request is answered with an error: the connection must stay usable */
+        AsyncUpgradeTest t2 = { .event = e, .input_fd = -EBADF, .output_fd = -EBADF };
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c2 = NULL;
+        ASSERT_OK(sd_varlink_connect_address(&c2, sp));
+        ASSERT_OK(sd_varlink_set_description(c2, "async-upgrade-error-client"));
+        ASSERT_OK(sd_varlink_attach_event(c2, e, /* priority= */ 0));
+        sd_varlink_set_userdata(c2, &t2);
+        ASSERT_OK(sd_varlink_bind_reply(c2, async_upgrade_on_error_reply));
+        ASSERT_OK(sd_varlink_bind_upgrade(c2, async_upgrade_on_unexpected_upgrade));
+        ASSERT_OK(sd_varlink_invoke_and_upgrade(c2, "io.test.NoSuchMethod", /* parameters= */ NULL));
+
+        while (!t2.got_error)
+                ASSERT_OK(sd_event_run(e, UINT64_MAX));
+
+        ASSERT_TRUE(sd_varlink_is_connected(c2));
+        ASSERT_OK_POSITIVE(sd_varlink_is_idle(c2));
+
+        /* After the refused upgrade regular calls work again */
+        t2.got_error = false;
+        ASSERT_OK(sd_varlink_invoke(c2, "io.test.NoSuchMethod", /* parameters= */ NULL));
+        while (!t2.got_error)
+                ASSERT_OK(sd_event_run(e, UINT64_MAX));
+        ASSERT_TRUE(sd_varlink_is_connected(c2));
+
+        /* Now a client driven entirely by the event loop whose upgrade is accepted */
+        AsyncUpgradeTest t = { .event = e, .input_fd = -EBADF, .output_fd = -EBADF };
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_address(&c, sp));
+        ASSERT_OK(sd_varlink_set_description(c, "async-upgrade-client"));
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+        sd_varlink_set_userdata(c, &t);
+        ASSERT_OK(sd_varlink_bind_reply(c, async_upgrade_on_reply));
+        ASSERT_OK(sd_varlink_bind_upgrade(c, async_upgrade_on_upgrade));
+        assert_varlink_xattr(ASSERT_OK(sd_varlink_get_input_fd(c)), "client");
+        ASSERT_OK(sd_varlink_invoke_and_upgrade(c, "io.test.Upgrade", /* parameters= */ NULL));
+
+        /* No other calls may be pipelined behind an upgrade request */
+        ASSERT_ERROR(sd_varlink_invoke(c, "io.test.Upgrade", /* parameters= */ NULL), EBUSY);
+        ASSERT_ERROR(sd_varlink_invoke_and_upgrade(c, "io.test.Upgrade", /* parameters= */ NULL), EBUSY);
+
+        ASSERT_OK(sd_event_loop(e));
+
+        ASSERT_TRUE(t.got_reply);
+        ASSERT_TRUE(t.got_upgrade);
+        ASSERT_TRUE(t.echo_done);
+        ASSERT_FALSE(sd_varlink_is_connected(c));
+}
+
+static int upgrade_pipelining_client_fiber(void *arg) {
+        union sockaddr_union sa = {};
+        _cleanup_close_ int fd = -EBADF;
+
+        /* Connect a raw socket and pipeline: upgrade JSON + \0 + raw data in a single write.
+         * This tests that the server's byte-by-byte reading (SD_VARLINK_SERVER_UPGRADABLE)
+         * doesn't consume the raw data into the varlink input buffer. */
+        fd = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
+        ASSERT_FD(fd);
+        int addrlen = sockaddr_un_set_path(&sa.un, arg);
+        ASSERT_OK(addrlen);
+        ASSERT_OK_ERRNO(connect(fd, &sa.sa, addrlen));
+
+        /* Build pipelined message: upgrade JSON + \0 + raw payload, all in one write */
+        static const char upgrade_msg[] = "{\"method\":\"io.test.Upgrade\",\"upgrade\":true}";
+        static const char raw_payload[] = "Pipelined!";
+        char send_buf[sizeof(upgrade_msg) + sizeof(raw_payload)]; /* includes \0 from upgrade_msg as delimiter */
+
+        memcpy(send_buf, upgrade_msg, sizeof(upgrade_msg)); /* copies trailing \0 = varlink delimiter */
+        memcpy(send_buf + sizeof(upgrade_msg), raw_payload, sizeof(raw_payload) - 1);
+
+        size_t total = sizeof(upgrade_msg) + strlen(raw_payload);
+        ASSERT_OK(loop_write(fd, send_buf, total));
+
+        /* Shut down write side so server's method_upgrade sees EOF after raw payload */
+        ASSERT_OK_ERRNO(shutdown(fd, SHUT_WR));
+
+        /* Read everything: upgrade reply (JSON + \0) + reversed raw payload. The server closes the
+         * connection after writing, so loop_read() reads until EOF and gets it all. */
+        char buf[256] = {};
+        ssize_t n = ASSERT_OK(loop_read(fd, buf, sizeof(buf) - 1, /* do_poll= */ true));
+        ASSERT_GT(n, 0);
+
+        /* Split at the \0 delimiter between JSON reply and raw payload */
+        char *delim = memchr(buf, 0, n);
+        ASSERT_NOT_NULL(delim);
+
+        char *raw = delim + 1;
+        size_t raw_size = (size_t) n - (size_t)(raw - buf);
+
+        ASSERT_EQ(raw_size, strlen(raw_payload));
+        ASSERT_STREQ(strndupa_safe(raw, raw_size), "!denilepiP");
+
+        ASSERT_OK(sd_event_exit(sd_fiber_get_event(), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(upgrade_pipelining) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmpdir = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_future_unrefp) sd_future *f = NULL;
+        const char *sp;
+
+        ASSERT_OK(mkdtemp_malloc("/tmp/varlink-test-XXXXXX", &tmpdir));
+        sp = strjoina(tmpdir, "/socket");
+
+        ASSERT_OK(sd_event_new(&e));
+
+        ASSERT_OK(sd_varlink_server_new(&s, SD_VARLINK_SERVER_UPGRADABLE));
+        ASSERT_OK(sd_varlink_server_set_description(s, "upgrade-pipelining-server"));
+        /* method_upgrade does raw I/O on the upgraded socket, so bind as a fiber method. */
+        ASSERT_OK(varlink_server_bind_fiber(s, "io.test.Upgrade", method_upgrade));
+        ASSERT_OK(sd_varlink_server_listen_address(s, sp, 0600));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_fiber_new(e, "upgrade-pipelining-client", upgrade_pipelining_client_fiber, (void*) sp, &f));
+
+        ASSERT_OK(sd_event_loop(e));
+
+        ASSERT_OK(sd_future_result(f));
+}
+
+/* Stashes the fds handed to the asynchronous upgrade callback so the raw-I/O fiber can pick them up.
+ * A single connection is upgraded per test run, so globals are sufficient. */
+static int respond_upgrade_input_fd = -EBADF;
+static int respond_upgrade_output_fd = -EBADF;
+
+static int respond_upgrade_io_fiber(void *arg) {
+        _cleanup_close_ int input_fd = TAKE_FD(respond_upgrade_input_fd), output_fd = TAKE_FD(respond_upgrade_output_fd);
+
+        /* Same reverse-echo raw protocol as method_upgrade(), but reached through the asynchronous
+         * upgrade callback instead of a synchronous fiber method: read until the client shuts down its
+         * write side, reverse the bytes, and write them back. */
+        char buf[64] = {};
+        ssize_t n = ASSERT_OK(loop_read(input_fd, buf, sizeof(buf) - 1, /* do_poll= */ true));
+        ASSERT_GT(n, 0);
+
+        for (ssize_t i = 0; i < n / 2; i++)
+                SWAP_TWO(buf[i], buf[n - 1 - i]);
+
+        ASSERT_OK(loop_write(output_fd, buf, n));
+
+        return 0;
+}
+
+static int respond_upgrade_callback(sd_varlink *link, int input_fd, int output_fd, void *userdata) {
+        sd_event *e = ASSERT_PTR(userdata);
+
+        /* The upgrade callback is invoked from sd_varlink_process() in the main event loop (not a
+         * fiber), so it must not block on raw I/O. Hand the connection's fds to a floating fiber that
+         * speaks the raw protocol, allowing the client fiber to make progress concurrently. Ownership of
+         * the fds is transferred to us regardless of what happens next, so stash them before spawning. */
+        respond_upgrade_input_fd = input_fd;
+        respond_upgrade_output_fd = output_fd;
+
+        ASSERT_OK(sd_fiber_new(e, "respond-upgrade-io", respond_upgrade_io_fiber, /* userdata= */ NULL, /* ret= */ NULL));
+
+        return 0;
+}
+
+static int method_respond_upgrade(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        int r;
+
+        ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_METHOD_UPGRADE));
+
+        /* Register the async upgrade callback, then enqueue the final reply. Unlike
+         * sd_varlink_reply_and_upgrade(), sd_varlink_respond_and_upgradebo() returns immediately without
+         * blocking: the reply is flushed by the event loop and the fds are subsequently handed to
+         * respond_upgrade_callback(). This is why the method may be bound as a regular (non-fiber) method. */
+        ASSERT_OK(sd_varlink_bind_upgrade(link, respond_upgrade_callback));
+
+        r = sd_varlink_respond_and_upgradebo(
+                        link,
+                        SD_JSON_BUILD_PAIR_STRING("greeting", "aloha"));
+        if (r < 0)
+                return r;
+
+        return 0;
+}
+
+static int respond_upgrade_client_fiber(void *arg) {
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *c = NULL;
+        _cleanup_close_ int input_fd = -EBADF, output_fd = -EBADF;
+        sd_json_variant *o = NULL;
+        const char *error_id = NULL;
+
+        ASSERT_OK(sd_varlink_connect_address(&c, arg));
+        ASSERT_OK(sd_varlink_set_description(c, "respond-upgrade-client"));
+
+        ASSERT_OK(sd_varlink_call_and_upgrade(c, "io.test.RespondUpgrade", /* parameters= */ NULL, &o, &error_id, &input_fd, &output_fd));
+        ASSERT_NULL(error_id);
+
+        /* The reply parameters enqueued asynchronously by the server must have arrived intact. */
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(o, "greeting")), "aloha");
+
+        ASSERT_GE(input_fd, 0);
+        ASSERT_GE(output_fd, 0);
+        ASSERT_NE(input_fd, output_fd); /* library dups for bidirectional sockets */
+
+        /* Send a test string, shut down write side so the server sees EOF, then read the reversed reply */
+        static const char msg[] = "Hello!";
+        ASSERT_OK(loop_write(output_fd, msg, strlen(msg)));
+        ASSERT_OK_ERRNO(shutdown(output_fd, SHUT_WR));
+
+        char buf[64] = {};
+        ssize_t n = ASSERT_OK(loop_read(input_fd, buf, strlen(msg), /* do_poll= */ true));
+        ASSERT_EQ((size_t) n, strlen(msg));
+        ASSERT_STREQ(buf, "!olleH");
+
+        ASSERT_OK(sd_event_exit(sd_fiber_get_event(), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(respond_upgrade) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *tmpdir = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_future_unrefp) sd_future *f = NULL;
+        const char *sp;
+
+        ASSERT_OK(mkdtemp_malloc("/tmp/varlink-test-XXXXXX", &tmpdir));
+        sp = strjoina(tmpdir, "/socket");
+
+        ASSERT_OK(sd_event_new(&e));
+
+        ASSERT_OK(sd_varlink_server_new(&s, SD_VARLINK_SERVER_UPGRADABLE|SD_VARLINK_SERVER_INHERIT_USERDATA));
+        ASSERT_OK(sd_varlink_server_set_description(s, "respond-upgrade-server"));
+        /* The event loop is propagated to the async upgrade callback via the connection userdata (inherited
+         * from the server) so the callback can spawn the raw-I/O fiber. */
+        sd_varlink_server_set_userdata(s, e);
+        /* Unlike TEST(upgrade), this is a *regular* (non-fiber) method: it drives the asynchronous
+         * sd_varlink_respond_and_upgradebo() API, which never blocks the event loop on a single client. */
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.RespondUpgrade", method_respond_upgrade));
+        ASSERT_OK(sd_varlink_server_listen_address(s, sp, 0600));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+
+        ASSERT_OK(sd_fiber_new(e, "respond-upgrade-client", respond_upgrade_client_fiber, (void*) sp, &f));
+
+        ASSERT_OK(sd_event_loop(e));
+
+        ASSERT_OK(sd_future_result(f));
+}
+
+typedef struct ExecDirServer {
+        sd_varlink_server *server;
+        const char *name;
+} ExecDirServer;
+
+static int method_execute_dir_ping(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        ExecDirServer *srv = ASSERT_PTR(userdata);
+
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_STRING("name", srv->name));
+}
+
+static int execute_dir_reply(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        size_t *count = ASSERT_PTR(userdata);
+
+        ASSERT_NULL(error_id);
+        ASSERT_NOT_NULL(sd_json_variant_by_key(parameters, "name"));
+
+        (*count)++;
+        return 0;
+}
+
+typedef struct ExecDirClientArgs {
+        const char *tmpdir;
+        size_t n_servers;
+        size_t *reply_count;
+} ExecDirClientArgs;
+
+static int execute_dir_client_fiber(void *arg) {
+        ExecDirClientArgs *a = ASSERT_PTR(arg);
+
+        ASSERT_OK_EQ(varlink_execute_directory(
+                                     a->tmpdir,
+                                     "io.test.ExecDirPing",
+                                     /* parameters= */ NULL,
+                                     /* more= */ false,
+                                     /* timeout_usec= */ USEC_INFINITY,
+                                     execute_dir_reply,
+                                     a->reply_count), (ssize_t) a->n_servers);
+        ASSERT_EQ(*a->reply_count, a->n_servers);
+
+        /* Sockets that have a live listener must be counted as contacted, not as offline. */
+        _cleanup_strv_free_ char **offline = NULL;
+        ASSERT_OK_EQ(varlink_execute_directory_full(
+                                     a->tmpdir,
+                                     "io.test.ExecDirPing",
+                                     /* parameters= */ NULL,
+                                     /* more= */ false,
+                                     /* timeout_usec= */ USEC_INFINITY,
+                                     execute_dir_reply,
+                                     a->reply_count,
+                                     &offline), (ssize_t) a->n_servers);
+        ASSERT_TRUE(strv_isempty(offline));
+        ASSERT_EQ(*a->reply_count, 2 * a->n_servers);
+
+        /* Calling the helper against a non-existent directory must fail. */
+        _cleanup_free_ char *nope = NULL;
+        ASSERT_OK(asprintf(&nope, "%s/does-not-exist", a->tmpdir));
+        ASSERT_FAIL(varlink_execute_directory(
+                                    nope,
+                                    "io.test.ExecDirPing",
+                                    /* parameters= */ NULL,
+                                    /* more= */ false,
+                                    /* timeout_usec= */ USEC_INFINITY,
+                                    execute_dir_reply,
+                                    a->reply_count));
+
+        /* An empty directory must simply return 0 and not invoke the reply callback. */
+        _cleanup_free_ char *empty = ASSERT_PTR(path_join(a->tmpdir, "empty"));
+        ASSERT_OK_ERRNO(mkdir(empty, 0755));
+
+        size_t count_before = *a->reply_count;
+        ASSERT_OK_ZERO(varlink_execute_directory(
+                                       empty,
+                                       "io.test.ExecDirPing",
+                                       /* parameters= */ NULL,
+                                       /* more= */ false,
+                                       /* timeout_usec= */ USEC_INFINITY,
+                                       execute_dir_reply,
+                                       a->reply_count));
+        ASSERT_EQ(*a->reply_count, count_before);
+
+        ASSERT_OK_ZERO(varlink_execute_directory_full(
+                                       empty,
+                                       "io.test.ExecDirPing",
+                                       /* parameters= */ NULL,
+                                       /* more= */ false,
+                                       /* timeout_usec= */ USEC_INFINITY,
+                                       execute_dir_reply,
+                                       a->reply_count,
+                                       &offline));
+        ASSERT_TRUE(strv_isempty(offline));
+
+        /* A socket inode nobody listens on must not be counted as contacted, but as offline. */
+        _cleanup_free_ char *dead = ASSERT_PTR(path_join(empty, "dead"));
+        ASSERT_OK_ERRNO(mknod(dead, S_IFSOCK|0600, 0));
+
+        ASSERT_OK_ZERO(varlink_execute_directory_full(
+                                       empty,
+                                       "io.test.ExecDirPing",
+                                       /* parameters= */ NULL,
+                                       /* more= */ false,
+                                       /* timeout_usec= */ USEC_INFINITY,
+                                       execute_dir_reply,
+                                       a->reply_count,
+                                       &offline));
+        ASSERT_STRV_EQ_SET(offline, "dead");
+        ASSERT_EQ(*a->reply_count, count_before);
+
+        ASSERT_OK(sd_event_exit(sd_fiber_get_event(), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(execute_directory) {
+        _cleanup_(rm_rf_physical_and_freep) char *tmpdir = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_future_unrefp) sd_future *f = NULL;
+        static const char * const names[] = { "alpha", "beta", "gamma" };
+        ExecDirServer servers[ELEMENTSOF(names)] = {};
+        size_t reply_count = 0;
+
+        ASSERT_OK(mkdtemp_malloc("/tmp/varlink-execdir-XXXXXX", &tmpdir));
+
+        ASSERT_OK(sd_event_new(&e));
+
+        for (size_t i = 0; i < ELEMENTSOF(names); i++) {
+                ExecDirServer *eds = servers + i;
+                servers[i].name = names[i];
+
+                _cleanup_free_ char *j = ASSERT_PTR(path_join(tmpdir, names[i]));
+
+                ASSERT_OK(varlink_server_new(&eds->server,
+                                             SD_VARLINK_SERVER_INHERIT_USERDATA,
+                                             eds));
+                ASSERT_OK(sd_varlink_server_bind_method(eds->server, "io.test.ExecDirPing", method_execute_dir_ping));
+                ASSERT_OK(sd_varlink_server_listen_address(eds->server, j, 0600));
+                ASSERT_OK(sd_varlink_server_attach_event(eds->server, e, /* priority= */ 0));
+        }
+
+        ExecDirClientArgs args = {
+                .tmpdir = tmpdir,
+                .n_servers = ELEMENTSOF(names),
+                .reply_count = &reply_count,
+        };
+        ASSERT_OK(sd_fiber_new(e, "execute-dir-client", execute_dir_client_fiber, &args, &f));
+
+        ASSERT_OK(sd_event_loop(e));
+
+        ASSERT_OK(sd_future_result(f));
+
+        FOREACH_ELEMENT(eds, servers)
+                eds->server = sd_varlink_server_unref(eds->server);
+}
+
+#define CTRUNC_N_FDS 64U
+
+static int method_ctrunc(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* Peek the first fd the client supposedly sent. With SCM_RIGHTS truncated by the kernel
+         * because the receiver hit RLIMIT_NOFILE, sd_varlink_peek_fd() returns -ENXIO once we
+         * walk past the last successfully installed fd. We're forcing the missing-fd case here,
+         * so we expect to fail and let varlink translate -ENXIO into io.systemd.System for the
+         * peer. */
+        int fd = sd_varlink_peek_fd(link, CTRUNC_N_FDS - 1);
+        if (fd < 0)
+                return fd;
+
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_INTEGER("ok", 1));
+}
+
+static int reply_ctrunc(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        /* We expect a clean system error back rather than a hanging connection: the server
+         * dropped the truncated fds and our handler surfaced -ENXIO, which varlink wraps as
+         * io.systemd.System. */
+        ASSERT_STREQ(error_id, SD_VARLINK_ERROR_SYSTEM);
+        ASSERT_ERROR(sd_varlink_error_to_errno(error_id, parameters), ENXIO);
+
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(ctrunc) {
+        int r;
+
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        ASSERT_OK(sd_varlink_server_new(&s, SD_VARLINK_SERVER_ALLOW_FD_PASSING_INPUT|SD_VARLINK_SERVER_ALLOW_FD_PASSING_OUTPUT));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.CTrunc", method_ctrunc));
+
+        int connfd[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, connfd[1]));
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_input(c, true));
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_output(c, true));
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_ctrunc));
+
+        /* Open a batch of memfds we'll attach to the call. We push duplicates so the originals
+         * keep occupying fd table slots after the stream sends and closes the dup'd copies,
+         * making the receiver hit RLIMIT_NOFILE when it tries to install the incoming fds. */
+        int originals[CTRUNC_N_FDS];
+        for (size_t i = 0; i < CTRUNC_N_FDS; i++)
+                originals[i] = -EBADF;
+        CLEANUP_ELEMENTS(originals, close_many_unset);
+
+        for (size_t i = 0; i < CTRUNC_N_FDS; i++) {
+                originals[i] = ASSERT_OK(memfd_new_and_seal_string("ctrunc", "x"));
+                ASSERT_OK_EQ(sd_varlink_push_dup_fd(c, originals[i]), (int) i);
+        }
+
+        /* Constrain RLIMIT_NOFILE so the server can't install every received fd. The kernel
+         * will then drop the remaining fds from the SCM_RIGHTS message and set MSG_CTRUNC,
+         * which is precisely what an LSM denial (or a real fd-table-full peer) looks like to
+         * the receive side. Pick the new limit slightly above our current open-fd count so
+         * the kernel can install only a handful of received fds before failing the rest. */
+        struct rlimit orig_rl;
+        ASSERT_OK_ERRNO(getrlimit(RLIMIT_NOFILE, &orig_rl));
+
+        size_t n_open = 0;
+        _cleanup_closedir_ DIR *d = ASSERT_NOT_NULL(opendir("/proc/self/fd"));
+        FOREACH_DIRENT_ALL(de, d, break)
+                if (!dot_or_dot_dot(de->d_name))
+                        n_open++;
+
+        /* n_open currently includes the CTRUNC_N_FDS dup'd fds that the stream will close once
+         * the message has been sent. After the send, we'll be back down to n_open - CTRUNC_N_FDS
+         * fds. Set the limit just slightly above that, so the kernel can install only a handful
+         * of the CTRUNC_N_FDS incoming fds before failing the rest with MSG_CTRUNC. */
+        ASSERT_GT(n_open, CTRUNC_N_FDS);
+        struct rlimit new_rl = {
+                .rlim_cur = n_open - CTRUNC_N_FDS + 8,
+                .rlim_max = orig_rl.rlim_max,
+        };
+        ASSERT_OK_ERRNO(setrlimit(RLIMIT_NOFILE, &new_rl));
+
+        r = sd_varlink_invoke(c, "io.test.CTrunc", /* parameters= */ NULL);
+        if (r >= 0)
+                r = sd_event_loop(e);
+
+        ASSERT_OK_ERRNO(setrlimit(RLIMIT_NOFILE, &orig_rl));
+        ASSERT_OK(r);
+}
+
+static void disconnect_callback(sd_varlink_server *server, sd_varlink *link, void *userdata) {
+        unsigned *counter = ASSERT_PTR(userdata);
+
+        (*counter)++;
+}
+
+static void test_method_flags_one(const char *flags, int expected_error) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *v = NULL;
+        _cleanup_close_pair_ int fds[2] = EBADF_PAIR;
+        int r;
+
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, fds));
+        ASSERT_OK(sd_varlink_server_add_connection(s, fds[0], &v));
+        TAKE_FD(fds[0]);
+        sd_varlink_ref(v);
+
+        _cleanup_free_ char *request = ASSERT_NOT_NULL(strjoin(
+                        "{\"method\":\"org.varlink.service.GetInfo\",", flags, "}"));
+        ASSERT_OK(loop_write(fds[1], request, strlen(request) + 1));
+
+        while ((r = sd_varlink_process(v)) > 0)
+                ;
+        ASSERT_EQ(r, -expected_error);
+
+        /* JSON parse errors schedule disconnection instead of closing the connection immediately. */
+        if (expected_error != 0)
+                while (sd_varlink_is_connected(v))
+                        ASSERT_OK_POSITIVE(sd_varlink_process(v));
+        ASSERT_EQ(sd_varlink_is_connected(v), expected_error == 0);
+
+        if (expected_error == 0) {
+                char buffer[4096];
+                ssize_t n = ASSERT_OK_ERRNO(recv(fds[1], buffer, sizeof(buffer), MSG_DONTWAIT));
+                ASSERT_GT(n, 0);
+                ASSERT_EQ(buffer[n - 1], 0);
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+                ASSERT_OK(sd_json_parse(buffer, /* flags= */ 0, &reply, /* reterr_line= */ NULL, /* reterr_column= */ NULL));
+                ASSERT_NOT_NULL(sd_json_variant_by_key(reply, "parameters"));
+                ASSERT_NULL(sd_json_variant_by_key(reply, "error"));
+        }
+}
+
+TEST(method_flags) {
+        FOREACH_STRING(flags,
+                       "\"more\":true,\"oneway\":false,\"upgrade\":false",
+                       "\"oneway\":false,\"more\":true,\"upgrade\":false",
+                       "\"upgrade\":false,\"oneway\":false,\"more\":true",
+                       "\"more\":false,\"oneway\":false,\"upgrade\":false")
+                test_method_flags_one(flags, /* expected_error= */ 0);
+
+        FOREACH_STRING(flags,
+                       "\"more\":true,\"oneway\":true",
+                       "\"oneway\":true,\"more\":true",
+                       "\"more\":true,\"upgrade\":true",
+                       "\"upgrade\":true,\"oneway\":true",
+                       "\"more\":null",
+                       "\"more\":1")
+                test_method_flags_one(flags, EINVAL);
+
+        FOREACH_STRING(flags,
+                       "\"oneway\":false,\"oneway\":false",
+                       "\"oneway\":false,\"oneway\":true",
+                       "\"oneway\":true,\"oneway\":false",
+                       "\"oneway\":true,\"oneway\":true",
+                       "\"more\":false,\"more\":false",
+                       "\"more\":false,\"more\":true",
+                       "\"more\":true,\"more\":false",
+                       "\"more\":true,\"more\":true",
+                       "\"upgrade\":false,\"upgrade\":false",
+                       "\"upgrade\":false,\"upgrade\":true",
+                       "\"upgrade\":true,\"upgrade\":false",
+                       "\"upgrade\":true,\"upgrade\":true")
+                test_method_flags_one(flags, ENOTUNIQ);
+}
+
+static void test_method_reply(sd_varlink_server *s, const char *request, const char *error) {
+        _cleanup_(sd_varlink_close_unrefp) sd_varlink *v = NULL;
+        _cleanup_close_pair_ int fds[2] = EBADF_PAIR;
+        int r;
+
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, fds));
+        ASSERT_OK(sd_varlink_server_add_connection(s, fds[0], &v));
+        TAKE_FD(fds[0]);
+        sd_varlink_ref(v);
+
+        ASSERT_OK(loop_write(fds[1], request, strlen(request) + 1));
+        while ((r = sd_varlink_process(v)) > 0)
+                ;
+        ASSERT_OK(r);
+
+        char buffer[4096];
+        ssize_t n = ASSERT_OK_ERRNO(recv(fds[1], buffer, sizeof(buffer), MSG_DONTWAIT));
+        ASSERT_GT(n, 0);
+        ASSERT_EQ(buffer[n - 1], 0);
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
+        ASSERT_OK(sd_json_parse(buffer, /* flags= */ 0, &reply, /* reterr_line= */ NULL, /* reterr_column= */ NULL));
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(reply, "error")), error);
+        ASSERT_TRUE(sd_varlink_is_connected(v));
+}
+
+static int method_unexpected(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        assert_not_reached();
+}
+
+static int method_ordinary_reply(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        return sd_varlink_reply(link, /* parameters= */ NULL);
+}
+
+TEST(required_method_flags) {
+        static SD_VARLINK_DEFINE_METHOD_FULL(More, SD_VARLINK_REQUIRES_MORE);
+        static SD_VARLINK_DEFINE_METHOD_FULL(Upgrade, SD_VARLINK_REQUIRES_UPGRADE);
+        static SD_VARLINK_DEFINE_INTERFACE(test_flags, "io.test.Flags", &vl_method_More, &vl_method_Upgrade);
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+        ASSERT_OK(sd_varlink_server_add_interface(s, &vl_interface_test_flags));
+        ASSERT_OK(sd_varlink_server_bind_method_many(s,
+                                                   "io.test.Flags.More", method_ordinary_reply,
+                                                   "io.test.Flags.Upgrade", method_ordinary_reply));
+
+        test_method_reply(s, "{\"method\":\"io.test.Flags.More\"}", SD_VARLINK_ERROR_EXPECTED_MORE);
+        test_method_reply(s, "{\"method\":\"io.test.Flags.More\",\"upgrade\":true}", SD_VARLINK_ERROR_EXPECTED_MORE);
+        test_method_reply(s, "{\"method\":\"io.test.Flags.More\",\"more\":true}", /* error= */ NULL);
+        test_method_reply(s, "{\"method\":\"io.test.Flags.Upgrade\"}", SD_VARLINK_ERROR_EXPECTED_UPGRADE);
+        test_method_reply(s, "{\"method\":\"io.test.Flags.Upgrade\",\"more\":true}", SD_VARLINK_ERROR_EXPECTED_UPGRADE);
+}
+
+TEST(unsupported_upgrade) {
+        static SD_VARLINK_DEFINE_METHOD(Plain);
+        static SD_VARLINK_DEFINE_INTERFACE(test_plain, "io.test.Plain", &vl_method_Plain);
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+
+        ASSERT_OK(sd_varlink_server_new(&s, /* flags= */ 0));
+        ASSERT_OK(sd_varlink_server_add_interface(s, &vl_interface_test_plain));
+        ASSERT_OK(sd_varlink_server_bind_method_many(s,
+                                                   "io.test.Plain.Plain", method_unexpected,
+                                                   "io.test.Unspecified", method_ordinary_reply));
+
+        test_method_reply(s, "{\"method\":\"org.varlink.service.GetInfo\",\"upgrade\":true}",
+                          SD_VARLINK_ERROR_OPERATION_NOT_SUPPORTED);
+        test_method_reply(s, "{\"method\":\"io.test.Plain.Plain\",\"upgrade\":true}",
+                          SD_VARLINK_ERROR_OPERATION_NOT_SUPPORTED);
+        test_method_reply(s, "{\"method\":\"io.test.Unspecified\",\"upgrade\":true}",
+                          SD_VARLINK_ERROR_OPERATION_NOT_SUPPORTED);
+}
+
+TEST(is_connected_null) {
+        /* A non-existent connection is not connected */
+        ASSERT_OK_ZERO(sd_varlink_is_connected(NULL));
+}
+
+TEST(wants_reply_null) {
+        /* A non-existent connection wants no reply */
+        ASSERT_OK_ZERO(sd_varlink_wants_reply(NULL));
+}
+
+TEST(add_connection_failure_cleanup) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_close_pair_ int fds[2] = EBADF_PAIR;
+        const struct ucred ucred = {
+                .pid = getpid(),
+                .uid = getuid(),
+                .gid = getgid(),
+        };
+
+        ASSERT_OK(sd_varlink_server_new(&s, SD_VARLINK_SERVER_ACCOUNT_UID));
+
+        unsigned c = 0;
+        ASSERT_OK(sd_varlink_server_bind_disconnect(s, disconnect_callback));
+        ASSERT_NULL(sd_varlink_server_set_userdata(s, &c));
+
+        ASSERT_OK(sd_varlink_server_set_connections_per_uid_max(s, 1));
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, fds));
+
+        int bad_fd = ASSERT_OK(memfd_new("closed-fd"));
+        ASSERT_OK_ERRNO(close(bad_fd));
+
+        ASSERT_ERROR(sd_varlink_server_add_connection_pair(s, fds[0], bad_fd, &ucred, /* ret= */ NULL), EBADF);
+        ASSERT_EQ(sd_varlink_server_current_connections(s), 0U);
+        ASSERT_EQ(c, 0U); /* The disconnect callback is not called. */
+
+        sd_varlink *v = NULL;
+        ASSERT_OK(sd_varlink_server_add_connection(s, fds[0], &v));
+        TAKE_FD(fds[0]);
+        ASSERT_NOT_NULL(v);
+        ASSERT_EQ(sd_varlink_server_current_connections(s), 1U);
+        ASSERT_EQ(c, 0U); /* The disconnect callback is not called yet. */
+
+        ASSERT_OK_POSITIVE(sd_varlink_close(v));
+        ASSERT_EQ(sd_varlink_server_current_connections(s), 0U);
+        ASSERT_EQ(c, 1U); /* The disconnect callback is called when the connection is closed. */
+}
+
+static int method_echo(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        return sd_varlink_reply(link, parameters);
+}
+
+typedef struct PinnedReplyTest {
+        sd_event *event;
+        int fd;
+        int n;
+        int input_fd, output_fd;
+} PinnedReplyTest;
+
+/* The reply callbacks below check that every reply is one to the asynchronous call, not the reply still
+ * pinned from the preceding synchronous call, i.e. the one from call_pinned(), which has no "sum". */
+
+static int reply_pinned_invoke(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        PinnedReplyTest *t = ASSERT_PTR(userdata);
+
+        ASSERT_NULL(error_id);
+        ASSERT_EQ(sd_json_variant_integer(sd_json_variant_by_key(parameters, "sum")), 3);
+        ASSERT_FALSE(FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES));
+        t->n++;
+
+        return 0;
+}
+
+static int reply_pinned_observe(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        PinnedReplyTest *t = ASSERT_PTR(userdata);
+
+        ASSERT_NULL(error_id);
+        ASSERT_EQ(sd_json_variant_integer(sd_json_variant_by_key(parameters, "sum")), 1 + 2 * t->n);
+        ASSERT_EQ(FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES), t->n < 5);
+        t->n++;
+
+        return 0;
+}
+
+static int reply_pinned_upgrade(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        PinnedReplyTest *t = ASSERT_PTR(userdata);
+
+        ASSERT_NULL(error_id);
+        ASSERT_TRUE(sd_json_variant_is_blank_object(parameters));
+        t->n++;
+
+        return 0;
+}
+
+static int reply_pinned_pipelined(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        PinnedReplyTest *t = ASSERT_PTR(userdata);
+
+        /* The n-th call asked for a sum of n, hence this checks that no reply was dropped */
+        ASSERT_NULL(error_id);
+        ASSERT_EQ(sd_json_variant_integer(sd_json_variant_by_key(parameters, "sum")), t->n);
+        t->n++;
+
+        return 0;
+}
+
+static void invoke_pipelined(sd_varlink *c, int *n_invoked) {
+        assert(c);
+        assert(n_invoked);
+
+        ASSERT_OK(sd_varlink_invokebo(c, "io.test.DoSomething",
+                                      SD_JSON_BUILD_PAIR_INTEGER("a", *n_invoked),
+                                      SD_JSON_BUILD_PAIR_INTEGER("b", 0)));
+        (*n_invoked)++;
+
+        /* Write the call out right away, so that the processing steps in pinned_reply_fiber() are only
+         * reading, parsing and dispatching replies. */
+        ASSERT_OK(sd_varlink_flush(c));
+}
+
+static int upgrade_pinned(sd_varlink *link, int input_fd, int output_fd, void *userdata) {
+        PinnedReplyTest *t = ASSERT_PTR(userdata);
+
+        /* Called after reply_pinned_upgrade() */
+        ASSERT_EQ(t->n, 1);
+        t->input_fd = input_fd;
+        t->output_fd = output_fd;
+        t->n++;
+
+        return 0;
+}
+
+static sd_json_variant* call_pinned(sd_varlink *c) {
+        sd_json_variant *o = NULL;
+        const char *error_id = NULL;
+
+        /* This leaves the reply pinned in the connection object. The returned parameters are owned by it,
+         * and are passed as parameters to the following asynchronous call, to check that they are still
+         * valid while that call is built (run with ASan to catch a use-after-free). */
+        ASSERT_OK(sd_varlink_callbo(c, "io.test.Echo", &o, &error_id,
+                                    SD_JSON_BUILD_PAIR_INTEGER("a", 1),
+                                    SD_JSON_BUILD_PAIR_INTEGER("b", 2)));
+        ASSERT_NULL(error_id);
+        ASSERT_EQ(sd_json_variant_integer(sd_json_variant_by_key(o, "a")), 1);
+        ASSERT_EQ(sd_json_variant_integer(sd_json_variant_by_key(o, "b")), 2);
+
+        return o;
+}
+
+static void process_pinned(sd_varlink *c, const int *n, int until) {
+        int r;
+
+        assert(c);
+        assert(n);
+
+        while (*n < until) {
+                r = ASSERT_OK(sd_varlink_process(c));
+                if (r > 0)
+                        continue;
+
+                ASSERT_OK(sd_varlink_wait(c, USEC_INFINITY));
+        }
+}
+
+static int pinned_reply_fiber(void *userdata) {
+        PinnedReplyTest *t = ASSERT_PTR(userdata);
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *c = NULL;
+        _cleanup_close_ int input_fd = -EBADF, output_fd = -EBADF;
+        static const char msg[] = "Hello!";
+        char buf[64] = {};
+        sd_json_variant *p, *j;
+        const char *error_id;
+        int n_invoked = 0, r;
+        ssize_t n;
+
+        ASSERT_OK(sd_varlink_connect_fd(&c, TAKE_FD(t->fd)));
+        sd_varlink_set_userdata(c, t);
+
+        p = call_pinned(c);
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_pinned_invoke));
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.DoSomething", p));
+        process_pinned(c, &t->n, 1);
+
+        p = call_pinned(c);
+        t->n = 0;
+        ASSERT_OK(sd_varlink_bind_reply(c, /* reply= */ NULL));
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_pinned_observe));
+        ASSERT_OK(sd_varlink_observe(c, "io.test.DoSomethingMore", p));
+        process_pinned(c, &t->n, 6);
+
+        /* sd_varlink_collect() drops the pinned reply too, hence pass parameters owned by it here as well */
+        p = call_pinned(c);
+        error_id = NULL;
+        ASSERT_OK(sd_varlink_collect(c, "io.test.DoSomethingMore", p, &j, &error_id));
+        ASSERT_NULL(error_id);
+        ASSERT_EQ(sd_json_variant_elements(j), 6U);
+        for (size_t i = 0; i < 6; i++)
+                ASSERT_EQ(sd_json_variant_integer(sd_json_variant_by_key(sd_json_variant_by_index(j, i), "sum")),
+                          (int64_t) (1 + 2 * i));
+
+        /* Pipeline another call after each processing step until the first reply is dispatched. Parsing
+         * and dispatching a reply are separate steps, hence one of these calls is made while the first
+         * reply is parsed but not dispatched yet. Unlike a pinned reply, that one must be kept. */
+        t->n = 0;
+        ASSERT_OK(sd_varlink_bind_reply(c, /* reply= */ NULL));
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_pinned_pipelined));
+        invoke_pipelined(c, &n_invoked);
+        while (t->n < n_invoked) {
+                r = ASSERT_OK(sd_varlink_process(c));
+                if (r > 0) {
+                        if (t->n == 0)
+                                invoke_pipelined(c, &n_invoked);
+                        continue;
+                }
+
+                ASSERT_OK(sd_varlink_wait(c, USEC_INFINITY));
+        }
+        ASSERT_GE(n_invoked, 3); /* the initial call, plus one each after reading and after parsing */
+
+        /* Both the reply and the upgrade callback count, the latter also stores the fds in t */
+        p = call_pinned(c);
+        t->n = 0;
+        ASSERT_OK(sd_varlink_bind_reply(c, /* reply= */ NULL));
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_pinned_upgrade));
+        ASSERT_OK(sd_varlink_bind_upgrade(c, upgrade_pinned));
+        ASSERT_OK(sd_varlink_invoke_and_upgrade(c, "io.test.Upgrade", p)); /* parameters are ignored */
+        process_pinned(c, &t->n, 2);
+        input_fd = TAKE_FD(t->input_fd);
+        output_fd = TAKE_FD(t->output_fd);
+
+        /* Same exchange as in upgrade_client_fiber(), to verify we are in sync with the server */
+        ASSERT_OK(loop_write(output_fd, msg, strlen(msg)));
+        ASSERT_OK_ERRNO(shutdown(output_fd, SHUT_WR));
+
+        n = ASSERT_OK(loop_read(input_fd, buf, strlen(msg), /* do_poll= */ true));
+        ASSERT_EQ((size_t) n, strlen(msg));
+        ASSERT_STREQ(buf, "!olleH");
+
+        return sd_event_exit(t->event, EXIT_SUCCESS);
+}
+
+TEST(async_call_after_pinned_reply) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_(sd_future_unrefp) sd_future *f = NULL;
+        PinnedReplyTest t = {};
+        int connfd[2];
+
+        ASSERT_OK(sd_event_default(&e));
+
+        ASSERT_OK(sd_varlink_server_new(&s, SD_VARLINK_SERVER_UPGRADABLE));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.DoSomething", method_something));
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.DoSomethingMore", method_something_more));
+        ASSERT_OK(sd_varlink_server_bind_method(s, "io.test.Echo", method_echo));
+        ASSERT_OK(varlink_server_bind_fiber(s, "io.test.Upgrade", method_upgrade));
+
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, connfd));
+        ASSERT_OK(sd_varlink_server_add_connection(s, connfd[0], /* ret= */ NULL));
+
+        t = (PinnedReplyTest) {
+                .event = e,
+                .fd = connfd[1],
+                .input_fd = -EBADF,
+                .output_fd = -EBADF,
+        };
+
+        ASSERT_OK(sd_fiber_new(e, "client", pinned_reply_fiber, &t, &f));
+        ASSERT_OK(sd_event_loop(e));
+        ASSERT_OK(sd_future_result(f));
+}
+
+static sd_varlink *serialize_stream_link = NULL, *serialize_hang_link = NULL;
+
+static int method_serialize_stream(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* Keep the call pending, and ask for it to be kept across serialization */
+        ASSERT_NULL(serialize_stream_link);
+        serialize_stream_link = sd_varlink_ref(link);
+        ASSERT_OK(sd_varlink_set_serialize_pending(link, true));
+
+        return sd_varlink_notifybo(link, SD_JSON_BUILD_PAIR_UNSIGNED("index", 0));
+}
+
+static int method_serialize_hang(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        /* Keep the call pending, but without asking for it to be kept */
+        ASSERT_NULL(serialize_hang_link);
+        serialize_hang_link = sd_varlink_ref(link);
+        return 0;
+}
+
+static int method_serialize_ping(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        return sd_varlink_replybo(link, SD_JSON_BUILD_PAIR_BOOLEAN("pong", true));
+}
+
+static int method_serialize_self(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        _cleanup_free_ void *data = NULL;
+        _cleanup_free_ int *fds = NULL;
+        size_t size = 0, n_fds = 0;
+
+        /* Server side connections can only be serialized together with their server, and that is refused
+         * while we are dispatching a method call */
+        ASSERT_ERROR(sd_varlink_serialize(link, &data, &size, &fds, &n_fds), EOPNOTSUPP);
+        ASSERT_ERROR(sd_varlink_server_serialize(sd_varlink_get_server(link), &data, &size, &fds, &n_fds), EBUSY);
+
+        return sd_varlink_reply(link, /* parameters= */ NULL);
+}
+
+static sd_varlink *serialize_upgrade_link = NULL;
+
+static int method_serialize_upgrade(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        ASSERT_TRUE(FLAGS_SET(flags, SD_VARLINK_METHOD_UPGRADE));
+
+        /* Don't reply right-away, the test does that later, outside of the method callback */
+        ASSERT_NULL(serialize_upgrade_link);
+        serialize_upgrade_link = sd_varlink_ref(link);
+        return 0;
+}
+
+static unsigned serialize_stream_seen = 0;
+static bool serialize_stream_done = false;
+
+static int reply_serialize_stream(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        ASSERT_NULL(error_id);
+
+        if (FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES)) {
+                sd_json_variant *index = ASSERT_NOT_NULL(sd_json_variant_by_key(parameters, "index"));
+                ASSERT_EQ(sd_json_variant_unsigned(index), (uint64_t) serialize_stream_seen);
+
+                /* The second notification carries an fd */
+                if (serialize_stream_seen == 2) {
+                        _cleanup_close_ int fd = ASSERT_OK(sd_varlink_take_fd(link, 0));
+                        test_fd(fd, "piff", 4);
+                }
+
+                serialize_stream_seen++;
+                return 0;
+        }
+
+        ASSERT_EQ(serialize_stream_seen, 3U);
+        ASSERT_TRUE(sd_json_variant_boolean(sd_json_variant_by_key(parameters, "final")));
+
+        /* Don't exit the event loop here, since that closes all connections attached to it */
+        serialize_stream_done = true;
+        return 0;
+}
+
+static int reply_serialize_hang(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        unsigned *n = ASSERT_PTR(userdata);
+
+        /* Calls we didn't ask to keep across serialization get the connection closed */
+        ASSERT_STREQ(error_id, SD_VARLINK_ERROR_DISCONNECTED);
+        (*n)++;
+        return 0;
+}
+
+static void run_until(sd_event *e, bool (*condition)(void *userdata), void *userdata) {
+        while (!condition(userdata))
+                ASSERT_OK(sd_event_run(e, 5 * USEC_PER_SEC));
+}
+
+static bool stream_done(void *userdata) {
+        return serialize_stream_done;
+}
+
+static bool stream_started(void *userdata) {
+        return serialize_stream_link && serialize_stream_seen > 0;
+}
+
+static bool hang_started(void *userdata) {
+        return serialize_hang_link;
+}
+
+static bool counter_reached(void *userdata) {
+        return *(unsigned*) userdata > 0;
+}
+
+static sd_varlink_server* make_serialize_server(sd_event *e) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = NULL;
+
+        ASSERT_OK(sd_varlink_server_new(&s, SD_VARLINK_SERVER_ALLOW_FD_PASSING_OUTPUT));
+        ASSERT_OK(sd_varlink_server_attach_event(s, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_server_bind_method_many(
+                                  s,
+                                  "io.test.Stream",        method_serialize_stream,
+                                  "io.test.Hang",          method_serialize_hang,
+                                  "io.test.Ping",          method_serialize_ping,
+                                  "io.test.SerializeSelf", method_serialize_self,
+                                  "io.test.Upgrade",       method_serialize_upgrade));
+
+        return TAKE_PTR(s);
+}
+
+TEST(serialize_server) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        /* The test order is not defined, hence reset the global state other tests might have left behind */
+        serialize_stream_seen = 0;
+        serialize_stream_done = false;
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = make_serialize_server(e);
+
+        /* Connection 1: a streaming method call, kept across serialization */
+        int stream_fds[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, stream_fds));
+        ASSERT_OK(sd_varlink_server_add_connection(s, stream_fds[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *stream_client = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&stream_client, stream_fds[1]));
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_input(stream_client, true));
+        ASSERT_OK(sd_varlink_attach_event(stream_client, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_bind_reply(stream_client, reply_serialize_stream));
+        ASSERT_OK(sd_varlink_observe(stream_client, "io.test.Stream", /* parameters= */ NULL));
+
+        /* Connection 2: a pending method call, not kept across serialization */
+        int hang_fds[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, hang_fds));
+        ASSERT_OK(sd_varlink_server_add_connection(s, hang_fds[0], /* ret= */ NULL));
+
+        unsigned hang_disconnected = 0;
+        _cleanup_(sd_varlink_unrefp) sd_varlink *hang_client = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&hang_client, hang_fds[1]));
+        ASSERT_OK(sd_varlink_attach_event(hang_client, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_bind_reply(hang_client, reply_serialize_hang));
+        ASSERT_NULL(sd_varlink_set_userdata(hang_client, &hang_disconnected));
+        ASSERT_OK(sd_varlink_invoke(hang_client, "io.test.Hang", /* parameters= */ NULL));
+
+        /* Connection 3: an idle connection with a partially received request, driven by hand */
+        int raw_fds[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, raw_fds));
+        _cleanup_close_ int raw_fd = raw_fds[1];
+        sd_varlink *raw_server_link = NULL;
+        ASSERT_OK(sd_varlink_server_add_connection(s, raw_fds[0], &raw_server_link));
+
+        run_until(e, stream_started, /* userdata= */ NULL);
+        run_until(e, hang_started, /* userdata= */ NULL);
+
+        /* Let the server read a partial request into its input buffer */
+        static const char partial[] = "{\"method\":\"io.test.Ping\",";
+        ASSERT_OK(loop_write(raw_fd, partial, strlen(partial)));
+        while (ASSERT_OK(fd_wait_for_event(raw_fds[0], POLLIN, /* timeout= */ 0)) > 0)
+                ASSERT_OK(sd_event_run(e, 100 * USEC_PER_MSEC));
+
+        /* Queue more output on the stream, without letting the event loop write it out. The second
+         * notification carries an fd. */
+        ASSERT_OK(sd_varlink_notifybo(serialize_stream_link, SD_JSON_BUILD_PAIR_UNSIGNED("index", 1)));
+        _cleanup_close_ int passed_fd = ASSERT_OK(memfd_new_and_seal("piff", "piff", 4));
+        ASSERT_OK(sd_varlink_push_dup_fd(serialize_stream_link, passed_fd));
+        ASSERT_OK(sd_varlink_notifybo(serialize_stream_link, SD_JSON_BUILD_PAIR_UNSIGNED("index", 2)));
+
+        /* Copy the identifiers, since the connections are closed during serialization */
+        const char *id;
+        ASSERT_OK(sd_varlink_get_connection_id(serialize_stream_link, &id));
+        _cleanup_free_ char *stream_id = ASSERT_NOT_NULL(strdup(id));
+        ASSERT_TRUE(startswith(stream_id, "cookie:"));
+        ASSERT_OK(sd_varlink_get_connection_id(raw_server_link, &id));
+        _cleanup_free_ char *raw_id = ASSERT_NOT_NULL(strdup(id));
+        ASSERT_FALSE(streq(stream_id, raw_id));
+
+        /* Serialize, which disconnects the call we didn't ask to keep */
+        _cleanup_free_ void *data = NULL;
+        size_t size = 0, n_fds = 0;
+        int *fds = NULL;
+        CLEANUP_ARRAY(fds, n_fds, close_many_and_free);
+        ASSERT_OK(sd_varlink_server_serialize(s, &data, &size, &fds, &n_fds));
+        ASSERT_GT(n_fds, 0U);
+        ASSERT_FALSE(sd_varlink_is_connected(serialize_hang_link));
+        serialize_hang_link = sd_varlink_unref(serialize_hang_link);
+
+        /* Get rid of the old server, as if we went through execve() */
+        sd_varlink_close(raw_server_link);
+        sd_varlink_close(serialize_stream_link);
+        serialize_stream_link = sd_varlink_unref(serialize_stream_link);
+        ASSERT_EQ(sd_varlink_server_current_connections(s), 0U);
+        s = sd_varlink_server_unref(s);
+
+        /* The disconnected call is noticed by its client */
+        run_until(e, counter_reached, &hang_disconnected);
+
+        s = make_serialize_server(e);
+        ASSERT_OK(sd_varlink_server_deserialize(s, data, size, fds, n_fds));
+        ASSERT_EQ(sd_varlink_server_current_connections(s), 2U);
+
+        /* The fds were consumed */
+        FOREACH_ARRAY(fd, fds, n_fds)
+                ASSERT_EQ(*fd, -EBADF);
+
+        /* Only connections with a pending method call can be claimed. */
+        ASSERT_ERROR(sd_varlink_server_claim_connection(s, raw_id, /* flags= */ 0, /* ret= */ NULL), ESRCH);
+        ASSERT_ERROR(sd_varlink_server_claim_connection(s, "cookie:4711", /* flags= */ 0, /* ret= */ NULL), ESRCH);
+
+        sd_varlink *claimed = NULL;
+        ASSERT_OK(sd_varlink_server_claim_connection(s, stream_id, /* flags= */ 0, &claimed));
+        ASSERT_NOT_NULL(claimed);
+        ASSERT_ERROR(sd_varlink_server_claim_connection(s, stream_id, /* flags= */ 0, /* ret= */ NULL), EALREADY);
+        sd_varlink *claimed_again = NULL;
+        ASSERT_OK(sd_varlink_server_claim_connection(s, stream_id, SD_VARLINK_SERVER_CLAIM_AGAIN, &claimed_again));
+        ASSERT_PTR_EQ(claimed, claimed_again);
+        ASSERT_OK_ZERO(sd_varlink_server_disconnect_unclaimed_connections(s));
+        ASSERT_ERROR(sd_varlink_server_claim_connection(s, stream_id, /* flags= */ 0, /* ret= */ NULL), ESRCH);
+        ASSERT_ERROR(sd_varlink_server_claim_connection(s, stream_id, SD_VARLINK_SERVER_CLAIM_AGAIN, /* ret= */ NULL), ESRCH);
+
+        /* Complete the stream: the client sees the queued notifications first, then the final reply */
+        ASSERT_OK(sd_varlink_replybo(claimed, SD_JSON_BUILD_PAIR_BOOLEAN("final", true)));
+        run_until(e, stream_done, /* userdata= */ NULL);
+        ASSERT_ERROR(sd_varlink_server_claim_connection(s, stream_id, SD_VARLINK_SERVER_CLAIM_AGAIN, /* ret= */ NULL), ESRCH);
+
+        /* Complete the partial request on the idle connection */
+        ASSERT_OK(loop_write(raw_fd, "\"parameters\":{}}", STRLEN("\"parameters\":{}}") + 1));
+
+        char buf[LINE_MAX] = {};
+        size_t n = 0;
+        while (!memchr(buf, 0, n)) {
+                ASSERT_OK(sd_event_run(e, 100 * USEC_PER_MSEC));
+
+                ssize_t k = read(raw_fd, buf + n, sizeof(buf) - n - 1);
+                if (k < 0 && errno == EAGAIN)
+                        continue;
+                ASSERT_GT(k, 0);
+                n += k;
+        }
+        ASSERT_NOT_NULL(strstr(buf, "\"pong\":true"));
+}
+
+static bool stream_seen_reached(void *userdata) {
+        return serialize_stream_seen >= *(unsigned*) userdata;
+}
+
+TEST(serialize_client) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        serialize_stream_seen = 0;
+        serialize_stream_done = false;
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = make_serialize_server(e);
+
+        int sfds[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, sfds));
+        ASSERT_OK(sd_varlink_server_add_connection(s, sfds[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, sfds[1]));
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_input(c, true));
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_serialize_stream));
+        ASSERT_OK(sd_varlink_observe(c, "io.test.Stream", /* parameters= */ NULL));
+
+        unsigned one = 1;
+        run_until(e, stream_seen_reached, &one);
+
+        /* Send another notification, and let the client read it into its input buffer, but don't let it
+         * parse or dispatch it. With nothing else to do, a single processing step reads from the socket and
+         * stops there. */
+        ASSERT_OK(sd_varlink_notifybo(serialize_stream_link, SD_JSON_BUILD_PAIR_UNSIGNED("index", 1)));
+        ASSERT_OK(sd_varlink_flush(serialize_stream_link));
+        ASSERT_OK_POSITIVE(fd_wait_for_event(sfds[1], POLLIN, USEC_INFINITY));
+        ASSERT_OK_POSITIVE(sd_varlink_process(c));
+        ASSERT_OK_ZERO(fd_wait_for_event(sfds[1], POLLIN, /* timeout= */ 0)); /* the socket was drained… */
+        ASSERT_EQ(serialize_stream_seen, 1U);                                 /* … but nothing dispatched */
+
+        /* Acquire the peer pidfd, so that it is passed on too (if the kernel supports SO_PEERPIDFD) */
+        bool have_pidfd = sd_varlink_get_peer_pidfd(c) >= 0;
+
+        _cleanup_free_ void *data = NULL;
+        size_t size = 0, n_fds = 0;
+        int *fds = NULL;
+        CLEANUP_ARRAY(fds, n_fds, close_many_and_free);
+        ASSERT_OK(sd_varlink_serialize(c, &data, &size, &fds, &n_fds));
+        ASSERT_EQ(n_fds, have_pidfd ? 2U : 1U);
+
+        /* Client connections cannot be restored into a server, the "connections" field is missing */
+        ASSERT_ERROR(sd_varlink_server_deserialize(s, data, size, fds, n_fds), ENXIO);
+
+        c = sd_varlink_close_unref(c);
+
+        ASSERT_OK(sd_varlink_deserialize(&c, data, size, fds, n_fds));
+        FOREACH_ARRAY(fd, fds, n_fds)
+                ASSERT_EQ(*fd, -EBADF);
+
+        if (have_pidfd) {
+                int pidfd = ASSERT_OK(sd_varlink_get_peer_pidfd(c));
+                pid_t pid;
+                ASSERT_OK(pidfd_get_pid(pidfd, &pid));
+                ASSERT_EQ(pid, getpid_cached());
+        }
+
+        ASSERT_OK(sd_varlink_set_allow_fd_passing_input(c, true));
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_serialize_stream));
+
+        unsigned two = 2;
+        run_until(e, stream_seen_reached, &two);
+
+        _cleanup_close_ int passed_fd = ASSERT_OK(memfd_new_and_seal("piff", "piff", 4));
+        ASSERT_OK(sd_varlink_push_dup_fd(serialize_stream_link, passed_fd));
+        ASSERT_OK(sd_varlink_notifybo(serialize_stream_link, SD_JSON_BUILD_PAIR_UNSIGNED("index", 2)));
+        ASSERT_OK(sd_varlink_replybo(serialize_stream_link, SD_JSON_BUILD_PAIR_BOOLEAN("final", true)));
+        serialize_stream_link = sd_varlink_unref(serialize_stream_link);
+
+        run_until(e, stream_done, /* userdata= */ NULL);
+}
+
+static int reply_serialize_self(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata) {
+        _cleanup_free_ void *data = NULL;
+        _cleanup_free_ int *fds = NULL;
+        size_t size = 0, n_fds = 0;
+
+        ASSERT_NULL(error_id);
+
+        /* Client side connections can't be serialized while a reply is dispatched either */
+        ASSERT_ERROR(sd_varlink_serialize(link, &data, &size, &fds, &n_fds), EBUSY);
+
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), EXIT_SUCCESS));
+        return 0;
+}
+
+TEST(serialize_refused) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = make_serialize_server(e);
+
+        int sfds[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, sfds));
+        ASSERT_OK(sd_varlink_server_add_connection(s, sfds[0], /* ret= */ NULL));
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, sfds[1]));
+
+        /* Refused while the server is dispatching the method call, see method_serialize_self() */
+        ASSERT_OK(sd_varlink_attach_event(c, e, /* priority= */ 0));
+        ASSERT_OK(sd_varlink_bind_reply(c, reply_serialize_self));
+        ASSERT_OK(sd_varlink_invoke(c, "io.test.SerializeSelf", /* parameters= */ NULL));
+        ASSERT_OK(sd_event_loop(e));
+
+        /* Connections with exec'ed peers can't be serialized */
+        _cleanup_(sd_varlink_unrefp) sd_varlink *x = NULL;
+        ASSERT_OK(sd_varlink_connect_exec(&x, "/bin/true", /* argv= */ NULL));
+
+        _cleanup_free_ void *data = NULL;
+        _cleanup_free_ int *fds = NULL;
+        size_t size = 0, n_fds = 0;
+        ASSERT_ERROR(sd_varlink_serialize(x, &data, &size, &fds, &n_fds), EOPNOTSUPP);
+
+        /* Closed connections neither */
+        ASSERT_OK(sd_varlink_close(c));
+        ASSERT_ERROR(sd_varlink_serialize(c, &data, &size, &fds, &n_fds), ENOTCONN);
+
+        /* Garbage is refused */
+        ASSERT_ERROR(sd_varlink_deserialize(&c, "{\"state\":\"idle_client\"}", STRLEN("{\"state\":\"idle_client\"}"), /* fds= */ NULL, /* n_fds= */ 0), ENXIO);
+        ASSERT_ERROR(sd_varlink_deserialize(&c, "{\"state\":\"foo\"}", STRLEN("{\"state\":\"foo\"}"), /* fds= */ NULL, /* n_fds= */ 0), EINVAL);
+        ASSERT_ERROR(sd_varlink_deserialize(&c, "{}\0", 3, /* fds= */ NULL, /* n_fds= */ 0), EBADMSG);
+}
+
+static bool upgrade_started(void *userdata) {
+        return serialize_upgrade_link;
+}
+
+TEST(serialize_upgrading) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = make_serialize_server(e);
+
+        int sfds[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, sfds));
+        _cleanup_close_ int raw_fd = sfds[1];
+        ASSERT_OK(sd_varlink_server_add_connection(s, sfds[0], /* ret= */ NULL));
+
+        static const char request[] = "{\"method\":\"io.test.Upgrade\",\"upgrade\":true}";
+        ASSERT_OK(loop_write(raw_fd, request, sizeof(request))); /* including the NUL terminator */
+        run_until(e, upgrade_started, /* userdata= */ NULL);
+
+        /* Reply without giving the event loop a chance to write the reply out, i.e. the connection is
+         * stuck in the upgrading state until the peer reads the reply. Such connections can't be taken
+         * over after deserialization, hence they are disconnected on serialization. */
+        ASSERT_OK(sd_varlink_respond_and_upgrade(serialize_upgrade_link, /* parameters= */ NULL));
+
+        _cleanup_free_ void *data = NULL;
+        size_t size = 0, n_fds = 0;
+        int *fds = NULL;
+        CLEANUP_ARRAY(fds, n_fds, close_many_and_free);
+        ASSERT_OK(sd_varlink_server_serialize(s, &data, &size, &fds, &n_fds));
+        ASSERT_FALSE(sd_varlink_is_connected(serialize_upgrade_link));
+        serialize_upgrade_link = sd_varlink_unref(serialize_upgrade_link);
+        ASSERT_EQ(n_fds, 0U);
+        ASSERT_EQ(sd_varlink_server_current_connections(s), 0U);
+        s = sd_varlink_server_unref(s);
+
+        /* Nothing is restored */
+        s = make_serialize_server(e);
+        ASSERT_OK(sd_varlink_server_deserialize(s, data, size, fds, n_fds));
+        ASSERT_EQ(sd_varlink_server_current_connections(s), 0U);
+}
+
+TEST(serialize_unclaimed) {
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        ASSERT_OK(sd_event_default(&e));
+
+        serialize_stream_seen = 0;
+        serialize_stream_done = false;
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *s = make_serialize_server(e);
+
+        int sfds[2];
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0, sfds));
+        ASSERT_OK(sd_varlink_server_add_connection(s, sfds[0], /* ret= */ NULL));
+
+        /* The client is not attached to the event loop, we only care about the server side here */
+        _cleanup_(sd_varlink_unrefp) sd_varlink *c = NULL;
+        ASSERT_OK(sd_varlink_connect_fd(&c, sfds[1]));
+        ASSERT_OK(sd_varlink_observe(c, "io.test.Stream", /* parameters= */ NULL));
+        ASSERT_OK(sd_varlink_flush(c));
+
+        while (!serialize_stream_link)
+                ASSERT_OK(sd_event_run(e, 5 * USEC_PER_SEC));
+
+        _cleanup_free_ void *data = NULL;
+        size_t size = 0, n_fds = 0;
+        int *fds = NULL;
+        CLEANUP_ARRAY(fds, n_fds, close_many_and_free);
+        ASSERT_OK(sd_varlink_server_serialize(s, &data, &size, &fds, &n_fds));
+
+        sd_varlink_close(serialize_stream_link);
+        serialize_stream_link = sd_varlink_unref(serialize_stream_link);
+        s = sd_varlink_server_unref(s);
+
+        s = make_serialize_server(e);
+        ASSERT_OK(sd_varlink_server_deserialize(s, data, size, fds, n_fds));
+        ASSERT_EQ(sd_varlink_server_current_connections(s), 1U);
+
+        /* Nobody claims the pending call, hence the connection is disconnected */
+        ASSERT_EQ(sd_varlink_server_disconnect_unclaimed_connections(s), 1);
+        ASSERT_EQ(sd_varlink_server_current_connections(s), 0U);
+        ASSERT_OK_ZERO(sd_varlink_server_disconnect_unclaimed_connections(s));
+}
+
+TEST(connection_id) {
+        int pipe_in[2], pipe_out[2];
+        ASSERT_OK_ERRNO(pipe2(pipe_in, O_CLOEXEC|O_NONBLOCK));
+        ASSERT_OK_ERRNO(pipe2(pipe_out, O_CLOEXEC|O_NONBLOCK));
+
+        /* Keep the other ends open while the connection is alive */
+        _unused_ _cleanup_close_ int other_in = pipe_in[1], other_out = pipe_out[0];
+
+        struct ucred ucred = {
+                .pid = getpid_cached(),
+                .uid = getuid(),
+                .gid = getgid(),
+        };
+
+        _cleanup_(sd_varlink_unrefp) sd_varlink *v = NULL;
+        ASSERT_OK(sd_varlink_connect_fd_pair(&v, pipe_in[0], pipe_out[1], &ucred));
+
+        /* Not a socket, hence identified by the inodes of the input and output pipes */
+        struct stat st_in, st_out;
+        ASSERT_OK_ERRNO(fstat(pipe_in[0], &st_in));
+        ASSERT_OK_ERRNO(fstat(pipe_out[1], &st_out));
+
+        const char *id;
+        ASSERT_OK(sd_varlink_get_connection_id(v, &id));
+
+        _cleanup_free_ char *expected = NULL;
+        ASSERT_OK(asprintf(&expected, "inode:%u:%u:%" PRIu64 ",inode:%u:%u:%" PRIu64,
+                           major(st_in.st_dev), minor(st_in.st_dev), (uint64_t) st_in.st_ino,
+                           major(st_out.st_dev), minor(st_out.st_dev), (uint64_t) st_out.st_ino));
+        ASSERT_STREQ(id, expected);
+
+        /* Copy the identifier, since the connection is closed below */
+        _cleanup_free_ char *saved_id = ASSERT_NOT_NULL(strdup(id));
+
+        /* The overridden credentials are retained across serialization */
+        _cleanup_free_ void *data = NULL;
+        size_t size = 0, n_fds = 0;
+        int *fds = NULL;
+        CLEANUP_ARRAY(fds, n_fds, close_many_and_free);
+        ASSERT_OK(sd_varlink_serialize(v, &data, &size, &fds, &n_fds));
+        ASSERT_EQ(n_fds, 2U);
+        v = sd_varlink_close_unref(v);
+
+        ASSERT_OK(sd_varlink_deserialize(&v, data, size, fds, n_fds));
+
+        uid_t uid;
+        ASSERT_OK(sd_varlink_get_peer_uid(v, &uid));
+        ASSERT_EQ(uid, ucred.uid);
+
+        ASSERT_OK(sd_varlink_get_connection_id(v, &id));
+        ASSERT_STREQ(id, saved_id);
+}
+
+DEFINE_TEST_MAIN(LOG_DEBUG);

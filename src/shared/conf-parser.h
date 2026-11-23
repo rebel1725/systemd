@@ -102,7 +102,7 @@ static inline int config_parse_many(
                         flags,
                         userdata,
                         /* ret_stats_by_path= */ NULL,
-                        /* ret_drop_in_files= */ NULL);
+                        /* ret_dropin_files= */ NULL);
 }
 
 int config_parse_standard_file_with_dropins_full(
@@ -237,6 +237,7 @@ CONFIG_PARSER_PROTOTYPE(config_parse_int32);
 CONFIG_PARSER_PROTOTYPE(config_parse_uint64);
 CONFIG_PARSER_PROTOTYPE(config_parse_double);
 CONFIG_PARSER_PROTOTYPE(config_parse_iec_size);
+CONFIG_PARSER_PROTOTYPE(config_parse_iec_size_long);
 CONFIG_PARSER_PROTOTYPE(config_parse_si_uint64);
 CONFIG_PARSER_PROTOTYPE(config_parse_iec_uint64);
 CONFIG_PARSER_PROTOTYPE(config_parse_iec_uint64_infinity);

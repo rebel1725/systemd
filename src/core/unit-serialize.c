@@ -46,7 +46,7 @@ static int deserialize_markers(Unit *u, const char *value) {
         for (const char *p = value;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&p, &word, NULL, 0);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r <= 0)
                         return r;
 
@@ -131,6 +131,8 @@ int unit_serialize_state(Unit *u, FILE *f, FDSet *fds, bool switching_root) {
         (void) serialize_markers(f, u->markers);
 
         bus_track_serialize(u->bus_track, f, "ref");
+        STRV_FOREACH(i, u->deserialized_refs)
+                (void) serialize_item(f, "ref", *i);
 
         if (!switching_root) {
                 if (u->job) {
@@ -402,6 +404,23 @@ int unit_deserialize_state_skip(FILE *f) {
                 /* End marker */
                 if (isempty(line))
                         return 1;
+
+                /* A unit's serialized state may embed one or more "job" subsections (for u->job and
+                 * u->nop_job), each itself terminated by an empty line. We must consume those nested
+                 * sections fully, otherwise we'd stop at the job's end marker and treat the rest of the
+                 * unit's fields as a new top-level entry. */
+                if (streq(line, "job"))
+                        for (;;) {
+                                _cleanup_free_ char *job_line = NULL;
+
+                                r = read_stripped_line(f, LONG_LINE_MAX, &job_line);
+                                if (r < 0)
+                                        return log_error_errno(r, "Failed to read serialization line: %m");
+                                if (r == 0)
+                                        return 0;
+                                if (isempty(job_line))
+                                        break;
+                        }
         }
 }
 
@@ -548,12 +567,15 @@ void unit_dump(Unit *u, FILE *f, const char *prefix) {
                 }
         }
 
-        if (!sd_id128_is_null(u->invocation_id))
+        if (unit_has_invocation_id(u))
                 fprintf(f, "%s\tInvocation ID: " SD_ID128_FORMAT_STR "\n",
                         prefix, SD_ID128_FORMAT_VAL(u->invocation_id));
 
         STRV_FOREACH(j, u->documentation)
                 fprintf(f, "%s\tDocumentation: %s\n", prefix, *j);
+
+        STRV_FOREACH(j, u->tags)
+                fprintf(f, "%s\tTags: %s\n", prefix, *j);
 
         if (u->access_selinux_context)
                 fprintf(f, "%s\tAccess SELinux Context: %s\n", prefix, u->access_selinux_context);

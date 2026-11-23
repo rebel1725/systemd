@@ -285,7 +285,7 @@ int dns_answer_add_soa(DnsAnswer *a, const char *name, uint32_t ttl, int ifindex
         soa->soa.expire = 1;
         soa->soa.minimum = ttl;
 
-        return dns_answer_add(a, soa, ifindex, DNS_ANSWER_AUTHENTICATED, NULL);
+        return dns_answer_add(a, soa, ifindex, DNS_ANSWER_AUTHENTICATED, /* rrsig= */ NULL);
 }
 
 int dns_answer_match_key(DnsAnswer *a, const DnsResourceKey *key, DnsAnswerFlags *ret_flags) {
@@ -297,7 +297,7 @@ int dns_answer_match_key(DnsAnswer *a, const DnsResourceKey *key, DnsAnswerFlags
         assert(key);
 
         DNS_ANSWER_FOREACH_FLAGS(i, i_flags, a) {
-                r = dns_resource_key_match_rr(key, i, NULL);
+                r = dns_resource_key_match_rr(key, i, /* search_domain= */ NULL);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -438,7 +438,7 @@ int dns_answer_find_cname_or_dname(
                 return 0;
 
         DNS_ANSWER_FOREACH_FLAGS(rr, rr_flags, a) {
-                r = dns_resource_key_match_cname_or_dname(key, rr->key, NULL);
+                r = dns_resource_key_match_cname_or_dname(key, rr->key, /* search_domain= */ NULL);
                 if (r < 0)
                         return r;
                 if (r > 0) {
@@ -555,13 +555,27 @@ int dns_answer_remove_by_rr(DnsAnswer **a, DnsResourceRecord *rr) {
                 if (r < 0)
                         return r;
                 if (r > 0) {
-                        dns_answer_item_unref(ordered_set_remove((*a)->items, item));
                         found = true;
+                        break;
                 }
         }
 
         if (!found)
                 return 0;
+
+        if ((*a)->n_ref > 1) {
+                r = dns_answer_reserve_or_clone(a, 1);
+                if (r < 0)
+                        return r;
+        }
+
+        DNS_ANSWER_FOREACH_ITEM(item, *a) {
+                r = dns_resource_record_equal(item->rr, rr);
+                if (r < 0)
+                        return r;
+                if (r > 0)
+                        dns_answer_item_unref(ordered_set_remove((*a)->items, item));
+        }
 
         if (dns_answer_isempty(*a))
                 *a = dns_answer_unref(*a); /* Return NULL for the empty answer */
@@ -573,6 +587,8 @@ int dns_answer_remove_by_answer_keys(DnsAnswer **a, DnsAnswer *b) {
         _cleanup_(dns_resource_key_unrefp) DnsResourceKey *prev = NULL;
         DnsAnswerItem *item;
         int r;
+
+        assert(a);
 
         /* Removes all items from '*a' that have a matching key in 'b' */
 

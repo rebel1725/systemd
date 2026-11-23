@@ -1,4 +1,4 @@
----
+# SPDX-License-Identifier: LGPL-2.1-or-later
 # syntax - https://github.com/redhat-plumbers-in-action/advanced-issue-labeler#policy
 
 policy:
@@ -22,8 +22,11 @@ policy:
           - name: coredump
             keys: ['coredumpctl', 'systemd-coredump']
 
+          - name: creds
+            keys: ['systemd-creds']
+
           - name: cryptsetup
-            keys: ['systemd-cryptsetup']
+            keys: ['systemd-cryptsetup', 'systemd-cryptenroll']
 
           - name: delta
             keys: ['systemd-delta']
@@ -53,7 +56,7 @@ policy:
             keys: ['systemd-hwdb', 'hardware database files']
 
           - name: import
-            keys: ['systemd-import']
+            keys: ['systemd-importd', 'importctl']
 
           - name: journal
             keys: ['systemd-journald', 'journalctl']

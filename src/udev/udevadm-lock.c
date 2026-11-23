@@ -1,19 +1,23 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
-#include <getopt.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "sd-json.h"
+
+#include "build.h"
 #include "blockdev-util.h"
 #include "device-util.h"
 #include "fd-util.h"
 #include "fdset.h"
+#include "fs-util.h"
+#include "glyph-util.h"
 #include "hash-funcs.h"
 #include "lock-util.h"
+#include "options.h"
 #include "path-util.h"
 #include "pidref.h"
-#include "pretty-print.h"
 #include "process-util.h"
 #include "signal-util.h"
 #include "sort-util.h"
@@ -21,6 +25,7 @@
 #include "strv.h"
 #include "time-util.h"
 #include "udevadm.h"
+#include "verbs.h"
 
 static usec_t arg_timeout_usec = USEC_INFINITY;
 static char **arg_devices = NULL;
@@ -32,71 +37,33 @@ STATIC_DESTRUCTOR_REGISTER(arg_devices, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_backing, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_cmdline, strv_freep);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("udevadm", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] COMMAND\n"
-               "%s [OPTIONS...] --print\n"
-               "\n%sLock a block device and run a command.%s\n\n"
-               "  -h --help            Print this message\n"
-               "  -V --version         Print version of the program\n"
-               "  -d --device=DEVICE   Block device to lock\n"
-               "  -b --backing=FILE    File whose backing block device to lock\n"
-               "  -t --timeout=SECS    Block at most the specified time waiting for lock\n"
-               "  -p --print           Only show which block device the lock would be taken on\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               link);
-
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
-
-        static const struct option options[] = {
-                { "help",    no_argument,       NULL, 'h'      },
-                { "version", no_argument,       NULL, 'V'      },
-                { "device",  required_argument, NULL, 'd'      },
-                { "backing", required_argument, NULL, 'b'      },
-                { "timeout", required_argument, NULL, 't'      },
-                { "print",   no_argument,       NULL, 'p'      },
-                {}
-        };
-
-        int c, r;
+        int r;
 
         assert(argc >= 0);
         assert(argv);
 
-        /* Resetting to 0 forces the invocation of an internal initialization routine of getopt_long()
-         * that checks for GNU extensions in optstring ('-' or '+' at the beginning). */
-        optind = 0;
-        while ((c = getopt_long(argc, argv, arg_print ? "hVd:b:t:p" : "+hVd:b:t:p", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv, OPTION_PARSER_STOP_AT_FIRST_NONOPTION, "udevadm-lock" };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_NAMESPACE("udevadm-lock"): {}
 
-                case 'V':
-                        return print_version();
+                OPTION_COMMON_HELP:
+                        return command_print_verb_help("lock");
 
-                case 'd':
-                case 'b': {
+                OPTION_COMMON_VERSION_WITH_V:
+                        return version_only();
+
+                OPTION('d', "device", "DEVICE", "Block device to lock"): {} /* fall through */
+                OPTION('b', "backing", "FILE", "File whose backing block device to lock"): {
                         _cleanup_free_ char *s = NULL;
-                        char ***l = c == 'd' ? &arg_devices : &arg_backing;
+                        char ***l = opts.opt->short_code == 'd' ? &arg_devices : &arg_backing;
 
-                        r = path_make_absolute_cwd(optarg, &s);
+                        r = path_make_absolute_cwd(opts.arg, &s);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to make path '%s' absolute: %m", optarg);
+                                return log_error_errno(r, "Failed to make path '%s' absolute: %m", opts.arg);
 
                         path_simplify(s);
 
@@ -107,31 +74,29 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
                 }
 
-                case 't':
-                        r = parse_sec(optarg, &arg_timeout_usec);
+                OPTION('t', "timeout", "SECS", "Block at most the specified time waiting for lock"):
+                        r = parse_sec(opts.arg, &arg_timeout_usec);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to parse --timeout= parameter: %s", optarg);
+                                return log_error_errno(r, "Failed to parse --timeout= parameter: %s", opts.arg);
                         break;
 
-                case 'p':
+                OPTION('p', "print", NULL, "Only show which device would be locked, without running the command"):
                         arg_print = true;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
+        char **args = option_parser_get_args(&opts);
         if (arg_print) {
-                if (optind != argc)
+                if (!strv_isempty(args))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No arguments expected.");
         } else {
-                if (optind + 1 > argc)
+                if (strv_isempty(args))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Too few arguments, command to execute.");
 
-                arg_cmdline = strv_copy(argv + optind);
+                arg_cmdline = strv_copy(args);
                 if (!arg_cmdline)
                         return log_oom();
         }
@@ -185,9 +150,9 @@ static int lock_device(
         int r;
 
         /* We open in O_WRONLY mode here, to trigger a rescan in udev once we are done */
-        fd = open(path, O_WRONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+        fd = xopenat(AT_FDCWD, path, O_WRONLY|O_NONBLOCK|O_NOCTTY);
         if (fd < 0)
-                return log_error_errno(errno, "Failed to open '%s': %m", path);
+                return log_error_errno(fd, "Failed to open '%s': %m", path);
 
         if (fstat(fd, &st) < 0)
                 return log_error_errno(errno, "Failed to stat '%s': %m", path);
@@ -196,32 +161,13 @@ static int lock_device(
         if (!S_ISBLK(st.st_mode) || st.st_rdev != devno)
                 return log_error_errno(SYNTHETIC_ERRNO(ENXIO), "Path '%s' no longer refers to specified block device %u:%u.", path, major(devno), minor(devno));
 
-        r = lock_generic(fd, LOCK_BSD, LOCK_EX|LOCK_NB);
-        if (r < 0) {
-                if (r != -EAGAIN)
-                        return log_error_errno(r, "Failed to lock device '%s': %m", path);
-
-                if (deadline == 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EBUSY), "Device '%s' is currently locked.", path);
-
-                if (deadline == USEC_INFINITY)  {
-                        log_info("Device '%s' is currently locked, waiting%s", path, glyph(GLYPH_ELLIPSIS));
-
-                        r = lock_generic(fd, LOCK_BSD, LOCK_EX);
-                } else {
-                        usec_t left = usec_sub_unsigned(deadline, now(CLOCK_MONOTONIC));
-
-                        log_info("Device '%s' is currently locked, waiting %s%s",
-                                 path, FORMAT_TIMESPAN(left, 0),
-                                 glyph(GLYPH_ELLIPSIS));
-
-                        r = lock_generic_with_timeout(fd, LOCK_BSD, LOCK_EX, left);
-                        if (r == -ETIMEDOUT)
-                                return log_error_errno(r, "Timeout reached.");
-                }
-                if (r < 0)
-                        return log_error_errno(r, "Failed to lock device '%s': %m", path);
-        }
+        r = lock_generic_with_timeout(fd, LOCK_BSD, LOCK_EX, usec_sub_unsigned(deadline, now(CLOCK_MONOTONIC)));
+        if (r == -EAGAIN && deadline == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EBUSY), "Device '%s' is currently locked.", path);
+        if (r == -ETIMEDOUT)
+                return log_error_errno(r, "Timeout reached.");
+        if (r < 0)
+                return log_error_errno(r, "Failed to lock device '%s': %m", path);
 
         log_debug("Successfully locked %s (%u:%u)%s", path, major(devno), minor(devno), glyph(GLYPH_ELLIPSIS));
 
@@ -300,11 +246,11 @@ int verb_lock_main(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (r == 0) {
                 /* Child */
 
-                execvp(arg_cmdline[0], arg_cmdline);
+                r = execvp_safe(arg_cmdline[0], arg_cmdline);
                 log_open();
-                log_error_errno(errno, "Failed to execute %s: %m", arg_cmdline[0]);
+                log_error_errno(r, "Failed to execute %s: %m", arg_cmdline[0]);
                 _exit(EXIT_FAILURE);
         }
 
-        return pidref_wait_for_terminate_and_check(arg_cmdline[0], &pidref, 0);
+        return pidref_wait_for_terminate_and_check(arg_cmdline[0], &pidref, /* flags= */ 0);
 }

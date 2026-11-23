@@ -3,11 +3,12 @@
 
 #include "sd-json.h"
 
-#include "shared-forward.h"
+#include "forward.h"
 #include "log.h"
 #include "pager.h"
 
 typedef enum TableDataType {
+        /* Except for TABLE_EMPTY, declaration order defines the order between cells of different types. */
         TABLE_EMPTY,
         TABLE_STRING,
         TABLE_STRING_WITH_ANSI,    /* like the above, but contains ANSI sequences/TABs. They will be stripped when outputting to JSON */
@@ -20,6 +21,7 @@ typedef enum TableDataType {
         TABLE_VERSION,             /* just like TABLE_STRING, but uses version comparison when sorting */
         TABLE_BOOLEAN,
         TABLE_BOOLEAN_CHECKMARK,
+        TABLE_TRISTATE,
         TABLE_TIMESTAMP,
         TABLE_TIMESTAMP_UTC,
         TABLE_TIMESTAMP_RELATIVE,
@@ -45,6 +47,7 @@ typedef enum TableDataType {
         TABLE_UINT64,
         TABLE_UINT64_HEX,
         TABLE_UINT64_HEX_0x,
+        TABLE_DOUBLE,
         TABLE_PERCENT,
         TABLE_IFINDEX,
         TABLE_IN_ADDR,  /* Takes a union in_addr_union (or a struct in_addr) */
@@ -67,6 +70,7 @@ typedef enum TableDataType {
         TABLE_SET_MAXIMUM_WIDTH,
         TABLE_SET_WEIGHT,
         TABLE_SET_ALIGN_PERCENT,
+        TABLE_SET_DECIMALS,
         TABLE_SET_ELLIPSIZE_PERCENT,
         TABLE_SET_COLOR,
         TABLE_SET_RGAP_COLOR,
@@ -100,6 +104,7 @@ Table* table_new_vertical(void);
 Table* table_unref(Table *t);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(Table*, table_unref);
+static inline DEFINE_POINTER_ARRAY_CLEAR_FUNC(Table*, table_unref);
 
 int table_add_cell_full(Table *t, TableCell **ret_cell, TableDataType dt, const void *data, size_t minimum_width, size_t maximum_width, unsigned weight, unsigned align_percent, unsigned ellipsize_percent);
 static inline int table_add_cell(Table *t, TableCell **ret_cell, TableDataType dt, const void *data) {
@@ -116,6 +121,7 @@ int table_set_minimum_width(Table *t, TableCell *cell, size_t minimum_width);
 int table_set_maximum_width(Table *t, TableCell *cell, size_t maximum_width);
 int table_set_weight(Table *t, TableCell *cell, unsigned weight);
 int table_set_align_percent(Table *t, TableCell *cell, unsigned percent);
+int table_set_decimals(Table *t, TableCell *cell, unsigned decimals);
 int table_set_ellipsize_percent(Table *t, TableCell *cell, unsigned percent);
 int table_set_color(Table *t, TableCell *cell, const char *color);
 int table_set_rgap_color(Table *t, TableCell *cell, const char *color);
@@ -141,7 +147,15 @@ int table_set_reverse(Table *t, size_t column, bool b);
 int table_hide_column_from_display_internal(Table *t, ...);
 #define table_hide_column_from_display(t, ...) table_hide_column_from_display_internal(t, __VA_ARGS__, SIZE_MAX)
 
-int table_print(Table *t, FILE *f);
+int table_set_column_width(Table *t, size_t column, size_t width);
+int table_sync_all_column_widths(size_t column, Table **a);
+
+int table_print_full(Table *t, FILE *f, bool flush);
+static inline int table_print(Table *t) {
+        return table_print_full(t, /* f= */ NULL, /* flush= */ false);
+}
+int table_print_or_warn(Table *t);
+
 int table_format(Table *t, char **ret);
 
 static inline TableCell* TABLE_HEADER_CELL(size_t i) {

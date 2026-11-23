@@ -281,7 +281,7 @@ void hashmap_trim_pools(void) {
         if (getpid() != gettid())
                 return (void) log_debug("Not cleaning up memory pools, not in main thread.");
 
-        r = get_process_threads(0);
+        r = get_process_threads(/* pid= */ 0);
         if (r < 0)
                 return (void) log_debug_errno(r, "Failed to determine number of threads, not cleaning up memory pools: %m");
         if (r != 1)
@@ -299,17 +299,21 @@ _destructor_ static void cleanup_pools(void) {
 }
 #endif
 
-static unsigned n_buckets(HashmapBase *h) {
+static inline unsigned n_buckets(HashmapBase *h) {
+        assert(h);
         return h->has_indirect ? h->indirect.n_buckets
                                : hashmap_type_info[h->type].n_direct_buckets;
 }
 
 static unsigned n_entries(HashmapBase *h) {
+        assert(h);
         return h->has_indirect ? h->indirect.n_entries
                                : h->n_direct_entries;
 }
 
 static void n_entries_inc(HashmapBase *h) {
+        assert(h);
+
         if (h->has_indirect)
                 h->indirect.n_entries++;
         else
@@ -317,18 +321,22 @@ static void n_entries_inc(HashmapBase *h) {
 }
 
 static void n_entries_dec(HashmapBase *h) {
+        assert(h);
+
         if (h->has_indirect)
                 h->indirect.n_entries--;
         else
                 h->n_direct_entries--;
 }
 
-static void* storage_ptr(HashmapBase *h) {
+static inline void* storage_ptr(HashmapBase *h) {
+        assert(h);
         return h->has_indirect ? h->indirect.storage
                                : h->direct.storage;
 }
 
-static uint8_t* hash_key(HashmapBase *h) {
+static inline uint8_t* hash_key(HashmapBase *h) {
+        assert(h);
         return h->has_indirect ? h->indirect.hash_key
                                : shared_hash_key;
 }
@@ -337,17 +345,33 @@ static unsigned base_bucket_hash(HashmapBase *h, const void *p) {
         struct siphash state;
         uint64_t hash;
 
-        siphash24_init(&state, hash_key(h));
+        assert(h);
 
-        h->hash_ops->hash(p, &state);
+        /* The keys of trivial_hash_ops and uint64_hash_ops fit in 64 bits. siphash24_uint64() hashes such
+         * a key without the indirect call through hash_ops and keeps the SipHash state in registers. On
+         * 32-bit and big-endian architectures, the result differs from the result of trivial_hash_func(),
+         * which hashes the key in native byte order. Only this function maps keys to buckets, so the
+         * difference does not matter. */
+        if (h->hash_ops->hash == trivial_hash_func)
+                hash = siphash24_uint64((uintptr_t) p, hash_key(h));
+        else if (h->hash_ops->hash == (hash_func_t) uint64_hash_func)
+                hash = siphash24_uint64(*(const uint64_t*) p, hash_key(h));
+        else {
+                siphash24_init(&state, hash_key(h));
+                h->hash_ops->hash(p, &state);
+                hash = siphash24_finalize(&state);
+        }
 
-        hash = siphash24_finalize(&state);
-
-        return (unsigned) (hash % n_buckets(h));
+        /* n_buckets is not a power of two, so a modulo needs a division. Multiplying the upper 32 bits of
+         * the hash with n_buckets and keeping the upper 32 bits of the product maps the hash to
+         * [0, n_buckets) almost as evenly, without a division. */
+        return (unsigned) (((hash >> 32) * n_buckets(h)) >> 32);
 }
 #define bucket_hash(h, p) base_bucket_hash(HASHMAP_BASE(h), p)
 
 static void base_set_dirty(HashmapBase *h) {
+        assert(h);
+
         h->dirty = true;
 }
 #define hashmap_set_dirty(h) base_set_dirty(HASHMAP_BASE(h))
@@ -371,7 +395,8 @@ static void get_hash_key(uint8_t hash_key[HASH_KEY_SIZE], bool reuse_is_ok) {
         memcpy(hash_key, current, sizeof(current));
 }
 
-static struct hashmap_base_entry* bucket_at(HashmapBase *h, unsigned idx) {
+static inline struct hashmap_base_entry* bucket_at(HashmapBase *h, unsigned idx) {
+        assert(h);
         return CAST_ALIGN_PTR(
                         struct hashmap_base_entry,
                         (uint8_t *) storage_ptr(h) + idx * hashmap_type_info[h->type].entry_size);
@@ -390,6 +415,7 @@ static struct set_entry *set_bucket_at(Set *h, unsigned idx) {
 }
 
 static struct ordered_hashmap_entry* bucket_at_swap(struct swap_entries *swap, unsigned idx) {
+        assert(swap);
         return &swap->e[idx - _IDX_SWAP_BEGIN];
 }
 
@@ -406,7 +432,8 @@ static struct hashmap_base_entry* bucket_at_virtual(HashmapBase *h, struct swap_
         assert_not_reached();
 }
 
-static dib_raw_t* dib_raw_ptr(HashmapBase *h) {
+static inline dib_raw_t* dib_raw_ptr(HashmapBase *h) {
+        assert(h);
         return (dib_raw_t*)
                 ((uint8_t*) storage_ptr(h) + hashmap_type_info[h->type].entry_size * n_buckets(h));
 }
@@ -456,6 +483,8 @@ static unsigned skip_free_buckets(HashmapBase *h, unsigned idx) {
 }
 
 static void bucket_mark_free(HashmapBase *h, unsigned idx) {
+        assert(h);
+
         memzero(bucket_at(h, idx), hashmap_type_info[h->type].entry_size);
         bucket_set_dib(h, idx, DIB_FREE);
 }
@@ -464,6 +493,7 @@ static void bucket_move_entry(HashmapBase *h, struct swap_entries *swap,
                               unsigned from, unsigned to) {
         struct hashmap_base_entry *e_from, *e_to;
 
+        assert(h);
         assert(from != to);
 
         e_from = bucket_at_virtual(h, swap, from);
@@ -496,15 +526,18 @@ static void bucket_move_entry(HashmapBase *h, struct swap_entries *swap,
         }
 }
 
-static unsigned next_idx(HashmapBase *h, unsigned idx) {
-        return (idx + 1U) % n_buckets(h);
+static inline unsigned next_idx(HashmapBase *h, unsigned idx) {
+        return idx + 1U < n_buckets(h) ? idx + 1U : 0U;
 }
 
 static unsigned prev_idx(HashmapBase *h, unsigned idx) {
-        return (n_buckets(h) + idx - 1U) % n_buckets(h);
+        return idx > 0U ? idx - 1U : n_buckets(h) - 1U;
 }
 
-static void* entry_value(HashmapBase *h, struct hashmap_base_entry *e) {
+static inline void* entry_value(HashmapBase *h, struct hashmap_base_entry *e) {
+        assert(h);
+        assert(e);
+
         switch (h->type) {
 
         case HASHMAP_TYPE_PLAIN:
@@ -527,6 +560,7 @@ static void base_remove_entry(HashmapBase *h, unsigned idx) {
         assert(dibs[idx] != DIB_RAW_FREE);
 
 #if ENABLE_DEBUG_HASHMAP
+        assert(h);
         h->debug.rem_count++;
         h->debug.last_rem_idx = idx;
 #endif
@@ -564,7 +598,7 @@ static void base_remove_entry(HashmapBase *h, unsigned idx) {
              prev = left, left = next_idx(h, left)) {
                 dib = bucket_calculate_dib(h, left, dibs[left]);
                 assert(dib != 0);
-                bucket_move_entry(h, NULL, left, prev);
+                bucket_move_entry(h, /* swap= */ NULL, left, prev);
                 bucket_set_dib(h, prev, dib - 1);
         }
 
@@ -640,7 +674,7 @@ static unsigned hashmap_iterate_in_internal_order(HashmapBase *h, Iterator *i) {
                         i->idx = skip_free_buckets(h, h->indirect.idx_lowest_entry);
                         h->indirect.idx_lowest_entry = i->idx;
                 } else
-                        i->idx = skip_free_buckets(h, 0);
+                        i->idx = skip_free_buckets(h, /* idx= */ 0);
 
                 if (i->idx == IDX_NIL)
                         goto at_end;
@@ -848,6 +882,8 @@ int set_ensure_allocated(Set **s, const struct hash_ops *hash_ops) {
 int hashmap_ensure_put(Hashmap **h, const struct hash_ops *hash_ops, const void *key, void *value) {
         int r;
 
+        assert(h);
+
         r = hashmap_ensure_allocated(h, hash_ops);
         if (r < 0)
                 return r;
@@ -857,6 +893,8 @@ int hashmap_ensure_put(Hashmap **h, const struct hash_ops *hash_ops, const void 
 
 int ordered_hashmap_ensure_put(OrderedHashmap **h, const struct hash_ops *hash_ops, const void *key, void *value) {
         int r;
+
+        assert(h);
 
         r = ordered_hashmap_ensure_allocated(h, hash_ops);
         if (r < 0)
@@ -868,6 +906,8 @@ int ordered_hashmap_ensure_put(OrderedHashmap **h, const struct hash_ops *hash_o
 int ordered_hashmap_ensure_replace(OrderedHashmap **h, const struct hash_ops *hash_ops, const void *key, void *value) {
         int r;
 
+        assert(h);
+
         r = ordered_hashmap_ensure_allocated(h, hash_ops);
         if (r < 0)
                 return r;
@@ -877,6 +917,8 @@ int ordered_hashmap_ensure_replace(OrderedHashmap **h, const struct hash_ops *ha
 
 int hashmap_ensure_replace(Hashmap **h, const struct hash_ops *hash_ops, const void *key, void *value) {
         int r;
+
+        assert(h);
 
         r = hashmap_ensure_allocated(h, hash_ops);
         if (r < 0)
@@ -926,7 +968,7 @@ void _hashmap_clear(HashmapBase *h) {
                         void *k = NULL;
                         void *v;
 
-                        v = _hashmap_first_key_and_value(h, true, &k);
+                        v = _hashmap_first_key_and_value(h, /* remove= */ true, &k);
 
                         if (h->hash_ops->free_key)
                                 h->hash_ops->free_key(k);
@@ -969,6 +1011,7 @@ static bool hashmap_put_robin_hood(HashmapBase *h, unsigned idx,
         unsigned dib, distance;
 
 #if ENABLE_DEBUG_HASHMAP
+        assert(h);
         h->debug.put_count++;
 #endif
 
@@ -1109,13 +1152,13 @@ static int resize_buckets(HashmapBase *h, unsigned entries_add) {
         if (_unlikely_(new_n_buckets < new_n_entries))
                 return -ENOMEM;
 
-        if (_unlikely_(new_n_buckets > UINT_MAX / (hi->entry_size + sizeof(dib_raw_t))))
-                return -ENOMEM;
-
         old_n_buckets = n_buckets(h);
 
         if (_likely_(new_n_buckets <= old_n_buckets))
                 return 0;
+
+        if (_unlikely_(new_n_buckets > UINT_MAX / (hi->entry_size + sizeof(dib_raw_t))))
+                return -ENOMEM;
 
         new_shift = log2u_round_up(MAX(
                         new_n_buckets * (hi->entry_size + sizeof(dib_raw_t)),
@@ -1216,6 +1259,7 @@ static int resize_buckets(HashmapBase *h, unsigned entries_add) {
  * Returns: index of the found entry, or IDX_NIL if not found.
  */
 static unsigned base_bucket_scan(HashmapBase *h, unsigned idx, const void *key) {
+        compare_func_t compare = h->hash_ops->compare;
         struct hashmap_base_entry *e;
         unsigned dib, distance;
         dib_raw_t *dibs = dib_raw_ptr(h);
@@ -1232,7 +1276,9 @@ static unsigned base_bucket_scan(HashmapBase *h, unsigned idx, const void *key) 
                         return IDX_NIL;
                 if (dib == distance) {
                         e = bucket_at(h, idx);
-                        if (h->hash_ops->compare(e->key, key) == 0)
+
+                        /* Most maps compare keys by pointer. Do that here, without the indirect call. */
+                        if (compare == trivial_compare_func ? e->key == key : compare(e->key, key) == 0)
                                 return idx;
                 }
 
@@ -1283,6 +1329,8 @@ int set_put(Set *s, const void *key) {
 int set_ensure_put(Set **s, const struct hash_ops *hash_ops, const void *key) {
         int r;
 
+        assert(s);
+
         r = set_ensure_allocated(s, hash_ops);
         if (r < 0)
                 return r;
@@ -1297,6 +1345,9 @@ int set_ensure_consume(Set **s, const struct hash_ops *hash_ops, void *key) {
         if (r <= 0) {
                 if (hash_ops && hash_ops->free_key)
                         hash_ops->free_key(key);
+                else if (hash_ops && hash_ops->free_value)
+                        /* Sets store their element in the key slot but may carry a value destructor. */
+                        hash_ops->free_value(key);
                 else
                         free(key);
         }
@@ -1773,14 +1824,12 @@ HashmapBase* _hashmap_copy(HashmapBase *h) {
 }
 
 char** _hashmap_get_strv(HashmapBase *h) {
-        char **sv;
+        /* Build a strv with borrowed Hashmap values. */
+
         Iterator i;
         unsigned idx, n;
 
-        if (!h)
-                return new0(char*, 1);
-
-        sv = new(char*, n_entries(h)+1);
+        char **sv = new(char*, (h ? n_entries(h) : 0) + 1);
         if (!sv)
                 return NULL;
 
@@ -1788,6 +1837,26 @@ char** _hashmap_get_strv(HashmapBase *h) {
         HASHMAP_FOREACH_IDX(idx, h, i)
                 sv[n++] = entry_value(h, bucket_at(h, idx));
         sv[n] = NULL;
+
+        return sv;
+}
+
+char** _hashmap_values_to_strv(HashmapBase *h) {
+        /* Convert the Hashmap values to a strv.
+         *
+         * The key:value pairs are drained from the hashmap, the keys are freed if the
+         * hash_ops->free_key function is defined, and values are used by the returned
+         * strv. The input hashmap is left empty. */
+
+        char **sv = new(char*, (h ? n_entries(h) : 0) + 1);
+        if (!sv)
+                return NULL;
+
+        unsigned n = 0;
+        void *key;
+        while ((sv[n++] = _hashmap_first_key_and_value(h, /* remove= */ true, &key)))
+                if (h->hash_ops->free_key)
+                        h->hash_ops->free_key(key);
 
         return sv;
 }
@@ -1842,6 +1911,8 @@ int set_consume(Set *s, void *value) {
 
 int hashmap_put_strdup_full(Hashmap **h, const struct hash_ops *hash_ops, const char *k, const char *v) {
         int r;
+
+        assert(h);
 
         r = hashmap_ensure_allocated(h, hash_ops);
         if (r < 0)
@@ -2187,6 +2258,8 @@ int _hashmap_dump_keys_sorted(HashmapBase *h, void ***ret, size_t *ret_n) {
         size_t n;
         int r;
 
+        assert(ret);
+
         r = _hashmap_dump_entries_sorted(h, &entries, &n);
         if (r < 0)
                 return r;
@@ -2205,6 +2278,8 @@ int _hashmap_dump_sorted(HashmapBase *h, void ***ret, size_t *ret_n) {
         _cleanup_free_ void **entries = NULL;
         size_t n;
         int r;
+
+        assert(ret);
 
         r = _hashmap_dump_entries_sorted(h, &entries, &n);
         if (r < 0)

@@ -16,6 +16,7 @@
 #include "env-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "hibernate-util.h"
 #include "log.h"
 #include "parse-util.h"
@@ -37,14 +38,16 @@ int read_fiemap(int fd, struct fiemap **ret) {
         uint32_t result_extents = 0;
         uint64_t fiemap_start = 0, fiemap_length;
         const size_t n_extra = DIV_ROUND_UP(sizeof(struct fiemap), sizeof(struct fiemap_extent));
+        int r;
 
         assert(fd >= 0);
         assert(ret);
 
         if (fstat(fd, &statinfo) < 0)
                 return log_debug_errno(errno, "Cannot determine file size: %m");
-        if (!S_ISREG(statinfo.st_mode))
-                return -ENOTTY;
+        r = stat_verify_regular(&statinfo);
+        if (r < 0)
+                return r;
         fiemap_length = statinfo.st_size;
 
         /* Zero this out in case we run on a file with no extents */
@@ -201,16 +204,17 @@ static int swap_entry_get_resume_config(SwapEntry *swap) {
         assert(swap);
         assert(swap->path);
 
-        fd = open(swap->path, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+        fd = xopenat(AT_FDCWD, swap->path, O_RDONLY|O_NONBLOCK|O_NOCTTY);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         if (fstat(fd, &st) < 0)
                 return -errno;
 
         if (!swap->swapfile) {
-                if (!S_ISBLK(st.st_mode))
-                        return -ENOTBLK;
+                r = stat_verify_block(&st);
+                if (r < 0)
+                        return r;
 
                 swap->devno = st.st_rdev;
                 swap->offset = 0;
@@ -314,6 +318,35 @@ static int read_swap_entries(SwapEntries *ret) {
         return 0;
 }
 
+static int get_proc_meminfo_active(uint64_t *ret) {
+        _cleanup_free_ char *active_str = NULL;
+        uint64_t active;
+        int r;
+
+        assert(ret);
+
+        r = get_proc_field("/proc/meminfo", "Active(anon)", &active_str);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to retrieve Active(anon) from /proc/meminfo: %m");
+
+        r = safe_atou64(active_str, &active);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse Active(anon) '%s' from /proc/meminfo: %m", active_str);
+
+        *ret = active;
+        return 0;
+}
+
+static uint64_t swap_free(const SwapEntry *s) {
+        assert(s);
+        return LESS_BY(s->size, s->used);
+}
+
+static bool swap_can_hold_image(const SwapEntry *s, uint64_t active) {
+        assert(s);
+        return active > 0 && active <= swap_free(s) * HIBERNATION_SWAP_THRESHOLD;
+}
+
 /* Attempt to find a suitable device for hibernation by parsing /proc/swaps, /sys/power/resume, and
  * /sys/power/resume_offset.
  *
@@ -329,7 +362,8 @@ static int read_swap_entries(SwapEntries *ret) {
  *  1 - Values are set in /sys/power/resume and /sys/power/resume_offset.
  *
  *  0 - No values are set in /sys/power/resume and /sys/power/resume_offset.
- *      ret will represent the highest priority swap with most remaining space discovered in /proc/swaps.
+ *      ret will represent the highest priority swap that can hold the hibernation image. If no swap is
+ *      large enough, ret will represent the highest priority swap with most remaining space.
  *
  *  Negative value in the case of error */
 int find_suitable_hibernation_device_full(HibernationDevice *ret_device, uint64_t *ret_size, uint64_t *ret_used) {
@@ -337,9 +371,14 @@ int find_suitable_hibernation_device_full(HibernationDevice *ret_device, uint64_
         SwapEntry *entry = NULL;
         uint64_t resume_config_offset;
         dev_t resume_config_devno;
+        uint64_t active = 0;
         int r;
 
         assert(!ret_size == !ret_used);
+
+        /* Best-effort: used to prefer swaps that can hold the hibernation image.
+         * On failure, selection falls back to priority + free space only. */
+        (void) get_proc_meminfo_active(&active);
 
         r = read_resume_config(&resume_config_devno, &resume_config_offset);
         if (r < 0)
@@ -376,8 +415,14 @@ int find_suitable_hibernation_device_full(HibernationDevice *ret_device, uint64_
                 }
 
                 if (!entry ||
-                    swap->priority > entry->priority ||
-                    swap->size - swap->used > entry->size - entry->used)
+                    /* prefer a swap that can hold the image over one that cannot */
+                    (swap_can_hold_image(swap, active) && !swap_can_hold_image(entry, active)) ||
+                    /* among equal capacity fitness: higher priority wins */
+                    (swap_can_hold_image(swap, active) == swap_can_hold_image(entry, active) &&
+                     (swap->priority > entry->priority ||
+                      /* equal priority: more free space wins */
+                      (swap->priority == entry->priority &&
+                       swap_free(swap) > swap_free(entry)))))
                         entry = swap;
         }
 
@@ -415,34 +460,14 @@ int find_suitable_hibernation_device_full(HibernationDevice *ret_device, uint64_
         return resume_config_devno > 0;
 }
 
-static int get_proc_meminfo_active(unsigned long long *ret) {
-        _cleanup_free_ char *active_str = NULL;
-        unsigned long long active;
-        int r;
-
-        assert(ret);
-
-        r = get_proc_field("/proc/meminfo", "Active(anon)", &active_str);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to retrieve Active(anon) from /proc/meminfo: %m");
-
-        r = safe_atollu(active_str, &active);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to parse Active(anon) '%s' from /proc/meminfo: %m", active_str);
-
-        *ret = active;
-        return 0;
-}
-
 int hibernation_is_safe(void) {
-        unsigned long long active;
-        uint64_t size, used;
+        uint64_t active, size, used;
         bool resume_set, bypass_space_check;
         int r;
 
         bypass_space_check = getenv_bool("SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK") > 0;
 
-        r = find_suitable_hibernation_device_full(NULL, &size, &used);
+        r = find_suitable_hibernation_device_full(/* ret_device= */ NULL, &size, &used);
         if (IN_SET(r, -ENOSPC, -ESTALE) && bypass_space_check)
                 /* If we don't have any available swap space at all, or the specified resume device is missing,
                  * and $SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK is set, skip all remaining checks since
@@ -465,7 +490,7 @@ int hibernation_is_safe(void) {
                 return r;
 
         r = active <= (size - used) * HIBERNATION_SWAP_THRESHOLD;
-        log_debug("Detected %s swap for hibernation: Active(anon)=%llu kB, size=%" PRIu64 " kB, used=%" PRIu64 " kB, threshold=%.2g%%",
+        log_debug("Detected %s swap for hibernation: Active(anon)=%" PRIu64 " kB, size=%" PRIu64 " kB, used=%" PRIu64 " kB, threshold=%.2g%%",
                   r ? "enough" : "not enough", active, size, used, 100 * HIBERNATION_SWAP_THRESHOLD);
         if (!r)
                 return -ENOSPC;
@@ -506,7 +531,7 @@ int clear_efi_hibernate_location_and_warn(void) {
         if (!is_efi_boot())
                 return 0;
 
-        r = efi_set_variable(EFI_SYSTEMD_VARIABLE_STR("HibernateLocation"), NULL, 0);
+        r = efi_set_variable(EFI_SYSTEMD_VARIABLE_STR("HibernateLocation"), /* value= */ NULL, /* size= */ 0);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)

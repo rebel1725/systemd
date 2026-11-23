@@ -3,10 +3,9 @@
 #include <netinet/in.h>
 #include <pwd.h>
 #include <stdlib.h>
-#include <sys/prctl.h>
+#include <sys/prctl.h> /* IWYU pragma: keep */
 #include <sys/socket.h>
 #include <unistd.h>
-#include "pidref.h"
 
 #define TEST_CAPABILITY_C
 
@@ -15,9 +14,9 @@
 #include "capability-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
-#include "fileio.h"
-#include "parse-util.h"
+#include "pidref.h"
 #include "process-util.h"
+#include "sysctl-util.h"
 #include "tests.h"
 
 static uid_t test_uid = -1;
@@ -46,16 +45,14 @@ static void show_capabilities(void) {
 
 /* verify cap_last_cap() against /proc/sys/kernel/cap_last_cap */
 TEST(last_cap_file) {
-        _cleanup_free_ char *content = NULL;
         unsigned long val = 0;
         int r;
 
-        r = read_one_line_file("/proc/sys/kernel/cap_last_cap", &content);
+        r = sysctl_read_lu("kernel/cap_last_cap", &val);
         if (ERRNO_IS_NEG_PRIVILEGE(r))
-                return (void) log_tests_skipped_errno(r, "Failed to /proc/sys/kernel/cap_last_cap");
+                return (void) log_tests_skipped_errno(r, "Failed to read kernel.cap_last_cap sysctl");
         ASSERT_OK(r);
 
-        ASSERT_OK(safe_atolu(content, &val));
         ASSERT_NE(val, 0UL);
         ASSERT_EQ(val, cap_last_cap());
 }
@@ -64,13 +61,13 @@ TEST(last_cap_file) {
 TEST(last_cap_probe) {
         unsigned long p = (unsigned long)CAP_LAST_CAP;
 
-        if (prctl(PR_CAPBSET_READ, p) < 0) {
+        if (prctl_safe(PR_CAPBSET_READ, p, 0, 0, 0) < 0) {
                 for (p--; p > 0; p--)
-                        if (prctl(PR_CAPBSET_READ, p) >= 0)
+                        if (prctl_safe(PR_CAPBSET_READ, p, 0, 0, 0) >= 0)
                                 break;
         } else {
                 for (;; p++)
-                        if (prctl(PR_CAPBSET_READ, p+1) < 0)
+                        if (prctl_safe(PR_CAPBSET_READ, p+1, 0, 0, 0) < 0)
                                 break;
         }
 
@@ -117,7 +114,7 @@ static void test_drop_privileges_fail(void) {
         ASSERT_EQ(getgid(), test_gid);
 
         ASSERT_FAIL(drop_privileges(test_uid, test_gid, test_flags));
-        ASSERT_FAIL(drop_privileges(0, 0, test_flags));
+        ASSERT_FAIL(drop_privileges(/* uid= */ 0, /* gid= */ 0, test_flags));
 }
 
 TEST(drop_privileges) {
@@ -180,17 +177,17 @@ TEST(have_effective_cap) {
 }
 
 static void test_apply_ambient_caps_impl(void) {
-        ASSERT_OK_EQ_ERRNO(prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0), 0);
+        ASSERT_OK_ZERO(prctl_safe(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0));
 
         ASSERT_OK(capability_ambient_set_apply(UINT64_C(1) << CAP_CHOWN, /* also_inherit= */ true));
         ASSERT_OK_POSITIVE(have_inheritable_cap(CAP_CHOWN));
 
-        ASSERT_OK_EQ_ERRNO(prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0), 1);
+        ASSERT_OK_EQ(prctl_safe(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0), 1);
 
-        ASSERT_OK(capability_ambient_set_apply(0, /* also_inherit= */ true));
+        ASSERT_OK(capability_ambient_set_apply(/* set= */ 0, /* also_inherit= */ true));
         ASSERT_OK_ZERO(have_inheritable_cap(CAP_CHOWN));
 
-        ASSERT_OK_EQ_ERRNO(prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0), 0);
+        ASSERT_OK_ZERO(prctl_safe(PR_CAP_AMBIENT, PR_CAP_AMBIENT_IS_SET, CAP_CHOWN, 0, 0));
 }
 
 TEST(apply_ambient_caps) {
@@ -209,16 +206,13 @@ TEST(apply_ambient_caps) {
 }
 
 TEST(ensure_cap_64_bit) {
-        _cleanup_free_ char *content = NULL;
         unsigned long p = 0;
         int r;
 
-        r = read_one_line_file("/proc/sys/kernel/cap_last_cap", &content);
+        r = sysctl_read_lu("kernel/cap_last_cap", &p);
         if (ERRNO_IS_NEG_PRIVILEGE(r))
-                return (void) log_tests_skipped_errno(r, "Failed to /proc/sys/kernel/cap_last_cap");
+                return (void) log_tests_skipped_errno(r, "Failed to read kernel.cap_last_cap sysctl");
         ASSERT_OK(r);
-
-        ASSERT_OK(safe_atolu(content, &p));
 
         /* If caps don't fit into 64-bit anymore, we have a problem, fail the test. Moreover, we use
          * UINT64_MAX as unset, hence it must be smaller than or equals to 62 (CAP_LIMIT). */
@@ -234,10 +228,10 @@ TEST(capability_get_ambient) {
 
         ASSERT_OK(capability_get_ambient(&c));
 
-        r = prctl(PR_CAPBSET_READ, CAP_MKNOD);
+        r = prctl_safe(PR_CAPBSET_READ, CAP_MKNOD, 0, 0, 0);
         if (r <= 0)
                 return (void) log_tests_skipped("Lacking CAP_MKNOD, skipping getambient test.");
-        r = prctl(PR_CAPBSET_READ, CAP_LINUX_IMMUTABLE);
+        r = prctl_safe(PR_CAPBSET_READ, CAP_LINUX_IMMUTABLE, 0, 0, 0);
         if (r <= 0)
                 return (void) log_tests_skipped("Lacking CAP_LINUX_IMMUTABLE, skipping getambient test.");
 
@@ -303,6 +297,8 @@ TEST(pidref_get_capability) {
 }
 
 static int intro(void) {
+        int r;
+
         /* Try to set up nobody user/ambient caps for tests that need them.
          * Not finding nobody is non-fatal — those tests will skip themselves. */
         struct passwd *nobody = getpwnam(NOBODY_USER_NAME);
@@ -311,10 +307,10 @@ static int intro(void) {
                 test_gid = nobody->pw_gid;
         }
 
-        int r = prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+        r = prctl_safe(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
         /* There's support for PR_CAP_AMBIENT if the prctl() call succeeded or error code was something else
          * than EINVAL. The EINVAL check should be good enough to rule out false positives. */
-        run_ambient = r >= 0 || errno != EINVAL;
+        run_ambient = r >= 0 || r != -EINVAL;
 
         if (getuid() == 0)
                 show_capabilities();

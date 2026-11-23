@@ -157,6 +157,7 @@ int sd_lldp_tx_set_multicast_mode(sd_lldp_tx *lldp_tx, sd_lldp_multicast_mode_t 
 
 int sd_lldp_tx_set_hwaddr(sd_lldp_tx *lldp_tx, const struct ether_addr *hwaddr) {
         assert_return(lldp_tx, -EINVAL);
+        assert_return(hwaddr, -EINVAL);
         assert_return(!ether_addr_is_null(hwaddr), -EINVAL);
 
         lldp_tx->hwaddr = *hwaddr;
@@ -332,7 +333,7 @@ static int packet_append_string(
                 uint8_t type,
                 const char *str) {
 
-        return packet_append_prefixed_string(packet, packet_size, offset, type, 0, NULL, str);
+        return packet_append_prefixed_string(packet, packet_size, offset, type, /* prefix_len= */ 0, /* prefix= */ NULL, str);
 }
 
 static int lldp_tx_get_machine_id(sd_id128_t *ret) {
@@ -477,7 +478,7 @@ static int lldp_tx_create_packet(sd_lldp_tx *lldp_tx, size_t *ret_packet_size, u
                 offset += 2;
         }
 
-        r = packet_append_tlv_header(packet, packet_size, &offset, SD_LLDP_TYPE_END, 0);
+        r = packet_append_tlv_header(packet, packet_size, &offset, SD_LLDP_TYPE_END, /* data_len= */ 0);
         if (r < 0)
                 return r;
 
@@ -653,7 +654,7 @@ int sd_lldp_tx_start(sd_lldp_tx *lldp_tx) {
         delay = lldp_tx_get_delay(lldp_tx);
 
         r = sd_event_add_time_relative(lldp_tx->event, &lldp_tx->timer_event_source,
-                                       CLOCK_BOOTTIME, delay, 0,
+                                       CLOCK_BOOTTIME, delay, /* accuracy= */ 0,
                                        on_timer_event, lldp_tx);
         if (r < 0)
                 return r;

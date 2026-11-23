@@ -85,8 +85,8 @@ static int get_machine_properties(sd_bus *bus, struct machine_info *mi) {
                         "/org/freedesktop/systemd1",
                         machine_info_property_map,
                         BUS_MAP_STRDUP,
-                        NULL,
-                        NULL,
+                        /* reterr_error= */ NULL,
+                        /* ret_reply= */ NULL,
                         mi);
         if (r < 0)
                 return r;
@@ -100,13 +100,16 @@ static bool output_show_machine(const char *name, char **patterns) {
 
 static int get_machine_list(
                 sd_bus *bus,
-                struct machine_info **_machine_infos,
+                struct machine_info **ret_machine_infos,
                 char **patterns) {
 
         struct machine_info *machine_infos = NULL;
         _cleanup_strv_free_ char **m = NULL;
         _cleanup_free_ char *hn = NULL;
         int c = 0, r;
+
+        assert(bus);
+        assert(ret_machine_infos);
 
         hn = gethostname_malloc();
         if (!hn)
@@ -149,11 +152,11 @@ static int get_machine_list(
                         return log_oom();
                 }
 
-                (void) get_machine_properties(NULL, &machine_infos[c]);
+                (void) get_machine_properties(/* bus= */ NULL, &machine_infos[c]);
                 c++;
         }
 
-        *_machine_infos = machine_infos;
+        *ret_machine_infos = machine_infos;
         return c;
 }
 
@@ -176,7 +179,7 @@ static int output_machines_list(struct machine_info *machine_infos, unsigned n) 
                         return log_error_errno(r, "Failed to hide column: %m");
         }
         if (arg_full)
-                table_set_width(table, 0);
+                table_set_width(table, /* width= */ 0);
 
         table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
 

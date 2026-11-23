@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "basic-forward.h"
+#include "forward.h"
 
 typedef enum Glyph {
         GLYPH_SPACE,
@@ -73,7 +73,7 @@ bool emoji_enabled(void);
 const char* glyph_full(Glyph code, bool force_utf) _const_;
 
 static inline const char* glyph(Glyph code) {
-        return glyph_full(code, false);
+        return glyph_full(code, /* force_utf= */ false);
 }
 
 static inline const char* optional_glyph(Glyph code) {

@@ -10,6 +10,15 @@
 #include "process-util.h"
 #include "string-table.h"
 #include "string-util.h"
+#include "verbs.h"
+
+COMMAND(
+        "systemd-quotacheck\0",
+        "Check file system quotas.",
+        .argspec = "[PATH]\0",
+        .man_page = "systemd-quotacheck@.service(8)",
+        .option_namespace = "common",
+);
 
 typedef enum QuotaCheckMode {
         QUOTA_CHECK_AUTO,
@@ -36,9 +45,11 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                 if (proc_cmdline_value_missing(key, value))
                         return 0;
 
-                arg_mode = quota_check_mode_from_string(value);
-                if (arg_mode < 0)
-                        log_warning_errno(arg_mode, "Invalid quotacheck.mode= value, ignoring: %s", value);
+                QuotaCheckMode mode = quota_check_mode_from_string(value);
+                if (mode < 0)
+                        log_warning_errno(mode, "Invalid quotacheck.mode= value, ignoring: %s", value);
+                else
+                        arg_mode = mode;
 
         } else if (streq(key, "forcequotacheck") && !value)
                 arg_mode = QUOTA_CHECK_FORCE;
@@ -54,9 +65,11 @@ static void parse_credentials(void) {
         if (r < 0)
                 log_debug_errno(r, "Failed to read credential 'quotacheck.mode', ignoring: %m");
         else {
-                arg_mode = quota_check_mode_from_string(value);
-                if (arg_mode < 0)
-                        log_warning_errno(arg_mode, "Invalid 'quotacheck.mode' credential, ignoring: %s", value);
+                QuotaCheckMode mode = quota_check_mode_from_string(value);
+                if (mode < 0)
+                        log_warning_errno(mode, "Invalid 'quotacheck.mode' credential, ignoring: %s", value);
+                else
+                        arg_mode = mode;
         }
 }
 
@@ -65,13 +78,14 @@ static int run(int argc, char *argv[]) {
 
         log_setup();
 
-        if (argc > 2)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "This program expects one or no arguments.");
+        char **args = NULL;
+        r = common_parse_argv_full(argc, argv, /* min_args= */ 0, /* max_args= */ 1, &args);
+        if (r <= 0)
+                return r;
 
         umask(0022);
 
-        r = proc_cmdline_parse(parse_proc_cmdline_item, NULL, 0);
+        r = proc_cmdline_parse(parse_proc_cmdline_item, /* userdata= */ NULL, /* flags= */ 0);
         if (r < 0)
                 log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
 
@@ -93,8 +107,8 @@ static int run(int argc, char *argv[]) {
         }
 
         _cleanup_free_ char *path = NULL;
-        if (argc == 2) {
-                path = strdup(argv[1]);
+        if (args[0]) {
+                path = strdup(args[0]);
                 if (!path)
                         return log_oom();
         }

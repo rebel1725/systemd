@@ -16,6 +16,9 @@
 #define DEFAULT_RECURSION_MAX 100
 
 static int sort_func(struct dirent * const *a, struct dirent * const *b) {
+        assert(a);
+        assert(b);
+
         return strcmp((*a)->d_name, (*b)->d_name);
 }
 
@@ -23,6 +26,35 @@ static bool ignore_dirent(const struct dirent *de, RecurseDirFlags flags) {
         assert(de);
 
         /* Depending on flag either ignore everything starting with ".", or just "." itself and ".." */
+
+        if ((flags & _RECURSE_DIR_MUST_BE_MASK) != 0) {
+                RecurseDirFlags f;
+
+                switch (de->d_type) {
+
+                case DT_DIR:
+                        f = RECURSE_DIR_MUST_BE_DIRECTORY;
+                        break;
+
+                case DT_REG:
+                        f = RECURSE_DIR_MUST_BE_REGULAR;
+                        break;
+
+                case DT_LNK:
+                        f = RECURSE_DIR_MUST_BE_SYMLINK;
+                        break;
+
+                case DT_SOCK:
+                        f = RECURSE_DIR_MUST_BE_SOCKET;
+                        break;
+
+                default:
+                        return true;
+                }
+
+                if (!FLAGS_SET(flags, f))
+                        return true;
+        }
 
         return FLAGS_SET(flags, RECURSE_DIR_IGNORE_DOT) ?
                 de->d_name[0] == '.' :
@@ -36,11 +68,16 @@ int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
 
         assert(dir_fd >= 0);
 
+        if ((flags & _RECURSE_DIR_MUST_BE_MASK) != 0) /* We need the type to validate it */
+                flags |= RECURSE_DIR_ENSURE_TYPE;
+
         /* Returns an array with pointers to "struct dirent" directory entries, optionally sorted.
          *
          * Start with space for up to 8 directory entries. We expect at least 2 ("." + ".."), hence hopefully
          * 8 will cover most cases comprehensively. (Note that most likely a lot more entries will actually
          * fit in the buffer, given we calculate maximum file name length here.) */
+        /* Silence static analyzers */
+        assert_cc(offsetof(DirectoryEntries, buffer) <= SIZE_MAX - DIRENT_SIZE_MAX * 8);
         de = malloc(offsetof(DirectoryEntries, buffer) + DIRENT_SIZE_MAX * 8);
         if (!de)
                 return -ENOMEM;
@@ -50,6 +87,8 @@ int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
                 size_t bs;
                 ssize_t n;
 
+                /* Silence static analyzers, MALLOC_SIZEOF_SAFE is at least as large as the allocation */
+                assert(MALLOC_SIZEOF_SAFE(de) >= offsetof(DirectoryEntries, buffer));
                 bs = MIN(MALLOC_SIZEOF_SAFE(de) - offsetof(DirectoryEntries, buffer), (size_t) SSIZE_MAX);
                 assert(bs > de->buffer_size);
 
@@ -80,9 +119,6 @@ int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
         de->n_entries = 0;
         struct dirent *entry;
         FOREACH_DIRENT_IN_BUFFER(entry, de->buffer, de->buffer_size) {
-                if (ignore_dirent(entry, flags))
-                        continue;
-
                 if (FLAGS_SET(flags, RECURSE_DIR_ENSURE_TYPE)) {
                         r = dirent_ensure_type(dir_fd, entry);
                         if (r == -ENOENT)
@@ -91,6 +127,9 @@ int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
                         if (r < 0)
                                 return r;
                 }
+
+                if (ignore_dirent(entry, flags))
+                        continue;
 
                 de->n_entries++;
         }
@@ -110,12 +149,12 @@ int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
 
         j = 0;
         FOREACH_DIRENT_IN_BUFFER(entry, de->buffer, de->buffer_size) {
-                if (ignore_dirent(entry, flags))
-                        continue;
-
                 /* If d_type == DT_UNKNOWN that means we failed to ensure the type in the earlier loop and
                  * didn't include the dentry in de->n_entries and as such should skip it here as well. */
                 if (FLAGS_SET(flags, RECURSE_DIR_ENSURE_TYPE) && entry->d_type == DT_UNKNOWN)
+                        continue;
+
+                if (ignore_dirent(entry, flags))
                         continue;
 
                 de->entries[j++] = entry;
@@ -136,7 +175,7 @@ int readdir_all_at(int fd, const char *path, RecurseDirFlags flags, DirectoryEnt
 
         assert(fd >= 0 || fd == AT_FDCWD);
 
-        dir_fd = xopenat(fd, path, O_DIRECTORY|O_CLOEXEC);
+        dir_fd = xopenat(fd, path, O_DIRECTORY);
         if (dir_fd < 0)
                 return dir_fd;
 
@@ -158,6 +197,9 @@ int recurse_dir(
 
         assert(dir_fd >= 0);
         assert(func);
+
+        /* We cannot descend into dirs if we are supposed to ignore them */
+        assert((flags & _RECURSE_DIR_MUST_BE_MASK) == 0 || FLAGS_SET(flags, RECURSE_DIR_MUST_BE_DIRECTORY));
 
         /* This is a lot like ftw()/nftw(), but a lot more modern, i.e. built around openat()/statx()/O_PATH,
          * and under the assumption that fds are not as 'expensive' as they used to be. */
@@ -216,18 +258,18 @@ int recurse_dir(
                         p = i->d_name;
 
                 if (IN_SET(i->d_type, DT_UNKNOWN, DT_DIR)) {
-                        subdir_fd = openat(dir_fd, i->d_name, O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+                        subdir_fd = xopenat(dir_fd, i->d_name, O_DIRECTORY|O_NOFOLLOW);
                         if (subdir_fd < 0) {
-                                if (errno == ENOENT) /* Vanished by now, go for next file immediately */
+                                if (subdir_fd == -ENOENT) /* Vanished by now, go for next file immediately */
                                         continue;
 
                                 /* If it is a subdir but we failed to open it, then fail */
-                                if (!IN_SET(errno, ENOTDIR, ELOOP)) {
-                                        log_debug_errno(errno, "Failed to open directory '%s': %m", p);
+                                if (!IN_SET(subdir_fd, -ENOTDIR, -ELOOP)) {
+                                        log_debug_errno(subdir_fd, "Failed to open directory '%s': %m", p);
 
-                                        assert(errno <= RECURSE_DIR_SKIP_OPEN_DIR_ERROR_MAX - RECURSE_DIR_SKIP_OPEN_DIR_ERROR_BASE);
+                                        assert(-subdir_fd <= RECURSE_DIR_SKIP_OPEN_DIR_ERROR_MAX - RECURSE_DIR_SKIP_OPEN_DIR_ERROR_BASE);
 
-                                        r = func(RECURSE_DIR_SKIP_OPEN_DIR_ERROR_BASE + errno,
+                                        r = func(RECURSE_DIR_SKIP_OPEN_DIR_ERROR_BASE - subdir_fd,
                                                  p,
                                                  dir_fd,
                                                  /* inode_fd= */ -EBADF,
@@ -262,16 +304,16 @@ int recurse_dir(
 
                         if (flags & RECURSE_DIR_INODE_FD) {
 
-                                inode_fd = openat(dir_fd, i->d_name, O_PATH|O_NOFOLLOW|O_CLOEXEC);
+                                inode_fd = xopenat(dir_fd, i->d_name, O_PATH|O_NOFOLLOW);
                                 if (inode_fd < 0) {
-                                        if (errno == ENOENT) /* Vanished by now, go for next file immediately */
+                                        if (inode_fd == -ENOENT) /* Vanished by now, go for next file immediately */
                                                 continue;
 
-                                        log_debug_errno(errno, "Failed to open directory entry '%s': %m", p);
+                                        log_debug_errno(inode_fd, "Failed to open directory entry '%s': %m", p);
 
-                                        assert(errno <= RECURSE_DIR_SKIP_OPEN_INODE_ERROR_MAX - RECURSE_DIR_SKIP_OPEN_INODE_ERROR_BASE);
+                                        assert(-inode_fd <= RECURSE_DIR_SKIP_OPEN_INODE_ERROR_MAX - RECURSE_DIR_SKIP_OPEN_INODE_ERROR_BASE);
 
-                                        r = func(RECURSE_DIR_SKIP_OPEN_INODE_ERROR_BASE + errno,
+                                        r = func(RECURSE_DIR_SKIP_OPEN_INODE_ERROR_BASE - inode_fd,
                                                  p,
                                                  dir_fd,
                                                  /* inode_fd= */ -EBADF,
@@ -302,7 +344,7 @@ int recurse_dir(
                                          * directory fd — which should be riskless now that we pinned the
                                          * inode. */
 
-                                        subdir_fd = fd_reopen(inode_fd, O_DIRECTORY|O_CLOEXEC);
+                                        subdir_fd = fd_reopen(inode_fd, O_DIRECTORY);
                                         if (subdir_fd < 0)
                                                 return subdir_fd;
 
@@ -512,9 +554,9 @@ int recurse_dir_at(
         assert(atfd >= 0 || atfd == AT_FDCWD);
         assert(func);
 
-        fd = openat(atfd, path ?: ".", O_DIRECTORY|O_CLOEXEC);
+        fd = xopenat(atfd, path ?: ".", O_DIRECTORY);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return recurse_dir(fd, path, statx_mask, n_depth_max, flags, func, userdata);
 }

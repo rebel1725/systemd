@@ -1,11 +1,22 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
+#include "sd-json.h"
 
+#include "alloc-util.h"
+#include "build.h"
 #include "env-util.h"
+#include "extract-word.h"
+#include "format-table.h"
+#include "json-util.h"
 #include "log.h"
+#include "nulstr-util.h"
+#include "options.h"
+#include "pager.h"
+#include "path-util.h"
+#include "pretty-print.h"
 #include "string-util.h"
 #include "strv.h"
+#include "terminal-util.h"
 #include "verbs.h"
 #include "virt.h"
 
@@ -57,43 +68,123 @@ bool should_bypass(const char *env_prefix) {
         return true;
 }
 
-const Verb* verbs_find_verb(const char *name, const Verb verbs[]) {
-        assert(verbs);
+static bool verb_is_metadata(const Verb *verb) {
+        /* A metadata entry that is not a real verb, i.e. either the command and group markers. */
+        return  FLAGS_SET(ASSERT_PTR(verb)->flags, VERB_COMMAND_MARKER) ||
+                FLAGS_SET(ASSERT_PTR(verb)->flags, VERB_GROUP_MARKER);
+}
 
-        for (size_t i = 0; verbs[i].dispatch; i++)
-                if (name ? streq(name, verbs[i].verb) : FLAGS_SET(verbs[i].flags, VERB_DEFAULT))
-                        return verbs + i;
+static const char* invoked_name(void) {
+        /* The name the program was invoked as, i.e. the alias in case of a multicall binary.
+         * $SYSTEMD_INVOKED_AS overrides argv[0], as in invoked_as(). */
+        return empty_to_null(last_path_component(secure_getenv("SYSTEMD_INVOKED_AS")))
+                ?: program_invocation_short_name;
+}
+
+static const Verb* find_invoked_command_in_namespace(
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const char *option_namespace,
+                bool exact,
+                const CommandDescription **ret_cmd) {
+
+        /* Find a command in the namespace named like the program, or with a name contained in the
+         * program name if !exact. */
+
+        const char *invoked = invoked_name();
+
+        for (const Verb *verb = verbs; verb < verbs_end; verb++) {
+                if (!FLAGS_SET(verb->flags, VERB_COMMAND_MARKER))
+                        continue;
+
+                const CommandDescription *cmd = (const CommandDescription*) ASSERT_PTR(verb->data);
+                if (!streq_ptr(cmd->option_namespace, option_namespace))
+                        continue;
+
+                NULSTR_FOREACH(name, cmd->names)
+                        if (exact ? streq(invoked, name) : !!strstr(invoked, name)) {
+                                if (ret_cmd)
+                                        *ret_cmd = cmd;
+                                return verb;
+                        }
+        }
+
+        return NULL;
+}
+
+const Verb* _verbs_find_invoked_command(
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const char *option_namespace,
+                const CommandDescription **ret_cmd) {
+
+        /* In a multicall binary several commands may share the option namespace, so prefer the one
+         * named like the program. Otherwise accept a command whose name is contained in the program
+         * name, e.g. "systemd-sysroot-fstab-check.real": this is how invoked_as() matches when a
+         * multicall binary picks its mode, so the help describes the mode that runs. Fall back to the
+         * first command in the namespace.
+         *
+         * Only commands in the namespace are considered, since the caller parses the options of that
+         * namespace. A command named like the program but with its own options, e.g. homectl when
+         * the fallback shell runs with $SYSTEMD_INVOKED_AS=homectl, is skipped. */
+
+        const Verb *v;
+
+        v = find_invoked_command_in_namespace(verbs, verbs_end, option_namespace,
+                                              /* exact= */ true, ret_cmd);
+        if (v)
+                return v;
+
+        v = find_invoked_command_in_namespace(verbs, verbs_end, option_namespace,
+                                              /* exact= */ false, ret_cmd);
+        if (v)
+                return v;
+
+        return _verbs_find_command(verbs, verbs_end, option_namespace, ret_cmd);
+}
+
+const Verb* _verbs_find_verb(const Verb verbs[], const Verb verbs_end[], const char *name) {
+        assert(verbs);
+        assert(verbs_end > verbs);
+        assert((uintptr_t) verbs % sizeof(void*) == 0);
+        assert(FLAGS_SET(verbs[0].flags, VERB_COMMAND_MARKER) || verbs[0].verb);
+
+        for (const Verb *verb = verbs; verb < verbs_end; verb++) {
+                if (verb_is_metadata(verb))
+                        continue;
+
+                if (name ? streq(name, verb->verb) : FLAGS_SET(verb->flags, VERB_DEFAULT))
+                        return verb;
+        }
 
         /* At the end of the list? */
         return NULL;
 }
 
-int dispatch_verb(int argc, char *argv[], const Verb verbs[], void *userdata) {
-        const Verb *verb;
-        const char *name;
-        int r, left;
+int _dispatch_verb(char **args, const Verb verbs[], const Verb verbs_end[], void *userdata) {
+        int r;
 
         assert(verbs);
-        assert(verbs[0].dispatch);
-        assert(verbs[0].verb);
-        assert(argc >= 0);
-        assert(argv);
-        assert(argc >= optind);
+        assert(verbs_end > verbs);
+        assert((uintptr_t) verbs % sizeof(void*) == 0);
+        assert(FLAGS_SET(verbs[0].flags, VERB_COMMAND_MARKER) || verbs[0].verb);
 
-        left = argc - optind;
-        argv += optind;
-        optind = 0;
-        name = argv[0];
+        const char *name = args ? args[0] : NULL;
+        size_t left = strv_length(args);
 
-        verb = verbs_find_verb(name, verbs);
+        const Verb *verb = _verbs_find_verb(verbs, verbs_end, name);
         if (!verb) {
                 _cleanup_strv_free_ char **verb_strv = NULL;
 
-                for (size_t i = 0; verbs[i].dispatch; i++) {
-                        r = strv_extend(&verb_strv, verbs[i].verb);
+                for (verb = verbs; verb < verbs_end; verb++) {
+                        if (verb_is_metadata(verb))
+                                continue;
+
+                        r = strv_extend(&verb_strv, verb->verb);
                         if (r < 0)
                                 return log_oom();
                 }
+                assert(!strv_isempty(verb_strv));  /* At least one verb should be defined… */
 
                 if (name) {
                         /* Be more helpful to the user, and give a hint what the user might have wanted to type. */
@@ -114,18 +205,16 @@ int dispatch_verb(int argc, char *argv[], const Verb verbs[], void *userdata) {
                                                "Command verb required (one of %s).", joined);
                 }
 
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Command verb '%s' required.", verbs[0].verb);
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Command verb '%s' required.", verb_strv[0]);
         }
 
         if (!name)
                 left = 1;
 
-        if (verb->min_args != VERB_ANY &&
-            (unsigned) left < verb->min_args)
+        if (verb->min_args != VERB_ANY && left < verb->min_args)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Too few arguments.");
 
-        if (verb->max_args != VERB_ANY &&
-            (unsigned) left > verb->max_args)
+        if (verb->max_args != VERB_ANY && left > verb->max_args)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Too many arguments.");
 
         if ((verb->flags & VERB_ONLINE_ONLY) && running_in_chroot_or_offline()) {
@@ -136,5 +225,876 @@ int dispatch_verb(int argc, char *argv[], const Verb verbs[], void *userdata) {
         if (!name)
                 return verb->dispatch(1, STRV_MAKE(verb->verb), verb->data, userdata);
 
-        return verb->dispatch(left, argv, verb->data, userdata);
+        assert(left < INT_MAX);  /* args are derived from argc+argv, so their size must fit in an int. */
+        return verb->dispatch(left, args, verb->data, userdata);
+}
+
+#define VERB_SYNOPSIS_WIDTH_SANE 25
+
+static const char* find_point_to_break(const char *s, size_t max_width) {
+        /* Locate the first space, preferably after max_width, or the last space otherwise.
+         * Return the part after the space. */
+
+        if (strlen(s) <= max_width)
+                return NULL;
+
+        const char *p = strchr(s + max_width, ' ') ?: strrchr(s, ' ');
+        return p ? p + 1 : NULL;
+}
+
+static int verb_add_help_one(Table *table, const Verb *verb) {
+        assert(table);
+        assert(verb);
+
+        _cleanup_free_ char *cell = NULL;
+        int r;
+
+        bool is_default = FLAGS_SET(verb->flags, VERB_DEFAULT);
+
+        /* The synopsis cell contains one line per entry in the argspec nulstr. An unset argspec is
+         * equivalent to a single empty specification. */
+        for (const char *spec = empty_to_null(verb->argspec);;) {
+                /* We indent the option string by two spaces. We could set the minimum cell width and
+                 * right-align for a similar result, but that'd be more work. This is only used for
+                 * display. */
+                _cleanup_free_ char *s = strjoin("  ",
+                                                 is_default ? "[" : "",
+                                                 verb->verb,
+                                                 spec ? " " : "",
+                                                 strempty(spec),
+                                                 is_default ? "]" : "",
+                                                 FLAGS_SET(verb->flags, VERB_OPTION_REQUIRED) ? " OPTION" : "");
+                if (!s)
+                        return log_oom();
+
+                const char *ss = NULL;
+                if (columns() < VERB_SYNOPSIS_WIDTH_SANE * 4) {
+                        /* If the synopsis is very wide, try to split it up. But do this only if the terminal
+                         * is not very wide. If it _is_ wide, the broken up synopsis would look silly. */
+                        const char *p = find_point_to_break(s, VERB_SYNOPSIS_WIDTH_SANE), *p2 = NULL;
+                        if (p) {
+                                const char *s1 = strndupa_safe(s, p - s), *s2 = NULL;
+
+                                p2 = find_point_to_break(p, VERB_SYNOPSIS_WIDTH_SANE - 4); /* we indent by two spaces more */
+                                if (p2)
+                                        s2 = strndupa_safe(p, p2 - p);
+
+                                if (s2)
+                                        ss = strjoina(s1, "\n    ", s2, "\n    ", p2);
+                                else
+                                        ss = strjoina(s1, "\n    ", p);
+                        }
+                }
+
+                if (!strextend_with_separator(&cell, "\n", ss ?: s))
+                        return log_oom();
+
+                if (!spec)
+                        break;
+                spec += strlen(spec) + 1;  /* Advance to the next entry in the nulstr */
+                if (isempty(spec))
+                        break;
+        }
+
+        r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_STRING, cell);
+        if (r < 0)
+                return table_log_add_error(r);
+
+        _cleanup_strv_free_ char **t = strv_split(verb->help, /* separators= */ NULL);
+        if (!t)
+                return log_oom();
+
+        r = table_add_many(table, TABLE_STRV_WRAPPED, t);
+        if (r < 0)
+                return table_log_add_error(r);
+
+        return 0;
+}
+
+const Verb* _verbs_find_command(
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const char *name,
+                const CommandDescription **ret_cmd) {
+
+        /* Locate the entry in the verbs array with VERB_COMMAND_MARKER.
+         * This entry contains a pointer to a CommandDescription 'cmd' in its .data field.
+         * If 'name' is specified, the name has to be in either cmd->names or
+         * cmd->option_namespace. The latter is intended to be used to match service
+         * implementations from the generic service code. */
+
+        assert(verbs);
+        assert(verbs_end > verbs);
+        assert((uintptr_t) verbs % sizeof(void*) == 0);
+        assert(FLAGS_SET(verbs[0].flags, VERB_COMMAND_MARKER) || verbs[0].verb);
+
+        for (const Verb *verb = verbs; verb < verbs_end; verb++) {
+                if (!FLAGS_SET(verb->flags, VERB_COMMAND_MARKER))
+                        continue;
+
+                const CommandDescription *cmd = (const CommandDescription*) ASSERT_PTR(verb->data);
+                if (name && !nulstr_contains(cmd->names, name) && !streq_ptr(name, cmd->option_namespace))
+                        continue;
+
+                /* This function returns the Verb slot through the return value, and the
+                 * CommandDescription it points to in the optional output parameter. */
+                if (ret_cmd)
+                        *ret_cmd = cmd;
+                return verb;
+        }
+
+        /* At the end of the list? */
+        return NULL;
+}
+
+static int verbs_get_help_table(
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const char *group,
+                Table **ret) {
+        int r;
+
+        assert(verbs);
+        assert(verbs_end > verbs);
+        assert((uintptr_t) verbs % sizeof(void*) == 0);
+        assert(ret);
+
+        _cleanup_(table_unrefp) Table *table = table_new("verb", "help");
+        if (!table)
+                return log_oom();
+
+        bool in_group = group == NULL;  /* Are we currently in the section on the array that forms
+                                         * group <group>? The first part is the default group, so
+                                         * if the group was not specified, we are in. */
+
+        const Verb *verb;
+        for (verb = verbs; verb < verbs_end; verb++) {
+                /* This function is called through print_verb_option_help(), which provides a verbs
+                 * slice that starts after the VERB_COMMAND entry. */
+                if (FLAGS_SET(verb->flags, VERB_COMMAND_MARKER))
+                        break;
+
+                assert(verb->verb);
+
+                bool group_marker = FLAGS_SET(verb->flags, VERB_GROUP_MARKER);
+                if (!in_group) {
+                        in_group = group_marker && streq(group, verb->verb);
+                        continue;
+                }
+                if (group_marker)
+                        break;  /* End of group */
+
+                if (FLAGS_SET(verb->flags, VERB_DEPRECATED) || !verb->help)
+                        /* Marked as deprecated or no help string — we do not show the verb */
+                        continue;
+
+                r = verb_add_help_one(table, verb);
+                if (r < 0)
+                        return r;
+        }
+
+        table_set_header(table, false);
+        *ret = TAKE_PTR(table);
+
+        assert(verb - verbs < INT_MAX);
+        return verb - verbs; /* Return the count of verb entries "consumed". */
+}
+
+static void table_array_freep(Table ***tables) {
+        assert(tables);
+
+        for (Table **t = *tables; t && *t; t++)
+                *t = table_unref(*t);
+        free(*tables);
+}
+
+static int print_verb_option_help(
+                const CommandDescription *cmd,
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const Option options[],
+                const Option options_end[]) {
+
+        assert(verbs);
+        assert(verbs_end >= verbs);
+        assert((uintptr_t) verbs % sizeof(void*) == 0);
+
+        _cleanup_free_ const char **groups = NULL;
+        _cleanup_(table_array_freep) Table **tables = NULL;
+        size_t n_verbs = 0, n_opts = 0;
+        int r;
+
+        for (const Verb *verb = verbs; verb < verbs_end;) {
+                if (FLAGS_SET(verb->flags, VERB_COMMAND_MARKER))
+                        /* Start of entries for another command */
+                        break;
+
+                assert(verb->verb);
+
+                /* The group marker gives us the group name.
+                 * If it's missing, we're in the default (unnamed) group. */
+                const char *group = FLAGS_SET(verb->flags, VERB_GROUP_MARKER) ? verb->verb : NULL;
+
+                _cleanup_(table_unrefp) Table *table = NULL;
+                r = verbs_get_help_table(verb, verbs_end, group, &table);
+                if (r < 0)
+                        return r;
+
+                if (!GREEDY_REALLOC0(tables, n_verbs + 2))
+                        return -ENOMEM;
+                if (!GREEDY_REALLOC0(groups, n_verbs + 2))
+                        return -ENOMEM;
+
+                tables[n_verbs] = TAKE_PTR(table);
+                groups[n_verbs++] = group ?: "Commands";
+
+                verb += r; /* Skip over the whole verb group */
+        }
+
+        if (cmd->flags & COMMAND_HELP_SEPARATE)
+                (void) table_sync_all_column_widths(/* column= */ 0, tables);
+
+        const Option *optns, *optns_stop;
+        if (!options_find_namespace(options, options_end, cmd->option_namespace, &optns, &optns_stop))
+                return log_error_errno(SYNTHETIC_ERRNO(EUCLEAN),
+                                       "Option namespace %s not found.",
+                                       cmd->option_namespace ?: "(unnamed)");
+
+        for (const Option *opt = optns; opt < optns_stop;) {
+                _cleanup_(table_unrefp) Table *table = NULL;
+                const char *group;
+
+                if (FLAGS_SET(opt->flags, OPTION_NAMESPACE_MARKER))
+                        /* End of our namespace */
+                        break;
+
+                r = options_get_help_table_group(opt, optns_stop, cmd->option_groups, &table, &group);
+                if (r < 0)
+                        return r;
+
+                if (table) {
+                        if (!GREEDY_REALLOC0(tables, n_verbs + n_opts + 2))
+                                return -ENOMEM;
+                        if (!GREEDY_REALLOC0(groups, n_verbs + n_opts + 2))
+                                return -ENOMEM;
+
+                        tables[n_verbs + n_opts] = TAKE_PTR(table);
+                        groups[n_verbs + n_opts++] = group ?: "Options";
+                }
+
+                opt += r; /* Skip over the whole option group */
+        }
+
+        if (cmd->flags & COMMAND_HELP_SEPARATE)
+                (void) table_sync_all_column_widths(/* column= */ 0, tables + n_verbs);
+        else
+                (void) table_sync_all_column_widths(/* column= */ 0, tables);
+
+        for (size_t i = 0; i < n_verbs + n_opts; i++) {
+                if (table_isempty(tables[i]))
+                        continue;
+
+                help_section(groups[i]);
+
+                r = table_print_or_warn(tables[i]);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+static int print_man_link(const char *page) {
+        _cleanup_free_ char *link = NULL;
+        int r;
+
+        if (!page)
+                return 0;
+
+        r = terminal_urlify_man(page, /* section= */ NULL, &link);
+        if (r < 0)
+                return r;
+
+        printf("\nSee the %s for details.\n", link);
+        return 0;
+}
+
+static bool verbs_array_has_verbs(const Verb verbs[], const Verb verbs_end[]) {
+        for (const Verb *verb = verbs; verb < verbs_end; verb++) {
+                if (FLAGS_SET(verb->flags, VERB_COMMAND_MARKER))  /* start of another command section */
+                        break;
+                if (!verb->help)  /* a hidden verb */
+                        continue;
+                return true;
+        }
+
+        return false;
+}
+
+static int print_wrapped(const char *text, const char *ansi_seq) {
+
+        /* Print the text wrapped at spaces to the specified width. Newlines embedded in the text
+         * are preserved and each line is wrapped independently, so explicit line breaks (e.g.
+         * before an example command line) can be used where needed. */
+
+        if (!text)
+                return 0;
+
+        _cleanup_strv_free_ char **lines = NULL, **lines2 = NULL;
+        int r;
+
+        size_t width = MIN(columns(), 80U);  /* This is a reasonable default. */
+
+        r = strv_split_full(&lines, text, "\n", EXTRACT_DONT_COALESCE_SEPARATORS);
+        if (r < 0)
+                return r;
+
+        r = strv_rebreak_lines(lines, width, &lines2);
+        if (r < 0)
+                return r;
+
+        /* Separate this block from the previous input. */
+        putchar('\n');
+
+        STRV_FOREACH(line, lines2)
+                if (ansi_seq)
+                        printf("%s%s%s\n",
+                               ansi_seq,
+                               *line,
+                               ansi_normal());
+                else
+                        puts(*line);
+
+        return 0;
+}
+
+static const Verb* verbs_find_cmd_verbs(const Verb *cmdverb, const Verb verbs_end[]) {
+        assert(cmdverb);
+        assert(FLAGS_SET(cmdverb->flags, VERB_COMMAND_MARKER));
+        assert(cmdverb < verbs_end);
+
+        const CommandDescription *cmd = (const CommandDescription*) ASSERT_PTR(cmdverb->data);
+
+        /* With COMMAND_VERBS_SHARED, we have a group of VERB_COMMAND_MARKER entries, and
+         * then the shared verbs below. Thus, we need to skip over them to locate the
+         * first actual verb. Without COMMAND_VERBS_SHARED, the verbs start immediately
+         * after the VERB_COMMAND_MARKER entry. */
+        const Verb *actual = cmdverb + 1;
+        if (FLAGS_SET(cmd->flags, COMMAND_VERBS_SHARED))
+                while (actual < verbs_end &&
+                       FLAGS_SET(actual->flags, VERB_COMMAND_MARKER) &&
+                       FLAGS_SET(((const CommandDescription*) ASSERT_PTR(actual->data))->flags,
+                                 COMMAND_VERBS_SHARED))
+                        actual++;
+        return actual;
+}
+
+static void help_cmdline(const char *arguments) {
+        assert(arguments);
+
+        printf("%s>%s %s %s\n",
+               ansi_grey(),
+               ansi_normal(),
+               invoked_name(),
+               arguments);
+}
+
+void help_section(const char *title) {
+        assert(title);
+
+        printf("\n%s%s:%s\n",
+               ansi_underline(),
+               title,
+               ansi_normal());
+}
+
+int _command_print_help_full(
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const Option options[],
+                const Option options_end[],
+                const char *name,
+                const char *footer_ansi_seq) {
+        int r;
+
+        const CommandDescription *cmd;
+        const Verb *cmdverb = ASSERT_PTR(_verbs_find_command(verbs, verbs_end, name, &cmd));
+        const Verb *verbverbs = ASSERT_PTR(verbs_find_cmd_verbs(cmdverb, verbs_end));
+
+        if (cmd->pager_flags)
+                pager_open(*cmd->pager_flags);
+
+        if (cmd->argspec)
+                NULSTR_FOREACH(spec, cmd->argspec) {
+                        _cleanup_free_ char *line = strjoin("[OPTION…] ", spec);
+                        if (!line)
+                                return log_oom();
+                        help_cmdline(line);
+                }
+        else {
+                bool have_verbs = verbs_array_has_verbs(verbverbs, verbs_end);
+                help_cmdline(have_verbs ? "[OPTION…] COMMAND …" : "[OPTION…]");
+        }
+
+        const char *seq = strjoina(ansi_highlight(), ansi_add_italics());
+        r = print_wrapped(cmd->abstract, seq);
+        if (r < 0)
+                return r;
+
+        if (FLAGS_SET(cmd->flags, COMMAND_EXPERIMENTAL))
+                printf("\n%sThis command is EXPERIMENTAL.%s\n",
+                       ansi_bright_yellow(), ansi_normal());
+
+        r = print_verb_option_help(cmd, verbverbs, verbs_end, options, options_end);
+        if (r < 0)
+                return log_error_errno(r, "Failed to print verb&option help: %m");
+
+        r = print_wrapped(cmd->footer, footer_ansi_seq);
+        if (r < 0)
+                return r;
+
+        r = print_man_link(cmd->man_page);
+        if (r < 0)
+                return log_error_errno(r, "Failed to print man page link: %m");
+
+        return 0;
+}
+
+int _command_print_verb_help(
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const Option options[],
+                const Option options_end[],
+                const char *name) {
+
+        int r;
+
+        assert(name);
+
+        const Verb *verb = ASSERT_PTR(_verbs_find_verb(verbs, verbs_end, name));
+
+        /* The owning command is described by the closest preceding VERB_COMMAND_MARKER entry. */
+        const Verb *cmdverb = verb;
+        while (!FLAGS_SET(cmdverb->flags, VERB_COMMAND_MARKER)) {
+                assert(cmdverb > verbs);
+                cmdverb--;
+        }
+        const CommandDescription *cmd = (const CommandDescription*) ASSERT_PTR(cmdverb->data);
+
+        if (cmd->pager_flags)
+                pager_open(*cmd->pager_flags);
+
+        const char *optionspec =
+                FLAGS_SET(verb->flags, VERB_OPTION_REQUIRED) ?
+                        " OPTION…" : verb->option_namespace ? " [OPTION…]" : "";
+
+        /* If argspec is empty, print one line with no argspec. Use " " as placeholder for the empty spec. */
+        NULSTR_FOREACH(spec, verb->argspec ?: " \0") {
+                bool some = !streq(spec, " ");
+                _cleanup_free_ char *line = strjoin(
+                                "[OPTION…] ", verb->verb,
+                                optionspec,
+                                some ? " " : NULL,
+                                some ? spec : NULL);
+                if (!line)
+                        return log_oom();
+                help_cmdline(line);
+        };
+
+        if (verb->help) {
+                const char *s = strjoina(ansi_highlight(), ansi_add_italics()),
+                           *t = strjoina(verb->help, ".");
+
+                r = print_wrapped(t, s);
+                if (r < 0)
+                        return r;
+        }
+
+        if (verb->option_namespace) {
+                const Option *optns, *optns_stop;
+                if (!options_find_namespace(options, options_end, verb->option_namespace, &optns, &optns_stop))
+                        return log_error_errno(SYNTHETIC_ERRNO(EUCLEAN),
+                                               "Option namespace %s not found.", verb->option_namespace);
+
+                _cleanup_(table_unrefp) Table *table = NULL;
+                r = options_get_help_table_group(
+                                optns, optns_stop,
+                                /* option_groups= */ NULL,
+                                &table,
+                                /* ret_group= */ NULL);
+                if (r < 0)
+                        return r;
+
+                /* Note: we assume that only one option group is used for a verb. If this ever
+                 * stops being true, the code here would need to be adjusted to loop over groups. */
+                help_section("Options");
+                r = table_print_or_warn(table);
+                if (r < 0)
+                        return r;
+        }
+
+        r = print_wrapped(verb->footer,
+                          FLAGS_SET(verb->flags, VERB_DEPRECATED) ? ansi_highlight_red() : NULL);
+        if (r < 0)
+                return r;
+
+        r = print_man_link(cmd->man_page);
+        if (r < 0)
+                return log_error_errno(r, "Failed to print man page link: %m");
+
+        return 0;
+}
+
+static int synopsis_build_json(const char *argspec, sd_json_variant **ret) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        int r;
+
+        assert(ret);
+
+        /* "synopsis" is an array of usage lines, each itself an array of strings. Our synopsis
+         * lines are passed through whole, as a single string each, since they are written for
+         * display and do not split into words cleanly, e.g. "[CONFIGURATION FILE…]". */
+
+        NULSTR_FOREACH(spec, argspec) {
+                r = sd_json_variant_append_arrayb(&v, SD_JSON_BUILD_STRV(STRV_MAKE(spec)));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to append JSON array to array: %m");
+        }
+
+        *ret = TAKE_PTR(v);
+        return 0;
+}
+
+static int verb_build_json(
+                const Verb *verb,
+                const char *group,
+                const Option options[],
+                const Option options_end[],
+                sd_json_variant **ret) {
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *opts = NULL, *synopsis = NULL;
+        int r;
+
+        assert(verb);
+        assert(verb->verb);
+        assert(ret);
+
+        /* Verbs are represented as nested command objects, as described in the CLI-Introspection
+         * Specification (https://uapi-group.org/specifications/specs/cli_introspection/). In
+         * particular, a verb which declares an option namespace carries its own option objects in
+         * "arguments", just like the top-level command object. "sections" names the group the verb
+         * is listed under in the help output, "Commands" for the default group (see
+         * print_verb_option_help()).
+         *
+         * The "minArguments", "maxArguments", "isDefault", and "isOnlineOnly" fields are extensions
+         * not (yet) covered by the specification, hence carry the "x-systemd." prefix which the
+         * specification requires for vendor extensions. Note that the argument counts include the
+         * verb itself. */
+
+        if (verb->option_namespace) {
+                r = options_build_json(options, options_end, verb->option_namespace,
+                                       /* option_groups= */ NULL, &opts);
+                if (r < 0)
+                        return r;
+        }
+
+        r = synopsis_build_json(verb->argspec, &synopsis);
+        if (r < 0)
+                return r;
+
+        r = sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_STRING("type", "command"),
+                        SD_JSON_BUILD_PAIR_STRING("id", verb->verb),
+                        SD_JSON_BUILD_PAIR_STRV("names", STRV_MAKE(verb->verb)),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        !!verb->help,
+                                        "help", SD_JSON_BUILD_STRING(verb->help)),
+                        SD_JSON_BUILD_PAIR_STRV("sections", STRV_MAKE(group ?: "Commands")),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        !!opts,
+                                        "arguments", SD_JSON_BUILD_VARIANT(opts)),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        !!verb->footer,
+                                        "postscript", SD_JSON_BUILD_STRV(STRV_MAKE(verb->footer))),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        !!synopsis,
+                                        "synopsis", SD_JSON_BUILD_VARIANT(synopsis)),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        FLAGS_SET(verb->flags, VERB_DEPRECATED),
+                                        "isDeprecated", SD_JSON_BUILD_BOOLEAN(true)),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        verb->min_args != VERB_ANY,
+                                        "x-systemd.minArguments", SD_JSON_BUILD_UNSIGNED(verb->min_args)),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        verb->max_args != VERB_ANY,
+                                        "x-systemd.maxArguments", SD_JSON_BUILD_UNSIGNED(verb->max_args)),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        FLAGS_SET(verb->flags, VERB_DEFAULT),
+                                        "x-systemd.isDefault", SD_JSON_BUILD_BOOLEAN(true)),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        FLAGS_SET(verb->flags, VERB_ONLINE_ONLY),
+                                        "x-systemd.isOnlineOnly", SD_JSON_BUILD_BOOLEAN(true)));
+        if (r < 0)
+                return log_error_errno(r, "Failed to build JSON object: %m");
+
+        return 0;
+}
+
+static int command_build_json(
+                const Verb *cmdverb,
+                const Verb verbs_end[],
+                const Option options[],
+                const Option options_end[],
+                sd_json_variant **ret) {
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *names = NULL, *opts = NULL,
+                *args = NULL, *synopsis = NULL;
+        int r;
+
+        assert(cmdverb);
+        assert(FLAGS_SET(cmdverb->flags, VERB_COMMAND_MARKER));
+        assert(cmdverb < verbs_end);
+        assert(ret);
+
+        const CommandDescription *cmd = (const CommandDescription*) ASSERT_PTR(cmdverb->data);
+        const Verb *verbverbs = verbs_find_cmd_verbs(cmdverb, verbs_end);
+
+        NULSTR_FOREACH(name, cmd->names) {
+                r = sd_json_variant_append_arrayb(&names, SD_JSON_BUILD_STRING(name));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to append JSON string to array: %m");
+        }
+        assert(names);  /* At least the primary name must be defined */
+
+        /* "arguments" lists the option objects first, followed by the verbs as nested command objects. */
+        r = options_build_json(options, options_end, cmd->option_namespace, cmd->option_groups, &opts);
+        if (r < 0)
+                return r;
+
+        sd_json_variant *o;
+        JSON_VARIANT_ARRAY_FOREACH(o, opts) {
+                r = sd_json_variant_append_array(&args, o);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to append JSON object to array: %m");
+        }
+
+        const char *group = NULL;
+        for (const Verb *verb = verbverbs; verb < verbs_end; verb++) {
+                if (FLAGS_SET(verb->flags, VERB_COMMAND_MARKER))
+                        break;  /* Start of entries for another command */
+
+                if (FLAGS_SET(verb->flags, VERB_GROUP_MARKER)) {
+                        group = verb->verb;
+                        continue;
+                }
+
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+                r = verb_build_json(verb, group, options, options_end, &v);
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_append_array(&args, v);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to append JSON object to array: %m");
+        }
+
+        r = synopsis_build_json(cmd->argspec, &synopsis);
+        if (r < 0)
+                return r;
+
+        /* Following the example in the specification, list the major version followed by the full
+         * version, unless they are the same. */
+        _cleanup_strv_free_ char **versions = strv_new(PROJECT_VERSION_STR, PROJECT_VERSION_FULL);
+        if (!versions)
+                return log_oom();
+        strv_uniq(versions);
+
+        _cleanup_strv_free_ char **features = strv_split(systemd_features, /* separators= */ NULL);
+        if (!features)
+                return log_oom();
+
+        const char *man_page = cmd->man_page ? strjoina("man:", cmd->man_page) : NULL;
+
+        /* The "id" is the primary name, as recommended by the specification. */
+        r = sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_STRING("type", "command"),
+                        SD_JSON_BUILD_PAIR_STRING("id", cmd->names),
+                        SD_JSON_BUILD_PAIR_VARIANT("names", names),
+                        SD_JSON_BUILD_PAIR_STRING("project", "systemd"),
+                        SD_JSON_BUILD_PAIR_STRV("versions", versions),
+                        SD_JSON_BUILD_PAIR_STRV("features", features),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        !!man_page,
+                                        "documentation", SD_JSON_BUILD_STRV(STRV_MAKE(man_page))),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        !!cmd->abstract,
+                                        "abstract", SD_JSON_BUILD_STRV(STRV_MAKE(cmd->abstract))),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        !!cmd->footer,
+                                        "postscript", SD_JSON_BUILD_STRV(STRV_MAKE(cmd->footer))),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        !!synopsis,
+                                        "synopsis", SD_JSON_BUILD_VARIANT(synopsis)),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        !!args,
+                                        "arguments", SD_JSON_BUILD_VARIANT(args)),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        FLAGS_SET(cmd->flags, COMMAND_EXPERIMENTAL),
+                                        "isExperimental", SD_JSON_BUILD_BOOLEAN(true)));
+        if (r < 0)
+                return log_error_errno(r, "Failed to build JSON object: %m");
+
+        return 0;
+}
+
+int _introspect_cli(
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const Option options[],
+                const Option options_end[],
+                sd_json_format_flags_t flags) {
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *commands = NULL, *w = NULL;
+        int r;
+
+        assert(verbs);
+        assert(verbs_end > verbs);
+        assert((uintptr_t) verbs % sizeof(void*) == 0);
+
+        if (flags == SD_JSON_FORMAT_OFF)
+                flags = SD_JSON_FORMAT_PRETTY_AUTO;
+
+        for (const Verb *verb = verbs; verb < verbs_end; verb++) {
+                if (!FLAGS_SET(verb->flags, VERB_COMMAND_MARKER))
+                        continue;
+
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *c = NULL;
+                r = command_build_json(verb, verbs_end, options, options_end, &c);
+                if (r < 0)
+                        return r;
+
+                r = sd_json_variant_append_array(&commands, c);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to append JSON object to array: %m");
+        }
+
+        if (!commands)
+                return log_error_errno(SYNTHETIC_ERRNO(ENODATA),
+                                       "No command description defined, cannot introspect.");
+
+        r = sd_json_buildo(
+                        &w,
+                        SD_JSON_BUILD_PAIR_STRING(
+                                        "mediaType",
+                                        "application/vnd.uapi-group.cli-introspection"),
+                        SD_JSON_BUILD_PAIR_VARIANT("commands", commands));
+        if (r < 0)
+                return log_error_errno(r, "Failed to build JSON object: %m");
+
+        r = sd_json_variant_dump(w, flags, stdout, /* prefix= */ NULL);
+        if (r < 0)
+                return log_error_errno(r, "Failed to print JSON object: %m");
+
+        return 0;
+}
+
+int _common_parse_argv(
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const Option options[],
+                const Option options_end[],
+                int argc, char *argv[],
+                OptionParserMode mode,
+                size_t min_args, size_t max_args,
+                char ***ret_args) {
+
+        assert(argc >= 0);
+        assert(argv);
+        assert(mode >= 0 && mode < _OPTION_PARSER_MODE_MAX);
+        assert(min_args <= max_args);
+        assert(ret_args || max_args == 0);
+
+        /* The COMMAND description must reference the option namespace defined below, otherwise
+         * --help and --introspect-cli would not find the options. */
+        const CommandDescription *cmd = NULL;
+        assert_se(_verbs_find_invoked_command(verbs, verbs_end, "common", &cmd));
+        assert(streq_ptr(cmd->option_namespace, "common"));
+
+        OptionParser opts = { argc, argv, mode, .namespace = "common" };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
+                switch (c) {
+
+                OPTION_NAMESPACE("common"): {}
+
+                OPTION_COMMON_HELP:
+                        return _command_print_help_full(
+                                        verbs, verbs_end,
+                                        options, options_end,
+                                        cmd->names,
+                                        /* footer_ansi_seq= */ NULL);
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return _introspect_cli(
+                                        verbs, verbs_end,
+                                        options, options_end,
+                                        SD_JSON_FORMAT_OFF);
+                }
+
+        size_t n = option_parser_get_n_args(&opts);
+        if (max_args == 0 && n > 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes no arguments.");
+        if (n < min_args)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Too few arguments.");
+        if (n > max_args)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Too many arguments.");
+
+        if (ret_args)
+                *ret_args = option_parser_get_args(&opts);
+        return 1; /* Further action */
+}
+
+int _common_parse_argv_passthrough(
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const Option options[],
+                const Option options_end[],
+                int argc, char *argv[]) {
+
+        assert(argc >= 0);
+        assert(argv);
+
+        /* Find out whether the command line consists of nothing but common options with a quiet dry run on
+         * a copy, since the parser reorders argv and complains about unknown options. */
+        _cleanup_free_ char **copy = newdup(char*, argv, argc + 1);
+        if (!copy)
+                return log_oom();
+
+        OptionParser opts = { argc, copy, .namespace = "common", .log_level_shift = LOG_DEBUG - LOG_ERR };
+        bool refused = false;
+
+        for (;;) {
+                int c = option_parse(__start_SYSTEMD_OPTIONS, __stop_SYSTEMD_OPTIONS, &opts);
+                if (c == 0)
+                        break;
+                if (c == -EPERM) {
+                        /* An experimental common option which this build refuses. Report that below, like
+                         * any other program does, rather than passing the option on. */
+                        refused = true;
+                        break;
+                }
+                if (c < 0)
+                        return 1; /* Not a common option, the program passes the command line on. */
+        }
+
+        if (!refused && option_parser_get_n_args(&opts) > 0)
+                return 1; /* Positional arguments are passed on too. */
+
+        return _common_parse_argv(verbs, verbs_end, options, options_end, argc, argv, OPTION_PARSER_NORMAL,
+                                  /* min_args= */ 0, /* max_args= */ 0, /* ret_args= */ NULL);
 }

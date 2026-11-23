@@ -44,21 +44,27 @@ set -x
 
 PID=0
 
-trap 'touch /terminate; kill 0' RTMIN+3
-trap 'touch /poweroff' RTMIN+4
-trap 'touch /reboot' INT
-trap 'touch /trap' TRAP
+# Use only builtins in trap handlers to avoid forking. External commands
+# (like touch) cause bash to enter wait_for() for the child, and a nested
+# signal arriving during that wait triggers a bash bug where
+# run_interrupt_trap() clears catch_flag while other traps are still
+# pending, creating an orphaned pending_traps[] entry that makes 'wait'
+# busy-loop indefinitely.
+trap ': >/terminate; kill 0' RTMIN+3
+trap ': >/poweroff' RTMIN+4
+trap ': >/reboot' INT
+trap ': >/trap' TRAP
 trap 'exit 0' TERM
 trap 'kill $PID' EXIT
 
 # We need to wait for the sleep process asynchronously in order to allow
 # bash to process signals
 sleep infinity &
+PID=$!
 
 # notify that the process is ready
-touch /ready
+: >/ready
 
-PID=$!
 while :; do
     wait || :
 done
@@ -114,6 +120,7 @@ machinectl disable long-running long-running long-running container1
 
 [[ "$(TERM=dumb machinectl shell testuser@ /usr/bin/bash -c 'echo -ne $FOO')" == "" ]]
 [[ "$(TERM=dumb machinectl shell --setenv=FOO=bar testuser@ /usr/bin/bash -c 'echo -ne $FOO')" == "bar" ]]
+[[ "$(TERM=dumb machinectl shell testuser@ --setenv=FOO=bar /usr/bin/bash -c 'echo -ne $FOO')" == "bar" ]]
 
 [[ "$(machinectl show --property=State --value long-running)" == "running" ]]
 # Equivalent to machinectl kill --signal=SIGRTMIN+4 --kill-whom=leader
@@ -174,6 +181,24 @@ if lsattr -d /var/lib/machines >/dev/null; then
     [[ "$(machinectl show-image --property=ReadOnly --value clone2)" == yes ]]
     machinectl read-only clone2 no
     [[ "$(machinectl show-image --property=ReadOnly --value clone2)" == no ]]
+
+    # Foreign-UID cloning also needs mountfsd/nsresourced and user namespace delegation.
+    if can_do_rootless_nspawn; then
+        mkdir /var/lib/machines/foreign-source
+        echo "foreign clone contents" >/var/lib/machines/foreign-source/payload
+        chown foreign-0:foreign-0 /var/lib/machines/foreign-source{,/payload}
+        machinectl clone --read-only foreign-source foreign-clone
+        [[ "$(machinectl show-image --property=ReadOnly --value foreign-clone)" == yes ]]
+        cmp /var/lib/machines/foreign-source/payload /var/lib/machines/foreign-clone/payload
+        assert_eq "$(stat -c %u:%g /var/lib/machines/foreign-source)" \
+                  "$(stat -c %u:%g /var/lib/machines/foreign-clone)"
+        assert_eq "$(stat -c %u:%g /var/lib/machines/foreign-source/payload)" \
+                  "$(stat -c %u:%g /var/lib/machines/foreign-clone/payload)"
+        (! touch /var/lib/machines/foreign-clone/new-file)
+        machinectl remove foreign-clone foreign-source
+    else
+        echo "Skipping foreign-UID read-only clone test: rootless nspawn prerequisites not met"
+    fi
 fi
 machinectl remove clone2
 for i in {0..4}; do
@@ -187,6 +212,24 @@ machinectl list-images --all
 test -d /var/lib/machines/.hidden1
 machinectl clean
 test ! -d /var/lib/machines/.hidden1
+
+if can_do_rootless_nspawn; then
+    mkdir /var/lib/machines/foreign-error-source
+    chown foreign-0:foreign-0 /var/lib/machines/foreign-error-source
+
+    # A regular file without an image suffix is not discovered as an image, but still prevents
+    # mountfsd from creating the clone directory. The clone operation must report this failure.
+    echo "existing file" >/var/lib/machines/foreign-error-target
+    (! machinectl show-image foreign-error-target)
+    (! machinectl clone foreign-error-source foreign-error-target)
+    assert_eq "$(</var/lib/machines/foreign-error-target)" "existing file"
+
+    rm /var/lib/machines/foreign-error-target
+    machinectl clone foreign-error-source foreign-error-target
+    machinectl remove foreign-error-target foreign-error-source
+else
+    echo "Skipping foreign-UID clone error test: rootless nspawn prerequisites not met"
+fi
 
 # Prepare a simple raw container
 mkdir -p /tmp/mnt
@@ -221,6 +264,16 @@ machinectl import-fs /var/tmp/container.dir container-dir
 [[ "$(machinectl show-image --property=Type --value container-dir)" =~ directory|subvolume ]]
 machinectl start container-dir
 rm -fr /var/tmp/container.dir
+
+# Check if machinectl can properly work with symlinks to raw images
+touch /var/lib/machines/linked.squashfs
+ln -svrf /var/lib/machines/linked.squashfs /var/lib/machines/linked.raw
+ls -la /var/lib/machines/
+machinectl list-images | tee /tmp/out.log
+grep -E "linked\s+raw" /tmp/out.log
+(! grep -E "squashfs" /tmp/out.log)
+[[ "$(machinectl show-image --property=Type --value linked)" == "raw" ]]
+rm -f /var/lib/machines/linked.{squashfs,raw} /tmp/out.log
 
 timeout 30 bash -c "until machinectl clean --all; do sleep .5; done"
 
@@ -332,11 +385,11 @@ trap 'kill $PID' EXIT
 # We need to wait for the sleep process asynchronously in order to allow
 # bash to process signals
 sleep infinity &
+PID=$!
 
 # notify that the process is ready
-touch /ready
+: >/ready
 
-PID=$!
 while :; do
     wait || :
 done

@@ -222,10 +222,6 @@ static int handle_action_execute(
         assert(m);
         assert(!IN_SET(handle, HANDLE_IGNORE, HANDLE_LOCK, HANDLE_SLEEP));
 
-        if (handle == HANDLE_KEXEC && access(KEXEC, X_OK) < 0)
-                return log_warning_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                         "Requested %s operation not supported, ignoring.", handle_action_to_string(handle));
-
         if (m->delayed_action)
                 return log_debug_errno(SYNTHETIC_ERRNO(EALREADY),
                                        "Action %s already in progress, ignoring requested %s operation.",
@@ -237,7 +233,7 @@ static int handle_action_execute(
         /* If the actual operation is inhibited, warn and fail */
         if (inhibit_what_is_valid(inhibit_operation) &&
             !ignore_inhibited &&
-            manager_is_inhibited(m, inhibit_operation, NULL, /* flags= */ 0, UID_INVALID, &offending)) {
+            manager_is_inhibited(m, inhibit_operation, /* since= */ NULL, /* flags= */ 0, UID_INVALID, &offending)) {
                 _cleanup_free_ char *comm = NULL, *u = NULL;
 
                 (void) pidref_get_comm(&offending->pid, &comm);
@@ -375,7 +371,7 @@ int manager_handle_action(
 
         /* If the key handling is inhibited, don't do anything */
         if (inhibit_key > 0) {
-                if (manager_is_inhibited(m, inhibit_key, NULL, MANAGER_IS_INHIBITED_IGNORE_INACTIVE, UID_INVALID, NULL)) {
+                if (manager_is_inhibited(m, inhibit_key, /* since= */ NULL, MANAGER_IS_INHIBITED_IGNORE_INACTIVE, UID_INVALID, /* ret_offending= */ NULL)) {
                         log_debug("Refusing %s operation, %s is inhibited.",
                                   handle_action_to_string(action),
                                   inhibit_what_to_string(inhibit_key));
@@ -389,7 +385,7 @@ int manager_handle_action(
                         return 0;
 
                 log_info("Locking sessions...");
-                session_send_lock_all(m, true);
+                session_send_lock_all(m, /* lock= */ true);
                 return 1;
         }
 
@@ -465,7 +461,7 @@ int config_parse_handle_action_sleep(
         if (isempty(rvalue))
                 goto empty;
 
-        if (strv_split_full(&actions, rvalue, NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE) < 0)
+        if (strv_split_full(&actions, rvalue, /* separators= */ NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE) < 0)
                 return log_oom();
 
         *mask = 0;

@@ -11,6 +11,7 @@
 #include "gunicode.h"
 #include "hexdecoct.h"
 #include "string-util.h"
+#include "unaligned.h"
 #include "utf8.h"
 
 bool unichar_is_valid(char32_t ch) {
@@ -63,6 +64,7 @@ int utf8_encoded_to_unichar(const char *str, char32_t *ret_unichar) {
         size_t len;
 
         assert(str);
+        assert(ret_unichar);
 
         len = utf8_encoded_expected_len(str[0]);
 
@@ -101,6 +103,20 @@ int utf8_encoded_to_unichar(const char *str, char32_t *ret_unichar) {
         return len;
 }
 
+/* Tests whether all eight bytes of a word are plain printable ASCII, i.e. within 0x20…0x7e. The three
+ * terms below cover the three ways a byte can fail. A byte that fails is always flagged in its own
+ * lane, but the converse does not hold: the two subtractions are whole-word ones, so a borrow out of
+ * a failing lane also flags bytes above it. Only the aggregate test is meaningful, the mask is not a
+ * per-byte map of which bytes failed. */
+static bool is_printable_fastpath_u64(uint64_t w) {
+        uint64_t x = w ^ UINT64_C(0x7f7f7f7f7f7f7f7f);
+
+        return (((w & UINT64_C(0x8080808080808080)) |                                  /* >= 0x80 */
+                 ((w - UINT64_C(0x2020202020202020)) & ~w) |                           /* < 0x20 */
+                 ((x - UINT64_C(0x0101010101010101)) & ~x)) &                          /* == 0x7f */
+                UINT64_C(0x8080808080808080)) == 0;
+}
+
 bool utf8_is_printable_newline(const char* str, size_t length, bool allow_newline) {
         assert(str);
 
@@ -108,14 +124,41 @@ bool utf8_is_printable_newline(const char* str, size_t length, bool allow_newlin
                 int encoded_len;
                 char32_t val;
 
-                encoded_len = utf8_encoded_valid_unichar(p, length);
+                /* Bulk fast path: almost everything we are asked about is plain printable ASCII, so
+                 * test eight bytes of it at once. Anything else falls through to the per-character
+                 * path below, which handles it as before. A remainder of less than eight bytes is
+                 * copied into a word padded with spaces, so that it can be tested the same way. */
+                while (length > 0) {
+                        uint64_t w;
+                        size_t n;
+
+                        if (length < sizeof(uint64_t)) {
+                                n = length;
+                                w = UINT64_C(0x2020202020202020);
+                                memcpy(&w, p, n);
+                        } else {
+                                n = sizeof(uint64_t);
+                                w = unaligned_read_ne64(p);
+                        }
+
+                        if (!is_printable_fastpath_u64(w))
+                                break;
+
+                        length -= n;
+                        p += n;
+                }
+
+                /* Note that this is not redundant with the loop condition above: the fast path may
+                 * have consumed the remainder of the string, and then there's nothing left to decode. */
+                if (length == 0)
+                        break;
+
+                encoded_len = utf8_encoded_valid_unichar_full(p, length, &val);
                 if (encoded_len < 0)
                         return false;
                 assert(encoded_len > 0 && (size_t) encoded_len <= length);
 
-                if (utf8_encoded_to_unichar(p, &val) < 0 ||
-                    unichar_is_control(val) ||
-                    (!allow_newline && val == '\n'))
+                if (unichar_is_control(val) || (!allow_newline && val == '\n'))
                         return false;
 
                 length -= encoded_len;
@@ -178,10 +221,22 @@ int utf8_char_console_width(const char *str) {
         char32_t c;
         int r;
 
-        r = utf8_encoded_to_unichar(str, &c);
+        assert(str);
+
+        /* Validate the same way utf8_is_valid() does. utf8_encoded_to_unichar() on its own accepts
+         * overlong encodings, surrogates, noncharacters and the obsolete 5 and 6 byte forms, which would
+         * make our idea of how wide a string is disagree with our idea of whether it is valid UTF-8 in
+         * the first place. */
+        r = utf8_encoded_valid_unichar(str, SIZE_MAX);
         if (r < 0)
                 return r;
 
+        assert_se(utf8_encoded_to_unichar(str, &c) == r);
+
+        return unichar_console_width(c);
+}
+
+int unichar_console_width(char32_t c) {
         if (c == '\t')
                 return 8; /* Assume a tab width of 8 */
 
@@ -199,7 +254,8 @@ char* utf8_escape_non_printable_full(const char *str, size_t console_width, bool
         if (console_width == 0)
                 return strdup("");
 
-        p = s = prev_s = malloc(strlen(str) * 4 + 1);
+        size_t body = strlen(str) * 4;
+        p = s = prev_s = malloc(body + STRLEN("…") + 1);
         if (!p)
                 return NULL;
 
@@ -282,6 +338,9 @@ char* ascii_is_valid_n(const char *str, size_t len) {
 int utf8_to_ascii(const char *str, char replacement_char, char **ret) {
         /* Convert to a string that has only ASCII chars, replacing anything that is not ASCII
          * by replacement_char. */
+
+        assert(str);
+        assert(ret);
 
         _cleanup_free_ char *ans = new(char, strlen(str) + 1);
         if (!ans)
@@ -419,6 +478,7 @@ char* utf16_to_utf8(const char16_t *s, size_t length /* bytes! */) {
 }
 
 size_t utf16_encode_unichar(char16_t *out, char32_t c) {
+        assert(out);
 
         /* Note that this encodes as little-endian. */
 
@@ -500,6 +560,8 @@ size_t char16_strlen(const char16_t *s) {
 }
 
 size_t char16_strsize(const char16_t *s) {
+        POINTER_MAY_BE_NULL(s);
+
         return s ? (char16_strlen(s) + 1) * sizeof(*s) : 0;
 }
 
@@ -521,7 +583,7 @@ static int utf8_unichar_to_encoded_len(char32_t unichar) {
 }
 
 /* validate one encoded unicode char and return its length */
-int utf8_encoded_valid_unichar(const char *str, size_t length /* bytes */) {
+int utf8_encoded_valid_unichar_full(const char *str, size_t length /* bytes */, char32_t *ret_unichar) {
         char32_t unichar;
         size_t len;
         int r;
@@ -529,7 +591,9 @@ int utf8_encoded_valid_unichar(const char *str, size_t length /* bytes */) {
         assert(str);
         assert(length > 0);
 
-        /* We read until NUL, at most length bytes. SIZE_MAX may be used to disable the length check. */
+        /* We read until NUL, at most length bytes. SIZE_MAX may be used to disable the length check.
+         * If ret_unichar is non-NULL the decoded character is returned in it, so that callers
+         * interested in both validity and value needn't decode the character a second time. */
 
         len = utf8_encoded_expected_len(str[0]);
         if (len == 0)
@@ -540,8 +604,11 @@ int utf8_encoded_valid_unichar(const char *str, size_t length /* bytes */) {
                 return -EINVAL;
 
         /* ascii is valid */
-        if (len == 1)
+        if (len == 1) {
+                if (ret_unichar)
+                        *ret_unichar = (char32_t) (uint8_t) str[0];
                 return 1;
+        }
 
         /* check if expected encoded chars are available */
         for (size_t i = 0; i < len; i++)
@@ -560,11 +627,16 @@ int utf8_encoded_valid_unichar(const char *str, size_t length /* bytes */) {
         if (!unichar_is_valid(unichar))
                 return -EINVAL;
 
+        if (ret_unichar)
+                *ret_unichar = unichar;
+
         return (int) len;
 }
 
 size_t utf8_n_codepoints(const char *str) {
         size_t n = 0;
+
+        assert(str);
 
         /* Returns the number of UTF-8 codepoints in this string, or SIZE_MAX if the string is not valid UTF-8. */
 
@@ -583,6 +655,7 @@ size_t utf8_n_codepoints(const char *str) {
 }
 
 size_t utf8_console_width(const char *str) {
+        POINTER_MAY_BE_NULL(str);
 
         if (isempty(str))
                 return 0;

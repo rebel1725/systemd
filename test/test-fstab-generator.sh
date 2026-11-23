@@ -53,7 +53,7 @@ test_one() (
     # Also, when $initrd is no, symlink to systemd-remount-fs.service is created.
     # The system that the test is currently running on may not have or may have outdated unit file.
     # Let's replace the symlink with an empty file.
-    for i in "$out"/*/systemd-growfs@*.service "$out"/local-fs.target.wants/systemd-remount-fs.service; do
+    for i in "$out"/*/systemd-growfs@*.service "$out"/*/systemd-validatefs@*.service "$out"/*/systemd-quotacheck@*.service "$out"/*/quotaon@*.service "$out"/local-fs.target.wants/systemd-remount-fs.service; do
         [[ -L "$i" ]] || continue
         rm "$i"
         touch "$i"
@@ -67,15 +67,15 @@ test_one() (
 
     # .deb packager seems to dislike files named with backslash. So, as a workaround, we store files
     # without backslash in .expected.
-    for i in "$out"/**/*\\*.{mount,swap}; do
+    for i in "$out"/**/*\\*.{mount,swap,automount}; do
         k="${i//\\/}"
         if [[ "$i" != "$k" ]]; then
-            if [[ -f "$i" ]]; then
-                mv "$i" "$k"
-            elif [[ -L "$i" ]]; then
+            if [[ -L "$i" ]]; then
                 dest=$(readlink "$i")
                 rm "$i"
                 ln -s "${dest//\\/}" "$k"
+            elif [[ -f "$i" ]]; then
+                mv "$i" "$k"
             fi
         fi
     done
@@ -130,8 +130,7 @@ test_one() (
 for f in "$src"/test-*.input; do
     # If /mnt is a symlink, then the expected output from this
     # test scenario will not match the actual output
-    if test "$f" = "$src/test-18-options.fstab.input" -a "$(readlink /mnt)" != "/mnt"
-    then
+    if [[ "$f" == "$src/test-18-options.fstab.input" && -L /mnt ]]; then
         echo "Skip $f because /mnt is a symlink"
         continue
     fi

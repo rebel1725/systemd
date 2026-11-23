@@ -189,6 +189,9 @@ static int parse_line(
         assert(line > 0);
         assert(lookup);
         assert(l);
+        assert(section);
+        assert(section_line);
+        assert(section_ignored);
 
         l = strstrip(l);
         if (isempty(l))
@@ -214,8 +217,8 @@ static int parse_line(
                 if (!n)
                         return log_oom();
 
-                if (!string_is_safe(n))
-                        return log_syntax(unit, LOG_ERR, filename, line, SYNTHETIC_ERRNO(EBADMSG), "Bad characters in section header '%s'", l);
+                if (!string_is_safe(n, /* flags= */ 0))
+                        return log_syntax(unit, LOG_ERR, filename, line, SYNTHETIC_ERRNO(EBADMSG), "Section header invalid '%s'", l);
 
                 if (sections && !nulstr_contains(sections, n)) {
                         bool ignore;
@@ -506,7 +509,7 @@ static int config_parse_many_files(
         /* Pin and stat() all dropins */
         STRV_FOREACH(fn, files) {
                 _cleanup_fclose_ FILE *f = NULL;
-                r = chase_and_fopenat_unlocked(root_fd, *fn, CHASE_AT_RESOLVE_IN_ROOT|CHASE_MUST_BE_REGULAR, "re", /* ret_path= */ NULL, &f);
+                r = chase_and_fopenat_unlocked(root_fd, root_fd, *fn, CHASE_MUST_BE_REGULAR, "re", /* ret_path= */ NULL, &f);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
@@ -541,7 +544,7 @@ static int config_parse_many_files(
         /* First process the first found main config file. */
         STRV_FOREACH(fn, conf_files) {
                 _cleanup_fclose_ FILE *f = NULL;
-                r = chase_and_fopenat_unlocked(root_fd, *fn, CHASE_AT_RESOLVE_IN_ROOT|CHASE_MUST_BE_REGULAR, "re", /* ret_path= */ NULL, &f);
+                r = chase_and_fopenat_unlocked(root_fd, root_fd, *fn, CHASE_MUST_BE_REGULAR, "re", /* ret_path= */ NULL, &f);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
@@ -600,7 +603,7 @@ static int normalize_root_fd(const char *root, int *root_fd, int *ret_opened_fd)
         /* Normalizes a root dir specification: if root_fd is already valid, keep it. Otherwise, we open the
          * specified dir */
 
-        if (*root_fd >= 0 || IN_SET(*root_fd, AT_FDCWD, XAT_FDROOT)) {
+        if (wildcard_fd_is_valid(*root_fd)) {
                 *ret_opened_fd = -EBADF;
                 return 0;
         }
@@ -611,9 +614,9 @@ static int normalize_root_fd(const char *root, int *root_fd, int *ret_opened_fd)
                 return 0;
         }
 
-        int fd = open(root, O_CLOEXEC|O_PATH|O_DIRECTORY);
+        int fd = xopenat(AT_FDCWD, root, O_PATH|O_DIRECTORY);
         if (fd < 0)
-                return log_error_errno(errno, "Failed to open root directory '%s': %m", root);
+                return log_error_errno(fd, "Failed to open root directory '%s': %m", root);
 
         *ret_opened_fd = *root_fd = fd;
         return 0;
@@ -918,6 +921,8 @@ static int _hashmap_by_section_find_unused_line(
         unsigned n = 0;
         void *entry;
 
+        assert(ret);
+
         HASHMAP_BASE_FOREACH_KEY(entry, cs, entries_by_section) {
                 if (filename && !streq(cs->filename, filename))
                         continue;
@@ -987,12 +992,42 @@ int config_parse_iec_size(
         assert(rvalue);
 
         r = parse_size(rvalue, 1024, &v);
-        if (r >= 0 && (uint64_t) (size_t) v != v)
+        if (r >= 0 && v > SIZE_MAX)
                 r = -ERANGE;
         if (r < 0)
                 return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         *sz = (size_t) v;
+        return 1;
+}
+
+int config_parse_iec_size_long(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        long *sz = ASSERT_PTR(data);
+        uint64_t v;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        r = parse_size(rvalue, 1024, &v);
+        if (r >= 0 && v > LONG_MAX)
+                r = -ERANGE;
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
+
+        *sz = (long) v;
         return 1;
 }
 
@@ -1239,7 +1274,7 @@ int config_parse_string(
                 return 1;
         }
 
-        if (FLAGS_SET(ltype, CONFIG_PARSE_STRING_SAFE) && !string_is_safe(rvalue)) {
+        if (FLAGS_SET(ltype, CONFIG_PARSE_STRING_SAFE) && !string_is_safe(rvalue, STRING_ALLOW_GLOBS)) {
                 _cleanup_free_ char *escaped = NULL;
 
                 escaped = cescape(rvalue);
@@ -1330,7 +1365,7 @@ int config_parse_hostname(
                 return 1;
         }
 
-        if (!hostname_is_valid(rvalue, 0)) {
+        if (!hostname_is_valid(rvalue, /* flags= */ 0)) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "Specified invalid hostname, ignoring assignment: %s", rvalue);
                 return 0;
@@ -1406,7 +1441,7 @@ int config_parse_strv(
         for (const char *p = rvalue;;) {
                 char *word;
 
-                r = extract_first_word(&p, &word, NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, EXTRACT_UNQUOTE|EXTRACT_RETAIN_ESCAPE);
                 if (r < 0)
                         return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
                 if (r == 0)
@@ -1641,7 +1676,7 @@ int config_parse_ifnames(
         for (const char *p = rvalue;;) {
                 _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&p, &word, NULL, 0);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
                 if (r == 0)
@@ -1659,7 +1694,7 @@ int config_parse_ifnames(
                         return log_oom();
         }
 
-        r = strv_extend_strv(s, names, true);
+        r = strv_extend_strv(s, names, /* filter_duplicates= */ true);
         if (r < 0)
                 return log_oom();
 
@@ -1886,7 +1921,7 @@ int config_parse_hw_addrs(
                 _cleanup_free_ char *word = NULL;
                 _cleanup_free_ struct hw_addr_data *n = NULL;
 
-                r = extract_first_word(&p, &word, NULL, 0);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
                 if (r == 0)
@@ -1975,7 +2010,7 @@ int config_parse_ether_addrs(
                 _cleanup_free_ char *word = NULL;
                 _cleanup_free_ struct ether_addr *n = NULL;
 
-                r = extract_first_word(&p, &word, NULL, 0);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
                 if (r == 0)

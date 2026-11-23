@@ -5,9 +5,11 @@
 
 #include "alloc-util.h"
 #include "creds-util.h"
+#include "dlopen-note.h"
 #include "extract-word.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "generator.h"
 #include "initrd-util.h"
 #include "log.h"
@@ -19,7 +21,16 @@
 #include "strv.h"
 #include "terminal-util.h"
 #include "unit-name.h"
+#include "verbs.h"
 #include "virt.h"
+
+COMMAND(
+        "systemd-getty-generator\0",
+        "Enable getty instances on the console and serial consoles.",
+        .argspec = GENERATOR_ARGSPEC,
+        .man_page = "systemd-getty-generator(8)",
+        .option_namespace = "common",
+);
 
 typedef enum {
         GETTY_SOURCE_NONE       = 0,
@@ -83,9 +94,9 @@ static int verify_tty(const char *path) {
          * classic ttyS0 and friends. Let's check that and open the device and run isatty() on it. */
 
         /* O_NONBLOCK is essential here, to make sure we don't wait for DCD */
-        fd = open(path, O_RDWR|O_NONBLOCK|O_NOCTTY|O_CLOEXEC|O_NOFOLLOW);
+        fd = xopenat(AT_FDCWD, path, O_RDWR|O_NONBLOCK|O_NOCTTY|O_NOFOLLOW);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         if (!isatty_safe(fd))
                 return -ENOTTY;
@@ -110,7 +121,7 @@ static int run_container(void) {
         for (const char *p = container_ttys;;) {
                _cleanup_free_ char *word = NULL;
 
-                r = extract_first_word(&p, &word, NULL, 0);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse $container_ttys: %m");
                 if (r == 0)
@@ -266,9 +277,11 @@ static void parse_credentials(void) {
         if (r < 0)
                 log_debug_errno(r, "Failed to read credential 'getty.auto', ignoring: %m");
         else if (r > 0) {
-                r = parse_getty_sources(value, &arg_getty_sources);
+                const char *p = strstrip(value);
+
+                r = parse_getty_sources(p, &arg_getty_sources);
                 if (r < 0)
-                        log_warning_errno(r, "Invalid 'getty.auto' credential, ignoring: %s", value);
+                        log_warning_errno(r, "Invalid 'getty.auto' credential, ignoring: %s", p);
         }
 }
 
@@ -277,12 +290,15 @@ static int run(const char *dest, const char *dest_early, const char *dest_late) 
 
         assert_se(arg_dest = dest);
 
+        LIBCRYPTO_NOTE(suggested);
+        TPM2_NOTE(suggested);
+
         if (in_initrd()) {
                 log_debug("Skipping generator, running in the initrd.");
                 return EXIT_SUCCESS;
         }
 
-        r = proc_cmdline_parse(parse_proc_cmdline_item, NULL, 0);
+        r = proc_cmdline_parse(parse_proc_cmdline_item, /* userdata= */ NULL, /* flags= */ 0);
         if (r < 0)
                 log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
 

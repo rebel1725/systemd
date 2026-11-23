@@ -6,11 +6,15 @@
 #include "sd-dhcp-client.h"
 #include "sd-dhcp6-client.h"
 
-#include "dhcp-lease-internal.h"
+#include "dhcp-client-internal.h"
+#include "dhcp-lease-internal.h"         /* IWYU pragma: keep */
+#include "dhcp-server-internal.h"
 #include "dhcp-server-lease-internal.h"
+#include "dhcp6-client-internal.h"
 #include "dhcp6-lease-internal.h"
 #include "extract-word.h"
 #include "in-addr-util.h"
+#include "iovec-util.h"
 #include "ip-protocol-list.h"
 #include "json-util.h"
 #include "netif-util.h"
@@ -1295,6 +1299,26 @@ static int dhcp6_client_duid_append_json(Link *link, sd_json_variant **v) {
         return sd_json_variant_merge_objectbo(v, SD_JSON_BUILD_PAIR_BYTE_ARRAY("DUID", data, data_size));
 }
 
+static int dhcp6_client_state_append_json(Link *link, sd_json_variant **v) {
+        int state;
+
+        assert(link);
+        assert(v);
+
+        if (!link->dhcp6_client)
+                return 0;
+
+        state = dhcp6_client_get_state(link->dhcp6_client);
+        if (state < 0)
+                return 0;
+
+        const char *s = dhcp6_state_to_string(state);
+        if (!s)
+                return 0;
+
+        return sd_json_variant_merge_objectbo(v, JSON_BUILD_PAIR_ENUM("State", s));
+}
+
 static int dhcp6_client_append_json(Link *link, sd_json_variant **v) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *w = NULL;
         int r;
@@ -1318,6 +1342,10 @@ static int dhcp6_client_append_json(Link *link, sd_json_variant **v) {
                 return r;
 
         r = dhcp6_client_duid_append_json(link, &w);
+        if (r < 0)
+                return r;
+
+        r = dhcp6_client_state_append_json(link, &w);
         if (r < 0)
                 return r;
 
@@ -1352,12 +1380,18 @@ static int dhcp_client_lease_append_json(Link *link, sd_json_variant **v) {
         if (r < 0 && r != -ENODATA)
                 return r;
 
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *m = NULL;
+        r = dhcp_message_build_json(link->dhcp_lease->message, &m);
+        if (r < 0)
+                return r;
+
         r = sd_json_buildo(
                         &w,
                         JSON_BUILD_PAIR_FINITE_USEC("LeaseTimestampUSec", lease_timestamp_usec),
                         JSON_BUILD_PAIR_FINITE_USEC("Timeout1USec", t1),
                         JSON_BUILD_PAIR_FINITE_USEC("Timeout2USec", t2),
-                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Hostname", hostname));
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Hostname", hostname),
+                        JSON_BUILD_PAIR_VARIANT_NON_NULL("Message", m));
         if (r < 0)
                 return r;
 
@@ -1419,23 +1453,46 @@ static int dhcp_client_private_options_append_json(Link *link, sd_json_variant *
         if (!link->dhcp_lease)
                 return 0;
 
-        LIST_FOREACH(options, option, link->dhcp_lease->private_options) {
+        for (uint8_t i = SD_DHCP_OPTION_PRIVATE_BASE; i <= SD_DHCP_OPTION_PRIVATE_LAST; i++) {
+                _cleanup_(iovec_done) struct iovec iov = {};
+                r = dhcp_message_get_option_alloc(link->dhcp_lease->message, i, &iov);
+                if (r == -ENODATA)
+                        continue;
+                if (r < 0)
+                        return r;
 
                 r = sd_json_variant_append_arraybo(
                                 &array,
-                                SD_JSON_BUILD_PAIR_UNSIGNED("Option", option->tag),
-                                SD_JSON_BUILD_PAIR_HEX("PrivateOptionData", option->data, option->length));
+                                SD_JSON_BUILD_PAIR_UNSIGNED("Option", i),
+                                SD_JSON_BUILD_PAIR_HEX("PrivateOptionData", iov.iov_base, iov.iov_len));
                 if (r < 0)
-                        return 0;
+                        return r;
         }
+
         return json_variant_set_field_non_null(v, "PrivateOptions", array);
 }
 
 static int dhcp_client_id_append_json(Link *link, sd_json_variant **v) {
+        assert(link);
+        assert(v);
+
+        if (!link->dhcp_client)
+                return 0;
+
         const sd_dhcp_client_id *client_id;
+        if (sd_dhcp_client_get_client_id(link->dhcp_client, &client_id) < 0)
+                return 0;
+
         const void *data;
         size_t l;
-        int r;
+        if (sd_dhcp_client_id_get_raw(client_id, &data, &l) < 0)
+                return 0;
+
+        return sd_json_variant_merge_objectbo(v, SD_JSON_BUILD_PAIR_BYTE_ARRAY("ClientIdentifier", data, l));
+}
+
+static int dhcp_client_state_append_json(Link *link, sd_json_variant **v) {
+        int state;
 
         assert(link);
         assert(v);
@@ -1443,15 +1500,15 @@ static int dhcp_client_id_append_json(Link *link, sd_json_variant **v) {
         if (!link->dhcp_client)
                 return 0;
 
-        r = sd_dhcp_client_get_client_id(link->dhcp_client, &client_id);
-        if (r < 0)
+        state = dhcp_client_get_state(link->dhcp_client);
+        if (state < 0)
                 return 0;
 
-        r = sd_dhcp_client_id_get_raw(client_id, &data, &l);
-        if (r < 0)
+        const char *s = dhcp_state_to_string(state);
+        if (!s)
                 return 0;
 
-        return sd_json_variant_merge_objectbo(v, SD_JSON_BUILD_PAIR_BYTE_ARRAY("ClientIdentifier", data, l));
+        return sd_json_variant_merge_objectbo(v, JSON_BUILD_PAIR_ENUM("State", s));
 }
 
 static int dhcp_client_append_json(Link *link, sd_json_variant **v) {
@@ -1480,6 +1537,10 @@ static int dhcp_client_append_json(Link *link, sd_json_variant **v) {
         if (r < 0)
                 return r;
 
+        r = dhcp_client_state_append_json(link, &w);
+        if (r < 0)
+                return r;
+
         return json_variant_set_field_non_null(v, "DHCPv4Client", w);
 }
 
@@ -1503,10 +1564,13 @@ static int lldp_tx_append_json(Link *link, sd_json_variant **v) {
 int link_build_json(Link *link, sd_json_variant **ret) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_free_ char *type = NULL, *flags = NULL;
+        LinkConfiguringReason configuring_reason;
         int r;
 
         assert(link);
         assert(ret);
+
+        configuring_reason = link_get_configuring_reason(link);
 
         r = net_get_type_string(link->dev, link->iftype, &type);
         if (r == -ENOMEM)
@@ -1547,12 +1611,16 @@ int link_build_json(Link *link, sd_json_variant **ret) {
                         JSON_BUILD_PAIR_ETHER_ADDR_NON_NULL("BSSID", &link->bssid),
                         /* link state */
                         SD_JSON_BUILD_PAIR_STRING("AdministrativeState", link_state_to_string(link->state)),
+                        SD_JSON_BUILD_PAIR_CONDITION(
+                                        configuring_reason >= 0, "ConfiguringReasons",
+                                        SD_JSON_BUILD_ARRAY(JSON_BUILD_STRING_UNDERSCORIFY(
+                                                        link_configuring_reason_to_string(configuring_reason)))),
                         SD_JSON_BUILD_PAIR_STRING("OperationalState", link_operstate_to_string(link->operstate)),
                         SD_JSON_BUILD_PAIR_STRING("CarrierState", link_carrier_state_to_string(link->carrier_state)),
-                        SD_JSON_BUILD_PAIR_STRING("AddressState", link_address_state_to_string(link->address_state)),
-                        SD_JSON_BUILD_PAIR_STRING("IPv4AddressState", link_address_state_to_string(link->ipv4_address_state)),
-                        SD_JSON_BUILD_PAIR_STRING("IPv6AddressState", link_address_state_to_string(link->ipv6_address_state)),
-                        SD_JSON_BUILD_PAIR_STRING("OnlineState", link_online_state_to_string(link->online_state)));
+                        JSON_BUILD_PAIR_ENUM("AddressState", link_address_state_to_string(link->address_state)),
+                        JSON_BUILD_PAIR_ENUM("IPv4AddressState", link_address_state_to_string(link->ipv4_address_state)),
+                        JSON_BUILD_PAIR_ENUM("IPv6AddressState", link_address_state_to_string(link->ipv6_address_state)),
+                        JSON_BUILD_PAIR_ENUM("OnlineState", link_online_state_to_string(link->online_state)));
         if (r < 0)
                 return r;
 

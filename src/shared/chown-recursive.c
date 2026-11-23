@@ -9,6 +9,7 @@
 #include "fd-util.h"
 #include "fs-util.h"
 #include "path-util.h"
+#include "stat-util.h"
 #include "strv.h"
 #include "user-util.h"
 #include "xattr-util.h"
@@ -68,9 +69,9 @@ static int chown_recursive_internal(
 
                 /* Let's pin the child inode we want to fix now with an O_PATH fd, so that it cannot be swapped out
                  * while we manipulate it. */
-                path_fd = openat(dirfd(d), de->d_name, O_PATH|O_CLOEXEC|O_NOFOLLOW);
+                path_fd = xopenat(dirfd(d), de->d_name, O_PATH|O_NOFOLLOW);
                 if (path_fd < 0)
-                        return -errno;
+                        return path_fd;
 
                 if (fstat(path_fd, &fst) < 0)
                         return -errno;
@@ -79,7 +80,7 @@ static int chown_recursive_internal(
                         int subdir_fd;
 
                         /* Convert it to a "real" (i.e. non-O_PATH) fd now */
-                        subdir_fd = fd_reopen(path_fd, O_RDONLY|O_CLOEXEC|O_NOATIME);
+                        subdir_fd = fd_reopen(path_fd, O_RDONLY|O_NOATIME);
                         if (subdir_fd < 0)
                                 return subdir_fd;
 
@@ -116,9 +117,9 @@ int path_chown_recursive(
 
         assert((flags & ~AT_SYMLINK_FOLLOW) == 0);
 
-        fd = open(path, O_RDONLY|O_DIRECTORY|O_CLOEXEC|O_NOATIME|(FLAGS_SET(flags, AT_SYMLINK_FOLLOW) ? 0 : O_NOFOLLOW));
+        fd = xopenat(AT_FDCWD, path, O_RDONLY|O_DIRECTORY|O_NOATIME|(FLAGS_SET(flags, AT_SYMLINK_FOLLOW) ? 0 : O_NOFOLLOW));
         if (fd < 0)
-                return -errno;
+                return fd;
 
         if (!uid_is_valid(uid) && !gid_is_valid(gid) && FLAGS_SET(mask, 07777))
                 return 0; /* nothing to do */
@@ -144,6 +145,7 @@ int fd_chown_recursive(
 
         int duplicated_fd = -EBADF;
         struct stat st;
+        int r;
 
         /* Note that the slightly different order of fstat() and the checks here and in
          * path_chown_recursive(). That's because when we open the directory ourselves we can specify
@@ -153,8 +155,9 @@ int fd_chown_recursive(
         if (fstat(fd, &st) < 0)
                 return -errno;
 
-        if (!S_ISDIR(st.st_mode))
-                return -ENOTDIR;
+        r = stat_verify_directory(&st);
+        if (r < 0)
+                return r;
 
         if (!uid_is_valid(uid) && !gid_is_valid(gid) && FLAGS_SET(mask, 07777))
                 return 0; /* nothing to do */

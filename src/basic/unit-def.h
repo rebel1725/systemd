@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "basic-forward.h"
+#include "forward.h"
 
 /* The enum order is used to order unit jobs in the job queue
  * when other criteria (cpu weight, nice level) are identical.
@@ -132,6 +132,7 @@ typedef enum ServiceState {
         SERVICE_START,
         SERVICE_START_POST,
         SERVICE_RUNNING,
+        SERVICE_RUNNING_REVALIDATING,   /* Temporarily waiting for the D-Bus name to reappear */
         SERVICE_EXITED,                 /* Nothing is running anymore, but RemainAfterExit is true hence this is OK */
         SERVICE_REFRESH_EXTENSIONS,     /* Refreshing extensions for a reload request */
         SERVICE_REFRESH_CREDENTIALS,    /* ditto, but for credentials */
@@ -321,10 +322,14 @@ void unit_types_list(void);
 
 DECLARE_STRING_TABLE_LOOKUP(unit_load_state, UnitLoadState);
 DECLARE_STRING_TABLE_LOOKUP(unit_active_state, UnitActiveState);
+const char* unit_type_to_capitalized_string(UnitType t);
 
 DECLARE_STRING_TABLE_LOOKUP(freezer_state, FreezerState);
 FreezerState freezer_state_finish(FreezerState state) _const_;
 FreezerState freezer_state_objective(FreezerState state) _const_;
+
+DECLARE_STRING_TABLE_LOOKUP(unit_dependency, UnitDependency);
+bool unit_dependency_can_be_transient(UnitDependency d) _const_;
 
 DECLARE_STRING_TABLE_LOOKUP(unit_marker, UnitMarker);
 DECLARE_STRING_TABLE_LOOKUP(automount_state, AutomountState);
@@ -338,9 +343,9 @@ DECLARE_STRING_TABLE_LOOKUP(socket_state, SocketState);
 DECLARE_STRING_TABLE_LOOKUP(swap_state, SwapState);
 DECLARE_STRING_TABLE_LOOKUP(target_state, TargetState);
 DECLARE_STRING_TABLE_LOOKUP(timer_state, TimerState);
-DECLARE_STRING_TABLE_LOOKUP(unit_dependency, UnitDependency);
 DECLARE_STRING_TABLE_LOOKUP(notify_access, NotifyAccess);
 DECLARE_STRING_TABLE_LOOKUP(job_mode, JobMode);
 DECLARE_STRING_TABLE_LOOKUP(exec_directory_type, ExecDirectoryType);
+DECLARE_STRING_TABLE_LOOKUP(exec_directory_type_symlink, ExecDirectoryType);
 
 Glyph unit_active_state_to_glyph(UnitActiveState state);

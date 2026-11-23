@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
-
 #include "sd-bus.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "build.h"
 #include "bus-error.h"
 #include "bus-locator.h"
@@ -21,7 +21,6 @@
 #include "parse-argument.h"
 #include "path-util.h"
 #include "polkit-agent.h"
-#include "pretty-print.h"
 #include "runtime-scope.h"
 #include "string-util.h"
 #include "strv.h"
@@ -37,6 +36,13 @@ static BusTransport arg_transport = BUS_TRANSPORT_LOCAL;
 static const char *arg_host = NULL;
 static bool arg_convert = true;
 static bool arg_full = false;
+
+COMMAND(
+        "localectl\0",
+        "Query or change system locale and keyboard settings.",
+        .man_page = "localectl(1)",
+        .pager_flags = &arg_pager_flags,
+);
 
 typedef struct StatusInfo {
         char **locale;
@@ -70,7 +76,7 @@ static int print_status_info(StatusInfo *i) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to read /proc/cmdline: %m");
 
-                r = locale_context_build_env(&c, &kernel_locale, NULL);
+                r = locale_context_build_env(&c, &kernel_locale, /* ret_unset= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to build locale settings from kernel command line: %m");
         }
@@ -80,9 +86,9 @@ static int print_status_info(StatusInfo *i) {
                 return log_oom();
 
         if (arg_full)
-                table_set_width(table, 0);
+                table_set_width(table, /* width= */ 0);
 
-        assert_se(cell = table_get_cell(table, 0, 0));
+        assert_se(cell = table_get_cell(table, /* row= */ 0, /* column= */ 0));
         (void) table_set_ellipsize_percent(table, cell, 100);
 
         table_set_ersatz_string(table, TABLE_ERSATZ_UNSET);
@@ -144,13 +150,10 @@ static int print_status_info(StatusInfo *i) {
                         return table_log_add_error(r);
         }
 
-        r = table_print(table, NULL);
-        if (r < 0)
-                return table_log_print_error(r);
-
-        return 0;
+        return table_print_or_warn(table);
 }
 
+VERB_DEFAULT_NOARG(verb_show_status, "status", "Show current locale settings");
 static int verb_show_status(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(status_info_clear) StatusInfo info = {};
         static const struct bus_properties_map map[]  = {
@@ -173,7 +176,7 @@ static int verb_show_status(int argc, char *argv[], uintptr_t _data, void *userd
                                    "org.freedesktop.locale1",
                                    "/org/freedesktop/locale1",
                                    map,
-                                   0,
+                                   /* flags= */ 0,
                                    &error,
                                    &m,
                                    &info);
@@ -183,6 +186,8 @@ static int verb_show_status(int argc, char *argv[], uintptr_t _data, void *userd
         return print_status_info(&info);
 }
 
+VERB(verb_set_locale, "set-locale", "LOCALE...\0", 2, VERB_ANY, 0,
+     "Set system locale");
 static int verb_set_locale(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -204,13 +209,15 @@ static int verb_set_locale(int argc, char *argv[], uintptr_t _data, void *userda
                 return bus_log_create_error(r);
 
         /* We use a longer timeout for the method call in case localed is running locale-gen */
-        r = sd_bus_call(bus, m, LOCALE_SLOW_BUS_CALL_TIMEOUT_USEC, &error, NULL);
+        r = sd_bus_call(bus, m, LOCALE_SLOW_BUS_CALL_TIMEOUT_USEC, &error, /* ret_reply= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to issue method call: %s", bus_error_message(&error, r));
 
         return 0;
 }
 
+VERB_NOARG(verb_list_locales, "list-locales",
+           "Show known locales");
 static int verb_list_locales(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_strv_free_ char **l = NULL;
         int r;
@@ -225,6 +232,8 @@ static int verb_list_locales(int argc, char *argv[], uintptr_t _data, void *user
         return 0;
 }
 
+VERB(verb_set_vconsole_keymap, "set-keymap", "MAP [MAP]\0", 2, 3, 0,
+     "Set console and X11 keyboard mappings");
 static int verb_set_vconsole_keymap(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         const char *map, *toggle_map;
@@ -241,7 +250,7 @@ static int verb_set_vconsole_keymap(int argc, char *argv[], uintptr_t _data, voi
                         bus_locale,
                         "SetVConsoleKeyboard",
                         &error,
-                        NULL,
+                        /* ret_reply= */ NULL,
                         "ssbb", map, toggle_map, arg_convert, arg_ask_password);
         if (r < 0)
                 return log_error_errno(r, "Failed to set keymap: %s", bus_error_message(&error, r));
@@ -249,6 +258,8 @@ static int verb_set_vconsole_keymap(int argc, char *argv[], uintptr_t _data, voi
         return 0;
 }
 
+VERB_NOARG(verb_list_vconsole_keymaps, "list-keymaps",
+           "Show known virtual console keyboard mappings");
 static int verb_list_vconsole_keymaps(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_strv_free_ char **l = NULL;
         int r;
@@ -264,6 +275,8 @@ static int verb_list_vconsole_keymaps(int argc, char *argv[], uintptr_t _data, v
         return 0;
 }
 
+VERB(verb_set_x11_keymap, "set-x11-keymap", "LAYOUT [MODEL [VARIANT [OPTIONS]]]\0", 2, 5, 0,
+     "Set X11 and console keyboard mappings");
 static int verb_set_x11_keymap(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
         const char *layout, *model, *variant, *options;
@@ -282,7 +295,7 @@ static int verb_set_x11_keymap(int argc, char *argv[], uintptr_t _data, void *us
                         bus_locale,
                         "SetX11Keyboard",
                         &error,
-                        NULL,
+                        /* ret_reply= */ NULL,
                         "ssssbb", layout, model, variant, options,
                                   arg_convert, arg_ask_password);
         if (r < 0)
@@ -299,6 +312,14 @@ static const char* xkb_directory(void) {
         return cached;
 }
 
+VERB_NOARG(verb_list_x11_keymaps, "list-x11-keymap-models",
+           "Show known X11 keyboard mapping models");
+VERB_NOARG(verb_list_x11_keymaps, "list-x11-keymap-layouts",
+           "Show known X11 keyboard mapping layouts");
+VERB(verb_list_x11_keymaps, "list-x11-keymap-variants", "[LAYOUT]\0", VERB_ANY, 2, 0,
+     "Show known X11 keyboard mapping variants");
+VERB_NOARG(verb_list_x11_keymaps, "list-x11-keymap-options",
+           "Show known X11 keyboard mapping options");
 static int verb_list_x11_keymaps(int argc, char *argv[], uintptr_t _data, void *userdata) {
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_strv_free_ char **list = NULL;
@@ -405,142 +426,58 @@ static int verb_list_x11_keymaps(int argc, char *argv[], uintptr_t _data, void *
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
+VERB_COMMON_HELP_AUTO_HIDDEN();
 
-        r = terminal_urlify_man("localectl", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] COMMAND ...\n\n"
-               "%sQuery or change system locale and keyboard settings.%s\n"
-               "\nCommands:\n"
-               "  status                   Show current locale settings\n"
-               "  set-locale LOCALE...     Set system locale\n"
-               "  list-locales             Show known locales\n"
-               "  set-keymap MAP [MAP]     Set console and X11 keyboard mappings\n"
-               "  list-keymaps             Show known virtual console keyboard mappings\n"
-               "  set-x11-keymap LAYOUT [MODEL [VARIANT [OPTIONS]]]\n"
-               "                           Set X11 and console keyboard mappings\n"
-               "  list-x11-keymap-models   Show known X11 keyboard mapping models\n"
-               "  list-x11-keymap-layouts  Show known X11 keyboard mapping layouts\n"
-               "  list-x11-keymap-variants [LAYOUT]\n"
-               "                           Show known X11 keyboard mapping variants\n"
-               "  list-x11-keymap-options  Show known X11 keyboard mapping options\n"
-               "\nOptions:\n"
-               "  -h --help                Show this help\n"
-               "     --version             Show package version\n"
-               "  -l --full                Do not ellipsize output\n"
-               "     --no-pager            Do not pipe output into a pager\n"
-               "     --no-ask-password     Do not prompt for password\n"
-               "  -H --host=[USER@]HOST    Operate on remote host\n"
-               "  -M --machine=CONTAINER   Operate on local container\n"
-               "     --no-convert          Don't convert keyboard mappings\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               link);
-
-        return 0;
-}
-
-static int verb_help(int argc, char *argv[], uintptr_t _data, void *userdata) {
-        return help();
-}
-
-static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_NO_PAGER,
-                ARG_NO_CONVERT,
-                ARG_NO_ASK_PASSWORD
-        };
-
-        static const struct option options[] = {
-                { "help",            no_argument,       NULL, 'h'                 },
-                { "version",         no_argument,       NULL, ARG_VERSION         },
-                { "full",            no_argument,       NULL, 'l'                 },
-                { "no-pager",        no_argument,       NULL, ARG_NO_PAGER        },
-                { "host",            required_argument, NULL, 'H'                 },
-                { "machine",         required_argument, NULL, 'M'                 },
-                { "no-ask-password", no_argument,       NULL, ARG_NO_ASK_PASSWORD },
-                { "no-convert",      no_argument,       NULL, ARG_NO_CONVERT      },
-                {}
-        };
-
-        int r, c;
-
+static int parse_argv(int argc, char *argv[], char ***remaining_args) {
         assert(argc >= 0);
         assert(argv);
+        assert(remaining_args);
 
-        while ((c = getopt_long(argc, argv, "hlH:M:", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case 'l':
+                OPTION_COMMON_FULL:
                         arg_full = true;
                         break;
 
-                case ARG_NO_CONVERT:
-                        arg_convert = false;
-                        break;
-
-                case ARG_NO_PAGER:
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case ARG_NO_ASK_PASSWORD:
+                OPTION_COMMON_NO_ASK_PASSWORD:
                         arg_ask_password = false;
                         break;
 
-                case 'H':
+                OPTION_COMMON_HOST:
                         arg_transport = BUS_TRANSPORT_REMOTE;
-                        arg_host = optarg;
+                        arg_host = opts.arg;
                         break;
 
-                case 'M':
-                        r = parse_machine_argument(optarg, &arg_host, &arg_transport);
+                OPTION_COMMON_MACHINE:
+                        r = parse_machine_argument(opts.arg, &arg_host, &arg_transport);
                         if (r < 0)
                                 return r;
                         break;
 
-                case '?':
-                        return -EINVAL;
+                OPTION_LONG("no-convert", NULL, "Don't convert keyboard mappings"):
+                        arg_convert = false;
+                        break;
 
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
+        *remaining_args = option_parser_get_args(&opts);
         return 1;
-}
-
-static int localectl_main(sd_bus *bus, int argc, char *argv[]) {
-
-        static const Verb verbs[] = {
-                { "status",                   VERB_ANY, 1,        VERB_DEFAULT, verb_show_status           },
-                { "set-locale",               2,        VERB_ANY, 0,            verb_set_locale            },
-                { "list-locales",             VERB_ANY, 1,        0,            verb_list_locales          },
-                { "set-keymap",               2,        3,        0,            verb_set_vconsole_keymap   },
-                { "list-keymaps",             VERB_ANY, 1,        0,            verb_list_vconsole_keymaps },
-                { "set-x11-keymap",           2,        5,        0,            verb_set_x11_keymap        },
-                { "list-x11-keymap-models",   VERB_ANY, 1,        0,            verb_list_x11_keymaps      },
-                { "list-x11-keymap-layouts",  VERB_ANY, 1,        0,            verb_list_x11_keymaps      },
-                { "list-x11-keymap-variants", VERB_ANY, 2,        0,            verb_list_x11_keymaps      },
-                { "list-x11-keymap-options",  VERB_ANY, 1,        0,            verb_list_x11_keymaps      },
-                { "help",                     VERB_ANY, VERB_ANY, 0,            verb_help                  }, /* Not documented, but supported since it has been created. */
-                {}
-        };
-
-        return dispatch_verb(argc, argv, verbs, bus);
 }
 
 static int run(int argc, char *argv[]) {
@@ -550,7 +487,8 @@ static int run(int argc, char *argv[]) {
         setlocale(LC_ALL, "");
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
@@ -558,7 +496,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return bus_log_connect_error(r, arg_transport, RUNTIME_SCOPE_SYSTEM);
 
-        return localectl_main(bus, argc, argv);
+        return dispatch_verb(args, bus);
 }
 
 DEFINE_MAIN_FUNCTION(run);

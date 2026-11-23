@@ -159,7 +159,7 @@ static void swap_done(Unit *u) {
         Swap *s = ASSERT_PTR(SWAP(u));
 
         swap_unset_proc_swaps(s);
-        swap_set_devnode(s, NULL);
+        swap_set_devnode(s, /* devnode= */ NULL);
 
         s->what = mfree(s->what);
         s->parameters_fragment.what = mfree(s->parameters_fragment.what);
@@ -219,10 +219,11 @@ static int swap_add_device_dependencies(Swap *s) {
 
         /* File based swap devices need to be ordered after systemd-remount-fs.service, since they might need
          * a writable file system. */
-        return unit_add_dependency_by_name(UNIT(s), UNIT_AFTER, SPECIAL_REMOUNT_FS_SERVICE, true, mask);
+        return unit_add_dependency_by_name(UNIT(s), UNIT_AFTER, SPECIAL_REMOUNT_FS_SERVICE, /* add_reference= */ true, mask);
 }
 
 static int swap_add_default_dependencies(Swap *s) {
+        SwapParameters *p;
         int r;
 
         assert(s);
@@ -236,13 +237,46 @@ static int swap_add_default_dependencies(Swap *s) {
         if (detect_container() > 0)
                 return 0;
 
-        /* swap units generated for the swap dev links are missing the
-         * ordering dep against the swap target. */
-        r = unit_add_dependency_by_name(UNIT(s), UNIT_BEFORE, SPECIAL_SWAP_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
-        if (r < 0)
-                return r;
+        p = swap_get_parameters(s);
 
-        return unit_add_two_dependencies_by_name(UNIT(s), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_UMOUNT_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
+        if (p && fstab_test_option(p->options, "_netdev\0")) {
+                /* Network swap devices (those with _netdev in options) are routed through
+                 * remote-fs.target instead of swap.target, mirroring how network mounts use
+                 * remote-fs.target instead of local-fs.target. This avoids an ordering cycle:
+                 * swap.target is pulled in at sysinit.target time, but network-online.target
+                 * only comes after basic.target which is after sysinit.target. */
+                r = unit_add_dependency_by_name(UNIT(s), UNIT_AFTER, SPECIAL_REMOTE_FS_PRE_TARGET,
+                                                /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
+                if (r < 0)
+                        return r;
+
+                r = unit_add_dependency_by_name(UNIT(s), UNIT_BEFORE, SPECIAL_REMOTE_FS_TARGET,
+                                                /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
+                if (r < 0)
+                        return r;
+
+                /* Pull in and order after network-online.target, analogous to
+                 * mount_add_default_network_dependencies() for network mounts. */
+                r = unit_add_dependency_by_name(UNIT(s), UNIT_AFTER, SPECIAL_NETWORK_TARGET,
+                                                /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
+                if (r < 0)
+                        return r;
+
+                r = unit_add_two_dependencies_by_name(UNIT(s), UNIT_WANTS, UNIT_AFTER, SPECIAL_NETWORK_ONLINE_TARGET,
+                                                      /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
+                if (r < 0)
+                        return r;
+        } else {
+                /* swap units generated for the swap dev links are missing the
+                 * ordering dep against the swap target. */
+                r = unit_add_dependency_by_name(UNIT(s), UNIT_BEFORE, SPECIAL_SWAP_TARGET,
+                                                /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
+                if (r < 0)
+                        return r;
+        }
+
+        return unit_add_two_dependencies_by_name(UNIT(s), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_UMOUNT_TARGET,
+                                                 /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
 }
 
 static int swap_verify(Swap *s) {
@@ -493,7 +527,7 @@ static void swap_set_state(Swap *s, SwapState state) {
         assert(s);
 
         if (s->state != state)
-                bus_unit_send_pending_change_signal(UNIT(s), false);
+                bus_unit_send_pending_change_signal(UNIT(s), /* including_new= */ false);
 
         old_state = s->state;
         s->state = state;
@@ -531,6 +565,23 @@ static int swap_coldplug(Unit *u) {
                 new_state = s->deserialized_state;
         else if (s->from_proc_swaps)
                 new_state = SWAP_ACTIVE;
+
+        /* If /proc/swaps doesn't know this unit, and we couldn't load a fragment for it either, then it is
+         * a leftover of the serialization describing a swap that doesn't exist anymore — typically because
+         * the device link the unit is named after has been repointed at some other device in the meantime.
+         * Don't adopt such a unit: it has no device we could pass to swapoff, and since active units are
+         * never garbage collected it would stick around until the end of time. Note that units with a
+         * fragment are explicitly *not* covered by this, as those are not backed by /proc/swaps to begin
+         * with when their name doesn't match What=.
+         *
+         * Units with a control process still around are left alone too: we want to re-adopt the process
+         * and re-arm the timeout rather than drop both on the floor. Once it is gone the state machine
+         * ends up in dead anyway, as the unit isn't backed by /proc/swaps. */
+        if (!s->from_proc_swaps && u->load_state != UNIT_LOADED && !SWAP_STATE_WITH_PROCESS(new_state)) {
+                log_unit_debug(u, "Not backed by /proc/swaps and has no fragment, ignoring.");
+                unit_add_to_gc_queue(u);
+                return 0;
+        }
 
         if (new_state == s->state)
                 return 0;
@@ -680,7 +731,7 @@ static void swap_enter_dead(Swap *s, SwapResult f) {
 
         unit_destroy_runtime_data(UNIT(s), &s->exec_context, /* destroy_runtime_dir= */ true);
 
-        unit_unref_uid_gid(UNIT(s), true);
+        unit_unref_uid_gid(UNIT(s), /* destroy_now= */ true);
 }
 
 static void swap_enter_active(Swap *s, SwapResult f) {
@@ -821,6 +872,17 @@ static void swap_enter_deactivating(Swap *s) {
         int r;
 
         assert(s);
+
+        /* A swap unit can be active without ever having been loaded, and hence without a device: an
+         * orphaned unit that still has a swapon running is adopted by swap_coldplug() on purpose, and
+         * swap_sigchld_event() moves it to SWAP_ACTIVE once that process exits successfully. There is
+         * nothing to deactivate for such a unit, and calling swapoff without an argument certainly isn't
+         * it — go to dead, like swap_process_proc_swaps() does when a unit disappears from /proc/swaps. */
+        if (isempty(s->what)) {
+                log_unit_warning(UNIT(s), "Swap unit has no device, assuming it is already deactivated.");
+                swap_enter_dead(s, SWAP_SUCCESS);
+                return;
+        }
 
         s->control_command_id = SWAP_EXEC_DEACTIVATE;
         s->control_command = s->exec_command + SWAP_EXEC_DEACTIVATE;
@@ -992,7 +1054,7 @@ static void swap_sigchld_event(Unit *u, pid_t pid, int code, int status) {
 
         pidref_done(&s->control_pid);
 
-        if (is_clean_exit(code, status, EXIT_CLEAN_COMMAND, NULL))
+        if (is_clean_exit(code, status, EXIT_CLEAN_COMMAND, /* success_status= */ NULL))
                 f = SWAP_SUCCESS;
         else if (code == CLD_EXITED)
                 f = SWAP_FAILURE_EXIT_CODE;
@@ -1145,7 +1207,7 @@ static int swap_process_proc_swaps(Manager *m) {
 
         assert(m);
 
-        r = swap_load_proc_swaps(m, true);
+        r = swap_load_proc_swaps(m, /* set_flags= */ true);
         if (r < 0) {
                 /* Reset flags, just in case, for late calls */
                 LIST_FOREACH(units_by_type, u, m->units_by_type[UNIT_SWAP]) {
@@ -1271,7 +1333,7 @@ static int swap_following_set(Unit *u, Set **ret) {
                 return 0;
         }
 
-        set = set_new(NULL);
+        set = set_new(/* hash_ops= */ NULL);
         if (!set)
                 return -ENOMEM;
 
@@ -1327,7 +1389,7 @@ static void swap_enumerate(Manager *m) {
                 (void) sd_event_source_set_description(m->swap_event_source, "swap-proc");
         }
 
-        r = swap_load_proc_swaps(m, false);
+        r = swap_load_proc_swaps(m, /* set_flags= */ false);
         if (r < 0)
                 goto fail;
 
@@ -1391,7 +1453,7 @@ int swap_process_device_remove(Manager *m, sd_device *dev) {
 
         r = 0;
         while ((s = hashmap_get(m->swaps_by_devnode, dn)))
-                RET_GATHER(r, swap_set_devnode(s, NULL));
+                RET_GATHER(r, swap_set_devnode(s, /* devnode= */ NULL));
 
         return r;
 }
@@ -1426,6 +1488,8 @@ static int swap_get_timeout(Unit *u, usec_t *timeout) {
         Swap *s = ASSERT_PTR(SWAP(u));
         usec_t t;
         int r;
+
+        assert(timeout);
 
         if (!s->timer_event_source)
                 return 0;
@@ -1580,6 +1644,7 @@ const UnitVTable swap_vtable = {
         .private_section = "Swap",
 
         .can_fail = true,
+        .track_orphaned = true,
 
         .init = swap_init,
         .load = swap_load,

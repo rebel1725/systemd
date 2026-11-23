@@ -197,6 +197,7 @@ int user_record_reconcile(
 
         assert(host);
         assert(embedded);
+        assert(ret);
 
         /* Make sure both records are initialized */
         if (!host->json || !embedded->json)
@@ -246,7 +247,7 @@ int user_record_reconcile(
 
                 /* The embedded version is newer */
 
-                if (mode == USER_RECONCILE_REQUIRE_NEWER_OR_EQUAL)
+                if (IN_SET(mode, USER_RECONCILE_REQUIRE_NEWER, USER_RECONCILE_REQUIRE_NEWER_OR_EQUAL))
                         return -ESTALE;
 
                 /* Copy in the binding data */
@@ -375,8 +376,7 @@ int user_record_add_binding(
                         if (r < 0)
                                 return r;
 
-                        sd_json_variant_unref(new_binding_entry);
-                        new_binding_entry = TAKE_PTR(be);
+                        json_variant_unref_and_replace(new_binding_entry, be);
                 }
         }
 
@@ -440,7 +440,7 @@ int user_record_test_home_directory(UserRecord *h) {
         if (!hd)
                 return -ENXIO;
 
-        r = is_dir(hd, false);
+        r = is_dir(hd, /* follow= */ false);
         if (r == -ENOENT)
                 return USER_TEST_ABSENT;
         if (r < 0)
@@ -786,12 +786,8 @@ int user_record_update_last_changed(UserRecord *h, bool with_password) {
         }
 
         h->last_change_usec = n;
-
-        sd_json_variant_unref(h->json);
-        h->json = TAKE_PTR(v);
-
         h->mask |= USER_RECORD_REGULAR;
-        return 0;
+        return json_variant_unref_and_replace(h->json, v);
 }
 
 int user_record_make_hashed_password(UserRecord *h, char **secret, bool extend) {
@@ -862,7 +858,7 @@ int user_record_set_password(UserRecord *h, char **password, bool prepend) {
                 if (!e)
                         return -ENOMEM;
 
-                r = strv_extend_strv(&e, h->password, true);
+                r = strv_extend_strv(&e, h->password, /* filter_duplicates= */ true);
                 if (r < 0)
                         return r;
 
@@ -906,7 +902,7 @@ int user_record_set_password(UserRecord *h, char **password, bool prepend) {
         if (r < 0)
                 return r;
 
-        strv_free_and_replace(h->password, e);
+        free_and_replace_full(h->password, e, strv_free_erase);
 
         SET_FLAG(h->mask, USER_RECORD_SECRET, !sd_json_variant_is_blank_object(w));
         return 0;
@@ -924,7 +920,7 @@ int user_record_set_token_pin(UserRecord *h, char **pin, bool prepend) {
                 if (!e)
                         return -ENOMEM;
 
-                r = strv_extend_strv(&e, h->token_pin, true);
+                r = strv_extend_strv(&e, h->token_pin, /* filter_duplicates= */ true);
                 if (r < 0)
                         return r;
 
@@ -968,7 +964,7 @@ int user_record_set_token_pin(UserRecord *h, char **pin, bool prepend) {
         if (r < 0)
                 return r;
 
-        strv_free_and_replace(h->token_pin, e);
+        free_and_replace_full(h->token_pin, e, strv_free_erase);
 
         SET_FLAG(h->mask, USER_RECORD_SECRET, !sd_json_variant_is_blank_object(w));
         return 0;
@@ -1130,12 +1126,8 @@ int user_record_set_password_change_now(UserRecord *h, int b) {
                 SET_FLAG(h->mask, USER_RECORD_PER_MACHINE, !sd_json_variant_is_blank_array(array));
         }
 
-        sd_json_variant_unref(h->json);
-        h->json = TAKE_PTR(w);
-
         h->password_change_now = b;
-
-        return 0;
+        return json_variant_unref_and_replace(h->json, w);
 }
 
 int user_record_merge_secret(UserRecord *h, UserRecord *secret) {
@@ -1146,11 +1138,11 @@ int user_record_merge_secret(UserRecord *h, UserRecord *secret) {
 
         /* Merges the secrets from 'secret' into 'h'. */
 
-        r = user_record_set_password(h, secret->password, true);
+        r = user_record_set_password(h, secret->password, /* prepend= */ true);
         if (r < 0)
                 return r;
 
-        r = user_record_set_token_pin(h, secret->token_pin, true);
+        r = user_record_set_token_pin(h, secret->token_pin, /* prepend= */ true);
         if (r < 0)
                 return r;
 
@@ -1226,14 +1218,10 @@ int user_record_good_authentication(UserRecord *h) {
         if (r < 0)
                 return r;
 
-        sd_json_variant_unref(h->json);
-        h->json = TAKE_PTR(v);
-
         h->good_authentication_counter = counter;
         h->last_good_authentication_usec = usec;
-
         h->mask |= USER_RECORD_STATUS;
-        return 0;
+        return json_variant_unref_and_replace(h->json, v);
 }
 
 int user_record_bad_authentication(UserRecord *h) {
@@ -1281,14 +1269,10 @@ int user_record_bad_authentication(UserRecord *h) {
         if (r < 0)
                 return r;
 
-        sd_json_variant_unref(h->json);
-        h->json = TAKE_PTR(v);
-
         h->bad_authentication_counter = counter;
         h->last_bad_authentication_usec = usec;
-
         h->mask |= USER_RECORD_STATUS;
-        return 0;
+        return json_variant_unref_and_replace(h->json, v);
 }
 
 int user_record_ratelimit(UserRecord *h) {
@@ -1343,13 +1327,10 @@ int user_record_ratelimit(UserRecord *h) {
         if (r < 0)
                 return r;
 
-        sd_json_variant_unref(h->json);
-        h->json = TAKE_PTR(v);
-
         h->ratelimit_begin_usec = new_ratelimit_begin_usec;
         h->ratelimit_count = new_ratelimit_count;
-
         h->mask |= USER_RECORD_STATUS;
+        json_variant_unref_and_replace(h->json, v);
         return 1;
 }
 
@@ -1484,7 +1465,11 @@ int user_record_set_rebalance_weight(UserRecord *h, uint64_t weight) {
         }
 
         if (weight == REBALANCE_WEIGHT_UNSET)
-                r = sd_json_variant_set_field(&per_machine_entry, "rebalanceWeight", NULL); /* set explicitly to NULL (so that the perMachine setting we are setting here can override the global setting) */
+                r = sd_json_variant_set_field(
+                                &per_machine_entry,
+                                "rebalanceWeight",
+                                /* value= */ NULL); /* set explicitly to NULL (so that the perMachine setting
+                                                       we are setting here can override the global setting) */
         else
                 r = sd_json_variant_set_field_unsigned(&per_machine_entry, "rebalanceWeight", weight);
         if (r < 0)

@@ -1,28 +1,116 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <fcntl.h>
+#include <stdio.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #if HAVE_VMLINUX_H
-#include "bpf/userns-restrict/userns-restrict-skel.h"
+#include "userns-restrict-skel.h"
 #endif
 
-#include "bpf-dlopen.h"
-#include "bpf-link.h"
-#include "fd-util.h"
+#include "bpf-util.h"
 #include "log.h"
 #include "lsm-util.h"
 #include "mkdir.h"
-#include "mountpoint-util.h"
 #include "namespace-util.h"
 #include "path-util.h"
+#include "rm-rf.h"
 #include "string-util.h"
+#include "strv.h"
 #include "userns-restrict.h"
 
 #define USERNS_MAX (16U*1024U)
-#define MOUNTS_MAX 4096U
 
-#define PROGRAM_LINK_PREFIX "/sys/fs/bpf/systemd/userns-restrict/programs"
-#define MAP_LINK_PREFIX "/sys/fs/bpf/systemd/userns-restrict/maps"
+/* No dots in any of the path components: bpffs reserves those for its own use and fails every lookup that
+ * contains one with EPERM, see bpf_lookup() in the kernel sources. */
+#define LINK_PREFIX "/sys/fs/bpf/systemd/userns-restrict-v2"
+#define PROGRAM_LINK_PREFIX LINK_PREFIX "/programs"
+#define MAP_LINK_PREFIX LINK_PREFIX "/maps"
+
+/* Programs pinned here enforce the mount allowlist policy we used until v261, which is bypassable with a
+ * single unshare(). They'd stay attached next to ours, hence get rid of them. */
+#define OBSOLETE_LINK_PREFIX "/sys/fs/bpf/systemd/userns-restrict"
+
+#if HAVE_VMLINUX_H
+static bool inode_hooks_supported(void) {
+        _cleanup_(sym_btf__freep) struct btf *btf = NULL;
+        int idmap_id;
+
+        if (!sym_btf__load_vmlinux_btf || !sym_btf__find_by_name_kind ||
+            !sym_btf__type_by_id || !sym_btf__free)
+                return false;
+
+        btf = sym_btf__load_vmlinux_btf();
+        if (bpf_get_error_translated(btf) < 0)
+                return false;
+
+        idmap_id = sym_btf__find_by_name_kind(btf, "mnt_idmap", BTF_KIND_STRUCT);
+        if (idmap_id <= 0)
+                return false;
+
+        FOREACH_STRING(name,
+                       "bpf_lsm_inode_create",
+                       "bpf_lsm_inode_link",
+                       "bpf_lsm_inode_symlink",
+                       "bpf_lsm_inode_mkdir",
+                       "bpf_lsm_inode_mknod",
+                       "bpf_lsm_inode_setattr") {
+                const struct btf_type *type;
+                int id;
+
+                id = sym_btf__find_by_name_kind(btf, name, BTF_KIND_FUNC);
+                if (id <= 0)
+                        return false;
+
+                type = sym_btf__type_by_id(btf, id);
+                if (!type)
+                        return false;
+
+                type = sym_btf__type_by_id(btf, type->type);
+                if (!type || !btf_is_func_proto(type) || btf_vlen(type) == 0)
+                        return false;
+
+                type = sym_btf__type_by_id(btf, btf_params(type)[0].type);
+                if (!type || !btf_is_ptr(type))
+                        return false;
+
+                /* Kernel 7.4 passes the idmap to the hooks as a const pointer. BTF records the const as a
+                 * separate type between the pointer and struct mnt_idmap. Without skipping it, we would
+                 * fall back to the path hooks on 7.4. */
+                id = type->type;
+                for (;;) {
+                        type = sym_btf__type_by_id(btf, id);
+                        if (!type)
+                                return false;
+                        if (!btf_is_mod(type))
+                                break;
+                        id = type->type;
+                }
+
+                if (id != idmap_id)
+                        return false;
+        }
+
+        return true;
+}
+
+static bool program_enabled(const char *name, bool inode_hooks) {
+        if (streq(name, "userns_restrict_file_ioctl_compat"))
+                return bpf_kernel_has_kfunc("bpf_lsm_file_ioctl_compat");
+
+        if (streq(name, "userns_restrict_path_rename"))
+                return true;
+
+        if (startswith(name, "userns_restrict_inode_"))
+                return inode_hooks;
+
+        if (startswith(name, "userns_restrict_path_") || streq(name, "userns_restrict_sb_kern_mount"))
+                return !inode_hooks;
+
+        return true;
+}
+#endif
 
 struct userns_restrict_bpf *userns_restrict_bpf_free(struct userns_restrict_bpf *obj) {
 #if HAVE_VMLINUX_H
@@ -32,31 +120,12 @@ struct userns_restrict_bpf *userns_restrict_bpf_free(struct userns_restrict_bpf 
 
 }
 
-#if HAVE_VMLINUX_H
-static int make_inner_hash_map(void) {
-        int fd;
-
-        fd = compat_bpf_map_create(
-                        BPF_MAP_TYPE_HASH,
-                        NULL,
-                        sizeof(int),
-                        sizeof(uint32_t),
-                        MOUNTS_MAX,
-                        NULL);
-        if (fd < 0)
-                return log_debug_errno(errno, "Failed to allocate inner BPF map: %m");
-
-        return fd;
-}
-#endif
-
 int userns_restrict_install(
                 bool pin,
                 struct userns_restrict_bpf **ret) {
 
 #if HAVE_VMLINUX_H
         _cleanup_(userns_restrict_bpf_freep) struct userns_restrict_bpf *obj = NULL;
-        _cleanup_close_ int dummy_mnt_id_hash_fd = -EBADF;
         int r;
 
         r = lsm_supported("bpf");
@@ -68,7 +137,8 @@ int userns_restrict_install(
         if (r == 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "bpf-lsm not supported, can't lock down user namespace.");
 
-        r = dlopen_bpf();
+        LIBBPF_NOTE(recommended);
+        r = dlopen_bpf(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -80,15 +150,30 @@ int userns_restrict_install(
         if (!obj)
                 return log_error_errno(errno, "Failed to open userns_restrict BPF object: %m");
 
+        bool inode_hooks = inode_hooks_supported();
+        log_debug("Using %s hooks to restrict user namespace writes.", inode_hooks ? "inode" : "path");
+
+        for (int i = 0; i < obj->skeleton->prog_cnt; i++) {
+                struct bpf_prog_skeleton *ps = obj->skeleton->progs + i;
+
+                r = sym_bpf_program__set_autoload(*ps->prog, program_enabled(ps->name, inode_hooks));
+                if (r < 0)
+                        return log_error_errno(r, "Failed to select user namespace restriction BPF program: %m");
+        }
+
         if (pin) {
                 struct bpf_map *map;
 
-                /* libbpf will only create one level of dirs. Let's create the rest */
-                (void) mkdir_p(MAP_LINK_PREFIX, 0755);
-                (void) mkdir_p(PROGRAM_LINK_PREFIX, 0755);
+                /* libbpf will only create one level of dirs. Let's create the rest. Failing here means the
+                 * pinning below fails too, so complain rather than run into that without a clue. */
+                FOREACH_STRING(d, MAP_LINK_PREFIX, PROGRAM_LINK_PREFIX) {
+                        r = mkdir_p(d, 0755);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to create '%s', ignoring: %m", d);
+                }
 
-                map = sym_bpf_object__next_map(obj->obj, NULL);
-                while (map) {
+                for (map = sym_bpf_object__next_map(obj->obj, /* map= */ NULL); map;
+                     map = sym_bpf_object__next_map(obj->obj, map)) {
                         _cleanup_free_ char *fn = NULL;
 
                         fn = path_join(MAP_LINK_PREFIX, sym_bpf_map__name(map));
@@ -98,14 +183,12 @@ int userns_restrict_install(
                         r = sym_bpf_map__set_pin_path(map, fn);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to set pin path to '%s': %m", fn);
-
-                        map = sym_bpf_object__next_map(obj->obj, map);
                 }
         }
 
-        r = sym_bpf_map__set_max_entries(obj->maps.userns_mnt_id_hash, USERNS_MAX);
+        r = sym_bpf_map__set_max_entries(obj->maps.userns_managed, USERNS_MAX);
         if (r < 0)
-                return log_error_errno(r, "Failed to size userns/mnt_id hash table: %m");
+                return log_error_errno(r, "Failed to size managed userns hash table: %m");
 
         r = sym_bpf_map__set_max_entries(obj->maps.userns_ringbuf, USERNS_MAX * sizeof(unsigned));
         if (r < 0)
@@ -115,68 +198,14 @@ int userns_restrict_install(
         if (r < 0)
                 return log_error_errno(r, "Failed to size userns setgroups deny hash table: %m");
 
-        /* Dummy map to satisfy the verifier */
-        dummy_mnt_id_hash_fd = make_inner_hash_map();
-        if (dummy_mnt_id_hash_fd < 0)
-                return dummy_mnt_id_hash_fd;
-
-        r = sym_bpf_map__set_inner_map_fd(obj->maps.userns_mnt_id_hash, dummy_mnt_id_hash_fd);
-        if (r < 0)
-                return log_error_errno(r, "Failed to set inner BPF map: %m");
-
         r = userns_restrict_bpf__load(obj);
         if (r < 0)
                 return log_error_errno(r, "Failed to load BPF object: %m");
 
-        for (int i = 0; i < obj->skeleton->prog_cnt; i++) {
-                _cleanup_(bpf_link_freep) struct bpf_link *link = NULL;
-                struct bpf_prog_skeleton *ps = obj->skeleton->progs + i;
-                _cleanup_free_ char *fn = NULL;
-                bool linked = false;
-                const char *e;
-
-                e = startswith(ps->name, "userns_restrict_");
-                assert(e);
-
-                if (pin) {
-                        fn = path_join(PROGRAM_LINK_PREFIX, e);
-                        if (!fn)
-                                return log_oom();
-
-                        link = sym_bpf_link__open(fn);
-                        r = bpf_get_error_translated(link);
-                        if (r < 0) {
-                                if (r != -ENOENT)
-                                        return log_error_errno(r, "Unable to open pinned program link: %m");
-                                link = NULL;
-                        } else {
-                                linked = true;
-                                log_debug("userns-restrict BPF-LSM program %s already attached.", ps->name);
-                        }
-                }
-
-                if (!link) {
-                        link = sym_bpf_program__attach(*ps->prog);
-                        r = bpf_get_error_translated(link);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to attach LSM BPF program: %m");
-
-                        log_info("userns-restrict BPF-LSM program %s now attached.", ps->name);
-                }
-
-                if (pin && !linked) {
-                        assert(fn);
-
-                        r = sym_bpf_link__pin(link, fn);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to pin LSM attachment: %m");
-                }
-
-                *ps->link = TAKE_PTR(link);
-        }
-
+        /* Pin the maps already here: the programs are not attached yet, so nothing enforces anything, but
+         * the caller may now seed the maps before userns_restrict_attach() puts the policy in effect. */
         if (pin) {
-                r = sym_bpf_object__pin_maps(obj->obj, NULL);
+                r = sym_bpf_object__pin_maps(obj->obj, /* path= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to pin BPF maps: %m");
         }
@@ -190,95 +219,75 @@ int userns_restrict_install(
 #endif
 }
 
-int userns_restrict_put_by_inode(
-                struct userns_restrict_bpf *obj,
-                uint64_t userns_inode,
-                bool replace,
-                const int mount_fds[],
-                size_t n_mount_fds) {
+int userns_restrict_attach(struct userns_restrict_bpf *obj, bool pin) {
 
 #if HAVE_VMLINUX_H
-        _cleanup_close_ int inner_map_fd = -EBADF;
-        _cleanup_free_ int *mnt_ids = NULL;
-        uint64_t ino = userns_inode;
-        int r, outer_map_fd;
+        _cleanup_(rm_rf_physical_and_freep) char *staging = NULL;
+        int r;
 
         assert(obj);
-        assert(userns_inode != 0);
-        assert(n_mount_fds == 0 || mount_fds);
 
-        /* The BPF map type BPF_MAP_TYPE_HASH_OF_MAPS only supports 32bit keys, and user namespace inode
-         * numbers are 32bit too, even though ino_t is 64bit these days. Should we ever run into a 64bit
-         * inode let's refuse early, we can't support this with the current BPF code for now. */
-        if (userns_inode > UINT32_MAX)
-                return -EINVAL;
+        /* Attach every program before we touch the pins. If a program fails to attach, the caller destroys
+         * the object, which detaches the programs attached here. The programs that a previous run pinned
+         * then stay attached and keep enforcing the policy. */
+        for (int i = 0; i < obj->skeleton->prog_cnt; i++) {
+                struct bpf_prog_skeleton *ps = obj->skeleton->progs + i;
+                struct bpf_link *link;
 
-        mnt_ids = new(int, n_mount_fds);
-        if (!mnt_ids)
-                return -ENOMEM;
+                if (sym_bpf_program__fd(*ps->prog) < 0)
+                        continue;
 
-        for (size_t i = 0; i < n_mount_fds; i++) {
-                r = path_get_mnt_id_at(mount_fds[i], "", mnt_ids + i);
+                link = sym_bpf_program__attach(*ps->prog);
+                r = bpf_get_error_translated(link);
                 if (r < 0)
-                        return log_debug_errno(r, "Failed to get mount ID: %m");
+                        return log_error_errno(r, "Failed to attach LSM BPF program %s: %m", ps->name);
+
+                *ps->link = link;
+                log_debug("userns-restrict BPF-LSM program %s now attached.", ps->name);
         }
 
-        outer_map_fd = sym_bpf_map__fd(obj->maps.userns_mnt_id_hash);
-        if (outer_map_fd < 0)
-                return log_debug_errno(outer_map_fd, "Failed to get outer BPF map fd: %m");
+        if (!pin)
+                return 0;
 
-        if (replace) {
-                /* Add if missing, replace if already exists */
-                inner_map_fd = make_inner_hash_map();
-                if (inner_map_fd < 0)
-                        return inner_map_fd;
+        staging = strdup(PROGRAM_LINK_PREFIX "-new");
+        if (!staging)
+                return log_oom();
 
-                r = sym_bpf_map_update_elem(outer_map_fd, &ino, &inner_map_fd, BPF_ANY);
+        /* A previous run may have exited before removing its staging directory. The active directory
+         * still pins the complete policy, so removing the staging directory cannot remove protection. */
+        r = rm_rf(staging, REMOVE_ROOT|REMOVE_PHYSICAL|REMOVE_MISSING_OK);
+        if (r < 0)
+                return log_error_errno(r, "Failed to remove previous LSM attachment staging directory: %m");
+
+        if (mkdir(staging, 0755) < 0)
+                return log_error_errno(errno, "Failed to create LSM attachment staging directory: %m");
+
+        for (int i = 0; i < obj->skeleton->prog_cnt; i++) {
+                struct bpf_prog_skeleton *ps = obj->skeleton->progs + i;
+                _cleanup_free_ char *fn = NULL;
+                const char *e;
+
+                if (sym_bpf_program__fd(*ps->prog) < 0)
+                        continue;
+
+                e = startswith(ps->name, "userns_restrict_");
+                assert(e);
+
+                fn = path_join(staging, e);
+                if (!fn)
+                        return log_oom();
+
+                r = sym_bpf_link__pin(*ps->link, fn);
                 if (r < 0)
-                        return log_debug_errno(r, "Failed to replace map in inode hash: %m");
-        } else {
-                /* Let's add an entry for this userns inode if missing. If it exists just extend the existing map. We
-                 * might race against each other, hence we try a couple of times */
-                for (size_t n_try = 10;; n_try--) {
-                        uint32_t innermap_id;
-
-                        if (n_try == 0)
-                                return log_debug_errno(SYNTHETIC_ERRNO(EEXIST),
-                                                       "Stillcan't create inode entry in BPF map after 10 tries.");
-
-                        r = sym_bpf_map_lookup_elem(outer_map_fd, &ino, &innermap_id);
-                        if (r >= 0) {
-                                inner_map_fd = sym_bpf_map_get_fd_by_id(innermap_id);
-                                if (inner_map_fd < 0)
-                                        return log_debug_errno(inner_map_fd, "Failed to get file descriptor for inner map: %m");
-
-                                break;
-                        }
-                        if (errno != ENOENT)
-                                return log_debug_errno(errno, "Failed to look up inode hash entry: %m");
-
-                        /* No entry for this user namespace yet. Let's create one */
-                        inner_map_fd = make_inner_hash_map();
-                        if (inner_map_fd < 0)
-                                return inner_map_fd;
-
-                        r = sym_bpf_map_update_elem(outer_map_fd, &ino, &inner_map_fd, BPF_NOEXIST);
-                        if (r >= 0)
-                                break;
-                        if (errno != EEXIST)
-                                return log_debug_errno(errno, "Failed to add mount ID list to inode hash: %m");
-                }
+                        return log_error_errno(r, "Failed to pin LSM attachment '%s': %m", fn);
         }
 
-        FOREACH_ARRAY(mntid, mnt_ids, n_mount_fds) {
-                uint32_t dummy_value = 1;
+        /* Replacing individual pins could remove protection if a later pin fails and the caller destroys
+         * the object. The exchange preserves every old pin until the complete replacement is pinned. */
+        if (renameat2(AT_FDCWD, staging, AT_FDCWD, PROGRAM_LINK_PREFIX, RENAME_EXCHANGE) < 0)
+                return log_error_errno(errno, "Failed to replace pinned LSM attachments: %m");
 
-                r = sym_bpf_map_update_elem(inner_map_fd, mntid, &dummy_value, BPF_ANY);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to add mount ID to map: %m");
-
-                log_debug("Allowing mount %i on userns inode %" PRIu64, *mntid, ino);
-        }
+        (void) rm_rf(OBSOLETE_LINK_PREFIX, REMOVE_PHYSICAL);
 
         return 0;
 #else
@@ -286,12 +295,45 @@ int userns_restrict_put_by_inode(
 #endif
 }
 
-int userns_restrict_put_by_fd(
+int userns_restrict_register_by_inode(
                 struct userns_restrict_bpf *obj,
-                int userns_fd,
-                bool replace,
-                const int mount_fds[],
-                size_t n_mount_fds) {
+                uint64_t userns_inode) {
+
+#if HAVE_VMLINUX_H
+        uint32_t dummy_value = 1;
+        int map_fd, r;
+        unsigned ino;
+
+        assert(obj);
+        assert(userns_inode != 0);
+
+        /* The BPF map only supports 32bit keys, and user namespace inode numbers are 32bit too, even though
+         * ino_t is 64bit these days. Should we ever run into a 64bit inode let's refuse early, we can't
+         * support this with the current BPF code for now. */
+        if (userns_inode > UINT32_MAX)
+                return -EINVAL;
+
+        ino = (unsigned) userns_inode;
+
+        map_fd = sym_bpf_map__fd(obj->maps.userns_managed);
+        if (map_fd < 0)
+                return log_debug_errno(map_fd, "Failed to get managed userns BPF map fd: %m");
+
+        r = sym_bpf_map_update_elem(map_fd, &ino, &dummy_value, BPF_ANY);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to add userns inode to managed map: %m");
+
+        log_debug("Restricting persistent writes for userns inode %" PRIu64, userns_inode);
+
+        return 0;
+#else
+        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "User Namespace Restriction BPF support disabled.");
+#endif
+}
+
+int userns_restrict_register_by_fd(
+                struct userns_restrict_bpf *obj,
+                int userns_fd) {
 
 #if HAVE_VMLINUX_H
         struct stat st;
@@ -299,7 +341,6 @@ int userns_restrict_put_by_fd(
 
         assert(obj);
         assert(userns_fd >= 0);
-        assert(n_mount_fds == 0 || mount_fds);
 
         r = fd_is_namespace(userns_fd, NAMESPACE_USER);
         if (r < 0)
@@ -310,12 +351,7 @@ int userns_restrict_put_by_fd(
         if (fstat(userns_fd, &st) < 0)
                 return log_debug_errno(errno, "Failed to fstat() user namespace: %m");
 
-        return userns_restrict_put_by_inode(
-                        obj,
-                        st.st_ino,
-                        replace,
-                        mount_fds,
-                        n_mount_fds);
+        return userns_restrict_register_by_inode(obj, st.st_ino);
 #else
         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "User Namespace Restriction BPF support disabled.");
 #endif
@@ -324,7 +360,7 @@ int userns_restrict_put_by_fd(
 int userns_restrict_reset_by_inode(struct userns_restrict_bpf *obj, uint64_t userns_inode) {
 
 #if HAVE_VMLINUX_H
-        int r, outer_map_fd, setgroups_deny_fd;
+        int r, managed_fd, setgroups_deny_fd;
         unsigned u;
 
         assert(obj);
@@ -333,15 +369,17 @@ int userns_restrict_reset_by_inode(struct userns_restrict_bpf *obj, uint64_t use
         if (userns_inode > UINT32_MAX) /* inodes larger than 32bit are definitely not included in our map, exit early */
                 return 0;
 
-        outer_map_fd = sym_bpf_map__fd(obj->maps.userns_mnt_id_hash);
-        if (outer_map_fd < 0)
-                return log_debug_errno(outer_map_fd, "Failed to get outer BPF map fd: %m");
+        managed_fd = sym_bpf_map__fd(obj->maps.userns_managed);
+        if (managed_fd < 0)
+                return log_debug_errno(managed_fd, "Failed to get managed userns BPF map fd: %m");
 
         u = (uint32_t) userns_inode;
 
-        r = sym_bpf_map_delete_elem(outer_map_fd, &u);
-        if (r < 0)
-                return log_debug_errno(r, "Failed to remove entry for inode %" PRIu64 " from outer map: %m", userns_inode);
+        /* A missing entry is an ordinary state here (the maps come up empty after a schema change, and
+         * registration is idempotent), so don't let it cut the setgroups deny cleanup below short. */
+        r = sym_bpf_map_delete_elem(managed_fd, &u);
+        if (r < 0 && r != -ENOENT)
+                return log_debug_errno(r, "Failed to remove entry for inode %" PRIu64 " from managed map: %m", userns_inode);
 
         setgroups_deny_fd = sym_bpf_map__fd(obj->maps.userns_setgroups_deny);
         if (setgroups_deny_fd < 0)

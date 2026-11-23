@@ -1,8 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include <linux/if_ether.h>
-#include <linux/if_infiniband.h>
 #include <linux/if_packet.h>
 #include <linux/netlink.h>
 #include <linux/vm_sockets.h>
@@ -10,7 +8,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-#include "basic-forward.h"
+#include "forward.h"
 #include "memory-util.h"
 #include "missing-network.h"
 
@@ -29,8 +27,8 @@ union sockaddr_union {
         struct sockaddr_ll ll;
         struct sockaddr_vm vm;
 
-        /* Ensure there is enough space to store Infiniband addresses */
-        uint8_t ll_buffer[offsetof(struct sockaddr_ll, sll_addr) + CONST_MAX(ETH_ALEN, INFINIBAND_ALEN)];
+        /* Ensure there is enough space to store an arbitrary hardware address, e.g. Infiniband */
+        uint8_t ll_buffer[offsetof(struct sockaddr_ll, sll_addr) + HW_ADDR_MAX_SIZE];
 
         /* Ensure there is enough space after the AF_UNIX sun_path for one more NUL byte, just to be sure that the path
          * component is always followed by at least one NUL byte. */
@@ -92,11 +90,11 @@ bool sockaddr_equal(const union sockaddr_union *a, const union sockaddr_union *b
 
 int fd_set_sndbuf(int fd, size_t n, bool increase);
 static inline int fd_inc_sndbuf(int fd, size_t n) {
-        return fd_set_sndbuf(fd, n, true);
+        return fd_set_sndbuf(fd, n, /* increase= */ true);
 }
 int fd_set_rcvbuf(int fd, size_t n, bool increase);
 static inline int fd_increase_rxbuf(int fd, size_t n) {
-        return fd_set_rcvbuf(fd, n, true);
+        return fd_set_rcvbuf(fd, n, /* increase= */ true);
 }
 
 DECLARE_STRING_TABLE_LOOKUP_WITH_FALLBACK(ip_tos, int);
@@ -110,14 +108,17 @@ typedef enum {
 bool ifname_valid_char(char a) _const_;
 bool ifname_valid_full(const char *p, IfnameValidFlags flags) _pure_;
 static inline bool ifname_valid(const char *p) {
-        return ifname_valid_full(p, 0);
+        return ifname_valid_full(p, /* flags= */ 0);
 }
 bool address_label_valid(const char *p) _pure_;
 
 int getpeercred(int fd, struct ucred *ucred);
 int getpeersec(int fd, char **ret);
 int getpeergroups(int fd, gid_t **ret);
-int getpeerpidfd(int fd);
+int getpeerpidfd_full(int fd, unsigned flags);
+static inline int getpeerpidfd(int fd) {
+        return getpeerpidfd_full(fd, /* flags= */ 0);
+}
 int getpeerpidref(int fd, PidRef *ret);
 
 ssize_t send_one_fd_iov_sa(
@@ -208,7 +209,18 @@ int socket_autobind(int fd, char **ret_name);
 #define CMSG_SPACE_TIMESPEC                                             \
         (CMSG_SPACE(sizeof(struct timespec)) + CMSG_SPACE(2 * sizeof(uint64_t)))
 
-ssize_t recvmsg_safe(int sockfd, struct msghdr *msg, int flags);
+typedef enum RecvMsgSafeFlags {
+        /* By default recvmsg_safe() suppresses AF_INET/AF_INET6 datagrams whose source port is 0. Raw IP
+         * sockets (SOCK_RAW, e.g. ICMP/ICMPv6/NDisc) and ICMP "ping" sockets (SOCK_DGRAM + IPPROTO_ICMP)
+         * have no concept of ports, and the kernel always reports the source port as 0 for them. Set this
+         * flag when receiving from such sockets, otherwise every datagram would be dropped. */
+        RECVMSG_SAFE_ALLOW_PORT_ZERO = 1 << 0,
+} RecvMsgSafeFlags;
+
+ssize_t recvmsg_safe_full(int sockfd, struct msghdr *msg, int flags, RecvMsgSafeFlags safe_flags);
+static inline ssize_t recvmsg_safe(int sockfd, struct msghdr *msg, int flags) {
+        return recvmsg_safe_full(sockfd, msg, flags, /* safe_flags= */ 0);
+}
 
 int socket_get_family(int fd);
 int socket_set_recvpktinfo(int fd, int af, bool b);
@@ -242,8 +254,12 @@ int socket_get_mtu(int fd, int af, size_t *ret);
 int connect_unix_path(int fd, int dir_fd, const char *path);
 
 static inline bool VSOCK_CID_IS_REGULAR(unsigned cid) {
-        /* 0, 1, 2, UINT32_MAX are special, refuse those */
-        return cid > 2 && cid < UINT32_MAX;
+        /* Refuse special CID values */
+        return !IN_SET(cid,
+                       VMADDR_CID_HYPERVISOR,
+                       VMADDR_CID_LOCAL,
+                       VMADDR_CID_HOST,
+                       VMADDR_CID_ANY);
 }
 
 int vsock_parse_port(const char *s, unsigned *ret);
@@ -263,10 +279,12 @@ int socket_address_equal_unix(const char *a, const char *b);
  * authoritative. */
 #define SOMAXCONN_DELUXE INT_MAX
 
-int vsock_get_local_cid(unsigned *ret);
-
 int netlink_socket_get_multicast_groups(int fd, size_t *ret_len, uint32_t **ret_groups);
 
 int socket_get_cookie(int fd, uint64_t *ret);
 
 void cmsg_close_all(struct msghdr *mh);
+
+int tos_to_priority(uint8_t tos);
+
+int socket_xattr_supported(void);

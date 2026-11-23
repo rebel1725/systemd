@@ -17,7 +17,7 @@
 #include "label-util.h"
 #include "log.h"
 #include "manager.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "namespace-util.h"
@@ -36,6 +36,8 @@
 #include "strv.h"
 #include "unit.h"
 #include "user-util.h"
+
+#define CREDENTIALS_WORKSPACE_DIRECTORY "systemd/temporary-credentials"
 
 ExecSetCredential* exec_set_credential_free(ExecSetCredential *sc) {
         if (!sc)
@@ -279,6 +281,25 @@ static int get_credential_directory(
         return 1;
 }
 
+static int get_credential_workspace(
+                const char *runtime_prefix,
+                const char *unit,
+                char **ret) {
+
+        char *p;
+
+        assert(runtime_prefix);
+        assert(unit);
+        assert(ret);
+
+        p = path_join(runtime_prefix, CREDENTIALS_WORKSPACE_DIRECTORY, unit);
+        if (!p)
+                return -ENOMEM;
+
+        *ret = p;
+        return 0;
+}
+
 int exec_context_get_credential_directory(
                 const ExecContext *context,
                 const ExecParameters *params,
@@ -298,6 +319,17 @@ int exec_context_get_credential_directory(
         return get_credential_directory(params->prefix[EXEC_DIRECTORY_RUNTIME], unit, ret);
 }
 
+int exec_context_destroy_credentials_workspace(const char *runtime_prefix, const char *unit) {
+        _cleanup_free_ char *workspace = NULL;
+        int r;
+
+        r = get_credential_workspace(runtime_prefix, unit, &workspace);
+        if (r < 0)
+                return r;
+
+        return rm_rf(workspace, REMOVE_ROOT|REMOVE_CHMOD|REMOVE_MISSING_OK);
+}
+
 int exec_context_destroy_credentials(const ExecContext *c, const char *runtime_prefix, const char *unit) {
         _cleanup_free_ char *p = NULL;
         int r;
@@ -312,6 +344,9 @@ int exec_context_destroy_credentials(const ExecContext *c, const char *runtime_p
          * unmount it, and afterwards remove the mount point */
         (void) umount2(p, MNT_DETACH|UMOUNT_NOFOLLOW);
         (void) rm_rf(p, REMOVE_ROOT|REMOVE_CHMOD);
+
+        /* The preparing child's cleanup does not run if it is killed. */
+        (void) exec_context_destroy_credentials_workspace(runtime_prefix, unit);
 
         return 0;
 }
@@ -423,9 +458,9 @@ static int write_credential(
         assert(id);
         assert(data || size == 0);
 
-        fd = openat(dfd, id, O_CREAT|O_EXCL|O_WRONLY|O_CLOEXEC, 0600);
+        fd = xopenat_full(dfd, id, O_CREAT|O_EXCL|O_WRONLY, /* xopen_flags= */ 0, 0600);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         r = loop_write(fd, data, size);
         if (r < 0)
@@ -601,7 +636,7 @@ static int load_credential_glob(
                                         UINT64_MAX,
                                         args->encrypted ? CREDENTIAL_ENCRYPTED_SIZE_MAX : CREDENTIAL_SIZE_MAX,
                                         flags,
-                                        NULL,
+                                        /* bind_name= */ NULL,
                                         &data, &size);
                         if (r < 0)
                                 return log_debug_errno(r, "Failed to read credential '%s': %m", *p);
@@ -619,7 +654,8 @@ static int load_credential(
                 LoadCredentialArguments *args,
                 const char *id,
                 int read_dfd,
-                const char *path) {
+                const char *path,
+                bool connect_socket) {
 
         ReadFullFileFlags flags = READ_FULL_FILE_SECURE|READ_FULL_FILE_FAIL_WHEN_LARGER;
         _cleanup_strv_free_ char **search_path = NULL;
@@ -639,10 +675,8 @@ static int load_credential(
         assert(path);
 
         if (read_dfd >= 0) {
-                /* If a directory fd is specified, then read the file directly from that dir. In this case we
-                 * won't do AF_UNIX stuff (we simply don't want to recursively iterate down a tree of AF_UNIX
-                 * IPC sockets). It's OK if a file vanishes here in the time we enumerate it and intend to
-                 * open it. */
+                /* If a directory fd is specified, then read the credential directly from that dir. It's OK
+                 * if an entry vanishes in the time between enumeration and opening it. */
 
                 if (!filename_is_valid(path)) /* safety check */
                         return -EINVAL;
@@ -657,13 +691,7 @@ static int load_credential(
                 if (!path_is_valid(path)) /* safety check */
                         return -EINVAL;
 
-                flags |= READ_FULL_FILE_CONNECT_SOCKET;
-
-                /* Pass some minimal info about the unit and the credential name we are looking to acquire
-                 * via the source socket address in case we read off an AF_UNIX socket. */
-                if (asprintf(&bindname, "@%" PRIx64 "/unit/%s/%s", random_u64(), args->context->unit, id) < 0)
-                        return -ENOMEM;
-
+                connect_socket = true;
                 missing_ok = false;
                 source = path;
 
@@ -686,6 +714,15 @@ static int load_credential(
         } else
                 maxsz = CREDENTIAL_SIZE_MAX;
 
+        if (connect_socket) {
+                flags |= READ_FULL_FILE_CONNECT_SOCKET;
+
+                /* Pass some minimal info about the unit and the credential name we are looking to acquire
+                 * via the source socket address in case we read off an AF_UNIX socket. */
+                if (asprintf(&bindname, "@%" PRIx64 "/unit/%s/%s", random_u64(), args->context->unit, id) < 0)
+                        return -ENOMEM;
+        }
+
         if (search_path)
                 STRV_FOREACH(d, search_path) {
                         _cleanup_free_ char *j = NULL;
@@ -699,7 +736,7 @@ static int load_credential(
                                         UINT64_MAX,
                                         maxsz,
                                         flags,
-                                        NULL,
+                                        /* bind_name= */ NULL,
                                         &data, &size);
                         if (r != -ENOENT)
                                 break;
@@ -774,7 +811,8 @@ static int load_cred_recurse_dir_cb(
 
         r = load_credential(args,
                             sub_id,
-                            dir_fd, de->d_name);
+                            dir_fd, de->d_name,
+                            de->d_type == DT_SOCK);
         if (r < 0)
                 return r;
 
@@ -833,18 +871,19 @@ static int acquire_credentials(
                  * propagate a credential passed to us from further up. */
 
                 if (path_is_absolute(lc->path)) {
-                        sub_fd = open(lc->path, O_DIRECTORY|O_CLOEXEC);
-                        if (sub_fd < 0 && !IN_SET(errno,
-                                                  ENOTDIR,  /* Not a directory */
-                                                  ENOENT))  /* Doesn't exist? */
-                                return log_debug_errno(errno, "Failed to open credential source '%s': %m", lc->path);
+                        sub_fd = xopenat(AT_FDCWD, lc->path, O_DIRECTORY);
+                        if (sub_fd < 0 && !IN_SET(sub_fd,
+                                                  -ENOTDIR,  /* Not a directory */
+                                                  -ENOENT))  /* Doesn't exist? */
+                                return log_debug_errno(sub_fd, "Failed to open credential source '%s': %m", lc->path);
                 }
 
                 if (sub_fd < 0)
                         /* Regular file (incl. a credential passed in from higher up) */
                         r = load_credential(&args,
                                             lc->id,
-                                            AT_FDCWD, lc->path);
+                                            AT_FDCWD, lc->path,
+                                            /* connect_socket= */ false);
                 else
                         /* Directory */
                         r = recurse_dir(sub_fd,
@@ -961,7 +1000,7 @@ static int setup_credentials_plain_dir(
 
         /* Temporary workspace, that remains inaccessible all the time. We prepare stuff there before moving
          * it into place, so that users can't access half-initialized credential stores. */
-        t = path_join(context->runtime_prefix, "systemd/temporary-credentials");
+        t = path_join(context->runtime_prefix, CREDENTIALS_WORKSPACE_DIRECTORY);
         if (!t)
                 return -ENOMEM;
 
@@ -969,16 +1008,16 @@ static int setup_credentials_plain_dir(
         if (r < 0 && r != -EEXIST)
                 return r;
 
-        workspace = path_join(t, context->unit);
-        if (!workspace)
-                return -ENOMEM;
+        r = get_credential_workspace(context->runtime_prefix, context->unit, &workspace);
+        if (r < 0)
+                return r;
 
-        dfd = open_mkdir(workspace, O_CLOEXEC|O_EXCL, 0700);
+        dfd = open_mkdir(workspace, O_EXCL, 0700);
         if (dfd < 0)
                 return log_debug_errno(dfd, "Failed to create workspace for credentials: %m");
         workspace_rm = workspace;
 
-        (void) label_fix_full(dfd, /* inode_path= */ NULL, cred_dir, /* flags= */ 0);
+        (void) label_fix_full(dfd, /* inode_path= */ NULL, cred_dir, /* flags= */ 0, /* label_context= */ NULL);
 
         r = acquire_credentials(context, dfd, /* ownership_ok= */ false);
         if (r < 0)
@@ -988,9 +1027,9 @@ static int setup_credentials_plain_dir(
         if (r >= 0)
                 workspace_rm = NULL;
         if (IN_SET(r, -ENOTEMPTY, -EEXIST)) {
-                _cleanup_close_ int old_dfd = open(cred_dir, O_DIRECTORY|O_CLOEXEC|O_NOFOLLOW);
+                _cleanup_close_ int old_dfd = xopenat(AT_FDCWD, cred_dir, O_DIRECTORY|O_NOFOLLOW);
                 if (old_dfd < 0)
-                        return log_debug_errno(errno, "Failed to open credentials dir '%s': %m", cred_dir);
+                        return log_debug_errno(old_dfd, "Failed to open credentials dir '%s': %m", cred_dir);
 
                 (void) fd_acl_make_writable(old_dfd);
 
@@ -1055,11 +1094,11 @@ static int setup_credentials_internal(
         if (mfd < 0)
                 return log_debug_errno(mfd, "Failed to mount credentials fs: %m");
 
-        dfd = fd_reopen(mfd, O_DIRECTORY|O_CLOEXEC);
+        dfd = fd_reopen(mfd, O_DIRECTORY);
         if (dfd < 0)
                 return dfd;
 
-        (void) label_fix_full(dfd, /* inode_path= */ NULL, cred_dir, /* flags= */ 0);
+        (void) label_fix_full(dfd, /* inode_path= */ NULL, cred_dir, /* flags= */ 0, /* label_context= */ NULL);
 
         r = acquire_credentials(context, dfd, /* ownership_ok= */ true);
         if (r < 0)
@@ -1072,12 +1111,12 @@ static int setup_credentials_internal(
         // Work around a kernel bug that results in tmpfs reconfiguration failure.
         // FIXME: drop this once https://lore.kernel.org/linux-fsdevel/20251108190930.440685-1-me@yhndnzj.com/
         // is merged and hits the distro kernels.
-        (void) fsconfig(fs_fd, FSCONFIG_SET_FLAG, "noswap", NULL, 0);
+        (void) fsconfig(fs_fd, FSCONFIG_SET_FLAG, "noswap", /* value= */ NULL, /* aux= */ 0);
 
-        if (fsconfig(fs_fd, FSCONFIG_SET_FLAG, "ro", NULL, 0) < 0)
+        if (fsconfig(fs_fd, FSCONFIG_SET_FLAG, "ro", /* value= */ NULL, /* aux= */ 0) < 0)
                 return -errno;
 
-        if (fsconfig(fs_fd, FSCONFIG_CMD_RECONFIGURE, NULL, NULL, 0) < 0)
+        if (fsconfig(fs_fd, FSCONFIG_CMD_RECONFIGURE, /* key= */ NULL, /* value= */ NULL, /* aux= */ 0) < 0)
                 return -errno;
 
         log_debug("Successfully reconfigured credentials fs to be read only.");
@@ -1251,10 +1290,14 @@ int unit_refresh_credentials(Unit *u) {
                         if (socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, tunnel_fds) < 0)
                                 return log_error_errno(errno, "Failed to allocate socket pair: %m");
 
+                        /* User units with PrivateUsers=self only map the user manager's own identity. Keep it
+                         * in that case, but still become root when a managed UID/GID range is mapped. */
                         r = namespace_fork_full("(sd-creds-ns)", "(sd-creds-ns-inner)",
                                                 (int[]) { tunnel_fds[1] }, 1,
                                                 FORK_RESET_SIGNALS|FORK_DEATHSIG_SIGKILL|FORK_CLOSE_ALL_FDS|FORK_REOPEN_LOG,
                                                 pidns_fd, mntns_fd, /* netns_fd = */ -EBADF, userns_fd, root_fd,
+                                                MANAGER_IS_USER(u->manager) ?
+                                                NAMESPACE_ENTER_KEEP_UID_GID_IF_ROOT_UNMAPPED : 0,
                                                 &child);
                         if (r < 0)
                                 return log_full_errno(ERRNO_IS_NEG_PRIVILEGE(r) ? LOG_WARNING : LOG_ERR, r,

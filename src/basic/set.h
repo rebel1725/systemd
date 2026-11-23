@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "basic-forward.h"
+#include "forward.h"
 #include "hashmap.h"
 
 #define set_free_and_replace(a, b)              \
@@ -64,7 +64,7 @@ static inline unsigned set_buckets(const Set *s) {
 }
 
 static inline bool set_iterate(const Set *s, Iterator *i, void **value) {
-        return _hashmap_iterate(HASHMAP_BASE((Set*) s), i, value, NULL);
+        return _hashmap_iterate(HASHMAP_BASE((Set*) s), i, value, /* key= */ NULL);
 }
 
 static inline void set_clear(Set *s) {
@@ -72,14 +72,14 @@ static inline void set_clear(Set *s) {
 }
 
 static inline void *set_steal_first(Set *s) {
-        return _hashmap_first_key_and_value(HASHMAP_BASE(s), true, NULL);
+        return _hashmap_first_key_and_value(HASHMAP_BASE(s), /* remove= */ true, /* ret_key= */ NULL);
 }
 
 /* no set_steal_first_key */
 /* no set_first_key */
 
 static inline void *set_first(const Set *s) {
-        return _hashmap_first_key_and_value(HASHMAP_BASE((Set *) s), false, NULL);
+        return _hashmap_first_key_and_value(HASHMAP_BASE((Set *) s), /* remove= */ false, /* ret_key= */ NULL);
 }
 
 /* no set_next */

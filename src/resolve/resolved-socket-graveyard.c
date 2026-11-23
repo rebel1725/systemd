@@ -2,7 +2,7 @@
 
 #include "sd-event.h"
 #include "alloc-util.h"
-#include "assert-fundamental.h"
+#include "assert-util.h"
 #include "log.h"
 #include "resolved-manager.h"
 #include "resolved-socket-graveyard.h"
@@ -124,7 +124,7 @@ int manager_add_socket_to_graveyard(Manager *m, int fd) {
         if (r < 0)
                 return log_error_errno(r, "Failed to create graveyard IO source: %m");
 
-        r = sd_event_source_set_io_fd_own(g->io_event_source, true);
+        r = sd_event_source_set_io_fd_own(g->io_event_source, /* own= */ true);
         if (r < 0)
                 return log_error_errno(r, "Failed to enable graveyard IO source fd ownership: %m");
 

@@ -34,24 +34,6 @@ static const char * const catalog_file_dirs[] = {
         NULL
 };
 
-#define CATALOG_SIGNATURE { 'R', 'H', 'H', 'H', 'K', 'S', 'L', 'P' }
-
-typedef struct CatalogHeader {
-        uint8_t signature[8];  /* "RHHHKSLP" */
-        le32_t compatible_flags;
-        le32_t incompatible_flags;
-        le64_t header_size;
-        le64_t n_items;
-        le64_t catalog_item_size;
-} CatalogHeader;
-
-typedef struct CatalogItem {
-        sd_id128_t id;
-        char language[32]; /* One byte is used for termination, so the maximum allowed
-                            * length of the string is actually 31 bytes. */
-        le64_t offset;
-} CatalogItem;
-
 static void catalog_hash_func(const CatalogItem *i, struct siphash *state) {
         assert(i);
         assert(state);
@@ -451,7 +433,7 @@ int catalog_update(const char *database, const char *root, const char* const *di
         ConfFile **files = NULL;
         size_t n_files = 0;
 
-        CLEANUP_ARRAY(files, n_files, conf_file_free_many);
+        CLEANUP_ARRAY(files, n_files, conf_file_free_array);
 
         r = conf_files_list_strv_full(".catalog", root,
                                       CONF_FILES_REGULAR | CONF_FILES_FILTER_MASKED | CONF_FILES_WARN,
@@ -514,15 +496,21 @@ int catalog_update(const char *database, const char *root, const char* const *di
         return 0;
 }
 
-static int open_mmap(const char *database, int *ret_fd, struct stat *ret_st, void **ret_map) {
-        assert(database);
-        assert(ret_fd);
-        assert(ret_st);
-        assert(ret_map);
+struct CatalogFile {
+        void *map;
+        size_t size;
+        uint64_t strings_offset; /* start of the string store, already validated to fit in the file */
+};
 
-        _cleanup_close_ int fd = open(database, O_RDONLY|O_CLOEXEC);
+int catalog_file_open(const char *database, CatalogFile **ret) {
+        int r;
+
+        assert(database);
+        assert(ret);
+
+        _cleanup_close_ int fd = xopenat(AT_FDCWD, database, O_RDONLY);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         struct stat st;
         if (fstat(fd, &st) < 0)
@@ -531,34 +519,66 @@ static int open_mmap(const char *database, int *ret_fd, struct stat *ret_st, voi
         if (st.st_size < (off_t) sizeof(CatalogHeader) || file_offset_beyond_memory_size(st.st_size))
                 return -EINVAL;
 
-        void *p = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+        /* The fd is not needed anymore once the file is mapped, hence don't keep it around: this object
+         * might live for a long time in library users. */
+        void *p = mmap(/* addr= */ NULL, st.st_size, PROT_READ, MAP_SHARED, fd, /* offset= */ 0);
         if (p == MAP_FAILED)
                 return -errno;
 
         const CatalogHeader *h = p;
+        uint64_t total;
         if (memcmp(h->signature, (const uint8_t[]) CATALOG_SIGNATURE, sizeof(h->signature)) != 0 ||
             le64toh(h->header_size) < sizeof(CatalogHeader) ||
             le64toh(h->catalog_item_size) < sizeof(CatalogItem) ||
             h->incompatible_flags != 0 ||
             le64toh(h->n_items) <= 0 ||
-            st.st_size < (off_t) (le64toh(h->header_size) + le64toh(h->catalog_item_size) * le64toh(h->n_items))) {
-                munmap(p, st.st_size);
-                return -EBADMSG;
+            !MUL_SAFE(&total, le64toh(h->catalog_item_size), le64toh(h->n_items)) ||
+            !INC_SAFE(&total, le64toh(h->header_size)) ||
+            (uint64_t) st.st_size < total) {
+                r = -EBADMSG;
+                goto fail;
         }
 
-        *ret_fd = TAKE_FD(fd);
-        *ret_st = st;
-        *ret_map = p;
+        CatalogFile *c = new(CatalogFile, 1);
+        if (!c) {
+                r = -ENOMEM;
+                goto fail;
+        }
+
+        *c = (CatalogFile) {
+                .map = p,
+                .size = st.st_size,
+                .strings_offset = total,
+        };
+
+        *ret = c;
         return 0;
+
+fail:
+        munmap_safe(p, st.st_size);
+        return r;
 }
 
-static const char* find_id(const void *p, sd_id128_t id) {
-        CatalogItem key = { .id = id };
-        const CatalogItem *f = NULL;
-        const CatalogHeader *h = ASSERT_PTR(p);
-        const char *loc;
+CatalogFile* catalog_file_free(CatalogFile *c) {
+        if (!c)
+                return NULL;
 
-        loc = setlocale(LC_MESSAGES, NULL);
+        munmap_safe(c->map, c->size);
+        return mfree(c);
+}
+
+static const char* find_id(const CatalogFile *c, sd_id128_t id) {
+        assert(c);
+
+        const void *p = ASSERT_PTR(c->map);
+        const CatalogHeader *h = p;
+
+        CatalogItem key = {
+                .id = id
+        };
+        const CatalogItem *f = NULL;
+
+        const char *loc = setlocale(LC_MESSAGES, NULL);
         if (!isempty(loc) && !STR_IN_SET(loc, "C", "POSIX")) {
                 size_t len;
 
@@ -566,8 +586,7 @@ static const char* find_id(const void *p, sd_id128_t id) {
                 if (len > sizeof(key.language) - 1)
                         log_debug("LC_MESSAGES value too long, ignoring: \"%.*s\"", (int) len, loc);
                 else {
-                        strncpy(key.language, loc, len);
-                        key.language[len] = '\0';
+                        memcpy(key.language, loc, len);
 
                         f = bsearch(&key,
                                     (const uint8_t*) p + le64toh(h->header_size),
@@ -575,9 +594,7 @@ static const char* find_id(const void *p, sd_id128_t id) {
                                     le64toh(h->catalog_item_size),
                                     (comparison_fn_t) catalog_compare_func);
                         if (!f) {
-                                char *e;
-
-                                e = strchr(key.language, '_');
+                                char *e = strchr(key.language, '_');
                                 if (e) {
                                         *e = 0;
                                         f = bsearch(&key,
@@ -591,6 +608,7 @@ static const char* find_id(const void *p, sd_id128_t id) {
         }
 
         if (!f) {
+                /* Fall back to the untranslated entry */
                 zero(key.language);
                 f = bsearch(&key,
                             (const uint8_t*) p + le64toh(h->header_size),
@@ -598,14 +616,35 @@ static const char* find_id(const void *p, sd_id128_t id) {
                             le64toh(h->catalog_item_size),
                             (comparison_fn_t) catalog_compare_func);
         }
-
         if (!f)
                 return NULL;
 
-        return (const char*) p +
-                le64toh(h->header_size) +
-                le64toh(h->n_items) * le64toh(h->catalog_item_size) +
-                le64toh(f->offset);
+        /* f->offset is attacker-controlled in a hostile database; make sure the string start, plus a
+         * terminating NUL, stay inside the mapping before handing the pointer out for strlen()/strdup().
+         * strings_offset (the start of the string store) was already bounded against the file in
+         * catalog_file_open(), so only f->offset needs to be added and checked here. */
+        uint64_t off = c->strings_offset;
+        if (!INC_SAFE(&off, le64toh(f->offset)) ||
+            off >= c->size)
+                return NULL;
+
+        const char *s = (const char*) p + off;
+        if (!memchr(s, 0, c->size - off))
+                return NULL;
+
+        return s;
+}
+
+int catalog_file_lookup(const CatalogFile *c, sd_id128_t id, const char **ret_text) {
+        assert(c);
+        assert(ret_text);
+
+        const char *s = find_id(c, id);
+        if (!s)
+                return -ENOENT;
+
+        *ret_text = s;
+        return 0;
 }
 
 int catalog_get(const char *database, sd_id128_t id, char **ret_text) {
@@ -614,21 +653,17 @@ int catalog_get(const char *database, sd_id128_t id, char **ret_text) {
         assert(database);
         assert(ret_text);
 
-        _cleanup_close_ int fd = -EBADF;
-        struct stat st;
-        void *p;
-        r = open_mmap(database, &fd, &st, &p);
+        _cleanup_(catalog_file_freep) CatalogFile *c = NULL;
+        r = catalog_file_open(database, &c);
         if (r < 0)
                 return r;
 
-        const char *s = find_id(p, id);
-        if (!s)
-                r = -ENOENT;
-        else
-                r = strdup_to(ret_text, s);
+        const char *s;
+        r = catalog_file_lookup(c, id, &s);
+        if (r < 0)
+                return r;
 
-        (void) munmap(p, st.st_size);
-        return r;
+        return strdup_to(ret_text, s);
 }
 
 static char* find_header(const char *s, const char *header) {
@@ -675,15 +710,13 @@ int catalog_list(FILE *f, const char *database, bool oneline) {
 
         assert(database);
 
-        _cleanup_close_ int fd = -EBADF;
-        struct stat st;
-        void *p;
-        r = open_mmap(database, &fd, &st, &p);
+        _cleanup_(catalog_file_freep) CatalogFile *c = NULL;
+        r = catalog_file_open(database, &c);
         if (r < 0)
                 return r;
 
-        const CatalogHeader *h = p;
-        const CatalogItem *items = (const CatalogItem*) ((const uint8_t*) p + le64toh(h->header_size));
+        const CatalogHeader *h = c->map;
+        const CatalogItem *items = (const CatalogItem*) ((const uint8_t*) c->map + le64toh(h->header_size));
 
         sd_id128_t last_id;
         bool last_id_set = false;
@@ -693,7 +726,12 @@ int catalog_list(FILE *f, const char *database, bool oneline) {
                 if (last_id_set && sd_id128_equal(last_id, items[n].id))
                         continue;
 
-                assert_se(s = find_id(p, items[n].id));
+                s = find_id(c, items[n].id);
+                if (!s) {
+                        log_debug("Skipping catalog item " SD_ID128_FORMAT_STR " with out-of-bounds string offset.",
+                                  SD_ID128_FORMAT_VAL(items[n].id));
+                        continue;
+                }
 
                 dump_catalog_entry(f, items[n].id, s, oneline);
 
@@ -701,7 +739,6 @@ int catalog_list(FILE *f, const char *database, bool oneline) {
                 last_id = items[n].id;
         }
 
-        (void) munmap(p, st.st_size);
         return 0;
 }
 
@@ -709,6 +746,14 @@ int catalog_list_items(FILE *f, const char *database, bool oneline, char **items
         int r, ret = 0;
 
         assert(database);
+
+        if (strv_isempty(items))
+                return 0;
+
+        _cleanup_(catalog_file_freep) CatalogFile *c = NULL;
+        r = catalog_file_open(database, &c);
+        if (r < 0)
+                return r;
 
         STRV_FOREACH(item, items) {
                 sd_id128_t id;
@@ -718,8 +763,8 @@ int catalog_list_items(FILE *f, const char *database, bool oneline, char **items
                         continue;
                 }
 
-                _cleanup_free_ char *msg = NULL;
-                r = catalog_get(database, id, &msg);
+                const char *msg;
+                r = catalog_file_lookup(c, id, &msg);
                 if (r < 0) {
                         RET_GATHER(ret, log_full_errno(r == -ENOENT ? LOG_NOTICE : LOG_ERR, r,
                                                        "Failed to retrieve catalog entry for '%s': %m", *item));

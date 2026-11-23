@@ -3,6 +3,10 @@
 #include <fcntl.h>
 #include <linux/if.h>
 #include <linux/if_arp.h>
+#include <linux/if_ether.h>
+#include <linux/if_infiniband.h>
+#include <linux/pidfd.h>
+#include <linux/pkt_sched.h>
 #include <mqueue.h>
 #include <net/if.h>
 #include <netdb.h>
@@ -10,6 +14,7 @@
 #include <poll.h>
 #include <stdio.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
@@ -18,6 +23,7 @@
 #include "fd-util.h"
 #include "format-ifname.h"
 #include "format-util.h"
+#include "fs-util.h"
 #include "in-addr-util.h"
 #include "io-util.h"
 #include "log.h"
@@ -33,6 +39,8 @@
 #include "string-util.h"
 #include "strv.h"
 #include "sysctl-util.h"
+#include "user-util.h"
+#include "xattr-util.h"
 
 #if ENABLE_IDN
 #  define IDN_FLAGS NI_IDN
@@ -147,10 +155,10 @@ int socket_address_print(const SocketAddress *a, char **ret) {
         assert(a);
         assert(ret);
 
-        r = socket_address_verify(a, false); /* We do non-strict validation, because we want to be
-                                              * able to pretty-print any socket the kernel considers
-                                              * valid. We still need to do validation to know if we
-                                              * can meaningfully print the address. */
+        r = socket_address_verify(a, /* strict= */ false); /* We do non-strict validation, because we want to be
+                                                            * able to pretty-print any socket the kernel considers
+                                                            * valid. We still need to do validation to know if we
+                                                            * can meaningfully print the address. */
         if (r < 0)
                 return r;
 
@@ -168,7 +176,7 @@ int socket_address_print(const SocketAddress *a, char **ret) {
                 return 0;
         }
 
-        return sockaddr_pretty(&a->sockaddr.sa, a->size, false, true, ret);
+        return sockaddr_pretty(&a->sockaddr.sa, a->size, /* translate_ipv6= */ false, /* include_port= */ true, ret);
 }
 
 bool socket_address_can_accept(const SocketAddress *a) {
@@ -183,8 +191,8 @@ bool socket_address_equal(const SocketAddress *a, const SocketAddress *b) {
         assert(b);
 
         /* Invalid addresses are unequal to all */
-        if (socket_address_verify(a, false) < 0 ||
-            socket_address_verify(b, false) < 0)
+        if (socket_address_verify(a, /* strict= */ false) < 0 ||
+            socket_address_verify(b, /* strict= */ false) < 0)
                 return false;
 
         if (a->type != b->type)
@@ -222,13 +230,14 @@ bool socket_address_equal(const SocketAddress *a, const SocketAddress *b) {
                         return false;
 
                 if (a->sockaddr.un.sun_path[0]) {
-                        if (!path_equal_or_inode_same(a->sockaddr.un.sun_path, b->sockaddr.un.sun_path, 0))
+                        if (!path_equal_or_inode_same(a->sockaddr.un.sun_path, b->sockaddr.un.sun_path, /* flags= */ 0))
                                 return false;
                 } else {
                         if (a->size != b->size)
                                 return false;
 
-                        if (memcmp(a->sockaddr.un.sun_path, b->sockaddr.un.sun_path, a->size) != 0)
+                        if (memcmp(a->sockaddr.un.sun_path, b->sockaddr.un.sun_path,
+                                   a->size - offsetof(struct sockaddr_un, sun_path)) != 0)
                                 return false;
                 }
 
@@ -323,7 +332,6 @@ bool socket_ipv6_is_enabled(void) {
 
 bool socket_address_matches_fd(const SocketAddress *a, int fd) {
         SocketAddress b;
-        socklen_t solen;
 
         assert(a);
         assert(fd >= 0);
@@ -335,16 +343,14 @@ bool socket_address_matches_fd(const SocketAddress *a, int fd) {
         if (b.sockaddr.sa.sa_family != a->sockaddr.sa.sa_family)
                 return false;
 
-        solen = sizeof(b.type);
-        if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &b.type, &solen) < 0)
+        if (getsockopt_int(fd, SOL_SOCKET, SO_TYPE, &b.type) < 0)
                 return false;
 
         if (b.type != a->type)
                 return false;
 
         if (a->protocol != 0)  {
-                solen = sizeof(b.protocol);
-                if (getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &b.protocol, &solen) < 0)
+                if (getsockopt_int(fd, SOL_SOCKET, SO_PROTOCOL, &b.protocol) < 0)
                         return false;
 
                 if (b.protocol != a->protocol)
@@ -360,6 +366,7 @@ int sockaddr_port(const struct sockaddr *_sa, unsigned *ret_port) {
         /* Note, this returns the port as 'unsigned' rather than 'uint16_t', as AF_VSOCK knows larger ports */
 
         assert(sa);
+        assert(ret_port);
 
         switch (sa->sa.sa_family) {
 
@@ -602,7 +609,7 @@ int getpeername_pretty(int fd, bool include_port, char **ret) {
         /* For remote sockets we translate IPv6 addresses back to IPv4
          * if applicable, since that's nicer. */
 
-        return sockaddr_pretty(&sa.sa, salen, true, include_port, ret);
+        return sockaddr_pretty(&sa.sa, salen, /* translate_ipv6= */ true, include_port, ret);
 }
 
 int getsockname_pretty(int fd, char **ret) {
@@ -620,7 +627,7 @@ int getsockname_pretty(int fd, char **ret) {
          * listening sockets where the difference between IPv4 and
          * IPv6 matters. */
 
-        return sockaddr_pretty(&sa.sa, salen, false, true, ret);
+        return sockaddr_pretty(&sa.sa, salen, /* translate_ipv6= */ false, /* include_port= */ true, ret);
 }
 
 int socknameinfo_pretty(const struct sockaddr *sa, socklen_t salen, char **ret) {
@@ -677,26 +684,28 @@ bool sockaddr_equal(const union sockaddr_union *a, const union sockaddr_union *b
                 return false;
 
         if (a->sa.sa_family == AF_INET)
-                return a->in.sin_addr.s_addr == b->in.sin_addr.s_addr;
+                return a->in.sin_addr.s_addr == b->in.sin_addr.s_addr &&
+                        a->in.sin_port == b->in.sin_port;
 
         if (a->sa.sa_family == AF_INET6)
-                return memcmp(&a->in6.sin6_addr, &b->in6.sin6_addr, sizeof(a->in6.sin6_addr)) == 0;
+                return in6_addr_equal(&a->in6.sin6_addr, &b->in6.sin6_addr) &&
+                        a->in6.sin6_port == b->in6.sin6_port;
 
         if (a->sa.sa_family == AF_VSOCK)
-                return a->vm.svm_cid == b->vm.svm_cid;
+                return a->vm.svm_cid == b->vm.svm_cid &&
+                        a->vm.svm_port == b->vm.svm_port;
 
         return false;
 }
 
 int fd_set_sndbuf(int fd, size_t n, bool increase) {
         int r, value;
-        socklen_t l = sizeof(value);
 
         if (n > INT_MAX)
                 return -ERANGE;
 
-        r = getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &value, &l);
-        if (r >= 0 && l == sizeof(value) && increase ? (size_t) value >= n*2 : (size_t) value == n*2)
+        if (getsockopt_int(fd, SOL_SOCKET, SO_SNDBUF, &value) >= 0 &&
+            (increase ? (size_t) value >= n*2 : (size_t) value == n*2))
                 return 0;
 
         /* First, try to set the buffer size with SO_SNDBUF. */
@@ -706,9 +715,8 @@ int fd_set_sndbuf(int fd, size_t n, bool increase) {
 
         /* SO_SNDBUF above may set to the kernel limit, instead of the requested size.
          * So, we need to check the actual buffer size here. */
-        l = sizeof(value);
-        r = getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &value, &l);
-        if (r >= 0 && l == sizeof(value) && increase ? (size_t) value >= n*2 : (size_t) value == n*2)
+        if (getsockopt_int(fd, SOL_SOCKET, SO_SNDBUF, &value) >= 0 &&
+            (increase ? (size_t) value >= n*2 : (size_t) value == n*2))
                 return 1;
 
         /* If we have the privileges we will ignore the kernel limit. */
@@ -721,13 +729,12 @@ int fd_set_sndbuf(int fd, size_t n, bool increase) {
 
 int fd_set_rcvbuf(int fd, size_t n, bool increase) {
         int r, value;
-        socklen_t l = sizeof(value);
 
         if (n > INT_MAX)
                 return -ERANGE;
 
-        r = getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, &l);
-        if (r >= 0 && l == sizeof(value) && increase ? (size_t) value >= n*2 : (size_t) value == n*2)
+        if (getsockopt_int(fd, SOL_SOCKET, SO_RCVBUF, &value) >= 0 &&
+            (increase ? (size_t) value >= n*2 : (size_t) value == n*2))
                 return 0;
 
         /* First, try to set the buffer size with SO_RCVBUF. */
@@ -737,9 +744,8 @@ int fd_set_rcvbuf(int fd, size_t n, bool increase) {
 
         /* SO_RCVBUF above may set to the kernel limit, instead of the requested size.
          * So, we need to check the actual buffer size here. */
-        l = sizeof(value);
-        r = getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &value, &l);
-        if (r >= 0 && l == sizeof(value) && increase ? (size_t) value >= n*2 : (size_t) value == n*2)
+        if (getsockopt_int(fd, SOL_SOCKET, SO_RCVBUF, &value) >= 0 &&
+            (increase ? (size_t) value >= n*2 : (size_t) value == n*2))
                 return 1;
 
         /* If we have the privileges we will ignore the kernel limit. */
@@ -824,6 +830,8 @@ bool ifname_valid_full(const char *p, IfnameValidFlags flags) {
 
 bool address_label_valid(const char *p) {
 
+        POINTER_MAY_BE_NULL(p);
+
         if (isempty(p))
                 return false;
 
@@ -904,7 +912,7 @@ int getpeergroups(int fd, gid_t **ret) {
         assert(fd >= 0);
         assert(ret);
 
-        long ngroups_max = sysconf(_SC_NGROUPS_MAX);
+        int ngroups_max = sysconf_ngroups_max();
         if (ngroups_max > 0)
                 n = MAX(n, sizeof(gid_t) * (socklen_t) ngroups_max);
 
@@ -933,13 +941,15 @@ int getpeergroups(int fd, gid_t **ret) {
         return (int) n;
 }
 
-int getpeerpidfd(int fd) {
+int getpeerpidfd_full(int fd, unsigned flags) {
         socklen_t n = sizeof(int);
         int pidfd = -EBADF;
 
         assert(fd >= 0);
+        assert((flags & ~PIDFD_THREAD) == 0);
 
-        if (getsockopt(fd, SOL_SOCKET, SO_PEERPIDFD, &pidfd, &n) < 0)
+        int opt = FLAGS_SET(flags, PIDFD_THREAD) ? SO_PEERPIDFD_THREAD : SO_PEERPIDFD;
+        if (getsockopt(fd, SOL_SOCKET, opt, &pidfd, &n) < 0)
                 return -errno;
 
         if (n != sizeof(int))
@@ -1022,7 +1032,7 @@ int send_one_fd_sa(
 
         assert(fd >= 0);
 
-        return (int) send_one_fd_iov_sa(transport_fd, fd, NULL, 0, sa, len, flags);
+        return (int) send_one_fd_iov_sa(transport_fd, fd, /* iov= */ NULL, /* iovlen= */ 0, sa, len, flags);
 }
 
 ssize_t receive_one_fd_iov(
@@ -1052,7 +1062,7 @@ ssize_t receive_one_fd_iov(
          * combination with send_one_fd().
          */
 
-        k = recvmsg_safe(transport_fd, &mh, MSG_CMSG_CLOEXEC | flags);
+        k = recvmsg_safe(transport_fd, &mh, flags);
         if (k < 0)
                 return k;
 
@@ -1077,7 +1087,7 @@ int receive_one_fd(int transport_fd, int flags) {
         int fd;
         ssize_t k;
 
-        k = receive_one_fd_iov(transport_fd, NULL, 0, flags, &fd);
+        k = receive_one_fd_iov(transport_fd, /* iov= */ NULL, /* iovlen= */ 0, flags, &fd);
         if (k == 0)
                 return fd;
 
@@ -1128,15 +1138,13 @@ fallback:
 int flush_accept(int fd) {
 
         int r, b;
-        socklen_t l = sizeof(b);
 
         /* Similar to flush_fd() but flushes all incoming connections by accepting and immediately closing
          * them. */
 
-        if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &b, &l) < 0)
-                return -errno;
-
-        assert(l == sizeof(b));
+        r = getsockopt_int(fd, SOL_SOCKET, SO_ACCEPTCONN, &b);
+        if (r < 0)
+                return r;
         if (!b) /* Let's check if this socket accepts connections before calling accept(). accept4() can
                  * return EOPNOTSUPP if the fd is not a listening socket, which we should treat as a fatal
                  * error, or in case the incoming TCP connection triggered a network issue, which we want to
@@ -1147,7 +1155,7 @@ int flush_accept(int fd) {
         for (unsigned iteration = 0;; iteration++) {
                 int cfd;
 
-                r = fd_wait_for_event(fd, POLLIN, 0);
+                r = fd_wait_for_event(fd, POLLIN, /* timeout= */ 0);
                 if (r == -EINTR)
                         continue;
                 if (r <= 0)
@@ -1256,6 +1264,7 @@ size_t sockaddr_ll_len(const struct sockaddr_ll *sa) {
          * must be passed to kernel. */
 
         assert(sa->sll_family == AF_PACKET);
+        assert(sa->sll_halen <= HW_ADDR_MAX_SIZE);
 
         size_t mac_len = sizeof(sa->sll_addr);
 
@@ -1263,6 +1272,11 @@ size_t sockaddr_ll_len(const struct sockaddr_ll *sa) {
                 mac_len = MAX(mac_len, (size_t) ETH_ALEN);
         if (be16toh(sa->sll_hatype) == ARPHRD_INFINIBAND)
                 mac_len = MAX(mac_len, (size_t) INFINIBAND_ALEN);
+
+        /* The kernel ignores sll_hatype when sending, and only requires the address length to cover
+         * sll_halen bytes. Hence also honor sll_halen, so that a sockaddr filled with a long address
+         * but without a hardware type is sized correctly. */
+        mac_len = MAX(mac_len, (size_t) sa->sll_halen);
 
         return offsetof(struct sockaddr_ll, sll_addr) + mac_len;
 }
@@ -1279,6 +1293,8 @@ size_t sockaddr_un_len(const struct sockaddr_un *sa) {
 }
 
 size_t sockaddr_len(const union sockaddr_union *sa) {
+        assert(sa);
+
         switch (sa->sa.sa_family) {
         case AF_INET:
                 return sizeof(struct sockaddr_in);
@@ -1447,18 +1463,86 @@ int socket_autobind(int fd, char **ret_name) {
         return 0;
 }
 
-ssize_t recvmsg_safe(int sockfd, struct msghdr *msg, int flags) {
-        ssize_t n;
+static int validate_source_port(const struct msghdr *msg, RecvMsgSafeFlags safe_flags) {
+        assert(msg);
 
-        /* A wrapper around recvmsg() that checks for MSG_CTRUNC and MSG_TRUNC, and turns them into an error,
-         * in a reasonably safe way, closing any received fds in the error path.
+        /* UDP (and similar) datagrams originating from port 0 are never legitimate: nobody can reply to
+         * them (the kernel refuses sending to port 0), and code processing them tends to get confused by
+         * the zero port. Returns 0 if the source address of the message is an AF_INET/AF_INET6 one with
+         * port 0, > 0 otherwise (including if the caller didn't ask for the source address), and -ENOTNAM
+         * if the source address is too short for its address family. If RECVMSG_SAFE_ALLOW_PORT_ZERO is
+         * set in safe_flags, nothing is checked. */
+
+        /* Caller didn't ask for the source address, or none is known (e.g. unbound AF_UNIX peer) */
+        if (msg->msg_namelen == 0)
+                return 1;
+
+        assert(msg->msg_name);
+        assert(msg->msg_namelen >= endoffsetof_field(struct sockaddr, sa_family)); /* Already checked by caller */
+
+        /* Caller explicitly wants port 0 (e.g. for raw IP sockets, which have no ports) */
+        if (FLAGS_SET(safe_flags, RECVMSG_SAFE_ALLOW_PORT_ZERO))
+                return 1;
+
+        switch (((const struct sockaddr*) msg->msg_name)->sa_family) {
+
+        case AF_INET: {
+                if (msg->msg_namelen < sizeof(struct sockaddr_in))
+                        return -ENOTNAM;
+
+                const struct sockaddr_in *sin = msg->msg_name;
+                return sin->sin_port != 0;
+        }
+
+        case AF_INET6: {
+                if (msg->msg_namelen < sizeof(struct sockaddr_in6))
+                        return -ENOTNAM;
+
+                const struct sockaddr_in6 *sin6 = msg->msg_name;
+                return sin6->sin6_port != 0;
+        }
+
+        case AF_VSOCK:
+                /* No port check on AF_VSOCK: port 0 is apparently a valid port number there (unlike
+                 * VMADDR_PORT_ANY, which is -1U). */
+                return 1;
+
+        default:
+                return 1;
+        }
+}
+
+ssize_t recvmsg_safe_full(int sockfd, struct msghdr *msg, int flags, RecvMsgSafeFlags safe_flags) {
+        ssize_t n;
+        int r;
+
+        /* A wrapper around recvmsg() that checks for MSG_CTRUNC and MSG_TRUNC, as well as for a truncated
+         * source address, and turns them into an error, in a reasonably safe way, closing any received fds
+         * in the error path.
          *
-         * Note that unlike our usual coding style this might modify *msg on failure. */
+         * Note that unlike our usual coding style this might modify *msg on failure.
+         *
+         * Received fds always get O_CLOEXEC.
+         *
+         * Datagrams from source port 0 are suppressed, unless RECVMSG_SAFE_ALLOW_PORT_ZERO is set, see
+         * validate_source_port(). */
 
         assert(sockfd >= 0);
         assert(msg);
 
-        n = recvmsg(sockfd, msg, flags);
+        /* Passing a non-zero size along with a NULL pointer would be very weird (the kernel will e.g. ignore
+         * .msg_namelen if .msg_name is NULL), and probably a programming error, hence let's assert on it. */
+        assert(msg->msg_namelen == 0 || msg->msg_name);
+        assert(msg->msg_iovlen == 0 || msg->msg_iov);
+        assert(msg->msg_controllen == 0 || msg->msg_control);
+
+        socklen_t name_size = msg->msg_namelen;
+
+        /* Fds can only be received into a control buffer. Protocols that can't pass fds might refuse
+         * MSG_CMSG_CLOEXEC, AF_PACKET does with EINVAL, MCTP with EOPNOTSUPP. Retry without it then. */
+        n = recvmsg(sockfd, msg, flags | (msg->msg_controllen > 0 ? MSG_CMSG_CLOEXEC : 0));
+        if (n < 0 && msg->msg_controllen > 0 && IN_SET(errno, EINVAL, EOPNOTSUPP))
+                n = recvmsg(sockfd, msg, flags);
         if (n < 0)
                 return -errno;
 
@@ -1468,18 +1552,37 @@ ssize_t recvmsg_safe(int sockfd, struct msghdr *msg, int flags) {
                 return FLAGS_SET(msg->msg_flags, MSG_CTRUNC) ? -ECHRNG : -EXFULL;
         }
 
+        /* If the source address doesn't fit into the buffer the kernel silently truncates it, but reports
+         * its full size in msg_namelen, without setting any flag. Refuse that too. Also refuse source
+         * addresses that are too short to even carry the address family, that's just broken. */
+        if (msg->msg_namelen > name_size ||
+            (msg->msg_namelen > 0 && msg->msg_namelen < endoffsetof_field(struct sockaddr, sa_family))) {
+                cmsg_close_all(msg);
+                return -ENOTNAM;
+        }
+
+        /* Suppress datagrams from port 0 early on, and make them look like a spurious wakeup */
+        r = validate_source_port(msg, safe_flags);
+        if (r <= 0) {
+                cmsg_close_all(msg);
+
+                /* If we only peeked, the datagram is still queued, and we'd see it again and again.
+                 * Hence, drop it from the queue. */
+                if (FLAGS_SET(flags, MSG_PEEK))
+                        (void) recv(sockfd, /* buf= */ NULL, /* size= */ 0, MSG_DONTWAIT);
+
+                return r < 0 ? r : -EAGAIN;
+        }
+
         return n;
 }
 
 int socket_get_family(int fd) {
-        int af;
-        socklen_t sl = sizeof(af);
+        int af, r;
 
-        if (getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &af, &sl) < 0)
-                return -errno;
-
-        if (sl != sizeof(af))
-                return -EINVAL;
+        r = getsockopt_int(fd, SOL_SOCKET, SO_DOMAIN, &af);
+        if (r < 0)
+                return r;
 
         return af;
 }
@@ -1556,6 +1659,8 @@ int socket_set_option(int fd, int af, int opt_ipv4, int opt_ipv6, int val) {
 int socket_get_mtu(int fd, int af, size_t *ret) {
         int mtu, r;
 
+        assert(ret);
+
         if (af == AF_UNSPEC) {
                 af = socket_get_family(fd);
                 if (af < 0)
@@ -1613,13 +1718,17 @@ int connect_unix_path(int fd, int dir_fd, const char *path) {
         _cleanup_close_ int inode_fd = -EBADF;
 
         assert(fd >= 0);
-        assert(dir_fd == AT_FDCWD || dir_fd >= 0);
+        assert(wildcard_fd_is_valid(dir_fd));
 
         /* Connects to the specified AF_UNIX socket in the file system. Works around the 108 byte size limit
          * in sockaddr_un, by going via O_PATH if needed. This hence works for any kind of path. */
 
-        if (!path)
+        if (!path) {
+                if (dir_fd < 0)
+                        return -EISDIR;
+
                 return connect_unix_inode(fd, dir_fd); /* If no path is specified, then dir_fd refers to the socket inode to connect to. */
+        }
 
         /* Refuse zero length path early, to make sure AF_UNIX stack won't mistake this for an abstract
          * namespace path, since first char is NUL */
@@ -1634,9 +1743,9 @@ int connect_unix_path(int fd, int dir_fd, const char *path) {
          * exist. If the path is too long, we also need to take the indirect route, since we can't fit this
          * into a sockaddr_un directly. */
 
-        inode_fd = openat(dir_fd, path, O_PATH|O_CLOEXEC);
+        inode_fd = xopenat(dir_fd, path, O_PATH);
         if (inode_fd < 0)
-                return -errno;
+                return inode_fd;
 
         return connect_unix_inode(fd, inode_fd);
 }
@@ -1711,7 +1820,7 @@ int vsock_parse_cid(const char *s, unsigned *ret) {
                 return -EINVAL;
 
         /* Parsed an AF_VSOCK "CID". This is a 32bit entity, and the usual type is "unsigned". We recognize
-         * the three special CIDs as strings, and otherwise parse the numeric CIDs. */
+         * the four special CIDs as strings, and otherwise parse the numeric CIDs. */
 
         if (streq(s, "hypervisor"))
                 *ret = VMADDR_CID_HYPERVISOR;
@@ -1719,6 +1828,8 @@ int vsock_parse_cid(const char *s, unsigned *ret) {
                 *ret = VMADDR_CID_LOCAL;
         else if (streq(s, "host"))
                 *ret = VMADDR_CID_HOST;
+        else if (STR_IN_SET(s, "any", "-1"))
+                *ret = VMADDR_CID_ANY;
         else
                 return safe_atou(s, ret);
 
@@ -1776,30 +1887,6 @@ int socket_address_parse_vsock(SocketAddress *ret_address, const char *s) {
                 .size = sizeof(struct sockaddr_vm),
         };
 
-        return 0;
-}
-
-int vsock_get_local_cid(unsigned *ret) {
-        _cleanup_close_ int vsock_fd = -EBADF;
-
-        vsock_fd = open("/dev/vsock", O_RDONLY|O_CLOEXEC);
-        if (vsock_fd < 0)
-                return log_debug_errno(errno, "Failed to open %s: %m", "/dev/vsock");
-
-        unsigned tmp;
-        if (ioctl(vsock_fd, IOCTL_VM_SOCKETS_GET_LOCAL_CID, &tmp) < 0)
-                return log_debug_errno(errno, "Failed to query local AF_VSOCK CID: %m");
-        log_debug("Local AF_VSOCK CID: %u", tmp);
-
-        /* If ret == NULL, we're just want to check if AF_VSOCK is available, so accept
-         * any address. Otherwise, filter out special addresses that are cannot be used
-         * to identify _this_ machine from the outside. */
-        if (ret && IN_SET(tmp, VMADDR_CID_LOCAL, VMADDR_CID_HOST, VMADDR_CID_ANY))
-                return log_debug_errno(SYNTHETIC_ERRNO(EADDRNOTAVAIL),
-                                       "IOCTL_VM_SOCKETS_GET_LOCAL_CID returned special value (%u), ignoring.", tmp);
-
-        if (ret)
-                *ret = tmp;
         return 0;
 }
 
@@ -1867,4 +1954,54 @@ void cmsg_close_all(struct msghdr *mh) {
                         safe_close(*CMSG_TYPED_DATA(cmsg, int));
                 }
         }
+}
+
+int tos_to_priority(uint8_t tos) {
+        /* Map the IP Precedence (top 3 bits of the TOS field) to Linux internal packet priorities
+         * (TC_PRIO_*). This exactly mirrors the standard Linux kernel IP precedence-to-priority mapping
+         * (rt_tos2priority) to ensure consistent behavior when explicitly setting SO_PRIORITY. */
+        switch (IPTOS_PREC(tos)) {
+        case IPTOS_PREC_NETCONTROL:      /* 0xc0 (CS7) - Network Control. Used for infrastructure control (e.g., STP, keepalives). */
+        case IPTOS_PREC_INTERNETCONTROL: /* 0xe0 (CS6) - Internetwork Control. Used for routing protocols (e.g., OSPF, BGP) and DHCP. */
+                return TC_PRIO_CONTROL;
+
+        case IPTOS_PREC_CRITIC_ECP:      /* 0xa0 (CS5) - Critical. Used for delay-sensitive traffic like Voice over IP (VoIP). */
+        case IPTOS_PREC_FLASHOVERRIDE:   /* 0x80 (CS4) - Flash Override. Used for interactive video and multimedia. */
+                return TC_PRIO_INTERACTIVE;
+
+        case IPTOS_PREC_FLASH:           /* 0x60 (CS3) - Flash. Used for broadcast video and call signaling (e.g., SIP). */
+        case IPTOS_PREC_IMMEDIATE:       /* 0x40 (CS2) - Immediate. Used for OAM (Operations, Administration, and Management) and transactional data. */
+                return TC_PRIO_INTERACTIVE_BULK;
+
+        case IPTOS_PREC_PRIORITY:        /* 0x20 (CS1) - Priority. Used for background traffic and bulk data transfers. */
+                return TC_PRIO_BULK;
+
+        case IPTOS_PREC_ROUTINE:         /* 0x00 (CS0) - Routine. Best effort traffic. */
+        default:
+                return TC_PRIO_BESTEFFORT;
+        }
+}
+
+int socket_xattr_supported(void) {
+        int r;
+
+        // FIXME: Drop this check once Linux 7.1 becomes our baseline
+
+        static int cached = -1;
+        if (cached >= 0)
+                return cached;
+
+        _cleanup_close_ int fd = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC, /* protocol= */ 0);
+        if (fd < 0)
+                return -errno;
+
+        /* Old kernels return EPERM. But let's also check for more appropriate error codes, to be friendly to
+         * seccomp policies */
+        r = xsetxattr(fd, /* path= */ NULL, AT_EMPTY_PATH, "user.testxxx", "1");
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r) || r == -EPERM)
+                return (cached = false);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to set test xattr on socket: %m");
+
+        return (cached = true);
 }

@@ -7,6 +7,7 @@ typedef enum ResolveConfigSource {
         RESOLVE_CONFIG_SOURCE_FILE,
         RESOLVE_CONFIG_SOURCE_NETWORKD,
         RESOLVE_CONFIG_SOURCE_DBUS,
+        RESOLVE_CONFIG_SOURCE_VARLINK,
         _RESOLVE_CONFIG_SOURCE_MAX,
         _RESOLVE_CONFIG_SOURCE_INVALID = -EINVAL,
 } ResolveConfigSource;
@@ -19,4 +20,5 @@ CONFIG_PARSER_PROTOTYPE(config_parse_dns_servers);
 CONFIG_PARSER_PROTOTYPE(config_parse_search_domains);
 CONFIG_PARSER_PROTOTYPE(config_parse_dns_stub_listener_mode);
 CONFIG_PARSER_PROTOTYPE(config_parse_dns_stub_listener_extra);
+CONFIG_PARSER_PROTOTYPE(config_parse_dns_cache_max);
 CONFIG_PARSER_PROTOTYPE(config_parse_record_types);

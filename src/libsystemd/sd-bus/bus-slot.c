@@ -71,12 +71,12 @@ void bus_slot_disconnect(sd_bus_slot *slot, bool unref) {
                         (void) bus_remove_match_internal(slot->bus, slot->match_callback.match_string);
 
                 if (slot->match_callback.install_slot) {
-                        bus_slot_disconnect(slot->match_callback.install_slot, true);
+                        bus_slot_disconnect(slot->match_callback.install_slot, /* unref= */ true);
                         slot->match_callback.install_slot = sd_bus_slot_unref(slot->match_callback.install_slot);
                 }
 
                 slot->bus->match_callbacks_modified = true;
-                bus_match_remove(&slot->bus->match_callbacks, &slot->match_callback);
+                (void) bus_match_remove(&slot->bus->match_callbacks, &slot->match_callback);
 
                 slot->match_callback.match_string = mfree(slot->match_callback.match_string);
 
@@ -182,7 +182,7 @@ void bus_slot_disconnect(sd_bus_slot *slot, bool unref) {
 static sd_bus_slot* bus_slot_free(sd_bus_slot *slot) {
         assert(slot);
 
-        bus_slot_disconnect(slot, false);
+        bus_slot_disconnect(slot, /* unref= */ false);
 
         if (slot->destroy_callback)
                 slot->destroy_callback(slot->userdata);

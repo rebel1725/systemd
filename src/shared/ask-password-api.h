@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 
 typedef enum AskPasswordFlags {
         ASK_PASSWORD_ACCEPT_CACHED = 1 << 0,  /* read from kernel keyring */
@@ -30,8 +30,19 @@ typedef struct AskPasswordRequest {
         usec_t until;                /* CLOCK_MONOTONIC time until which to show the prompt (if zero: forever) */
 } AskPasswordRequest;
 
+#define ASK_PASSWORD_PRIVATE_KEY_PIN(tool, key)                 \
+        &(AskPasswordRequest) {                                 \
+                .tty_fd = -EBADF,                               \
+                .id = tool "-private-key-pin",                  \
+                .keyring = (key),                               \
+                .credential = tool ".private-key-pin",          \
+                .until = USEC_INFINITY,                         \
+                .hup_fd = -EBADF,                               \
+        }
+
 int ask_password_tty(const AskPasswordRequest *req, AskPasswordFlags flags, char ***ret);
 int ask_password_plymouth(const AskPasswordRequest *req, AskPasswordFlags flags, char ***ret);
+bool ask_password_agent_prompt_fields_are_safe(const AskPasswordRequest *req) _pure_;
 int ask_password_agent(const AskPasswordRequest *req, AskPasswordFlags flags, char ***ret);
 int ask_password_auto(const AskPasswordRequest *req, AskPasswordFlags flags, char ***ret);
 

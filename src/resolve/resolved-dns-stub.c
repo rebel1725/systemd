@@ -81,9 +81,9 @@ int dns_stub_listener_extra_new(
                 Manager *m,
                 DnsStubListenerExtra **ret) {
 
-        DnsStubListenerExtra *l;
+        assert(ret);
 
-        l = new(DnsStubListenerExtra, 1);
+        DnsStubListenerExtra *l = new(DnsStubListenerExtra, 1);
         if (!l)
                 return -ENOMEM;
 
@@ -101,6 +101,19 @@ DnsStubListenerExtra *dns_stub_listener_extra_free(DnsStubListenerExtra *p) {
 
         p->udp_event_source = sd_event_source_disable_unref(p->udp_event_source);
         p->tcp_event_source = sd_event_source_disable_unref(p->tcp_event_source);
+
+        assert(p->manager);
+
+        /* Detach the raw back-pointers that DnsStream and DnsQuery objects keep to this listener before we
+         * free it. Otherwise a later dns_stream_complete()/dns_query_free() during the same reload would
+         * dereference the freed slab: dns_query_free() reads q->stub_listener_extra->queries_by_packet. */
+        LIST_FOREACH(streams, s, p->manager->dns_streams)
+                if (s->stub_listener_extra == p)
+                        s->stub_listener_extra = NULL;
+
+        LIST_FOREACH(queries, q, p->manager->dns_queries)
+                if (q->stub_listener_extra == p)
+                        q->stub_listener_extra = NULL;
 
         hashmap_free(p->queries_by_packet);
 
@@ -165,7 +178,7 @@ static int reply_add_with_rrsig(
                 return r;
 
         if (with_rrsig && rrsig) {
-                r = dns_answer_add_extend(reply, rrsig, ifindex, flags, NULL);
+                r = dns_answer_add_extend(reply, rrsig, ifindex, flags, /* rrsig= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -189,12 +202,12 @@ static int dns_stub_collect_answer_by_question(
         DNS_ANSWER_FOREACH_ITEM(item, answer) {
 
                 /* We have a question, let's see if this RR matches it */
-                r = dns_question_matches_rr(question, item->rr, NULL);
+                r = dns_question_matches_rr(question, item->rr, /* search_domain= */ NULL);
                 if (r < 0)
                         return r;
                 if (!r) {
                         /* Maybe there's a CNAME/DNAME in here? If so, that's an answer too */
-                        r = dns_question_matches_cname_or_dname(question, item->rr, NULL);
+                        r = dns_question_matches_cname_or_dname(question, item->rr, /* search_domain= */ NULL);
                         if (r < 0)
                                 return r;
                         if (!r)
@@ -298,7 +311,7 @@ static int dns_stub_assign_sections(
                         &q->reply_authoritative,
                         q->answer,
                         DNS_ANSWER_SECTION_AUTHORITY,
-                        q->reply_answer, NULL,
+                        q->reply_answer, /* exclude2= */ NULL,
                         edns0_do);
         if (r < 0)
                 return r;
@@ -324,7 +337,7 @@ static int dns_stub_assign_sections(
         r = dns_stub_collect_answer_by_section(
                         &q->reply_additional,
                         q->answer,
-                        0,
+                        /* section= */ 0,
                         q->reply_answer, q->reply_authoritative,
                         edns0_do);
         if (r < 0)
@@ -345,7 +358,7 @@ static int dns_stub_make_reply_packet(
 
         assert(ret);
 
-        r = dns_packet_new(&p, DNS_PROTOCOL_DNS, 0, max_size);
+        r = dns_packet_new(&p, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, max_size);
         if (r < 0)
                 return r;
 
@@ -464,7 +477,7 @@ static int dns_stub_finish_reply_packet(
         assert(p);
 
         if (add_opt) {
-                r = dns_packet_append_opt(p, max_udp_size, edns0_do, /* include_rfc6975= */ false, nsid ? nsid_string() : NULL, rcode, NULL);
+                r = dns_packet_append_opt(p, max_udp_size, edns0_do, /* include_rfc6975= */ false, nsid ? nsid_string() : NULL, rcode, /* ret_start= */ NULL);
                 if (r == -EMSGSIZE) /* Hit the size limit? then indicate truncation */
                         tc = true;
                 else if (r < 0)
@@ -680,7 +693,7 @@ static int dns_stub_send_failure(
                         DNS_PACKET_ID(p),
                         rcode,
                         truncated,
-                        false,
+                        /* aa= */ false,
                         DNS_PACKET_RD(p),
                         !!p->opt,
                         dns_packet_do(p),
@@ -694,7 +707,7 @@ static int dns_stub_send_failure(
         return dns_stub_send(m, l, s, p, reply);
 }
 
-static int dns_stub_patch_bypass_reply_packet(
+int dns_stub_patch_bypass_reply_packet(
                 DnsPacket **ret,       /* Where to place the patched packet */
                 DnsPacket *original,   /* The packet to patch */
                 DnsPacket *request,    /* The packet the patched packet shall look like a reply to */
@@ -735,7 +748,10 @@ static int dns_stub_patch_bypass_reply_packet(
          * set the TC bit if our reply is larger than what the client supports, and truncate. */
         if (c->size > dns_packet_payload_size_max(request)) {
                 log_debug("Artificially truncating stub response, as advertised size of client is smaller than upstream one.");
-                dns_packet_truncate(c, dns_packet_payload_size_max(request));
+                r = dns_packet_truncate_rrs(c, dns_packet_payload_size_max(request),
+                                            /* reserve_opt= */ !!request->opt);
+                if (r < 0)
+                        return r;
                 DNS_PACKET_HEADER(c)->flags = htobe16(be16toh(DNS_PACKET_HEADER(c)->flags) | DNS_PACKET_FLAG_TC);
         }
 
@@ -926,60 +942,52 @@ static void dns_stub_process_query(Manager *m, DnsStubListenerExtra *l, DnsStrea
         if (!l && /* l == NULL if this is the main stub */
             !address_is_proxy(p->family, &p->destination) && /* don't restrict needlessly for 127.0.0.54 */
             (in_addr_is_localhost(p->family, &p->sender) <= 0 ||
-             in_addr_is_localhost(p->family, &p->destination) <= 0)) {
-                log_warning("Got packet on unexpected (i.e. non-localhost) IP range, ignoring.");
-                return;
-        }
+             in_addr_is_localhost(p->family, &p->destination) <= 0))
+                return (void) log_warning("Got packet on unexpected (i.e. non-localhost) IP range, ignoring.");
 
-        if (manager_packet_from_our_transaction(m, p)) {
-                log_debug("Got our own packet looped back, ignoring.");
-                return;
-        }
+        if (manager_packet_from_our_transaction(m, p))
+                return (void) log_debug("Got our own packet looped back, ignoring.");
 
         queries_by_packet = l ? &l->queries_by_packet : &m->stub_queries_by_packet;
         existing = hashmap_get(*queries_by_packet, p);
-        if (existing && dns_packet_equal(existing->request_packet, p)) {
-                log_debug("Got repeat packet from client, ignoring.");
-                return;
-        }
+        if (existing && dns_packet_equal(existing->request_packet, p))
+                return (void) log_debug("Got repeat packet from client, ignoring.");
 
         r = dns_packet_extract(p);
         if (r < 0) {
                 log_debug_errno(r, "Failed to extract resources from incoming packet, ignoring packet: %m");
-                dns_stub_send_failure(m, l, s, p, DNS_RCODE_FORMERR, false);
+                dns_stub_send_failure(m, l, s, p, DNS_RCODE_FORMERR, /* authenticated= */ false);
                 return;
         }
 
         if (!dns_packet_version_supported(p)) {
                 log_debug("Got EDNS OPT field with unsupported version number.");
-                dns_stub_send_failure(m, l, s, p, DNS_RCODE_BADVERS, false);
+                dns_stub_send_failure(m, l, s, p, DNS_RCODE_BADVERS, /* authenticated= */ false);
                 return;
         }
 
         if (dns_type_is_obsolete(dns_question_first_key(p->question)->type)) {
                 log_debug("Got message with obsolete key type, refusing.");
-                dns_stub_send_failure(m, l, s, p, DNS_RCODE_REFUSED, false);
+                dns_stub_send_failure(m, l, s, p, DNS_RCODE_REFUSED, /* authenticated= */ false);
                 return;
         }
 
         if (dns_type_is_zone_transfer(dns_question_first_key(p->question)->type)) {
                 log_debug("Got request for zone transfer, refusing.");
-                dns_stub_send_failure(m, l, s, p, DNS_RCODE_REFUSED, false);
+                dns_stub_send_failure(m, l, s, p, DNS_RCODE_REFUSED, /* authenticated= */ false);
                 return;
         }
 
         if (!DNS_PACKET_RD(p))  {
                 /* If the "rd" bit is off (i.e. recursion was not requested), then refuse operation */
                 log_debug("Got request with recursion disabled, refusing.");
-                dns_stub_send_failure(m, l, s, p, DNS_RCODE_REFUSED, false);
+                dns_stub_send_failure(m, l, s, p, DNS_RCODE_REFUSED, /* authenticated= */ false);
                 return;
         }
 
         r = hashmap_ensure_allocated(queries_by_packet, &stub_packet_hash_ops);
-        if (r < 0) {
-                log_oom();
-                return;
-        }
+        if (r < 0)
+                return (void) log_oom();
 
         if (address_is_proxy(p->family, &p->destination)) {
                 _cleanup_free_ char *dipa = NULL;
@@ -997,7 +1005,7 @@ static void dns_stub_process_query(Manager *m, DnsStubListenerExtra *l, DnsStrea
         }
 
         if (bypass)
-                r = dns_query_new(m, &q, NULL, NULL, p, 0,
+                r = dns_query_new(m, &q, /* question_utf8= */ NULL, /* question_idna= */ NULL, p, /* ifindex= */ 0,
                                   protocol_flags|
                                   SD_RESOLVED_NO_CNAME|
                                   SD_RESOLVED_NO_SEARCH|
@@ -1006,17 +1014,17 @@ static void dns_stub_process_query(Manager *m, DnsStubListenerExtra *l, DnsStrea
                                   SD_RESOLVED_CLAMP_TTL|
                                   SD_RESOLVED_RELAX_SINGLE_LABEL);
         else
-                r = dns_query_new(m, &q, p->question, p->question, NULL, 0,
+                r = dns_query_new(m, &q, p->question, p->question, /* question_bypass= */ NULL, /* ifindex= */ 0,
                                   protocol_flags|
                                   SD_RESOLVED_NO_SEARCH|
                                   (DNS_PACKET_CD(p) ? SD_RESOLVED_NO_VALIDATE | SD_RESOLVED_NO_CACHE : 0)|
                                   (dns_packet_do(p) ? SD_RESOLVED_REQUIRE_PRIMARY : 0)|
                                   SD_RESOLVED_CLAMP_TTL);
         if (r == -ENOANO) /* Refuse query if there is -ENOANO */
-                return (void) dns_stub_send_failure(m, l, s, p, DNS_RCODE_REFUSED, false);
+                return (void) dns_stub_send_failure(m, l, s, p, DNS_RCODE_REFUSED, /* authenticated= */ false);
         if (r < 0) {
                 log_error_errno(r, "Failed to generate query object: %m");
-                dns_stub_send_failure(m, l, s, p, DNS_RCODE_SERVFAIL, false);
+                dns_stub_send_failure(m, l, s, p, DNS_RCODE_SERVFAIL, /* authenticated= */ false);
                 return;
         }
 
@@ -1029,11 +1037,10 @@ static void dns_stub_process_query(Manager *m, DnsStubListenerExtra *l, DnsStrea
                 /* Remember which queries belong to this stream, so that we can cancel them when the stream
                  * is disconnected early */
 
-                r = set_ensure_put(&s->queries, NULL, q);
-                if (r < 0) {
-                        log_oom();
-                        return;
-                }
+                r = set_ensure_put(&s->queries, /* hash_ops= */ NULL, q);
+                if (r < 0)
+                        return (void) log_oom();
+
                 assert(r > 0);
         }
 
@@ -1045,7 +1052,7 @@ static void dns_stub_process_query(Manager *m, DnsStubListenerExtra *l, DnsStrea
         r = dns_query_go(q);
         if (r < 0) {
                 log_error_errno(r, "Failed to start query: %m");
-                dns_stub_send_failure(m, l, s, p, DNS_RCODE_SERVFAIL, false);
+                dns_stub_send_failure(m, l, s, p, DNS_RCODE_SERVFAIL, /* authenticated= */ false);
                 return;
         }
 
@@ -1108,7 +1115,7 @@ static int on_dns_stub_stream_internal(sd_event_source *s, int fd, uint32_t reve
                 return -errno;
         }
 
-        r = dns_stream_new(m, &stream, DNS_STREAM_STUB, DNS_PROTOCOL_DNS, cfd, NULL,
+        r = dns_stream_new(m, &stream, DNS_STREAM_STUB, DNS_PROTOCOL_DNS, cfd, /* tfo_address= */ NULL,
                            on_dns_stub_stream_packet, dns_stub_stream_complete, DNS_STREAM_STUB_TIMEOUT_USEC);
         if (r < 0) {
                 safe_close(cfd);
@@ -1138,7 +1145,7 @@ static int set_dns_stub_common_socket_options(int fd, int family) {
         assert(fd >= 0);
         assert(IN_SET(family, AF_INET, AF_INET6));
 
-        r = setsockopt_int(fd, SOL_SOCKET, SO_REUSEADDR, true);
+        r = setsockopt_int(fd, SOL_SOCKET, SO_REUSEADDR, /* value= */ true);
         if (r < 0)
                 return r;
 
@@ -1162,7 +1169,7 @@ static int set_dns_stub_common_tcp_socket_options(int fd) {
         if (r < 0)
                 log_debug_errno(r, "Failed to enable TCP_FASTOPEN on TCP listening socket, ignoring: %m");
 
-        r = setsockopt_int(fd, IPPROTO_TCP, TCP_NODELAY, true);
+        r = setsockopt_int(fd, IPPROTO_TCP, TCP_NODELAY, /* value= */ true);
         if (r < 0)
                 log_debug_errno(r, "Failed to enable TCP_NODELAY mode, ignoring: %m");
 
@@ -1251,7 +1258,7 @@ static int manager_dns_stub_fd(
         if (r < 0)
                 return r;
 
-        r = sd_event_source_set_io_fd_own(*event_source, true);
+        r = sd_event_source_set_io_fd_own(*event_source, /* own= */ true);
         if (r < 0)
                 return r;
 
@@ -1343,7 +1350,7 @@ static int manager_dns_stub_fd_extra(Manager *m, DnsStubListenerExtra *l, int ty
         if (r < 0)
                 goto fail;
 
-        r = sd_event_source_set_io_fd_own(*event_source, true);
+        r = sd_event_source_set_io_fd_own(*event_source, /* own= */ true);
         if (r < 0)
                 goto fail;
 

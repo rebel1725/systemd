@@ -6,22 +6,20 @@
 
 #include "tests.h"
 
-int main(int argc, char *argv[]) {
+TEST(journal_enum) {
         unsigned n = 0;
         _cleanup_(sd_journal_closep) sd_journal *j = NULL;
 
-        test_setup_logging(LOG_DEBUG);
+        ASSERT_OK(sd_journal_open(&j, SD_JOURNAL_LOCAL_ONLY | SD_JOURNAL_ASSUME_IMMUTABLE));
 
-        assert_se(sd_journal_open(&j, SD_JOURNAL_LOCAL_ONLY | SD_JOURNAL_ASSUME_IMMUTABLE) >= 0);
-
-        assert_se(sd_journal_add_match(j, "_TRANSPORT=syslog", SIZE_MAX) >= 0);
-        assert_se(sd_journal_add_match(j, "_UID=0", SIZE_MAX) >= 0);
+        ASSERT_OK(sd_journal_add_match(j, "_TRANSPORT=syslog", SIZE_MAX));
+        ASSERT_OK(sd_journal_add_match(j, "_UID=0", SIZE_MAX));
 
         SD_JOURNAL_FOREACH_BACKWARDS(j) {
                 const void *d;
                 size_t l;
 
-                assert_se(sd_journal_get_data(j, "MESSAGE", &d, &l) >= 0);
+                ASSERT_OK(sd_journal_get_data(j, "MESSAGE", &d, &l));
 
                 printf("%.*s\n", (int) l, (char*) d);
 
@@ -29,6 +27,6 @@ int main(int argc, char *argv[]) {
                 if (n >= 10)
                         break;
         }
-
-        return 0;
 }
+
+DEFINE_TEST_MAIN(LOG_DEBUG);

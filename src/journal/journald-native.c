@@ -10,11 +10,11 @@
 #include "fd-util.h"
 #include "format-util.h"
 #include "iovec-util.h"
-#include "journal-importer.h"
 #include "journal-internal.h"
 #include "journald-client.h"
 #include "journald-console.h"
 #include "journald-context.h"
+#include "journald-counters.h"
 #include "journald-kmsg.h"
 #include "journald-manager.h"
 #include "journald-native.h"
@@ -43,7 +43,13 @@ static void manager_process_entry_meta(
                 int *priority,
                 char **identifier,
                 char **message,
+                size_t *message_size,
                 pid_t *object_pid) {
+
+        assert(priority);
+        assert(identifier);
+        assert(message);
+        assert(message_size);
 
         /* We need to determine the priority of this entry for the rate limiting logic */
 
@@ -76,8 +82,10 @@ static void manager_process_entry_meta(
                 char *t;
 
                 t = memdup_suffix0(p + 8, l - 8);
-                if (t)
+                if (t) {
                         free_and_replace(*message, t);
+                        *message_size = l - 8;
+                }
 
         } else if (l > STRLEN("OBJECT_PID=") &&
                    l < STRLEN("OBJECT_PID=")  + DECIMAL_STR_MAX(pid_t) &&
@@ -107,11 +115,14 @@ static int manager_process_entry(
 
         size_t n = 0, j, tn = SIZE_MAX, entry_size = 0;
         char *identifier = NULL, *message = NULL;
+        size_t message_size = 0;
         struct iovec *iovec = NULL;
         int priority = LOG_INFO;
         pid_t object_pid = 0;
         const char *p;
         int r = 1;
+
+        assert(remaining);
 
         p = buffer;
 
@@ -140,7 +151,7 @@ static int manager_process_entry(
                 }
 
                 /* A property follows */
-                if (n > ENTRY_FIELD_COUNT_MAX) {
+                if (n >= ENTRY_FIELD_COUNT_MAX) {
                         log_debug("Received an entry that has more than " STRINGIFY(ENTRY_FIELD_COUNT_MAX) " fields, ignoring entry.");
                         goto finish;
                 }
@@ -156,7 +167,7 @@ static int manager_process_entry(
 
                 q = memchr(p, '=', e - p);
                 if (q) {
-                        if (journal_field_valid(p, q - p, false)) {
+                        if (journal_field_valid(p, q - p, /* allow_protected= */ false)) {
                                 size_t l;
 
                                 l = e - p;
@@ -180,6 +191,7 @@ static int manager_process_entry(
                                                           &priority,
                                                           &identifier,
                                                           &message,
+                                                          &message_size,
                                                           &object_pid);
                         }
 
@@ -224,7 +236,7 @@ static int manager_process_entry(
                         k[e - p] = '=';
                         memcpy(k + (e - p) + 1, e + 1 + sizeof(uint64_t), l);
 
-                        if (journal_field_valid(p, e - p, false)) {
+                        if (journal_field_valid(p, e - p, /* allow_protected= */ false)) {
                                 iovec[n] = IOVEC_MAKE(k, (e - p) + 1 + l);
                                 entry_size += iovec[n].iov_len;
                                 n++;
@@ -233,6 +245,7 @@ static int manager_process_entry(
                                                           &priority,
                                                           &identifier,
                                                           &message,
+                                                          &message_size,
                                                           &object_pid);
                         } else
                                 free(k);
@@ -256,14 +269,14 @@ static int manager_process_entry(
 
         r = 0; /* Success, we read the message. */
 
+        /* Count before any filtering or rate limiting */
+        manager_count_message(m, JOURNAL_TRANSPORT_NATIVE, priority);
+
         if (!client_context_test_priority(context, priority))
                 goto finish;
 
         if (message) {
-                /* Ensure message is not NULL, otherwise strlen(message) would crash. This check needs to
-                 * be here until manager_process_entry() is able to process messages containing \0 characters,
-                 * as we would have access to the actual size of message. */
-                r = client_context_check_keep_log(context, message, strlen(message));
+                r = client_context_check_keep_log(context, message, message_size);
                 if (r <= 0)
                         goto finish;
 
@@ -314,7 +327,10 @@ void manager_process_native_message(
         assert(buffer || buffer_size == 0);
 
         if (ucred && pid_is_valid(ucred->pid)) {
-                r = client_context_get(m, ucred->pid, ucred, label, /* unit_id= */ NULL, &context);
+                /* Pin the sender's context for the whole dispatch below, as processing an entry may look up
+                 * further contexts (e.g. for an OBJECT_PID=), which can flush already reaped entries from
+                 * the cache */
+                r = client_context_acquire(m, ucred->pid, ucred, label, /* unit_id= */ NULL, &context);
                 if (r < 0)
                         log_ratelimit_warning_errno(r, JOURNAL_LOG_RATELIMIT,
                                                     "Failed to retrieve credentials for PID " PID_FMT ", ignoring: %m",
@@ -326,6 +342,8 @@ void manager_process_native_message(
                                          (const uint8_t*) buffer + (buffer_size - remaining), &remaining,
                                          context, ucred, tv, label);
         } while (r == 0);
+
+        client_context_release(m, context);
 }
 
 static size_t entry_size_max_by_ucred(Manager *m, const struct ucred *ucred, const char *label) {
@@ -367,7 +385,9 @@ static size_t entry_size_max_by_ucred(Manager *m, const struct ucred *ucred, con
                         log_ratelimit_warning_errno(r, JOURNAL_LOG_RATELIMIT,
                                                     "Failed to retrieve credentials for PID " PID_FMT ", ignoring: %m",
                                                     ucred->pid);
-                else if (context->unit && startswith(context->unit, "systemd-coredump@"))
+                else if (context->unit &&
+                         (startswith(context->unit, "systemd-coredump@") ||
+                          streq(context->unit, "systemd-coredumpd.service")))
                         return ENTRY_SIZE_MAX;
         }
 
@@ -457,7 +477,7 @@ int manager_process_native_file(
                                                          "Failed to map memfd: %m");
 
                 manager_process_native_message(m, p, st.st_size, ucred, tv, label);
-                assert_se(munmap(p, ps) >= 0);
+                munmap_safe(p, ps);
 
                 return 0;
         }
@@ -480,7 +500,7 @@ int manager_process_native_file(
          * locking. Of course, this should normally not be necessary given the check above, but let's
          * better be safe than sorry, after all NFS is pretty confusing regarding file system flags,
          * and we better don't trust it, and so is SMB. */
-        r = fd_nonblock(fd, true);
+        r = fd_nonblock(fd, /* nonblock= */ true);
         if (r < 0)
                 return log_ratelimit_error_errno(r, JOURNAL_LOG_RATELIMIT,
                                                  "Failed to make fd non-blocking: %m");
@@ -529,19 +549,19 @@ int manager_open_native_socket(Manager *m, const char *native_socket) {
 
                 (void) chmod(sa.un.sun_path, 0666);
         } else
-                (void) fd_nonblock(m->native_fd, true);
+                (void) fd_nonblock(m->native_fd, /* nonblock= */ true);
 
-        r = setsockopt_int(m->native_fd, SOL_SOCKET, SO_PASSCRED, true);
+        r = setsockopt_int(m->native_fd, SOL_SOCKET, SO_PASSCRED, /* value= */ true);
         if (r < 0)
                 return log_error_errno(r, "SO_PASSCRED failed: %m");
 
         if (mac_selinux_use()) {
-                r = setsockopt_int(m->native_fd, SOL_SOCKET, SO_PASSSEC, true);
+                r = setsockopt_int(m->native_fd, SOL_SOCKET, SO_PASSSEC, /* value= */ true);
                 if (r < 0)
                         log_full_errno(ERRNO_IS_NEG_NOT_SUPPORTED(r) ? LOG_DEBUG : LOG_WARNING, r, "SO_PASSSEC failed, ignoring: %m");
         }
 
-        r = setsockopt_int(m->native_fd, SOL_SOCKET, SO_TIMESTAMP, true);
+        r = setsockopt_int(m->native_fd, SOL_SOCKET, SO_TIMESTAMP, /* value= */ true);
         if (r < 0)
                 return log_error_errno(r, "SO_TIMESTAMP failed: %m");
 

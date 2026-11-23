@@ -78,12 +78,12 @@ int extract_first_word(const char **p, char **ret, const char *separators, Extra
                                 return -EINVAL;
                         }
 
-                        if (flags & (EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS)) {
+                        if (flags & (EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_SEPARATORS|EXTRACT_UNESCAPE_RELAX)) {
                                 bool eight_bit = false;
                                 char32_t u;
 
                                 if ((flags & EXTRACT_CUNESCAPE) &&
-                                    (r = cunescape_one(*p, SIZE_MAX, &u, &eight_bit, false)) >= 0) {
+                                    (r = cunescape_one(*p, SIZE_MAX, &u, &eight_bit, /* accept_nul= */ false)) >= 0) {
                                         /* A valid escaped sequence */
                                         assert(r >= 1);
 
@@ -203,6 +203,9 @@ int extract_first_word_and_warn(
 
         const char *save;
         int r;
+
+        assert(p);
+        assert(ret);
 
         save = *p;
         r = extract_first_word(p, ret, separators, flags);

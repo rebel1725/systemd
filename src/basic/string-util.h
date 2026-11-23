@@ -4,8 +4,9 @@
 #include <string.h>
 
 #include "alloc-util.h"
-#include "basic-forward.h"
-#include "string-util-fundamental.h" /* IWYU pragma: export */
+#include "forward.h"
+
+#include "../fundamental/string-util.h" /* IWYU pragma: export */
 
 static inline char* strstr_ptr_internal(const char *haystack, const char *needle) {
         if (!haystack || !needle)
@@ -57,14 +58,6 @@ static inline const char* enabled_disabled(bool b) {
         return b ? "enabled" : "disabled";
 }
 
-/* This macro's return pointer will have the "const" qualifier set or unset the same way as the input
- * pointer. */
-#define empty_to_null(p)                                \
-        ({                                              \
-                const char *_p = (p);                   \
-                (typeof(p)) (isempty(_p) ? NULL : _p);  \
-        })
-
 static inline const char* empty_to_na(const char *p) {
         return isempty(p) ? "n/a" : p;
 }
@@ -114,7 +107,7 @@ char* delete_chars(char *s, const char *bad);
 char* delete_trailing_chars(char *s, const char *bad);
 char* truncate_nl_full(char *s, size_t *ret_len);
 static inline char* truncate_nl(char *s) {
-        return truncate_nl_full(s, NULL);
+        return truncate_nl_full(s, /* ret_len= */ NULL);
 }
 
 static inline char* skip_leading_chars(const char *s, const char *bad) {
@@ -193,7 +186,7 @@ int strextendf_with_separator(char **x, const char *separator, const char *forma
         })
 #define strprepend(x, ...) strprepend_with_separator(x, NULL, __VA_ARGS__)
 
-char* strrep(const char *s, unsigned n);
+char* strrep(const char *s, size_t n);
 
 #define strrepa(s, n)                                                   \
         ({                                                              \
@@ -220,8 +213,19 @@ static inline int strdup_to(char **ret, const char *src) {
         return r < 0 ? r : 0;  /* Suppress return value of 1. */
 }
 
-bool string_is_safe(const char *p) _pure_;
-bool string_is_safe_ascii(const char *p) _pure_;
+typedef enum StringSafeFlags {
+        STRING_ASCII               = 1 << 0, /* Verify string is 7-Bit ASCII (rather than just UTF-8) */
+        STRING_ALLOW_EMPTY         = 1 << 1, /* Allow empty strings */
+        STRING_ALLOW_NEWLINES      = 1 << 2, /* Allow newlines (\n) */
+        STRING_ALLOW_BACKSLASHES   = 1 << 3, /* Allow backslashes (\) */
+        STRING_ALLOW_QUOTES        = 1 << 4, /* Allow quotes (" or ') */
+        STRING_ALLOW_GLOBS         = 1 << 5, /* Allow globs (?, * or [) */
+        STRING_FILENAME            = 1 << 6, /* Verify the string is valid as regular filename */
+        STRING_FILENAME_PART       = 1 << 7, /* Verify the string is valid as part of a regular filename */
+        STRING_DISALLOW_WHITESPACE = 1 << 8, /* Refuse whitespace (space, tab, newline, …) */
+} StringSafeFlags;
+
+bool string_is_safe(const char *p, StringSafeFlags flags) _pure_;
 
 DISABLE_WARNING_STRINGOP_TRUNCATION;
 static inline void strncpy_exact(char *buf, const char *src, size_t buf_len) {
@@ -256,7 +260,7 @@ int string_extract_line(const char *s, size_t i, char **ret);
 
 int string_contains_word_strv(const char *string, const char *separators, char * const *words, const char **ret_word);
 static inline int string_contains_word(const char *string, const char *separators, const char *word) {
-        return string_contains_word_strv(string, separators, STRV_MAKE(word), NULL);
+        return string_contains_word_strv(string, separators, STRV_MAKE(word), /* ret_word= */ NULL);
 }
 
 bool streq_skip_trailing_chars(const char *s1, const char *s2, const char *ok);
@@ -271,9 +275,10 @@ typedef enum MakeCStringMode {
         _MAKE_CSTRING_MODE_INVALID = -1,
 } MakeCStringMode;
 
-int make_cstring(const char *s, size_t n, MakeCStringMode mode, char **ret);
+int make_cstring(const void *s, size_t n, MakeCStringMode mode, char **ret);
 
 size_t strspn_from_end(const char *str, const char *accept) _pure_;
+size_t strnspn(const char *str, const char *accept, size_t n) _pure_ _nonnull_if_nonzero_(1, 3);
 
 char* strdupspn(const char *a, const char *accept);
 char* strdupcspn(const char *a, const char *reject);
@@ -303,13 +308,22 @@ char* find_line_after_internal(const char *haystack, const char *needle);
 #define find_line_after(haystack, needle) \
         const_generic(haystack, find_line_after_internal(haystack, needle))
 
-bool version_is_valid(const char *s) _pure_;
-bool version_is_valid_versionspec(const char *s) _pure_;
+typedef enum VersionFlags {
+        VERSION_ALLOW_EMPTY      = 1 << 0,
+        VERSION_ALLOW_UNDERSCORE = 1 << 1, /* Allow "_" as separator (recommended separator) */
+        VERSION_ALLOW_PLUS       = 1 << 2, /* Allow "+" as separator (sometimes used as separator for boot attempt counters) */
+} VersionFlags;
+
+bool version_is_valid(const char *s, VersionFlags flags) _pure_;
 
 ssize_t strlevenshtein(const char *x, const char *y);
 
 char* strrstr_internal(const char *haystack, const char *needle) _pure_;
 #define strrstr(haystack, needle) \
         const_generic(haystack, strrstr_internal(haystack, needle))
+
+char* strrstr_no_case_internal(const char *haystack, const char *needle) _pure_;
+#define strrstr_no_case(haystack, needle) \
+        const_generic(haystack, strrstr_no_case_internal(haystack, needle))
 
 size_t str_common_prefix(const char *a, const char *b) _pure_;

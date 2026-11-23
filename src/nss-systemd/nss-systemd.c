@@ -4,7 +4,6 @@
 #include <nss.h>
 #include <pthread.h>
 #include <string.h>
-#include <threads.h>
 
 #include "alloc-util.h"
 #include "env-util.h"
@@ -149,6 +148,7 @@ static enum nss_status copy_synthesized_passwd(
 
         assert(dest);
         assert(src);
+        assert(errnop);
         assert(src->pw_name);
         assert(src->pw_passwd);
         assert(src->pw_gecos);
@@ -191,6 +191,7 @@ static enum nss_status copy_synthesized_spwd(
 
         assert(dest);
         assert(src);
+        assert(errnop);
         assert(src->sp_namp);
         assert(src->sp_pwdp);
 
@@ -223,6 +224,7 @@ static enum nss_status copy_synthesized_group(
 
         assert(dest);
         assert(src);
+        assert(errnop);
         assert(src->gr_name);
         assert(src->gr_passwd);
         assert(src->gr_mem);
@@ -259,6 +261,7 @@ static enum nss_status copy_synthesized_sgrp(
 
         assert(dest);
         assert(src);
+        assert(errnop);
         assert(src->sg_namp);
         assert(src->sg_passwd);
         assert(src->sg_adm);
@@ -319,7 +322,7 @@ enum nss_status _nss_systemd_getpwnam_r(
 
                 if (streq(name, root_passwd.pw_name))
                         return copy_synthesized_passwd(pwd, &root_passwd,
-                                                       default_root_shell(NULL),
+                                                       default_root_shell(/* root= */ NULL),
                                                        buffer, buflen, errnop);
 
                 if (streq(name, nobody_passwd.pw_name)) {
@@ -327,7 +330,7 @@ enum nss_status _nss_systemd_getpwnam_r(
                                 return NSS_STATUS_NOTFOUND;
 
                         return copy_synthesized_passwd(pwd, &nobody_passwd,
-                                                       NULL,
+                                                       /* fallback_shell= */ NULL,
                                                        buffer, buflen, errnop);
                 }
 
@@ -367,7 +370,7 @@ enum nss_status _nss_systemd_getpwuid_r(
 
                 if (uid == root_passwd.pw_uid)
                         return copy_synthesized_passwd(pwd, &root_passwd,
-                                                       default_root_shell(NULL),
+                                                       default_root_shell(/* root= */ NULL),
                                                        buffer, buflen, errnop);
 
                 if (uid == nobody_passwd.pw_uid) {
@@ -375,7 +378,7 @@ enum nss_status _nss_systemd_getpwuid_r(
                                 return NSS_STATUS_NOTFOUND;
 
                         return copy_synthesized_passwd(pwd, &nobody_passwd,
-                                                       NULL,
+                                                       /* fallback_shell= */ NULL,
                                                        buffer, buflen, errnop);
                 }
 
@@ -828,7 +831,7 @@ enum nss_status _nss_systemd_getgrent_r(
                                 blocked = true;
                         }
 
-                        r = nss_group_record_by_name(group_name, false, &gr);
+                        r = nss_group_record_by_name(group_name, /* with_shadow= */ false, &gr);
                         if (r == -ESRCH)
                                 continue;
                         if (r < 0) {
@@ -1007,7 +1010,7 @@ enum nss_status _nss_systemd_initgroups_dyn(
                 _cleanup_(group_record_unrefp) GroupRecord *g = NULL;
                 _cleanup_free_ char *group_name = NULL;
 
-                r = membershipdb_iterator_get(iterator, NULL, &group_name);
+                r = membershipdb_iterator_get(iterator, /* user= */ NULL, &group_name);
                 if (r == -ESRCH)
                         break;
                 if (r < 0) {
@@ -1066,28 +1069,72 @@ enum nss_status _nss_systemd_initgroups_dyn(
         return any ? NSS_STATUS_SUCCESS : NSS_STATUS_NOTFOUND;
 }
 
-static thread_local unsigned _blocked = 0;
+/* Note that we intentionally use POSIX thread-specific data instead of a plain thread_local variable.
+ * A thread_local in this lazily-loaded DSO uses a dynamic TLS model by default and may require
+ * a dynamic TLS allocation. If that allocation fails, glibc calls _exit() from the dynamic linker,
+ * making the failure unrecoverable. Using pthread_key_t avoids ELF TLS entirely and lets any such
+ * failure propagate as a normal error instead of terminating the process. */
+static pthread_once_t nss_blocked_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t nss_blocked_key;
+static int nss_blocked_key_error;
+
+static void nss_blocked_key_init(void) {
+        /* NULL destructor: the per-thread value is a plain integer counter encoded as void*,
+         * not a heap allocation, so nothing needs to be freed at thread exit.
+         * No pthread_key_delete: this library is linked with -z nodelete and always opened with
+         * RTLD_NODELETE, so it is never unloaded and the key exists for the process lifetime. */
+        nss_blocked_key_error = pthread_key_create(&nss_blocked_key, NULL);
+}
+
+static int nss_blocked_key_ensure(void) {
+        int r;
+
+        r = pthread_once(&nss_blocked_key_once, nss_blocked_key_init);
+        if (r != 0)
+                return -r;
+
+        if (nss_blocked_key_error != 0)
+                return -nss_blocked_key_error;
+
+        return 0;
+}
 
 _public_ int _nss_systemd_block(bool b) {
+        int r;
+        uintptr_t blocked;
+
+        r = nss_blocked_key_ensure();
+        if (r < 0)
+                return r;
+
+        blocked = (uintptr_t) pthread_getspecific(nss_blocked_key);
 
         /* This blocks recursively: it's blocked for as many times this function is called with `true` until
          * it is called an equal time with `false`. */
 
         if (b) {
-                if (_blocked >= UINT_MAX)
+                if (blocked >= UINTPTR_MAX)
                         return -EOVERFLOW;
 
-                _blocked++;
+                blocked++;
         } else {
-                if (_blocked <= 0)
+                if (blocked == 0)
                         return -EOVERFLOW;
 
-                _blocked--;
+                blocked--;
         }
+
+        r = pthread_setspecific(nss_blocked_key, (void*) blocked);
+        /* Ignore failure on the unblock path: callers may assert on it. */
+        if (r != 0 && b)
+                return -r;
 
         return b; /* Return what is passed in, i.e. the new state from the PoV of the caller */
 }
 
 _public_ bool _nss_systemd_is_blocked(void) {
-        return _blocked > 0;
+        if (nss_blocked_key_ensure() < 0)
+                return false;
+
+        return (uintptr_t) pthread_getspecific(nss_blocked_key) > 0;
 }

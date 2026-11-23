@@ -3,11 +3,12 @@
 #include "qrcode-util.h"
 
 #if HAVE_QRENCODE
+#ifndef SYSTEMD_CFLAGS_MARKER_LIBQRENCODE
+#  error "missing libqrencode_cflags in meson dependency."
+#endif
 #include <qrencode.h>
 #endif
 #include <stdio.h>
-
-#include "sd-dlopen.h"
 
 #include "ansi-color.h"
 #include "dlfcn-util.h"
@@ -22,25 +23,20 @@
 #define UNICODE_UPPER_HALF_BLOCK UTF8("▀")
 
 #if HAVE_QRENCODE
-static void *qrcode_dl = NULL;
-
 static DLSYM_PROTOTYPE(QRcode_encodeString) = NULL;
 static DLSYM_PROTOTYPE(QRcode_free) = NULL;
 #endif
 
-int dlopen_qrencode(void) {
+int dlopen_qrencode(int log_level) {
 #if HAVE_QRENCODE
+        static void *qrcode_dl = NULL;
         int r;
 
-        SD_ELF_NOTE_DLOPEN(
-                        "qrencode",
-                        "Support for generating QR codes",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_SUGGESTED,
-                        "libqrencode.so.4", "libqrencode.so.3");
+        LIBQRENCODE_NOTE(suggested);
 
         FOREACH_STRING(s, "libqrencode.so.4", "libqrencode.so.3") {
                 r = dlopen_many_sym_or_warn(
-                        &qrcode_dl, s, LOG_DEBUG,
+                        &qrcode_dl, s, log_level,
                         DLSYM_ARG(QRcode_encodeString),
                         DLSYM_ARG(QRcode_free));
                 if (r >= 0)
@@ -49,7 +45,8 @@ int dlopen_qrencode(void) {
 
         return r;
 #else
-        return -EOPNOTSUPP;
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libqrencode support is not compiled in.");
 #endif
 }
 
@@ -210,11 +207,11 @@ int print_qrcode_full(
         if (check_tty && !colors_enabled())
                 return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Colors are disabled, cannot print qrcode");
 
-        r = dlopen_qrencode();
+        r = dlopen_qrencode(LOG_DEBUG);
         if (r < 0)
                 return r;
 
-        _cleanup_(QRcode_freep) QRcode *qr = sym_QRcode_encodeString(string, 0, QR_ECLEVEL_L, QR_MODE_8, 1);
+        _cleanup_(QRcode_freep) QRcode *qr = sym_QRcode_encodeString(string, /* version= */ 0, QR_ECLEVEL_L, QR_MODE_8, 1);
         if (!qr)
                 return log_oom_debug();
 

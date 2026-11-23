@@ -302,7 +302,7 @@ int dns_question_cname_redirect(DnsQuestion *q, const DnsResourceRecord *cname, 
                 if (!k)
                         return -ENOMEM;
 
-                r = dns_question_add(n, k, 0);
+                r = dns_question_add(n, k, /* flags= */ 0);
                 if (r < 0)
                         return r;
         }
@@ -364,7 +364,7 @@ int dns_question_new_address(DnsQuestion **ret, int family, const char *name, bo
                 if (!key)
                         return -ENOMEM;
 
-                r = dns_question_add(q, key, 0);
+                r = dns_question_add(q, key, /* flags= */ 0);
                 if (r < 0)
                         return r;
         }
@@ -376,7 +376,7 @@ int dns_question_new_address(DnsQuestion **ret, int family, const char *name, bo
                 if (!key)
                         return -ENOMEM;
 
-                r = dns_question_add(q, key, 0);
+                r = dns_question_add(q, key, /* flags= */ 0);
                 if (r < 0)
                         return r;
         }
@@ -412,7 +412,7 @@ int dns_question_new_reverse(DnsQuestion **ret, int family, const union in_addr_
 
         reverse = NULL;
 
-        r = dns_question_add(q, key, 0);
+        r = dns_question_add(q, key, /* flags= */ 0);
         if (r < 0)
                 return r;
 
@@ -442,7 +442,7 @@ int dns_question_new_service_pointer(DnsQuestion **ret, const char *type, const 
                                 domain = buf;
                 }
 
-                r = dns_service_join(NULL, type, domain, &joined);
+                r = dns_service_join(/* name= */ NULL, type, domain, &joined);
                 if (r < 0)
                         return r;
 
@@ -459,7 +459,7 @@ int dns_question_new_service_pointer(DnsQuestion **ret, const char *type, const 
         if (!key)
                 return -ENOMEM;
 
-        r = dns_question_add(q, key, 0);
+        r = dns_question_add(q, key, /* flags= */ 0);
         if (r < 0)
                 return r;
 
@@ -531,7 +531,7 @@ int dns_question_new_service(
         if (!key)
                 return -ENOMEM;
 
-        r = dns_question_add(q, key, 0);
+        r = dns_question_add(q, key, /* flags= */ 0);
         if (r < 0)
                 return r;
 
@@ -541,7 +541,7 @@ int dns_question_new_service(
                 if (!key)
                         return -ENOMEM;
 
-                r = dns_question_add(q, key, 0);
+                r = dns_question_add(q, key, /* flags= */ 0);
                 if (r < 0)
                         return r;
         }
@@ -607,6 +607,9 @@ int dns_json_dispatch_question(const char *name, sd_json_variant *variant, sd_js
 
         if (!sd_json_variant_is_array(variant))
                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an array.", strna(name));
+
+        if (sd_json_variant_elements(variant) > DNS_QUESTION_ITEMS_MAX)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(E2BIG), "Too many questions in a single query.");
 
         _cleanup_(dns_question_unrefp) DnsQuestion *nq = NULL;
         nq = dns_question_new(sd_json_variant_elements(variant));

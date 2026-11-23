@@ -3,9 +3,10 @@
 
 #include "sd-device.h"
 
-#include "sd-forward.h"
+#include "forward.h"
 #include "iterator.h"
 
+#define OLDEST_UDEV_DATABASE_VERSION 1
 #define LATEST_UDEV_DATABASE_VERSION 1
 
 struct sd_device {
@@ -51,7 +52,7 @@ struct sd_device {
         /* The database version indicates the supported features by the udev database.
          * This is saved and parsed in V field.
          *
-         * 0: None of the following features are supported (systemd version <= 246).
+         * 0: None of the following features are supported (systemd version <= 246), unsupported since v261.
          * 1: The current tags (Q) and the database version (V) features are implemented (>= 247).
          */
         unsigned database_version;
@@ -105,7 +106,7 @@ struct sd_device {
 int device_new_aux(sd_device **ret);
 int device_add_property_aux(sd_device *device, const char *key, const char *value, bool db);
 static inline int device_add_property_internal(sd_device *device, const char *key, const char *value) {
-        return device_add_property_aux(device, key, value, false);
+        return device_add_property_aux(device, key, value, /* db= */ false);
 }
 
 int device_set_syspath(sd_device *device, const char *_syspath, bool verify);

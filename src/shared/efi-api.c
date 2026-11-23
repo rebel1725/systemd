@@ -3,9 +3,10 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "architecture.h"
 #include "dirent-util.h"
 #include "efi-api.h"
-#include "efi-fundamental.h"
+#include "efi.h"
 #include "efivars.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -14,6 +15,7 @@
 #include "sort-util.h"
 #include "stat-util.h"
 #include "stdio-util.h"
+#include "string-table.h"
 #include "string-util.h"
 #include "tpm2-util.h"                  /* IWYU pragma: keep */
 #include "utf8.h"
@@ -102,7 +104,7 @@ static int get_os_indications(uint64_t *ret) {
                 return 0;
         }
 
-        r = efi_get_variable(EFI_GLOBAL_VARIABLE_STR("OsIndications"), NULL, &v, &s);
+        r = efi_get_variable(EFI_GLOBAL_VARIABLE_STR("OsIndications"), /* ret_attribute= */ NULL, &v, &s);
         if (r == -ENOENT) {
                 /* Some firmware implementations that do support OsIndications and report that with
                  * OsIndicationsSupported will remove the OsIndications variable when it is unset. Let's
@@ -185,7 +187,7 @@ int efi_reboot_to_firmware_supported(void) {
         if (!is_efi_boot())
                 goto not_supported;
 
-        r = efi_get_variable(EFI_GLOBAL_VARIABLE_STR("OsIndicationsSupported"), NULL, &v, &s);
+        r = efi_get_variable(EFI_GLOBAL_VARIABLE_STR("OsIndicationsSupported"), /* ret_attribute= */ NULL, &v, &s);
         if (r == -ENOENT)
                 goto not_supported; /* variable doesn't exist? it's not supported then */
         if (r < 0)
@@ -264,7 +266,7 @@ int efi_get_boot_option(
                 return -EOPNOTSUPP;
 
         xsprintf(variable, EFI_GLOBAL_VARIABLE_STR("Boot%04X"), id);
-        r = efi_get_variable(variable, NULL, (void **)&buf, &l);
+        r = efi_get_variable(variable, /* ret_attribute= */ NULL, (void **)&buf, &l);
         if (r < 0)
                 return r;
         if (l < offsetof(struct boot_option, title))
@@ -283,19 +285,23 @@ int efi_get_boot_option(
 
         if (header->path_len > 0) {
                 uint8_t *dbuf;
-                size_t dnext, doff;
+                size_t dnext, doff, path_len;
 
                 doff = offsetof(struct boot_option, title) + title_size;
                 dbuf = buf + doff;
-                if (header->path_len > l - doff)
-                        return -EINVAL;
+                path_len = MIN((size_t) header->path_len, l - doff);
 
                 dnext = 0;
-                while (dnext < header->path_len) {
+                while (dnext < path_len) {
                         struct device_path *dpath;
+                        size_t remaining = path_len - dnext;
+
+                        if (remaining < offsetof(struct device_path, path))
+                                break;
 
                         dpath = (struct device_path *)(dbuf + dnext);
-                        if (dpath->length < 4)
+                        if (dpath->length < offsetof(struct device_path, path) ||
+                            dpath->length > remaining)
                                 break;
 
                         /* Type 0x7F – End of Hardware Device Path, Sub-Type 0xFF – End Entire Device Path */
@@ -310,6 +316,9 @@ int efi_get_boot_option(
 
                         /* Sub-Type 1 – Hard Drive */
                         if (dpath->sub_type == MEDIA_HARDDRIVE_DP) {
+                                if (dpath->length < offsetof(struct device_path, drive) + sizeof(struct drive_path))
+                                        break;
+
                                 /* 0x02 – GUID Partition Table */
                                 if (dpath->drive.mbr_type != MBR_TYPE_EFI_PARTITION_TABLE_HEADER)
                                         continue;
@@ -325,9 +334,9 @@ int efi_get_boot_option(
 
                         /* Sub-Type 4 – File Path */
                         if (dpath->sub_type == MEDIA_FILEPATH_DP && !p && ret_path) {
-                                p = utf16_to_utf8(dpath->path, dpath->length-4);
+                                p = utf16_to_utf8(dpath->path, dpath->length - offsetof(struct device_path, path));
                                 if (!p)
-                                        return  -ENOMEM;
+                                        return -ENOMEM;
 
                                 efi_tilt_backslashes(p);
                                 continue;
@@ -430,7 +439,7 @@ int efi_remove_boot_option(uint16_t id) {
                 return -EOPNOTSUPP;
 
         xsprintf(variable, EFI_GLOBAL_VARIABLE_STR("Boot%04X"), id);
-        return efi_set_variable(variable, NULL, 0);
+        return efi_set_variable(variable, /* value= */ NULL, /* size= */ 0);
 #else
         return -EOPNOTSUPP;
 #endif
@@ -447,7 +456,7 @@ int efi_get_boot_order(uint16_t **ret_order) {
         if (!is_efi_boot())
                 return -EOPNOTSUPP;
 
-        r = efi_get_variable(EFI_GLOBAL_VARIABLE_STR("BootOrder"), NULL, &buf, &l);
+        r = efi_get_variable(EFI_GLOBAL_VARIABLE_STR("BootOrder"), /* ret_attribute= */ NULL, &buf, &l);
         if (r < 0)
                 return r;
 
@@ -645,21 +654,25 @@ bool efi_has_tpm2(void) {
 }
 
 sd_id128_t efi_guid_to_id128(const void *guid) {
-        const EFI_GUID *uuid = ASSERT_PTR(guid); /* cast is safe, because struct efi_guid is packed */
+        EFI_GUID uuid;
         sd_id128_t id128;
 
-        id128.bytes[0] = (uuid->Data1 >> 24) & 0xff;
-        id128.bytes[1] = (uuid->Data1 >> 16) & 0xff;
-        id128.bytes[2] = (uuid->Data1 >> 8) & 0xff;
-        id128.bytes[3] = uuid->Data1 & 0xff;
+        /* The input pointer is not guaranteed to be aligned (e.g. when pointing into a serialized EFI
+         * variable buffer), so copy into a properly aligned local first. */
+        memcpy(&uuid, ASSERT_PTR(guid), sizeof(uuid));
 
-        id128.bytes[4] = (uuid->Data2 >> 8) & 0xff;
-        id128.bytes[5] = uuid->Data2 & 0xff;
+        id128.bytes[0] = (uuid.Data1 >> 24) & 0xff;
+        id128.bytes[1] = (uuid.Data1 >> 16) & 0xff;
+        id128.bytes[2] = (uuid.Data1 >> 8) & 0xff;
+        id128.bytes[3] = uuid.Data1 & 0xff;
 
-        id128.bytes[6] = (uuid->Data3 >> 8) & 0xff;
-        id128.bytes[7] = uuid->Data3 & 0xff;
+        id128.bytes[4] = (uuid.Data2 >> 8) & 0xff;
+        id128.bytes[5] = uuid.Data2 & 0xff;
 
-        memcpy(&id128.bytes[8], uuid->Data4, sizeof(uuid->Data4));
+        id128.bytes[6] = (uuid.Data3 >> 8) & 0xff;
+        id128.bytes[7] = uuid.Data3 & 0xff;
+
+        memcpy(&id128.bytes[8], uuid.Data4, sizeof(uuid.Data4));
 
         return id128;
 }
@@ -674,4 +687,49 @@ void efi_id128_to_guid(sd_id128_t id, void *ret_guid) {
         };
         memcpy(uuid.Data4, id.bytes+8, sizeof(uuid.Data4));
         memcpy(ret_guid, &uuid, sizeof(uuid));
+}
+
+static const char* const efi_arch_table[_ARCHITECTURE_MAX] = {
+        [ARCHITECTURE_X86]         = "ia32",
+        [ARCHITECTURE_X86_64]      = "x64",
+        [ARCHITECTURE_ARM]         = "arm",
+        [ARCHITECTURE_ARM64]       = "aa64",
+        [ARCHITECTURE_LOONGARCH64] = "loongarch64",
+        [ARCHITECTURE_RISCV32]     = "riscv32",
+        [ARCHITECTURE_RISCV64]     = "riscv64",
+};
+
+DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(efi_arch, Architecture);
+
+const char* get_efi_arch(void) {
+        /* We use the architecture of the running kernel instead of the one systemd was built for, because a
+         * 32-bit userspace can run on a 64-bit kernel with 64-bit firmware. On mixed mode systems, the
+         * firmware can be 32-bit while the kernel runs in 64-bit mode. */
+
+        Architecture a = uname_architecture();
+        const char *arch = efi_arch_to_string(a);
+        if (!arch)
+                return EFI_MACHINE_TYPE_NAME;
+
+        if (a != ARCHITECTURE_X86_64)
+                return arch;
+
+        _cleanup_free_ char *platform_size = NULL;
+        int r;
+
+        r = read_one_line_file("/sys/firmware/efi/fw_platform_size", &platform_size);
+        if (r == -ENOENT)
+                return arch;
+        if (r < 0) {
+                log_warning_errno(r, "Error reading EFI firmware word size, assuming machine type '%s': %m", arch);
+                return arch;
+        }
+
+        if (streq(platform_size, "64"))
+                return arch;
+        if (streq(platform_size, "32"))
+                return "ia32";
+
+        log_warning("Unknown EFI firmware word size '%s', using machine type '%s'.", platform_size, arch);
+        return arch;
 }

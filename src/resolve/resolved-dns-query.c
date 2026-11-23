@@ -21,6 +21,7 @@
 #include "resolved-etc-hosts.h"
 #include "resolved-hook.h"
 #include "resolved-manager.h"
+#include "resolved-static-records.h"
 #include "resolved-timeouts.h"
 #include "set.h"
 #include "string-util.h"
@@ -168,7 +169,7 @@ static int dns_query_candidate_add_transaction(
 
                 t = dns_scope_find_transaction(c->scope, key, c->query->flags);
                 if (!t) {
-                        r = dns_transaction_new(&t, c->scope, key, NULL, c->query->flags);
+                        r = dns_transaction_new(&t, c->scope, key, /* bypass= */ NULL, c->query->flags);
                         if (r < 0)
                                 return r;
                 } else if (set_contains(c->transactions, t))
@@ -177,20 +178,20 @@ static int dns_query_candidate_add_transaction(
                 /* "Bypass" lookup with a query packet */
                 assert(bypass);
 
-                r = dns_transaction_new(&t, c->scope, NULL, bypass, c->query->flags);
+                r = dns_transaction_new(&t, c->scope, /* key= */ NULL, bypass, c->query->flags);
                 if (r < 0)
                         return r;
         }
 
-        r = set_ensure_allocated(&t->notify_query_candidates_done, NULL);
+        r = set_ensure_allocated(&t->notify_query_candidates_done, /* hash_ops= */ NULL);
         if (r < 0)
                 return r;
 
-        r = set_ensure_put(&t->notify_query_candidates, NULL, c);
+        r = set_ensure_put(&t->notify_query_candidates, /* hash_ops= */ NULL, c);
         if (r < 0)
                 return r;
 
-        r = set_ensure_put(&c->transactions, NULL, t);
+        r = set_ensure_put(&c->transactions, /* hash_ops= */ NULL, t);
         if (r < 0) {
                 (void) set_remove(t->notify_query_candidates, c);
                 return r;
@@ -300,7 +301,7 @@ static int dns_query_candidate_setup_transactions(DnsQueryCandidate *c) {
                 if (!dns_scope_good_key(c->scope, dns_question_first_key(c->query->question_bypass->question)))
                         return 0;
 
-                r = dns_query_candidate_add_transaction(c, NULL, c->query->question_bypass);
+                r = dns_query_candidate_add_transaction(c, /* key= */ NULL, c->query->question_bypass);
                 if (r < 0)
                         goto fail;
 
@@ -326,7 +327,7 @@ static int dns_query_candidate_setup_transactions(DnsQueryCandidate *c) {
                 if (!dns_scope_good_key(c->scope, qkey))
                         continue;
 
-                r = dns_query_candidate_add_transaction(c, qkey, NULL);
+                r = dns_query_candidate_add_transaction(c, qkey, /* bypass= */ NULL);
                 if (r < 0)
                         goto fail;
 
@@ -497,7 +498,7 @@ DnsQuery *dns_query_free(DnsQuery *q) {
         sd_bus_track_unref(q->bus_track);
 
         if (q->varlink_request) {
-                sd_varlink_set_userdata(q->varlink_request, NULL);
+                sd_varlink_set_userdata(q->varlink_request, /* userdata= */ NULL);
                 sd_varlink_unref(q->varlink_request);
         }
 
@@ -910,6 +911,33 @@ static int dns_query_try_etc_hosts(DnsQuery *q) {
         return 1;
 }
 
+static int dns_query_try_static_records(DnsQuery *q) {
+        int r;
+
+        assert(q);
+
+        if (FLAGS_SET(q->flags, SD_RESOLVED_NO_SYNTHESIZE))
+                return 0;
+
+        _cleanup_(dns_answer_unrefp) DnsAnswer *answer = NULL;
+        r = manager_static_records_lookup(
+                        q->manager,
+                        q->question_bypass ? q->question_bypass->question : q->question_utf8,
+                        &answer);
+        if (r <= 0)
+                return r;
+
+        dns_query_reset_answer(q);
+
+        q->answer = TAKE_PTR(answer);
+        q->answer_rcode = DNS_RCODE_SUCCESS;
+        q->answer_protocol = dns_synthesize_protocol(q->flags);
+        q->answer_family = dns_synthesize_family(q->flags);
+        q->answer_query_flags = SD_RESOLVED_AUTHENTICATED|SD_RESOLVED_CONFIDENTIAL|SD_RESOLVED_SYNTHETIC;
+
+        return 1;
+}
+
 static int dns_query_go_scopes(DnsQuery *q) {
         int r;
 
@@ -968,8 +996,8 @@ static int dns_query_go_scopes(DnsQuery *q) {
                         &q->timeout_event_source,
                         CLOCK_BOOTTIME,
                         SD_RESOLVED_QUERY_TIMEOUT_USEC,
-                        0, on_query_timeout, q,
-                        0, "query-timeout", true);
+                        /* accuracy= */ 0, on_query_timeout, q,
+                        /* priority= */ 0, "query-timeout", /* force_reset= */ true);
         if (r < 0)
                 goto fail;
 
@@ -1037,6 +1065,14 @@ int dns_query_go(DnsQuery *q) {
         if (q->hook_query ||
             q->state != DNS_TRANSACTION_NULL)
                 return 0;
+
+        r = dns_query_try_static_records(q);
+        if (r < 0)
+                return r;
+        if (r > 0) {
+                dns_query_complete(q, DNS_TRANSACTION_SUCCESS);
+                return 1;
+        }
 
         r = dns_query_try_etc_hosts(q);
         if (r < 0)
@@ -1302,6 +1338,11 @@ static int dns_query_cname_redirect(DnsQuery *q, const DnsResourceRecord *cname)
 
         if (r == 0 && k == 0) /* No actual cname happened? */
                 return -ELOOP;
+
+        if (r == 0)
+                nq_idna = dns_question_ref(q->question_idna);
+        if (k == 0)
+                nq_utf8 = dns_question_ref(q->question_utf8);
 
         if (q->answer_protocol == DNS_PROTOCOL_DNS)
                 /* Don't permit CNAME redirects from unicast DNS to LLMNR or MulticastDNS, so that global resources

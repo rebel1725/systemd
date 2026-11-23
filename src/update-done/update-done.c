@@ -1,10 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <sys/stat.h>
 
+#include "sd-json.h"
+
 #include "alloc-util.h"
+#include "build.h"
 #include "chase.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -12,13 +15,19 @@
 #include "log.h"
 #include "main-func.h"
 #include "parse-argument.h"
-#include "pretty-print.h"
 #include "string-util.h"
 #include "time-util.h"
+#include "verbs.h"
 
 static char *arg_root = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_root, freep);
+
+COMMAND(
+        "systemd-update-done\0",
+        "Mark /etc/ and /var/ as fully updated.",
+        .man_page = "systemd-update-done(8)",
+);
 
 static int save_timestamp(const char *dir, struct timespec *ts) {
         _cleanup_free_ char *message = NULL, *dirpath = NULL;
@@ -32,7 +41,7 @@ static int save_timestamp(const char *dir, struct timespec *ts) {
 
         fd = chase_and_open(dir, arg_root,
                             CHASE_PREFIX_ROOT | CHASE_WARN | CHASE_MUST_BE_DIRECTORY,
-                            O_DIRECTORY | O_CLOEXEC | O_CREAT,
+                            O_DIRECTORY | O_CREAT,
                             &dirpath);
         if (fd < 0)
                 return log_error_errno(fd, "Failed to open %s%s: %m", strempty(arg_root), dir);
@@ -48,7 +57,7 @@ static int save_timestamp(const char *dir, struct timespec *ts) {
 
         r = write_string_file_full(fd, ".updated", message,
                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_LABEL,
-                                   ts, NULL);
+                                   ts, /* label_fn= */ NULL);
         if (r == -EROFS && !arg_root)
                 log_debug_errno(r, "Cannot create \"%s/.updated\", file system is read-only.", dirpath);
         else if (r < 0)
@@ -59,67 +68,33 @@ static int save_timestamp(const char *dir, struct timespec *ts) {
         return 0;
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-update-done", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...]\n\n"
-               "%5$sMark /etc/ and /var/ as fully updated.%6$s\n"
-               "\n%3$sOptions:%4$s\n"
-               "  -h --help              Show this help\n"
-               "     --root=PATH         Operate on root directory PATH\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(),
-               ansi_normal(),
-               ansi_highlight(),
-               ansi_normal());
-
-        return 0;
-}
-
 static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_ROOT = 0x100,
-        };
-
-        static const struct option options[] = {
-                { "help",     no_argument,       NULL, 'h'          },
-                { "root",     required_argument, NULL, ARG_ROOT     },
-                {},
-        };
-
-        int r, c;
+        int r;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_VERSION:
+                        return version();
 
-                case ARG_ROOT:
-                        r = parse_path_argument(optarg, /* suppress_root= */ true, &arg_root);
+                OPTION_LONG("root", "PATH", "Operate on root directory PATH"):
+                        r = parse_path_argument(opts.arg, /* suppress_root= */ true, &arg_root);
                         if (r < 0)
                                 return r;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if (optind < argc)
+        if (option_parser_get_n_args(&opts) > 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "This program takes no arguments.");
 
         return 1;
@@ -129,6 +104,8 @@ static int parse_argv(int argc, char *argv[]) {
 static int run(int argc, char *argv[]) {
         struct stat st;
         int r;
+
+        LIBSELINUX_NOTE(recommended);
 
         r = parse_argv(argc, argv);
         if (r <= 0)

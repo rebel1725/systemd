@@ -11,7 +11,7 @@
 #include "glob-util.h"
 #include "netlink-util.h"
 #include "networkctl-link-info.h"
-#include "networkctl-util.h"
+#include "networkctl-link-info-json.h"
 #include "sort-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
@@ -26,10 +26,12 @@ LinkInfo* link_info_array_free(LinkInfo *array) {
         for (unsigned i = 0; array && array[i].needs_freeing; i++) {
                 sd_device_unref(array[i].sd_device);
                 sd_json_variant_unref(array[i].description);
+                sd_dhcp_message_unref(array[i].dhcp_message);
                 free(array[i].netdev_kind);
                 free(array[i].ssid);
                 free(array[i].qdisc);
                 strv_free(array[i].alternative_names);
+                strv_free(array[i].configuring_reasons);
         }
 
         return mfree(array);
@@ -195,12 +197,12 @@ static int decode_link(
                 assert(matched_patterns);
 
                 xsprintf(str, "%i", ifindex);
-                if (!strv_fnmatch_full(patterns, str, 0, &pos) &&
-                    !strv_fnmatch_full(patterns, name, 0, &pos)) {
+                if (!strv_fnmatch_full(patterns, str, /* flags= */ 0, &pos) &&
+                    !strv_fnmatch_full(patterns, name, /* flags= */ 0, &pos)) {
                         bool match = false;
 
                         STRV_FOREACH(p, altnames)
-                                if (strv_fnmatch_full(patterns, *p, 0, &pos)) {
+                                if (strv_fnmatch_full(patterns, *p, /* flags= */ 0, &pos)) {
                                         match = true;
                                         break;
                                 }
@@ -225,7 +227,7 @@ static int decode_link(
 
         info->has_permanent_hw_address =
                 (netlink_message_read_hw_addr(m, IFLA_PERM_ADDRESS, &info->permanent_hw_address) >= 0 ||
-                 ethtool_get_permanent_hw_addr(NULL, info->name, &info->permanent_hw_address) >= 0) &&
+                 ethtool_get_permanent_hw_addr(/* ethtool_fd= */ NULL, info->name, &info->permanent_hw_address) >= 0) &&
                 !hw_addr_is_null(&info->permanent_hw_address) &&
                 !hw_addr_equal(&info->permanent_hw_address, &info->hw_address);
 
@@ -278,34 +280,6 @@ static int decode_link(
         return 1;
 }
 
-static int acquire_link_bitrates(LinkInfo *link) {
-        int r;
-
-        assert(link);
-
-        sd_json_variant *v;
-        r = json_variant_find_object(link->description, STRV_MAKE("Interface", "BitRates"), &v);
-        if (r == -ENODATA)
-                return 0;
-        if (r < 0)
-                return r;
-
-        static const sd_json_dispatch_field dispatch_table[] = {
-                { "TxBitRate", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64, offsetof(LinkInfo, tx_bitrate), SD_JSON_MANDATORY },
-                { "RxBitRate", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64, offsetof(LinkInfo, rx_bitrate), SD_JSON_MANDATORY },
-                {}
-        };
-
-        r = sd_json_dispatch(v, dispatch_table,
-                             SD_JSON_LOG | SD_JSON_WARNING | SD_JSON_ALLOW_EXTENSIONS,
-                             link);
-        if (r < 0)
-                return r;
-
-        link->has_bitrates = true;
-        return 0;
-}
-
 static void acquire_ether_link_info(int *fd, LinkInfo *link) {
         assert(fd);
         assert(link);
@@ -332,10 +306,8 @@ static void acquire_wlan_link_info(LinkInfo *link) {
                 return;
 
         r = sd_genl_socket_open(&genl);
-        if (r < 0) {
-                log_debug_errno(r, "Failed to open generic netlink socket: %m");
-                return;
-        }
+        if (r < 0)
+                return (void) log_debug_errno(r, "Failed to open generic netlink socket: %m");
 
         (void) sd_netlink_increase_rxbuf(genl, RCVBUF_SIZE);
 
@@ -363,15 +335,15 @@ int acquire_link_info(sd_varlink *vl, sd_netlink *rtnl, char * const *patterns, 
         assert(rtnl);
         assert(ret);
 
-        r = sd_rtnl_message_new_link(rtnl, &req, RTM_GETLINK, 0);
+        r = sd_rtnl_message_new_link(rtnl, &req, RTM_GETLINK, /* ifindex= */ 0);
         if (r < 0)
                 return rtnl_log_create_error(r);
 
-        r = sd_netlink_message_set_request_dump(req, true);
+        r = sd_netlink_message_set_request_dump(req, /* dump= */ true);
         if (r < 0)
                 return rtnl_log_create_error(r);
 
-        r = sd_netlink_call(rtnl, req, 0, &reply);
+        r = sd_netlink_call(rtnl, req, /* timeout= */ 0, &reply);
         if (r < 0)
                 return log_error_errno(r, "Failed to enumerate links: %m");
 
@@ -398,9 +370,7 @@ int acquire_link_info(sd_varlink *vl, sd_netlink *rtnl, char * const *patterns, 
                 acquire_ether_link_info(&fd, &links[c]);
                 acquire_wlan_link_info(&links[c]);
 
-                if (vl)
-                        (void) acquire_link_description(vl, links[c].ifindex, &links[c].description);
-                (void) acquire_link_bitrates(&links[c]);
+                (void) link_info_parse_description(&links[c], vl);
 
                 c++;
         }

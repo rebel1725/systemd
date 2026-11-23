@@ -10,13 +10,162 @@
 #include "chase.h"
 #include "errno-util.h"
 #include "fd-util.h"
+#include "fs-util.h"
+#include "libmount-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
+#include "path-util.h"
 #include "rm-rf.h"
 #include "stat-util.h"
+#include "string-util.h"
 #include "switch-root.h"
+#include "sync-util.h"
+
+/* Flushes out the file systems that are about to become unreachable/"departing" as we switch to
+ * 'new_root', so that they are in a good state before they possibly are detached with MNT_DETACH.
+ * Explicitly excludes 'new_root' and any file systems mounted below it, since those remain mounted and
+ * reachable after the transition, and will continue to be written to/synced normally as part of their
+ * regular life cycle afterwards. This deliberately avoids a global sync() (which would also flush out any
+ * other, completely unrelated file systems that happen to be mounted on the system, e.g. any additional
+ * data partitions, network shares, removable media, …), since this code path is very much on the critical
+ * path during boot (as part of initrd-switch-root.service) and soft-reboot.
+ *
+ * On any failure that means we can't be sure we've covered everything (libmount unavailable, or
+ * /proc/self/mountinfo can't be parsed, in full or in part), returns a negative error and leaves it up to
+ * the caller to fall back to a plain, global sync() instead, rather than doing that here itself: that way
+ * the fallback logic lives in exactly one place. */
+static int sync_departing_file_systems(const char *new_root) {
+#if HAVE_LIBMOUNT
+        _cleanup_(mnt_free_tablep) struct libmnt_table *table = NULL;
+        _cleanup_(mnt_free_iterp) struct libmnt_iter *iter = NULL;
+        int r, new_root_mnt_id;
+
+        r = libmount_parse_mountinfo(/* source= */ NULL, &table, &iter);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse /proc/self/mountinfo: %m");
+
+        /* Determine new_root's own, definitely-current mount ID once upfront, so that below we can tell
+         * apart the file system that is actually still going to be reachable at 'new_root' after the
+         * switch (which we want to skip, see below) from any other, stale/shadowed mountinfo entry that
+         * merely happens to share the exact same target path (which we do not want to skip, see below). */
+        r = path_get_mnt_id(new_root, &new_root_mnt_id);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to determine current mount ID of '%s': %m", new_root);
+
+        for (;;) {
+                struct libmnt_fs *fs;
+                const char *path, *fstype, *rest;
+
+                r = sym_mnt_table_next_fs(table, iter, &fs);
+                if (r == 1) /* EOF */
+                        break;
+                if (r < 0)
+                        /* Something went wrong walking the remainder of the table. We can't tell which
+                         * (if any) of the remaining file systems still need to be synced, so let the
+                         * caller fall back to a global sync() to cover them (and everything we might have
+                         * already processed again, that's harmless), rather than risk silently skipping
+                         * something that matters. */
+                        return log_debug_errno(r, "Failed to get next entry from /proc/self/mountinfo: %m");
+
+                path = sym_mnt_fs_get_target(fs);
+                if (!path)
+                        /* Same reasoning as above: we can't identify (let alone sync) this entry at all,
+                         * so let the caller fall back to a global sync() rather than silently drop it. In
+                         * practice this shouldn't happen for a real mountinfo entry. */
+                        return log_debug_errno(SYNTHETIC_ERRNO(ENODATA), "Mount entry without a target path found, giving up.");
+
+                rest = path_startswith(path, new_root);
+                if (rest) {
+                        /* Anything strictly below new_root remains mounted and reachable after the switch
+                         * as part of its subtree, hence doesn't need to be synced out defensively here. */
+                        if (!isempty(rest))
+                                continue;
+
+                        /* 'path' is new_root itself. If this entry's mount ID matches the one we
+                         * determined new_root's current mount actually has, this is that same, still
+                         * reachable file system: skip it exactly as with anything below it, to avoid
+                         * needlessly syncing something that isn't going away. Otherwise, this entry must
+                         * be a stale one that's now shadowed by the (different) file system actually
+                         * mounted at new_root (e.g. if new_root wasn't already its own mount point and got
+                         * bind-mounted onto itself earlier in switch_root()) and is about to become
+                         * unreachable just the same: let it fall through to the general shadow/sync
+                         * handling below instead of silently skipping it here too. */
+                        if (sym_mnt_fs_get_id(fs) == new_root_mnt_id)
+                                continue;
+                }
+
+                fstype = sym_mnt_fs_get_fstype(fs);
+                if (fstype && fstype_is_api_vfs(fstype)) {
+                        log_debug("Not synchronizing '%s': file system type '%s' is API VFS.",
+                                  path, strna(fstype));
+                        continue;
+                }
+
+                /* mountinfo may list the same target path more than once, if one mount shadows another
+                 * (i.e. something else has since been mounted on top of it). Opening 'path' always
+                 * resolves to whatever is currently visible there, i.e. the top-most mount, which might
+                 * not be the (possibly departing) one this specific entry refers to. This uses the same
+                 * check get_sub_mounts() already does for the same reason.
+                 *
+                 * If this entry is confirmed to be currently shadowed (r == 0), its own superblock isn't
+                 * reachable by path at all any more, and if it's the one carrying dirty data that's about
+                 * to become unreachable, that data would be silently dropped if we just skipped it here
+                 * (unlike the blanket sync() we're replacing, which covers shadowed superblocks too, since
+                 * it isn't path based).
+                 *
+                 * If we fail to determine this either way (r < 0), we also don't know what's currently at
+                 * 'path' any more: plain syncfs_path() doesn't suppress automounts, so blindly opening
+                 * 'path' here could trigger an untouched autofs mount point, or block on a stale network
+                 * mount that has since been stacked on top - exactly what fstype_is_worth_syncing() above is
+                 * trying to prevent us from doing.
+                 *
+                 * Rather than risk either of these, let the caller fall back to one global sync(): a
+                 * global sync() trivially covers this (and every other) file system correctly, so there's
+                 * nothing left to do here afterwards. This should be rare in practice (shadowed departing
+                 * mounts, or failures determining this, are both unusual), so this doesn't meaningfully
+                 * undercut the benefit of the targeted sync in the common case. */
+                r = libmount_fs_id_matches_path(fs, path);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to determine whether '%s' is currently shadowed by another mount: %m", path);
+                if (r == 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(ESTALE), "'%s' is currently shadowed by another mount, giving up.", path);
+
+                /* Note there's an inherent, unavoidable TOCTOU race between the check above and the
+                 * open() syncfs_path() is about to do below: if something else mounts something new on
+                 * top of 'path' in between (e.g. an autofs mount point gets triggered by an unrelated
+                 * process, or a network mount appears), that open() could still end up triggering an
+                 * automount, or blocking on that new, possibly stale, mount — the very thing the check
+                 * above exists to prevent. Unlike a failed lookup (handled above) or a failed syncfs()
+                 * (handled below), a *hanging* open() can't be recovered from by falling back to sync()
+                 * afterwards, since we'd never get back here to do so. There is no way to open a real,
+                 * syncfs()-capable file descriptor while also reliably suppressing automounts the way
+                 * statx()'s AT_NO_AUTOMOUNT does for the check above (that flag has no open()/openat()
+                 * equivalent), so this narrow window can't be fully closed without disproportionate
+                 * effort (e.g. performing the open() in a separate, killable/timeout-bounded process).
+                 * We accept it here: this code only runs with most other activity on the system already
+                 * quiesced (during the switch_root() transition itself), so the window for something else
+                 * to concurrently and adversarially remount 'path' in the first place is already narrow. */
+                r = syncfs_path(AT_FDCWD, path);
+                if (r < 0)
+                        /* We can't tell here whether this failed because we couldn't even open 'path'
+                         * (e.g. a transient error, or its state changed between the mount ID check above
+                         * and this open()), in which case a global sync() would still cover it just fine,
+                         * or because syncfs() itself hit a genuine, lower-level I/O error, in which case a
+                         * global sync() would likely run into the very same error and not actually recover
+                         * anything. Since we can't distinguish the two, and dropping this file system's
+                         * writeback silently would violate our "never regress the safety of the sync() we
+                         * replace" guarantee for the (plausibly more common) former case, let the caller
+                         * fall back to a global sync() here too, same as for the other cases above. */
+                        return log_debug_errno(r, "Failed to synchronize file system '%s': %m", path);
+        }
+
+        return 0;
+#else
+        return -EOPNOTSUPP;
+#endif
+}
 
 int switch_root(const char *new_root,
                 const char *old_root_after,   /* path below the new root, where to place the old root after the transition; may be NULL to unmount it */
@@ -46,13 +195,13 @@ int switch_root(const char *new_root,
         assert(new_root);
 
         /* Check if we shall remove the contents of the old root */
-        old_root_fd = open("/", O_DIRECTORY|O_CLOEXEC);
+        old_root_fd = xopenat(AT_FDCWD, "/", O_DIRECTORY);
         if (old_root_fd < 0)
-                return log_error_errno(errno, "Failed to open root directory: %m");
+                return log_error_errno(old_root_fd, "Failed to open root directory: %m");
 
-        new_root_fd = open(new_root, O_PATH|O_DIRECTORY|O_CLOEXEC);
+        new_root_fd = xopenat(AT_FDCWD, new_root, O_PATH|O_DIRECTORY);
         if (new_root_fd < 0)
-                return log_error_errno(errno, "Failed to open target directory '%s': %m", new_root);
+                return log_error_errno(new_root_fd, "Failed to open target directory '%s': %m", new_root);
 
         r = fds_inode_and_mount_same(old_root_fd, new_root_fd); /* checks if referenced inodes and mounts match */
         if (r < 0)
@@ -72,9 +221,9 @@ int switch_root(const char *new_root,
                 /* When the path was not a mount point, then we need to reopen the path, otherwise, it still
                  * points to the underlying directory. */
 
-                fd = open(new_root, O_DIRECTORY|O_CLOEXEC);
+                fd = xopenat(AT_FDCWD, new_root, O_DIRECTORY);
                 if (fd < 0)
-                        return log_error_errno(errno, "Failed to reopen target directory '%s': %m", new_root);
+                        return log_error_errno(fd, "Failed to reopen target directory '%s': %m", new_root);
 
                 close_and_replace(new_root_fd, fd);
         }
@@ -90,7 +239,7 @@ int switch_root(const char *new_root,
 
         if (old_root_after) {
                 /* Determine where we shall place the old root after the transition */
-                r = chase(old_root_after, new_root, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &resolved_old_root_after, NULL);
+                r = chase(old_root_after, new_root, CHASE_PREFIX_ROOT|CHASE_NONEXISTENT, &resolved_old_root_after, /* ret_fd= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to resolve %s/%s: %m", new_root, old_root_after);
                 if (r == 0) /* Doesn't exist yet. Let's create it */
@@ -100,16 +249,24 @@ int switch_root(const char *new_root,
         /* We are about to unmount various file systems with MNT_DETACH (either explicitly via umount() or
          * indirectly via pivot_root()), and thus do not synchronously wait for them to be fully sync'ed —
          * all while making them invisible/inaccessible in the file system tree for later code. That makes
-         * sync'ing them then difficult. Let's hence issue a manual sync() here, so that we at least can
-         * guarantee all file systems are an a good state before entering this state. */
-        if (!FLAGS_SET(flags, SWITCH_ROOT_DONT_SYNC))
-                sync();
+         * sync'ing them then difficult. Let's hence issue a manual sync here, so that we at least can
+         * guarantee the file systems that are about to become unreachable are in a good state before
+         * entering this state. See sync_departing_file_systems() above for why we don't just call the
+         * global sync() here unconditionally: only fall back to it if the smarter, targeted sync couldn't
+         * be performed (e.g. libmount is unavailable, or /proc/self/mountinfo couldn't be parsed). */
+        if (!FLAGS_SET(flags, SWITCH_ROOT_DONT_SYNC)) {
+                r = sync_departing_file_systems(new_root);
+                if (r < 0) {
+                        log_debug_errno(r, "Failed to selectively synchronize departing file systems, falling back to global sync(): %m");
+                        sync();
+                }
+        }
 
         /* Work-around for kernel design: the kernel refuses MS_MOVE if any file systems are mounted
          * MS_SHARED. Hence remount them MS_PRIVATE here as a work-around.
          *
          * https://bugzilla.redhat.com/show_bug.cgi?id=847418 */
-        if (mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) < 0)
+        if (mount(/* source= */ NULL, "/", /* filesystemtype= */ NULL, MS_REC|MS_PRIVATE, /* data= */ NULL) < 0)
                 return log_error_errno(errno, "Failed to set \"/\" mount propagation to private: %m");
 
         /* Do not fail if base_filesystem_create() fails. Not all switch roots are like base_filesystem_create() wants
@@ -130,7 +287,7 @@ int switch_root(const char *new_root,
                         continue;
                 }
 
-                r = chase(transfer->path, new_root, CHASE_PREFIX_ROOT, &chased, NULL);
+                r = chase(transfer->path, new_root, CHASE_PREFIX_ROOT, &chased, /* ret_fd= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to resolve %s/%s: %m", new_root, transfer->path);
 
@@ -141,7 +298,7 @@ int switch_root(const char *new_root,
                 if (r > 0) /* If it is already mounted, then do nothing */
                         continue;
 
-                r = mount_nofollow_verbose(LOG_ERR, transfer->path, chased, NULL, mount_flags, NULL);
+                r = mount_nofollow_verbose(LOG_ERR, transfer->path, chased, /* fstype= */ NULL, mount_flags, /* options= */ NULL);
                 if (r < 0)
                         return r;
         }
@@ -165,7 +322,7 @@ int switch_root(const char *new_root,
                 log_debug_errno(r, "Pivoting root file system failed, moving mounts instead: %m");
 
                 if (resolved_old_root_after) {
-                        r = mount_nofollow_verbose(LOG_ERR, "/", resolved_old_root_after, NULL, MS_BIND|MS_REC, NULL);
+                        r = mount_nofollow_verbose(LOG_ERR, "/", resolved_old_root_after, /* fstype= */ NULL, MS_BIND|MS_REC, /* options= */ NULL);
                         if (r < 0)
                                 return r;
                 }
@@ -176,9 +333,9 @@ int switch_root(const char *new_root,
                  * MS_MOVE won't magically unmount anything below it. Once the chroot() succeeds the mounts
                  * below would still be around but invisible to us, because not accessible via
                  * /proc/self/mountinfo. Hence, let's clean everything up first, as long as we still can. */
-                (void) umount_recursive_full(NULL, MNT_DETACH, STRV_MAKE(new_root));
+                (void) umount_recursive_full(/* prefix= */ NULL, MNT_DETACH, STRV_MAKE(new_root));
 
-                if (mount(".", "/", NULL, MS_MOVE, NULL) < 0)
+                if (mount(".", "/", /* filesystemtype= */ NULL, MS_MOVE, /* data= */ NULL) < 0)
                         return log_error_errno(errno, "Failed to move %s to /: %m", new_root);
 
                 if (chroot(".") < 0)
@@ -196,7 +353,7 @@ int switch_root(const char *new_root,
 
                         /* Note: the below won't operate on non-memory file systems (i.e. only on tmpfs, ramfs), and
                          * it will stop at mount boundaries */
-                        (void) rm_rf_children(TAKE_FD(old_root_fd), 0, &rb); /* takes possession of the dir fd, even on failure */
+                        (void) rm_rf_children(TAKE_FD(old_root_fd), /* flags= */ 0, &rb); /* takes possession of the dir fd, even on failure */
                 }
         } else
                 /* NB: we don't bother with emptying the old root superblock here, under the assumption the

@@ -36,6 +36,8 @@ typedef enum ExecInput {
         EXEC_INPUT_NAMED_FD,
         EXEC_INPUT_DATA,
         EXEC_INPUT_FILE,
+        EXEC_INPUT_BROKER,      /* Acquire a pseudo TTY from ptybrokerd, output discarded */
+        EXEC_INPUT_BROKER_LOG,  /* Acquire a pseudo TTY from ptybrokerd, output written to the logs */
         _EXEC_INPUT_MAX,
         _EXEC_INPUT_INVALID = -EINVAL,
 } ExecInput;
@@ -53,6 +55,8 @@ typedef enum ExecOutput {
         EXEC_OUTPUT_FILE,
         EXEC_OUTPUT_FILE_APPEND,
         EXEC_OUTPUT_FILE_TRUNCATE,
+        EXEC_OUTPUT_BROKER,      /* Acquire a pseudo TTY from ptybrokerd, output discarded */
+        EXEC_OUTPUT_BROKER_LOG,  /* Acquire a pseudo TTY from ptybrokerd, output written to the logs */
         _EXEC_OUTPUT_MAX,
         _EXEC_OUTPUT_INVALID = -EINVAL,
 } ExecOutput;
@@ -61,6 +65,7 @@ typedef enum ExecPreserveMode {
         EXEC_PRESERVE_NO,
         EXEC_PRESERVE_YES,
         EXEC_PRESERVE_RESTART,
+        EXEC_PRESERVE_ON_SUCCESS,
         _EXEC_PRESERVE_MODE_MAX,
         _EXEC_PRESERVE_MODE_INVALID = -EINVAL,
 } ExecPreserveMode;
@@ -73,23 +78,23 @@ typedef enum ExecKeyringMode {
         _EXEC_KEYRING_MODE_INVALID = -EINVAL,
 } ExecKeyringMode;
 
-typedef enum MemoryTHP {
+typedef enum ExecMemoryTHP {
         /*
          * Inherit default from process that starts systemd, i.e. do not make
          * any PR_SET_THP_DISABLE call.
          */
-        MEMORY_THP_INHERIT,
-        MEMORY_THP_DISABLE, /* Disable THPs completely for the process */
-        MEMORY_THP_MADVISE, /* Disable THPs for the process except when madvised */
+        EXEC_MEMORY_THP_INHERIT,
+        EXEC_MEMORY_THP_DISABLE, /* Disable THPs completely for the process */
+        EXEC_MEMORY_THP_MADVISE, /* Disable THPs for the process except when madvised */
         /*
          * Use system default THP setting. this can be used when the process that
          * starts systemd has already disabled THPs via PR_SET_THP_DISABLE, and we
          * want to restore the system default THP setting at process invocation time.
          */
-        MEMORY_THP_SYSTEM,
-        _MEMORY_THP_MAX,
-        _MEMORY_THP_INVALID = -EINVAL,
-} MemoryTHP;
+        EXEC_MEMORY_THP_SYSTEM,
+        _EXEC_MEMORY_THP_MAX,
+        _EXEC_MEMORY_THP_INVALID = -EINVAL,
+} ExecMemoryTHP;
 
 /* Contains start and exit information about an executed command.  */
 typedef struct ExecStatus {
@@ -154,12 +159,12 @@ static inline bool EXEC_DIRECTORY_TYPE_SHALL_CHOWN(ExecDirectoryType t) {
         return t >= 0 && t < _EXEC_DIRECTORY_TYPE_MAX && t != EXEC_DIRECTORY_CONFIGURATION;
 }
 
-typedef struct QuotaLimit {
+typedef struct ExecQuotaLimit {
         uint64_t quota_absolute; /* absolute quota in bytes; if UINT64_MAX relative quota configured, see below */
         uint32_t quota_scale;    /* relative quota to backend size, scaled to 0…UINT32_MAX */
         bool quota_enforce;
         bool quota_accounting;
-} QuotaLimit;
+} ExecQuotaLimit;
 
 typedef struct ExecDirectoryItem {
         char *path;
@@ -172,7 +177,7 @@ typedef struct ExecDirectory {
         mode_t mode;
         size_t n_items;
         ExecDirectoryItem *items;
-        QuotaLimit exec_quota;
+        ExecQuotaLimit exec_quota;
 } ExecDirectory;
 
 typedef enum ExecCleanMask {
@@ -332,7 +337,7 @@ typedef struct ExecContext {
         int mount_apivfs;
         int bind_log_sockets;
         int memory_ksm;
-        MemoryTHP memory_thp;
+        ExecMemoryTHP memory_thp;
         PrivateTmp private_tmp;     /* Those are not independent parameters, but are calculated from */
         PrivateTmp private_var_tmp; /* other parameters in unit_patch_contexts(). */
 
@@ -377,6 +382,9 @@ typedef struct ExecContext {
 
         bool address_families_allow_list:1;
         Set *address_families;
+
+        bool io_uring_filter_allow_list:1;
+        Set *io_uring_filter; /* io_uring opcodes plus one */
 
         char *user_namespace_path;
         char *network_namespace_path;
@@ -469,6 +477,7 @@ typedef struct ExecParameters {
 
         bool debug_invocation;
         bool selinux_context_net;
+        bool io_uring_bpf_filter_supported;
 } ExecParameters;
 
 #define EXEC_PARAMETERS_INIT(_flags)              \
@@ -485,11 +494,28 @@ typedef struct ExecParameters {
                 .pidref_transport_fd    = -EBADF, \
         }
 
-static inline bool exec_input_is_terminal(ExecInput i) {
+static inline bool exec_input_is_broker(ExecInput i) {
         return IN_SET(i,
+                      EXEC_INPUT_BROKER,
+                      EXEC_INPUT_BROKER_LOG);
+}
+
+static inline bool exec_input_is_terminal(ExecInput i) {
+        /* Note that PTYs acquired from ptybrokerd are terminals too, even though they are not backed by a
+         * physical TTY device. The distinction matters for the few places that operate on the physical
+         * console (see exec_context_may_touch_console()), but for the purpose of stdio setup, controlling
+         * terminal handling, terminal sizing and $TERM propagation they behave exactly like any other TTY. */
+        return exec_input_is_broker(i) ||
+               IN_SET(i,
                       EXEC_INPUT_TTY,
                       EXEC_INPUT_TTY_FORCE,
                       EXEC_INPUT_TTY_FAIL);
+}
+
+static inline bool exec_output_is_broker(ExecOutput o) {
+        return IN_SET(o,
+                      EXEC_OUTPUT_BROKER,
+                      EXEC_OUTPUT_BROKER_LOG);
 }
 
 static inline bool exec_context_has_tty(const ExecContext *context) {
@@ -502,6 +528,15 @@ static inline bool exec_context_has_tty(const ExecContext *context) {
                 context->std_error == EXEC_OUTPUT_TTY;
 }
 
+static inline bool exec_context_has_broker(const ExecContext *context) {
+        assert(context);
+
+        return
+                exec_input_is_broker(context->std_input) ||
+                exec_output_is_broker(context->std_output) ||
+                exec_output_is_broker(context->std_error);
+}
+
 static inline bool exec_input_is_inheritable(ExecInput i) {
         /* We assume these listed inputs refer to bidirectional streams, and hence duplicating them from
          * stdin to stdout/stderr makes sense and hence allowing EXEC_OUTPUT_INHERIT makes sense, too.
@@ -510,6 +545,12 @@ static inline bool exec_input_is_inheritable(ExecInput i) {
          * loop). */
 
         return exec_input_is_terminal(i) || IN_SET(i, EXEC_INPUT_SOCKET, EXEC_INPUT_NAMED_FD);
+}
+
+static inline bool exec_output_is_file(ExecOutput o) {
+        /* The output types that refer to a regular file (StandardOutput=file:…, append:…, truncate:…), i.e.
+         * that require a companion path in ExecContext.stdio_file[] */
+        return IN_SET(o, EXEC_OUTPUT_FILE, EXEC_OUTPUT_FILE_APPEND, EXEC_OUTPUT_FILE_TRUNCATE);
 }
 
 int exec_spawn(
@@ -532,13 +573,19 @@ void exec_command_reset_status_list_array(ExecCommand **c, size_t n);
 
 void exec_command_dump(ExecCommand *c, FILE *f, const char *prefix);
 void exec_command_dump_list(ExecCommand *c, FILE *f, const char *prefix);
+/* Takes ownership of argv_consume, including on failure. */
+int exec_command_new(const char *path, char **argv_consume, ExecCommandFlags flags, ExecCommand **ret);
 void exec_command_append_list(ExecCommand **l, ExecCommand *e);
+int exec_command_to_setting(const ExecCommand *c, char **ret);
 int exec_command_set(ExecCommand *c, const char *path, ...) _sentinel_;
 int exec_command_append(ExecCommand *c, const char *path, ...) _sentinel_;
 
 void exec_context_init(ExecContext *c);
 void exec_context_done(ExecContext *c);
 void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix);
+
+int exec_context_apply_environment(Unit *u, ExecContext *c, char **env, UnitWriteFlags flags);
+int exec_context_apply_set_credential(Unit *u, ExecContext *c, const char *id, const void *data, size_t size, bool encrypted, UnitWriteFlags flags, const char **reterr_message);
 
 int exec_context_destroy_runtime_directory(const ExecContext *c, const char *runtime_prefix);
 int exec_context_destroy_mount_ns_dir(Unit *u);
@@ -576,11 +623,15 @@ char** exec_context_get_syscall_filter(const ExecContext *c);
 char** exec_context_get_syscall_archs(const ExecContext *c);
 char** exec_context_get_syscall_log(const ExecContext *c);
 char** exec_context_get_address_families(const ExecContext *c);
+char** exec_context_get_io_uring_filter(const ExecContext *c);
 char** exec_context_get_restrict_filesystems(const ExecContext *c);
+bool exec_context_has_address_families(const ExecContext *c);
+bool exec_context_has_syscall_filters(const ExecContext *c);
 bool exec_context_restrict_namespaces_set(const ExecContext *c);
 bool exec_context_restrict_filesystems_set(const ExecContext *c);
+bool exec_context_io_uring_filter_set(const ExecContext *c);
+bool exec_context_with_separate_rootfs(const ExecContext *c);
 bool exec_context_with_rootfs(const ExecContext *c);
-bool exec_context_with_rootfs_strict(const ExecContext *c);
 
 int exec_context_has_vpicked_extensions(const ExecContext *context);
 
@@ -631,12 +682,11 @@ DECLARE_STRING_TABLE_LOOKUP(exec_preserve_mode, ExecPreserveMode);
 
 DECLARE_STRING_TABLE_LOOKUP(exec_keyring_mode, ExecKeyringMode);
 
-DECLARE_STRING_TABLE_LOOKUP(exec_directory_type_symlink, ExecDirectoryType);
 DECLARE_STRING_TABLE_LOOKUP(exec_directory_type_mode, ExecDirectoryType);
 
 DECLARE_STRING_TABLE_LOOKUP(exec_resource_type, ExecDirectoryType);
 
-DECLARE_STRING_TABLE_LOOKUP(memory_thp, MemoryTHP);
+DECLARE_STRING_TABLE_LOOKUP(exec_memory_thp, ExecMemoryTHP);
 
 bool exec_needs_mount_namespace(const ExecContext *context, const ExecParameters *params);
 bool exec_needs_network_namespace(const ExecContext *context);

@@ -1,13 +1,13 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
-
 #include "format-util.h"
 #include "hashmap.h"
 #include "offline-passwd.h"
+#include "options.h"
+#include "strv.h"
 #include "tests.h"
 
-static char *arg_root = NULL;
+static const char *arg_root = NULL;
 
 static void test_resolve_one(const char *name) {
         bool relaxed = name || arg_root;
@@ -24,45 +24,35 @@ static void test_resolve_one(const char *name) {
 
         r = name_to_uid_offline(arg_root, name, &uid, &uid_cache);
         log_info_errno(r, "name_to_uid_offline: %s → "UID_FMT": %m", name, uid);
-        assert_se(relaxed || r == 0);
+        ASSERT_TRUE(relaxed || r == 0);
 
         r = name_to_uid_offline(arg_root, name, &uid, &uid_cache);
         log_info_errno(r, "name_to_uid_offline: %s → "UID_FMT": %m", name, uid);
-        assert_se(relaxed || r == 0);
+        ASSERT_TRUE(relaxed || r == 0);
 
         r = name_to_gid_offline(arg_root, name, &gid, &gid_cache);
         log_info_errno(r, "name_to_gid_offline: %s → "GID_FMT": %m", name, gid);
-        assert_se(relaxed || r == 0);
+        ASSERT_TRUE(relaxed || r == 0);
 
         r = name_to_gid_offline(arg_root, name, &gid, &gid_cache);
         log_info_errno(r, "name_to_gid_offline: %s → "GID_FMT": %m", name, gid);
-        assert_se(relaxed || r == 0);
+        ASSERT_TRUE(relaxed || r == 0);
 }
 
-static int parse_argv(int argc, char *argv[]) {
-        static const struct option options[] = {
-                { "root",           required_argument,   NULL, 'r' },
-                {}
-        };
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
+        ASSERT_GE(argc, 0);
 
-        int c;
+        OptionParser opts = { argc, ASSERT_PTR(argv) };
 
-        assert_se(argc >= 0);
-        assert_se(argv);
-
-        while ((c = getopt_long(argc, argv, "r:", options, NULL)) >= 0)
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 'r':
-                        arg_root = optarg;
+
+                OPTION('r', "root", "PATH", "Operate on an alternate filesystem root"):
+                        arg_root = opts.arg;
                         break;
-
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
                 }
 
+        *ASSERT_PTR(ret_args) = option_parser_get_args(&opts);
         return 0;
 }
 
@@ -71,15 +61,16 @@ int main(int argc, char **argv) {
 
         test_setup_logging(LOG_DEBUG);
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r < 0)
                 return r;
 
-        if (optind >= argc)
-                test_resolve_one(NULL);
+        if (strv_isempty(args))
+                test_resolve_one(/* name= */ NULL);
         else
-                while (optind < argc)
-                        test_resolve_one(argv[optind++]);
+                STRV_FOREACH(a, args)
+                        test_resolve_one(*a);
 
         return 0;
 }

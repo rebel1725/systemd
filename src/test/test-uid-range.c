@@ -15,8 +15,8 @@ TEST(uid_range) {
         _cleanup_(uid_range_freep) UIDRange *p = NULL;
         uid_t search;
 
-        ASSERT_TRUE(uid_range_covers(p, 0, 0));
-        ASSERT_FALSE(uid_range_covers(p, 0, 1));
+        ASSERT_TRUE(uid_range_covers(p, /* start= */ 0, /* nr= */ 0));
+        ASSERT_FALSE(uid_range_covers(p, /* start= */ 0, 1));
         ASSERT_FALSE(uid_range_covers(p, 100, UINT32_MAX));
         ASSERT_FALSE(uid_range_covers(p, UINT32_MAX, 1));
         ASSERT_FALSE(uid_range_covers(p, UINT32_MAX - 10, 11));
@@ -121,7 +121,7 @@ TEST(load_userns) {
         _cleanup_fclose_ FILE *f = NULL;
         int r;
 
-        r = uid_range_load_userns(NULL, UID_RANGE_USERNS_INSIDE, &p);
+        r = uid_range_load_userns(/* path= */ NULL, UID_RANGE_USERNS_INSIDE, &p);
         if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
                 return;
 
@@ -134,10 +134,10 @@ TEST(load_userns) {
                 ASSERT_EQ(p->entries[0].start, 0U);
                 ASSERT_EQ(p->entries[0].nr, UINT32_MAX);
 
-                ASSERT_TRUE(uid_range_covers(p, 0, UINT32_MAX));
+                ASSERT_TRUE(uid_range_covers(p, /* start= */ 0, UINT32_MAX));
         }
 
-        ASSERT_OK(fopen_temporary_child(NULL, &f, &fn));
+        ASSERT_OK(fopen_temporary_child(/* path= */ NULL, &f, &fn));
         fputs("0 0 20\n"
               "100 0 20\n", f);
         ASSERT_OK(fflush_and_check(f));
@@ -146,7 +146,7 @@ TEST(load_userns) {
 
         ASSERT_OK(uid_range_load_userns(fn, UID_RANGE_USERNS_INSIDE, &p));
 
-        ASSERT_TRUE(uid_range_contains(p, 0));
+        ASSERT_TRUE(uid_range_contains(p, /* uid= */ 0));
         ASSERT_TRUE(uid_range_contains(p, 19));
         ASSERT_FALSE(uid_range_contains(p, 20));
 
@@ -205,7 +205,7 @@ TEST(uid_range_clip) {
         ASSERT_EQ(uid_range_entries(p), 3U);
 
         /* Intersect with range that covers all entries */
-        ASSERT_OK(uid_range_clip(p, 0, 1000));
+        ASSERT_OK(uid_range_clip(p, /* min= */ 0, 1000));
         ASSERT_EQ(uid_range_entries(p), 3U);
         ASSERT_EQ(p->entries[0].start, 100U);
         ASSERT_EQ(p->entries[0].nr, 100U);
@@ -246,7 +246,7 @@ TEST(uid_range_clip) {
 
         /* Test with max == UINT32_MAX (should not overflow) */
         ASSERT_OK(uid_range_add_str(&p, "100-199"));
-        ASSERT_OK(uid_range_clip(p, 0, UINT32_MAX));
+        ASSERT_OK(uid_range_clip(p, /* min= */ 0, UINT32_MAX));
         ASSERT_EQ(uid_range_entries(p), 1U);
         ASSERT_EQ(p->entries[0].start, 100U);
         ASSERT_EQ(p->entries[0].nr, 100U);
@@ -318,6 +318,68 @@ TEST(uid_range_partition) {
 
         p = uid_range_free(p);
 
+        /* Small entry preceding a large entry: the small entry must be dropped and the large entry
+         * partitioned without the in-place backward-fill write cursor aliasing the still-live small entry
+         * slot. */
+        ASSERT_OK(uid_range_add_str(&p, "0-4"));
+        ASSERT_OK(uid_range_add_str(&p, "100-129"));
+        ASSERT_EQ(uid_range_entries(p), 2U);
+        ASSERT_OK(uid_range_partition(p, 10));
+        ASSERT_EQ(uid_range_entries(p), 3U);
+        ASSERT_EQ(p->entries[0].start, 100U);
+        ASSERT_EQ(p->entries[0].nr, 10U);
+        ASSERT_EQ(p->entries[1].start, 110U);
+        ASSERT_EQ(p->entries[1].nr, 10U);
+        ASSERT_EQ(p->entries[2].start, 120U);
+        ASSERT_EQ(p->entries[2].nr, 10U);
+
+        p = uid_range_free(p);
+
+        /* A too-small entry between two partitionable entries is dropped; the others still partition. */
+        ASSERT_OK(uid_range_add_str(&p, "0-4"));        /* nr=5  < size -> dropped */
+        ASSERT_OK(uid_range_add_str(&p, "50-69"));      /* nr=20       -> 2 parts */
+        ASSERT_OK(uid_range_add_str(&p, "200-204"));    /* nr=5  < size -> dropped */
+        ASSERT_OK(uid_range_add_str(&p, "1000-1029"));  /* nr=30       -> 3 parts */
+        ASSERT_EQ(uid_range_entries(p), 4U);
+        ASSERT_OK(uid_range_partition(p, 10));
+        ASSERT_EQ(uid_range_entries(p), 5U);
+        ASSERT_EQ(p->entries[0].start, 50U);
+        ASSERT_EQ(p->entries[0].nr, 10U);
+        ASSERT_EQ(p->entries[1].start, 60U);
+        ASSERT_EQ(p->entries[1].nr, 10U);
+        ASSERT_EQ(p->entries[2].start, 1000U);
+        ASSERT_EQ(p->entries[2].nr, 10U);
+        ASSERT_EQ(p->entries[3].start, 1010U);
+        ASSERT_EQ(p->entries[3].nr, 10U);
+        ASSERT_EQ(p->entries[4].start, 1020U);
+        ASSERT_EQ(p->entries[4].nr, 10U);
+
+        p = uid_range_free(p);
+
+        /* A too-small entry before a partitionable entry is dropped. */
+        ASSERT_OK(uid_range_add_str(&p, "0-4"));        /* nr=5  < size -> dropped */
+        ASSERT_OK(uid_range_add_str(&p, "100-119"));    /* nr=20       -> 2 parts */
+        ASSERT_OK(uid_range_partition(p, 10));
+        ASSERT_EQ(uid_range_entries(p), 2U);
+        ASSERT_EQ(p->entries[0].start, 100U);
+        ASSERT_EQ(p->entries[0].nr, 10U);
+        ASSERT_EQ(p->entries[1].start, 110U);
+        ASSERT_EQ(p->entries[1].nr, 10U);
+
+        p = uid_range_free(p);
+
+        /* A too-small entry after a partitionable entry is dropped. */
+        ASSERT_OK(uid_range_add_str(&p, "0-199"));      /* nr=200 -> 2 parts */
+        ASSERT_OK(uid_range_add_str(&p, "1000-1004"));  /* nr=5  < size -> dropped */
+        ASSERT_OK(uid_range_partition(p, 100));
+        ASSERT_EQ(uid_range_entries(p), 2U);
+        ASSERT_EQ(p->entries[0].start, 0U);
+        ASSERT_EQ(p->entries[0].nr, 100U);
+        ASSERT_EQ(p->entries[1].start, 100U);
+        ASSERT_EQ(p->entries[1].nr, 100U);
+
+        p = uid_range_free(p);
+
         /* Partition size of 1 */
         ASSERT_OK(uid_range_add_str(&p, "100-102"));
         ASSERT_OK(uid_range_partition(p, 1));
@@ -334,7 +396,7 @@ TEST(uid_range_copy) {
         _cleanup_(uid_range_freep) UIDRange *p = NULL, *copy = NULL;
 
         /* Copy NULL range */
-        ASSERT_OK(uid_range_copy(NULL, &copy));
+        ASSERT_OK(uid_range_copy(/* range= */ NULL, &copy));
         ASSERT_TRUE(uid_range_is_empty(copy));
 
         copy = uid_range_free(copy);
@@ -368,13 +430,13 @@ TEST(uid_range_remove) {
         ASSERT_OK(uid_range_add_str(&p, "100-199"));
 
         /* Remove with size 0 - no-op */
-        ASSERT_OK(uid_range_remove(p, 150, 0));
+        ASSERT_OK(uid_range_remove(p, 150, /* size= */ 0));
         ASSERT_EQ(uid_range_entries(p), 1U);
         ASSERT_EQ(p->entries[0].start, 100U);
         ASSERT_EQ(p->entries[0].nr, 100U);
 
         /* Remove range that doesn't overlap - no change */
-        ASSERT_OK(uid_range_remove(p, 0, 50));
+        ASSERT_OK(uid_range_remove(p, /* start= */ 0, 50));
         ASSERT_EQ(uid_range_entries(p), 1U);
         ASSERT_EQ(p->entries[0].start, 100U);
         ASSERT_EQ(p->entries[0].nr, 100U);
@@ -474,10 +536,10 @@ TEST(uid_range_translate) {
         ASSERT_EQ(uid, 399U);
 
         /* Test UID not in any range returns ESRCH */
-        ASSERT_ERROR(uid_range_translate(o, i, 0, &uid), ESRCH);
+        ASSERT_ERROR(uid_range_translate(o, i, /* uid= */ 0, &uid), ESRCH);
         ASSERT_ERROR(uid_range_translate(o, i, 199, &uid), ESRCH);
         ASSERT_ERROR(uid_range_translate(o, i, 400, &uid), ESRCH);
-        ASSERT_ERROR(uid_range_translate(i, o, 0, &uid), ESRCH);
+        ASSERT_ERROR(uid_range_translate(i, o, /* uid= */ 0, &uid), ESRCH);
         ASSERT_ERROR(uid_range_translate(i, o, 99, &uid), ESRCH);
         ASSERT_ERROR(uid_range_translate(i, o, 200, &uid), ESRCH);
         ASSERT_ERROR(uid_range_translate(i, o, 349, &uid), ESRCH);

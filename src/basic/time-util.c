@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <linux/time_types.h>
 #include <stdlib.h>
 #include <sys/timerfd.h>
 #include <threads.h>
@@ -49,7 +50,15 @@ usec_t now(clockid_t clock_id) {
 
         assert_se(clock_gettime(map_clock_id(clock_id), &ts) == 0);
 
-        return timespec_load(&ts);
+        usec_t n = timespec_load(&ts);
+
+        /* We use both 0 and USEC_INFINITY as niche values. If the current time collides with either, things are
+         * really weird and really broken. Let's not allow this to go through, it would break too many of our
+         * assumptions in code. */
+        assert(n > 0);
+        assert(n < USEC_INFINITY);
+
+        return n;
 }
 
 nsec_t now_nsec(clockid_t clock_id) {
@@ -57,7 +66,12 @@ nsec_t now_nsec(clockid_t clock_id) {
 
         assert_se(clock_gettime(map_clock_id(clock_id), &ts) == 0);
 
-        return timespec_load_nsec(&ts);
+        nsec_t n = timespec_load_nsec(&ts);
+
+        assert(n > 0);
+        assert(n < NSEC_INFINITY);
+
+        return n;
 }
 
 dual_timestamp* dual_timestamp_now(dual_timestamp *ts) {
@@ -279,6 +293,18 @@ struct timespec *timespec_store_nsec(struct timespec *ts, nsec_t n) {
         return ts;
 }
 
+struct __kernel_timespec *kernel_timespec_store(struct __kernel_timespec *ts, usec_t u) {
+        assert(ts);
+        /* struct __kernel_timespec has no encoding for "no timeout": io_uring expects a NULL pointer for
+         * that, so callers have to resolve USEC_INFINITY themselves. */
+        assert(u != USEC_INFINITY);
+
+        ts->tv_sec  = u / USEC_PER_SEC;
+        ts->tv_nsec = (u % USEC_PER_SEC) * NSEC_PER_USEC;
+
+        return ts;
+}
+
 usec_t timeval_load(const struct timeval *tv) {
         assert(tv);
 
@@ -308,24 +334,26 @@ struct timeval *timeval_store(struct timeval *tv, usec_t u) {
         return tv;
 }
 
+/* Returns the abbreviated English weekday name for wd in Mon=0 … Sun=6 order.
+ * We use non-localized (English) form so that timestamps can be parsed with
+ * parse_timestamp() and always read the same regardless of locale. */
+static const char *const weekday_table[_WEEKDAY_MAX] = {
+        [WEEKDAY_MON] = "Mon",
+        [WEEKDAY_TUE] = "Tue",
+        [WEEKDAY_WED] = "Wed",
+        [WEEKDAY_THU] = "Thu",
+        [WEEKDAY_FRI] = "Fri",
+        [WEEKDAY_SAT] = "Sat",
+        [WEEKDAY_SUN] = "Sun",
+};
+
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(weekday, int);
+
 char* format_timestamp_style(
                 char *buf,
                 size_t l,
                 usec_t t,
                 TimestampStyle style) {
-
-        /* The weekdays in non-localized (English) form. We use this instead of the localized form, so that
-         * our generated timestamps may be parsed with parse_timestamp(), and always read the same. */
-        static const char * const weekdays[] = {
-                [0] = "Sun",
-                [1] = "Mon",
-                [2] = "Tue",
-                [3] = "Wed",
-                [4] = "Thu",
-                [5] = "Fri",
-                [6] = "Sat",
-        };
-
         struct tm tm;
         bool utc, us;
         size_t n;
@@ -344,18 +372,6 @@ char* format_timestamp_style(
                 return snprintf_ok(buf, l, "@" USEC_FMT, t / USEC_PER_SEC);  /* round down μs → s */
         }
 
-        utc = IN_SET(style, TIMESTAMP_UTC, TIMESTAMP_US_UTC, TIMESTAMP_DATE);
-        us = IN_SET(style, TIMESTAMP_US, TIMESTAMP_US_UTC);
-
-        if (l < (size_t) (3 +                   /* week day */
-                          1 + 10 +              /* space and date */
-                          style == TIMESTAMP_DATE ? 0 :
-                          (1 + 8 +              /* space and time */
-                           (us ? 1 + 6 : 0) +   /* "." and microsecond part */
-                           1 + (utc ? 3 : 1)) + /* space and shortest possible zone */
-                          1))
-                return NULL; /* Not enough space even for the shortest form. */
-
         /* Let's not format times with years > 9999 */
         if (t > USEC_TIMESTAMP_FORMATTABLE_MAX) {
                 static const char* const xxx[_TIMESTAMP_STYLE_MAX] = {
@@ -366,16 +382,30 @@ char* format_timestamp_style(
                         [TIMESTAMP_DATE]   = "--- XXXX-XX-XX",
                 };
 
-                assert(l >= strlen(xxx[style]) + 1);
+                if (l < strlen(xxx[style]) + 1)
+                        return NULL;
                 return strcpy(buf, xxx[style]);
         }
+
+        utc = IN_SET(style, TIMESTAMP_UTC, TIMESTAMP_US_UTC, TIMESTAMP_DATE);
+        us = IN_SET(style, TIMESTAMP_US, TIMESTAMP_US_UTC);
+
+        if (l < (size_t) (3 +                     /* week day */
+                          1 + 10 +                /* space and date */
+                          (style == TIMESTAMP_DATE ? 0 :
+                           (1 + 8 +               /* space and time */
+                            (us ? 1 + 6 : 0) +    /* "." and microsecond part */
+                            1 + (utc ? 3 : 1))) + /* space and shortest possible zone */
+                          1))
+                return NULL; /* Not enough space even for the shortest form. */
 
         if (localtime_or_gmtime_usec(t, utc, &tm) < 0)
                 return NULL;
 
         /* Start with the week day */
-        assert((size_t) tm.tm_wday < ELEMENTSOF(weekdays));
-        memcpy(buf, weekdays[tm.tm_wday], 4);
+        const char *weekday = weekday_to_string(tm.tm_wday == 0 ? 6 : tm.tm_wday - 1);
+        assert(weekday);
+        memcpy(buf, weekday, 4);
 
         if (style == TIMESTAMP_DATE) {
                 /* Special format string if only date should be shown. */
@@ -1605,15 +1635,15 @@ int verify_timezone(const char *name, int log_level) {
 
         t = strjoina("/usr/share/zoneinfo/", name);
 
-        fd = open(t, O_RDONLY|O_CLOEXEC);
+        fd = xopenat(AT_FDCWD, t, O_RDONLY);
         if (fd < 0)
-                return log_full_errno(log_level, errno, "Failed to open timezone file '%s': %m", t);
+                return log_full_errno(log_level, fd, "Failed to open timezone file '%s': %m", t);
 
         r = fd_verify_regular(fd);
         if (r < 0)
                 return log_full_errno(log_level, r, "Timezone file '%s' is not a regular file: %m", t);
 
-        r = loop_read_exact(fd, buf, 4, false);
+        r = loop_read_exact(fd, buf, 4, /* do_poll= */ false);
         if (r < 0)
                 return log_full_errno(log_level, r, "Failed to read from timezone file '%s': %m", t);
 
@@ -1684,6 +1714,16 @@ int get_timezone(char **ret) {
         return strdup_to(ret, e);
 }
 
+int get_timezone_prefer_env(char **ret) {
+        assert(ret);
+
+        const char *e = getenv("TZ");
+        if (e && e[0] == ':' && timezone_is_valid(e + 1, LOG_DEBUG))
+                return strdup_to(ret, e + 1);
+
+        return get_timezone(ret);
+}
+
 const char* etc_localtime(void) {
         static const char *cached = NULL;
 
@@ -1743,27 +1783,26 @@ int localtime_or_gmtime_usec(
         return 0;
 }
 
-static uint32_t sysconf_clock_ticks_cached(void) {
-        static thread_local uint32_t hz = 0;
-        long r;
+uint64_t sysconf_clock_ticks_cached(void) {
+        static thread_local uint64_t hz = 0;
 
-        if (hz == 0) {
-                r = sysconf(_SC_CLK_TCK);
+        if (hz != 0)
+                return hz;
 
-                assert(r > 0);
-                hz = r;
-        }
+        long t = sysconf(_SC_CLK_TCK);
+        assert(t > 0);
+        hz = (uint64_t) t;
 
         return hz;
 }
 
 uint32_t usec_to_jiffies(usec_t u) {
-        uint32_t hz = sysconf_clock_ticks_cached();
+        uint64_t hz = sysconf_clock_ticks_cached();
         return DIV_ROUND_UP(u, USEC_PER_SEC / hz);
 }
 
 usec_t jiffies_to_usec(uint32_t j) {
-        uint32_t hz = sysconf_clock_ticks_cached();
+        uint64_t hz = sysconf_clock_ticks_cached();
         return DIV_ROUND_UP(j * USEC_PER_SEC, hz);
 }
 

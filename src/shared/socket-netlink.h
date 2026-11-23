@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 #include "in-addr-util.h"
 
 int make_socket_fd(int log_level, const char* address, int type, int flags);
@@ -21,10 +21,10 @@ int in_addr_port_ifindex_name_from_string_auto(
                 int *ret_ifindex,
                 char **ret_server_name);
 static inline int in_addr_ifindex_name_from_string_auto(const char *s, int *family, union in_addr_union *ret, int *ifindex, char **server_name) {
-        return in_addr_port_ifindex_name_from_string_auto(s, family, ret, NULL, ifindex, server_name);
+        return in_addr_port_ifindex_name_from_string_auto(s, family, ret, /* ret_port= */ NULL, ifindex, server_name);
 }
 static inline int in_addr_ifindex_from_string_auto(const char *s, int *family, union in_addr_union *ret, int *ifindex) {
-        return in_addr_ifindex_name_from_string_auto(s, family, ret, ifindex, NULL);
+        return in_addr_ifindex_name_from_string_auto(s, family, ret, ifindex, /* server_name= */ NULL);
 }
 
 struct in_addr_full {
@@ -36,9 +36,9 @@ struct in_addr_full {
         char *cached_server_string; /* Should not be handled directly, but through in_addr_full_to_string(). */
 };
 
-struct in_addr_full *in_addr_full_free(struct in_addr_full *a);
+struct in_addr_full* in_addr_full_free(struct in_addr_full *a);
 DEFINE_TRIVIAL_CLEANUP_FUNC(struct in_addr_full*, in_addr_full_free);
-void in_addr_full_array_free(struct in_addr_full *addrs[], size_t n);
+void in_addr_full_free_array(struct in_addr_full **array, size_t n);
 int in_addr_full_new(int family, const union in_addr_union *a, uint16_t port, int ifindex, const char *server_name, struct in_addr_full **ret);
 int in_addr_full_new_from_string(const char *s, struct in_addr_full **ret);
 const char* in_addr_full_to_string(struct in_addr_full *a);

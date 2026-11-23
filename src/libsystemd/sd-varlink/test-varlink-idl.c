@@ -1,0 +1,1117 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include <pthread.h>
+#include <sys/socket.h>
+
+#include "sd-event.h"
+#include "sd-json.h"
+#include "sd-varlink.h"
+#include "sd-varlink-idl.h"
+
+#include "bootspec.h"
+#include "discover-image.h"
+#include "fd-util.h"
+#include "gpt.h"
+#include "network-util.h"
+#include "pretty-print.h"
+#include "resolve-util.h"
+#include "tests.h"
+#include "test-varlink-idl-util.h"
+#include "varlink-idl-util.h"
+#include "varlink-io.systemd.h"
+#include "varlink-io.systemd.AskPassword.h"
+#include "varlink-io.systemd.BootControl.h"
+#include "varlink-io.systemd.Credentials.h"
+#include "varlink-io.systemd.CryptEnroll.h"
+#include "varlink-io.systemd.FactoryReset.h"
+#include "varlink-io.systemd.FirstBoot.h"
+#include "varlink-io.systemd.Hostname.h"
+#include "varlink-io.systemd.Import.h"
+#include "varlink-io.systemd.InstanceMetadata.h"
+#include "varlink-io.systemd.Job.h"
+#include "varlink-io.systemd.Journal.h"
+#include "varlink-io.systemd.JournalAccess.h"
+#include "varlink-io.systemd.Login.h"
+#include "varlink-io.systemd.Machine.h"
+#include "varlink-io.systemd.MachineImage.h"
+#include "varlink-io.systemd.MachineInstance.h"
+#include "varlink-io.systemd.ManagedOOM.h"
+#include "varlink-io.systemd.Manager.h"
+#include "varlink-io.systemd.Metrics.h"
+#include "varlink-io.systemd.MountFileSystem.h"
+#include "varlink-io.systemd.MuteConsole.h"
+#include "varlink-io.systemd.NamespaceResource.h"
+#include "varlink-io.systemd.Network.h"
+#include "varlink-io.systemd.Network.Link.h"
+#include "varlink-io.systemd.PCRExtend.h"
+#include "varlink-io.systemd.PCRLock.h"
+#include "varlink-io.systemd.PTYBroker.h"
+#include "varlink-io.systemd.Repart.h"
+#include "varlink-io.systemd.Report.h"
+#include "varlink-io.systemd.Report.Signer.h"
+#include "varlink-io.systemd.Report.Uploader.h"
+#include "varlink-io.systemd.Resolve.h"
+#include "varlink-io.systemd.Resolve.Hook.h"
+#include "varlink-io.systemd.Resolve.Link.h"
+#include "varlink-io.systemd.Resolve.Monitor.h"
+#include "varlink-io.systemd.ResourceProvider.h"
+#include "varlink-io.systemd.Shutdown.h"
+#include "varlink-io.systemd.StorageProvider.h"
+#include "varlink-io.systemd.SysInstall.h"
+#include "varlink-io.systemd.SysUpdate.h"
+#include "varlink-io.systemd.SysUpdate.Notify.h"
+#include "varlink-io.systemd.SysUpdate.Provider.h"
+#include "varlink-io.systemd.Timedate.h"
+#include "varlink-io.systemd.Udev.h"
+#include "varlink-io.systemd.Unit.h"
+#include "varlink-io.systemd.UserDatabase.h"
+#include "varlink-io.systemd.VarlinkMonitor.h"
+#include "varlink-io.systemd.VirtualMachineInstance.h"
+#include "varlink-io.systemd.oom.h"
+#include "varlink-io.systemd.oom.Prekill.h"
+#include "varlink-io.systemd.service.h"
+#include "varlink-io.systemd.sysext.h"
+#include "varlink-org.varlink.service.h"
+#include "varlink-util.h"
+
+static SD_VARLINK_DEFINE_ENUM_TYPE(
+                EnumTest,
+                SD_VARLINK_FIELD_COMMENT("piff paff"),
+                SD_VARLINK_DEFINE_ENUM_VALUE(foo),
+                SD_VARLINK_FIELD_COMMENT("waldo"),
+                SD_VARLINK_DEFINE_ENUM_VALUE(bar),
+                SD_VARLINK_FIELD_COMMENT("crux"),
+                SD_VARLINK_DEFINE_ENUM_VALUE(baz));
+
+static SD_VARLINK_DEFINE_STRUCT_TYPE(
+                NestedStructTest,
+                SD_VARLINK_FIELD_COMMENT("miepf"),
+                SD_VARLINK_DEFINE_FIELD(x, SD_VARLINK_INT, 0));
+
+static SD_VARLINK_DEFINE_STRUCT_TYPE(
+                StructTest,
+
+                SD_VARLINK_DEFINE_FIELD(bbb, SD_VARLINK_BOOL, 0),
+                SD_VARLINK_DEFINE_FIELD(bbbn, SD_VARLINK_BOOL, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_FIELD(bbba, SD_VARLINK_BOOL, SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(bbbna, SD_VARLINK_BOOL, SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(bbbm, SD_VARLINK_BOOL, SD_VARLINK_MAP),
+                SD_VARLINK_DEFINE_FIELD(bbbnm, SD_VARLINK_BOOL, SD_VARLINK_NULLABLE|SD_VARLINK_MAP),
+
+                SD_VARLINK_FIELD_COMMENT("more from here"),
+
+                SD_VARLINK_DEFINE_FIELD(iii, SD_VARLINK_INT, 0),
+                SD_VARLINK_DEFINE_FIELD(iiin, SD_VARLINK_INT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_FIELD(iiia, SD_VARLINK_INT, SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(iiina, SD_VARLINK_INT, SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(iiim, SD_VARLINK_INT, SD_VARLINK_MAP),
+                SD_VARLINK_DEFINE_FIELD(iiinm, SD_VARLINK_INT, SD_VARLINK_NULLABLE|SD_VARLINK_MAP),
+
+                SD_VARLINK_DEFINE_FIELD(fff, SD_VARLINK_FLOAT, 0),
+                SD_VARLINK_DEFINE_FIELD(fffn, SD_VARLINK_FLOAT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_FIELD(fffa, SD_VARLINK_FLOAT, SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(fffna, SD_VARLINK_FLOAT, SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(fffm, SD_VARLINK_FLOAT, SD_VARLINK_MAP),
+                SD_VARLINK_DEFINE_FIELD(fffnm, SD_VARLINK_FLOAT, SD_VARLINK_NULLABLE|SD_VARLINK_MAP),
+
+                SD_VARLINK_DEFINE_FIELD(sss, SD_VARLINK_STRING, 0),
+                SD_VARLINK_DEFINE_FIELD(sssn, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_FIELD(sssa, SD_VARLINK_STRING, SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(sssna, SD_VARLINK_STRING, SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(sssm, SD_VARLINK_STRING, SD_VARLINK_MAP),
+                SD_VARLINK_DEFINE_FIELD(sssnm, SD_VARLINK_STRING, SD_VARLINK_NULLABLE|SD_VARLINK_MAP),
+
+                SD_VARLINK_DEFINE_FIELD(ooo, SD_VARLINK_OBJECT, 0),
+                SD_VARLINK_DEFINE_FIELD(ooon, SD_VARLINK_OBJECT, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_FIELD(oooa, SD_VARLINK_OBJECT, SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(ooona, SD_VARLINK_OBJECT, SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(ooom, SD_VARLINK_OBJECT, SD_VARLINK_MAP),
+                SD_VARLINK_DEFINE_FIELD(ooonm, SD_VARLINK_OBJECT, SD_VARLINK_NULLABLE|SD_VARLINK_MAP),
+
+                SD_VARLINK_DEFINE_FIELD(aaa, SD_VARLINK_ANY, 0),
+                SD_VARLINK_DEFINE_FIELD(aaan, SD_VARLINK_ANY, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_FIELD(aaaa, SD_VARLINK_ANY, SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(aaana, SD_VARLINK_ANY, SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD(aaam, SD_VARLINK_ANY, SD_VARLINK_MAP),
+                SD_VARLINK_DEFINE_FIELD(aaanm, SD_VARLINK_ANY, SD_VARLINK_NULLABLE|SD_VARLINK_MAP),
+
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(eee, EnumTest, 0),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(eeen, EnumTest, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(eeea, EnumTest, SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(eeena, EnumTest, SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(eeem, EnumTest, SD_VARLINK_MAP),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(eeenm, EnumTest, SD_VARLINK_NULLABLE|SD_VARLINK_MAP),
+
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(nnn, NestedStructTest, 0),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(nnnn, NestedStructTest, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(nnna, NestedStructTest, SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(nnnna, NestedStructTest, SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(nnnm, NestedStructTest, SD_VARLINK_MAP),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(nnnnm, NestedStructTest, SD_VARLINK_NULLABLE|SD_VARLINK_MAP));
+
+static SD_VARLINK_DEFINE_METHOD(
+                MethodTest,
+                SD_VARLINK_DEFINE_INPUT(x, SD_VARLINK_BOOL, 0),
+                SD_VARLINK_DEFINE_INPUT_BY_TYPE(y, EnumTest, 0),
+                SD_VARLINK_DEFINE_INPUT_BY_TYPE(z, StructTest, 0),
+                SD_VARLINK_DEFINE_OUTPUT(x, SD_VARLINK_BOOL, 0),
+                SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(y, EnumTest, 0),
+                SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(z, StructTest, 0));
+
+static SD_VARLINK_DEFINE_ERROR(
+                ErrorTest,
+                SD_VARLINK_DEFINE_FIELD(x, SD_VARLINK_BOOL, 0),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(y, EnumTest, 0),
+                SD_VARLINK_DEFINE_FIELD_BY_TYPE(z, StructTest, 0));
+
+static SD_VARLINK_DEFINE_INTERFACE(
+                xyz_test,
+                "xyz.test",
+                &vl_type_EnumTest,
+                &vl_type_NestedStructTest,
+                &vl_type_StructTest,
+                &vl_method_MethodTest,
+                &vl_error_ErrorTest);
+
+static SD_VARLINK_DEFINE_ENUM_TYPE_FULL(
+                ExperimentalEnumTest,
+                SD_VARLINK_EXPERIMENTAL,
+                SD_VARLINK_DEFINE_ENUM_VALUE(foo),
+                SD_VARLINK_DEFINE_ENUM_VALUE_FULL(bar, SD_VARLINK_EXPERIMENTAL));
+
+static SD_VARLINK_DEFINE_STRUCT_TYPE_FULL(
+                ExperimentalStructTest,
+                SD_VARLINK_EXPERIMENTAL,
+                SD_VARLINK_DEFINE_FIELD(x, SD_VARLINK_BOOL, 0),
+                SD_VARLINK_DEFINE_FIELD(y, SD_VARLINK_INT, SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY|SD_VARLINK_EXPERIMENTAL));
+
+static SD_VARLINK_DEFINE_METHOD_FULL(
+                ExperimentalMethodTest,
+                SD_VARLINK_SUPPORTS_MORE|SD_VARLINK_EXPERIMENTAL,
+                SD_VARLINK_DEFINE_INPUT_BY_TYPE(e, ExperimentalEnumTest, SD_VARLINK_NULLABLE|SD_VARLINK_EXPERIMENTAL),
+                SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(s, ExperimentalStructTest, SD_VARLINK_MAP|SD_VARLINK_EXPERIMENTAL));
+
+static SD_VARLINK_DEFINE_ERROR_FULL(
+                ExperimentalErrorTest,
+                SD_VARLINK_EXPERIMENTAL,
+                SD_VARLINK_DEFINE_FIELD(x, SD_VARLINK_STRING, SD_VARLINK_EXPERIMENTAL));
+
+static SD_VARLINK_DEFINE_INTERFACE_FULL(
+                xyz_experimental,
+                "xyz.experimental",
+                SD_VARLINK_EXPERIMENTAL,
+                &vl_type_ExperimentalEnumTest,
+                &vl_type_ExperimentalStructTest,
+                &vl_method_ExperimentalMethodTest,
+                &vl_error_ExperimentalErrorTest);
+
+static void test_parse_format_one(const sd_varlink_interface *iface) {
+        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *parsed = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *json = NULL, *json2 = NULL;
+        _cleanup_free_ char *text = NULL, *text2 = NULL, *json_text = NULL, *json_text2 = NULL;
+
+        ASSERT_NOT_NULL(iface);
+
+        ASSERT_OK(sd_varlink_idl_dump(stdout, iface, SD_VARLINK_IDL_FORMAT_COLOR, /* cols= */ SIZE_MAX));
+        ASSERT_OK(varlink_idl_consistent(iface, LOG_ERR));
+        ASSERT_OK(sd_varlink_idl_format(iface, &text));
+        ASSERT_OK(sd_varlink_idl_parse(text, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+        ASSERT_OK(varlink_idl_consistent(parsed, LOG_ERR));
+        ASSERT_OK(sd_varlink_idl_format(parsed, &text2));
+
+        ASSERT_STREQ(text, text2);
+
+        /* Every interface goes through the JSON renderer too. The result must not depend on the
+         * path: a definition built with the C macros and the same definition parsed back from
+         * text have to render identically. */
+        ASSERT_OK(sd_varlink_idl_format_json(iface, &json));
+        ASSERT_OK(sd_varlink_idl_format_json(parsed, &json2));
+        ASSERT_OK(sd_json_variant_format(json, /* flags= */ 0, &json_text));
+        ASSERT_OK(sd_json_variant_format(json2, /* flags= */ 0, &json_text2));
+        ASSERT_STREQ(json_text, json_text2);
+
+        text = mfree(text);
+        text2 = mfree(text2);
+        json_text = mfree(json_text);
+        json_text2 = mfree(json_text2);
+        json = sd_json_variant_unref(json);
+        json2 = sd_json_variant_unref(json2);
+        parsed = sd_varlink_interface_free(parsed);
+
+        /* Do the same thing, but aggressively line break, and make sure this is roundtrippable as well */
+        ASSERT_OK(sd_varlink_idl_dump(stdout, iface, SD_VARLINK_IDL_FORMAT_COLOR, 23));
+        ASSERT_OK(varlink_idl_consistent(iface, LOG_ERR));
+        ASSERT_OK(sd_varlink_idl_format_full(iface, /* flags= */ 0, 23, &text));
+        ASSERT_OK(sd_varlink_idl_parse(text, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+        ASSERT_OK(varlink_idl_consistent(parsed, LOG_ERR));
+        ASSERT_OK(sd_varlink_idl_format_full(parsed, /* flags= */ 0, 23, &text2));
+
+        ASSERT_STREQ(text, text2);
+}
+
+TEST(parse_format) {
+        const sd_varlink_interface* const list[] = {
+                &vl_interface_io_systemd,
+                &vl_interface_io_systemd_AskPassword,
+                &vl_interface_io_systemd_BootControl,
+                &vl_interface_io_systemd_Credentials,
+                &vl_interface_io_systemd_CryptEnroll,
+                &vl_interface_io_systemd_FactoryReset,
+                &vl_interface_io_systemd_FirstBoot,
+                &vl_interface_io_systemd_Hostname,
+                &vl_interface_io_systemd_Import,
+                &vl_interface_io_systemd_InstanceMetadata,
+                &vl_interface_io_systemd_Job,
+                &vl_interface_io_systemd_Journal,
+                &vl_interface_io_systemd_JournalAccess,
+                &vl_interface_io_systemd_Login,
+                &vl_interface_io_systemd_Machine,
+                &vl_interface_io_systemd_MachineImage,
+                &vl_interface_io_systemd_MachineInstance,
+                &vl_interface_io_systemd_ManagedOOM,
+                &vl_interface_io_systemd_Manager,
+                &vl_interface_io_systemd_Metrics,
+                &vl_interface_io_systemd_MountFileSystem,
+                &vl_interface_io_systemd_MuteConsole,
+                &vl_interface_io_systemd_NamespaceResource,
+                &vl_interface_io_systemd_Network,
+                &vl_interface_io_systemd_Network_Link,
+                &vl_interface_io_systemd_PCRExtend,
+                &vl_interface_io_systemd_PCRLock,
+                &vl_interface_io_systemd_PTYBroker,
+                &vl_interface_io_systemd_Repart,
+                &vl_interface_io_systemd_Report,
+                &vl_interface_io_systemd_Report_Signer,
+                &vl_interface_io_systemd_Report_Uploader,
+                &vl_interface_io_systemd_Resolve,
+                &vl_interface_io_systemd_Resolve_Hook,
+                &vl_interface_io_systemd_Resolve_Link,
+                &vl_interface_io_systemd_Resolve_Monitor,
+                &vl_interface_io_systemd_ResourceProvider,
+                &vl_interface_io_systemd_Shutdown,
+                &vl_interface_io_systemd_StorageProvider,
+                &vl_interface_io_systemd_SysInstall,
+                &vl_interface_io_systemd_SysUpdate,
+                &vl_interface_io_systemd_SysUpdate_Notify,
+                &vl_interface_io_systemd_SysUpdate_Provider,
+                &vl_interface_io_systemd_Timedate,
+                &vl_interface_io_systemd_Udev,
+                &vl_interface_io_systemd_Unit,
+                &vl_interface_io_systemd_UserDatabase,
+                &vl_interface_io_systemd_VarlinkMonitor,
+                &vl_interface_io_systemd_VirtualMachineInstance,
+                &vl_interface_io_systemd_oom,
+                &vl_interface_io_systemd_oom_Prekill,
+                &vl_interface_io_systemd_service,
+                &vl_interface_io_systemd_sysext,
+                &vl_interface_org_varlink_service,
+                &vl_interface_xyz_test,
+                &vl_interface_xyz_experimental,
+        };
+
+        bool sep = false;
+        FOREACH_ELEMENT(i, list) {
+                if (sep)
+                        print_separator();
+                test_parse_format_one(*i);
+                sep = true;
+        }
+}
+
+TEST(format_json) {
+        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *iface = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        _cleanup_free_ char *text = NULL;
+
+        ASSERT_OK(sd_varlink_idl_parse(
+                                "# A comment on the interface\n"
+                                "# [Experimental]\n"
+                                "interface org.example.Format\n"
+                                "# A comment on the method\n"
+                                "# [Supports 'more' flag]\n"
+                                "method Ping(in: ?string) -> (out: ?Reply)\n"
+                                "method Reset() -> ()\n"
+                                "# A comment on the error\n"
+                                "error Failed(reason: string)\n"
+                                "type Reply(\n"
+                                "        count: int,\n"
+                                "        names: []string,\n"
+                                "        flag: ?bool,\n"
+                                "        inner: (x: int, y: ?(a, b)),\n"
+                                "        # [Experimental]\n"
+                                "        # A comment on the field\n"
+                                "        extra: ?string\n"
+                                ")\n"
+                                "type Color (red, green)\n",
+                                /* reterr_line= */ NULL, /* reterr_column= */ NULL, &iface));
+
+        ASSERT_OK(sd_varlink_idl_format_json(iface, &v));
+        ASSERT_OK(sd_json_variant_format(v, /* flags= */ 0, &text));
+        static const char expected[] =
+                "{\"name\":\"org.example.Format\",\"experimental\":true,"
+                "\"comment\":\"A comment on the interface\",\"symbols\":[{\"kind\":\"type\",\"name\":\"Color\","
+                "\"typeKind\":\"enum\",\"values\":[{\"name\":\"red\"},{\"name\":\"green\"}]},{\"kind\":\"type\","
+                "\"name\":\"Reply\",\"typeKind\":\"struct\",\"fields\":[{\"name\":\"count\",\"type\":\"int\"},"
+                "{\"name\":\"names\",\"type\":\"string\",\"array\":true},{\"name\":\"flag\",\"type\":\"bool\","
+                "\"nullable\":true},{\"name\":\"inner\",\"struct\":[{\"name\":\"x\",\"type\":\"int\"},"
+                "{\"name\":\"y\",\"enum\":[{\"name\":\"a\"},{\"name\":\"b\"}],\"nullable\":true}]},"
+                "{\"name\":\"extra\",\"experimental\":true,\"type\":\"string\",\"nullable\":true,"
+                "\"comment\":\"A comment on the field\"}]},{\"kind\":\"method\",\"name\":\"Ping\","
+                "\"comment\":\"A comment on the method\",\"flags\":[\"supports-more\"],"
+                "\"input\":[{\"name\":\"in\",\"type\":\"string\",\"nullable\":true}],"
+                "\"output\":[{\"name\":\"out\",\"namedType\":\"Reply\",\"nullable\":true}]},{\"kind\":\"method\","
+                "\"name\":\"Reset\",\"input\":[],\"output\":[]},{\"kind\":\"error\",\"name\":\"Failed\","
+                "\"comment\":\"A comment on the error\",\"fields\":[{\"name\":\"reason\",\"type\":\"string\"}]}]}";
+
+        ASSERT_STREQ(text, expected);
+}
+
+TEST(experimental) {
+        ASSERT_TRUE(FLAGS_SET(vl_interface_xyz_experimental.interface_flags, SD_VARLINK_EXPERIMENTAL));
+        ASSERT_TRUE(FLAGS_SET(vl_type_ExperimentalEnumTest.symbol_flags, SD_VARLINK_EXPERIMENTAL));
+        ASSERT_TRUE(FLAGS_SET(vl_type_ExperimentalStructTest.symbol_flags, SD_VARLINK_EXPERIMENTAL));
+        ASSERT_TRUE(FLAGS_SET(vl_method_ExperimentalMethodTest.symbol_flags, SD_VARLINK_SUPPORTS_MORE|SD_VARLINK_EXPERIMENTAL));
+        ASSERT_TRUE(FLAGS_SET(vl_error_ExperimentalErrorTest.symbol_flags, SD_VARLINK_EXPERIMENTAL));
+        ASSERT_FALSE(FLAGS_SET(vl_type_ExperimentalEnumTest.fields[0].field_flags, SD_VARLINK_EXPERIMENTAL));
+        ASSERT_TRUE(FLAGS_SET(vl_type_ExperimentalEnumTest.fields[1].field_flags, SD_VARLINK_EXPERIMENTAL));
+
+        ASSERT_OK(varlink_idl_consistent(&vl_interface_xyz_experimental, LOG_ERR));
+}
+
+TEST(method_flags_roundtrip) {
+        static SD_VARLINK_DEFINE_METHOD_FULL(SupportsMore, SD_VARLINK_SUPPORTS_MORE|SD_VARLINK_EXPERIMENTAL);
+        static SD_VARLINK_DEFINE_METHOD_FULL(RequiresMore, SD_VARLINK_REQUIRES_MORE);
+        static SD_VARLINK_DEFINE_METHOD_FULL(SupportsUpgrade, SD_VARLINK_SUPPORTS_UPGRADE);
+        static SD_VARLINK_DEFINE_METHOD_FULL(RequiresUpgrade, SD_VARLINK_REQUIRES_UPGRADE);
+        static SD_VARLINK_DEFINE_METHOD(Plain);
+        static SD_VARLINK_DEFINE_INTERFACE(
+                        xyz_flags, "xyz.flags",
+                        &vl_method_SupportsMore,
+                        &vl_method_RequiresMore,
+                        &vl_method_SupportsUpgrade,
+                        &vl_method_RequiresUpgrade,
+                        &vl_method_Plain);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *parameters = NULL;
+        ASSERT_OK(sd_json_build(&parameters, SD_JSON_BUILD_EMPTY_OBJECT));
+
+        FOREACH_ELEMENT(cols, ((const size_t[]) { SIZE_MAX, 23 })) {
+                _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *parsed = NULL;
+                _cleanup_free_ char *text = NULL, *formatted = NULL;
+                const sd_varlink_symbol *method;
+
+                ASSERT_OK(sd_varlink_idl_format_full(&vl_interface_xyz_flags, /* flags= */ 0, *cols, &text));
+                ASSERT_OK(sd_varlink_idl_parse(text, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+                ASSERT_OK(sd_varlink_idl_format_full(parsed, /* flags= */ 0, *cols, &formatted));
+                ASSERT_STREQ(text, formatted);
+
+                for (const sd_varlink_symbol *const *s = vl_interface_xyz_flags.symbols; *s; s++) {
+                        method = ASSERT_PTR(varlink_idl_find_symbol(parsed, SD_VARLINK_METHOD, (*s)->name));
+                        ASSERT_EQ((uint64_t) method->symbol_flags, (uint64_t) (*s)->symbol_flags);
+                }
+
+                method = ASSERT_PTR(varlink_idl_find_symbol(parsed, SD_VARLINK_METHOD, "SupportsUpgrade"));
+                ASSERT_OK(varlink_idl_validate_method_call(method, parameters, SD_VARLINK_METHOD_UPGRADE, /* reterr_bad_field= */ NULL));
+
+                method = ASSERT_PTR(varlink_idl_find_symbol(parsed, SD_VARLINK_METHOD, "RequiresUpgrade"));
+                ASSERT_OK(varlink_idl_validate_method_call(method, parameters, SD_VARLINK_METHOD_UPGRADE, /* reterr_bad_field= */ NULL));
+                ASSERT_ERROR(varlink_idl_validate_method_call(method, parameters, /* flags= */ 0, /* reterr_bad_field= */ NULL), EBADE);
+
+                method = ASSERT_PTR(varlink_idl_find_symbol(parsed, SD_VARLINK_METHOD, "Plain"));
+                ASSERT_ERROR(varlink_idl_validate_method_call(method, parameters, SD_VARLINK_METHOD_UPGRADE, /* reterr_bad_field= */ NULL), EOPNOTSUPP);
+        }
+}
+
+static bool symbol_is_experimental(const sd_varlink_interface *iface, const char *name) {
+        return FLAGS_SET(ASSERT_PTR(varlink_idl_find_symbol(iface, _SD_VARLINK_SYMBOL_TYPE_INVALID, name))->symbol_flags,
+                         SD_VARLINK_EXPERIMENTAL);
+}
+
+static bool field_is_experimental(const sd_varlink_interface *iface, const char *symbol, const char *field) {
+        const sd_varlink_symbol *s = ASSERT_PTR(varlink_idl_find_symbol(iface, _SD_VARLINK_SYMBOL_TYPE_INVALID, symbol));
+        return FLAGS_SET(ASSERT_PTR(varlink_idl_find_field(s, field))->field_flags, SD_VARLINK_EXPERIMENTAL);
+}
+
+TEST(experimental_roundtrip) {
+        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *parsed = NULL;
+        _cleanup_free_ char *text = NULL;
+        const sd_varlink_symbol *symbol;
+
+        ASSERT_OK(sd_varlink_idl_format(&vl_interface_xyz_experimental, &text));
+        ASSERT_OK(sd_varlink_idl_parse(text, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+
+        ASSERT_TRUE(FLAGS_SET(parsed->interface_flags, SD_VARLINK_EXPERIMENTAL));
+        ASSERT_TRUE(symbol_is_experimental(parsed, "ExperimentalEnumTest"));
+        ASSERT_TRUE(symbol_is_experimental(parsed, "ExperimentalStructTest"));
+        ASSERT_TRUE(symbol_is_experimental(parsed, "ExperimentalMethodTest"));
+        ASSERT_TRUE(symbol_is_experimental(parsed, "ExperimentalErrorTest"));
+        ASSERT_FALSE(field_is_experimental(parsed, "ExperimentalEnumTest", "foo"));
+        ASSERT_TRUE(field_is_experimental(parsed, "ExperimentalEnumTest", "bar"));
+        ASSERT_FALSE(field_is_experimental(parsed, "ExperimentalStructTest", "x"));
+        ASSERT_TRUE(field_is_experimental(parsed, "ExperimentalStructTest", "y"));
+        ASSERT_TRUE(field_is_experimental(parsed, "ExperimentalMethodTest", "e"));
+        ASSERT_TRUE(field_is_experimental(parsed, "ExperimentalMethodTest", "s"));
+        ASSERT_TRUE(field_is_experimental(parsed, "ExperimentalErrorTest", "x"));
+
+        /* Other flags of an experimental field must survive the roundtrip too */
+        symbol = ASSERT_PTR(varlink_idl_find_symbol(parsed, SD_VARLINK_STRUCT_TYPE, "ExperimentalStructTest"));
+        ASSERT_EQ((uint64_t) ASSERT_PTR(varlink_idl_find_field(symbol, "y"))->field_flags,
+                  (uint64_t) (SD_VARLINK_NULLABLE|SD_VARLINK_ARRAY|SD_VARLINK_EXPERIMENTAL));
+}
+
+TEST(experimental_parse) {
+        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *parsed = NULL;
+        _cleanup_free_ char *formatted = NULL;
+        const sd_varlink_symbol *foo, *method;
+        const sd_varlink_field *b;
+        size_t n_markers = 0;
+
+        static const char text[] =
+                "# Some interface\n"
+                "# [Experimental]\n"
+                "interface xyz.parse\n"
+                "\n"
+                "# [Experimental]\n"
+                "# A comment between marker and symbol\n"
+                "type Foo (\n"
+                "\t# [Experimental]\n"
+                "\ta: ?int,\n"
+                "\tb: (\n"
+                "\t\t# [Experimental]\n"
+                "\t\tc: string\n"
+                "\t)\n"
+                ")\n"
+                "\n"
+                "# This mentions [Experimental] but is not a marker\n"
+                "type Bar (\n"
+                "\t# [experimental]\n"
+                "\tx,\n"
+                "\t# [Experimental]\n"
+                "\ty\n"
+                ")\n"
+                "\n"
+                "method Baz(\n"
+                "\t# [Experimental]\n"
+                "\tz: ?Bar\n"
+                ") -> ()\n";
+
+        ASSERT_OK(sd_varlink_idl_parse(text, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+
+        ASSERT_TRUE(FLAGS_SET(parsed->interface_flags, SD_VARLINK_EXPERIMENTAL));
+        ASSERT_TRUE(symbol_is_experimental(parsed, "Foo"));
+        ASSERT_TRUE(field_is_experimental(parsed, "Foo", "a"));
+        ASSERT_FALSE(field_is_experimental(parsed, "Foo", "b"));
+        ASSERT_FALSE(symbol_is_experimental(parsed, "Bar"));
+        ASSERT_FALSE(field_is_experimental(parsed, "Bar", "x"));
+        ASSERT_TRUE(field_is_experimental(parsed, "Bar", "y"));
+        ASSERT_FALSE(symbol_is_experimental(parsed, "Baz"));
+        ASSERT_TRUE(field_is_experimental(parsed, "Baz", "z"));
+
+        /* Anonymous nested struct */
+        foo = ASSERT_PTR(varlink_idl_find_symbol(parsed, SD_VARLINK_STRUCT_TYPE, "Foo"));
+        b = ASSERT_PTR(varlink_idl_find_field(foo, "b"));
+        ASSERT_TRUE(FLAGS_SET(ASSERT_PTR(varlink_idl_find_field(ASSERT_PTR(b->symbol), "c"))->field_flags, SD_VARLINK_EXPERIMENTAL));
+
+        /* The markers are turned into flags rather than kept as comments, hence each is output once */
+        ASSERT_OK(sd_varlink_idl_format(parsed, &formatted));
+        for (const char *m = formatted; (m = strstr(m, "# [Experimental]\n")); m++)
+                n_markers++;
+        ASSERT_EQ(n_markers, 6U);
+        ASSERT_NOT_NULL(strstr(formatted, "# [experimental]\n"));
+
+        /* A marker that is not followed by an item is accepted, but dropped */
+        parsed = sd_varlink_interface_free(parsed);
+        ASSERT_OK(sd_varlink_idl_parse("interface xyz.parse\n"
+                                       "type Foo (a: int)\n"
+                                       "# [Experimental]\n", /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+        ASSERT_FALSE(symbol_is_experimental(parsed, "Foo"));
+        ASSERT_NULL(parsed->symbols[1]);
+
+        parsed = sd_varlink_interface_free(parsed);
+        ASSERT_OK(sd_varlink_idl_parse("interface xyz.parse\n"
+                                       "method Foo(\n"
+                                       "\t# [Experimental]\n"
+                                       ") -> (a: int)\n", /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+        method = ASSERT_PTR(varlink_idl_find_symbol(parsed, SD_VARLINK_METHOD, "Foo"));
+        ASSERT_FALSE(FLAGS_SET(method->symbol_flags, SD_VARLINK_EXPERIMENTAL));
+        ASSERT_FALSE(field_is_experimental(parsed, "Foo", "a"));
+        ASSERT_EQ(method->fields[1].field_type, _SD_VARLINK_FIELD_TYPE_END_MARKER);
+
+        /* … and in particular doesn't end up marking the first output field when formatted and parsed again */
+        formatted = mfree(formatted);
+        ASSERT_OK(sd_varlink_idl_format(parsed, &formatted));
+        parsed = sd_varlink_interface_free(parsed);
+        ASSERT_OK(sd_varlink_idl_parse(formatted, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+        ASSERT_FALSE(field_is_experimental(parsed, "Foo", "a"));
+        ASSERT_OK(varlink_idl_consistent(parsed, LOG_DEBUG));
+}
+
+static int parse_and_check_consistent(const char *text) {
+        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *parsed = NULL;
+
+        ASSERT_OK(sd_varlink_idl_parse(text, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+        return varlink_idl_consistent(parsed, LOG_DEBUG);
+}
+
+TEST(experimental_consistent) {
+        /* Experimental types may be used by experimental fields (which then must be nullable if the symbol
+         * is not experimental), by experimental symbols, and anywhere in an experimental interface. */
+        ASSERT_OK(parse_and_check_consistent(
+                        "interface xyz.good\n"
+                        "# [Experimental]\n"
+                        "type Exp (a: int)\n"
+                        "type Values (stable)\n"
+                        "# [Experimental]\n"
+                        "type ExpValues (\n"
+                        "\tstable,\n"
+                        "\t# [Experimental]\n"
+                        "\texp\n"
+                        ")\n"
+                        "type Stable (\n"
+                        "\tv: Values,\n"
+                        "\t# [Experimental]\n"
+                        "\tev: ?ExpValues,\n"
+                        "\t# [Experimental]\n"
+                        "\te: ?Exp,\n"
+                        "\t# [Experimental]\n"
+                        "\tanon: ?(x: Exp, y: []Exp)\n"
+                        ")\n"
+                        "# [Experimental]\n"
+                        "type AlsoExp (\n"
+                        "\te: Exp,\n"
+                        "\t# [Experimental]\n"
+                        "\tf: Exp,\n"
+                        "\tanon: (x: Exp)\n"
+                        ")\n"
+                        "# [Experimental]\n"
+                        "method ExpMethod(e: Exp) -> (e: [string]Exp)\n"
+                        "method StableMethod(\n"
+                        "\t# [Experimental]\n"
+                        "\te: ?Exp\n"
+                        ") -> (s: Stable)\n"
+                        "# [Experimental]\n"
+                        "error ExpError(e: Exp)\n"));
+
+        ASSERT_OK(parse_and_check_consistent(
+                        "# [Experimental]\n"
+                        "interface xyz.good\n"
+                        "# [Experimental]\n"
+                        "type Exp (a: int)\n"
+                        "type Stable (e: Exp)\n"
+                        "method StableMethod(e: Exp) -> (s: Stable)\n"));
+
+        /* Non-experimental fields must not refer to experimental types */
+        ASSERT_ERROR(parse_and_check_consistent(
+                        "interface xyz.bad\n"
+                        "# [Experimental]\n"
+                        "type Exp (a: int)\n"
+                        "type Stable (e: ?Exp)\n"), EUCLEAN);
+        ASSERT_ERROR(parse_and_check_consistent(
+                        "interface xyz.bad\n"
+                        "# [Experimental]\n"
+                        "type Exp (a, b)\n"
+                        "method StableMethod() -> (e: ?[]Exp)\n"), EUCLEAN);
+        ASSERT_ERROR(parse_and_check_consistent(
+                        "interface xyz.bad\n"
+                        "# [Experimental]\n"
+                        "type Exp (a: int)\n"
+                        "error StableError(e: ?Exp)\n"), EUCLEAN);
+
+        /* … not even from within an anonymous type */
+        ASSERT_ERROR(parse_and_check_consistent(
+                        "interface xyz.bad\n"
+                        "# [Experimental]\n"
+                        "type Exp (a: int)\n"
+                        "type Stable (anon: ?(x: ?(y: ?Exp)))\n"), EUCLEAN);
+
+        /* Experimental fields of non-experimental symbols must be nullable */
+        ASSERT_ERROR(parse_and_check_consistent(
+                        "interface xyz.bad\n"
+                        "type Stable (\n"
+                        "\t# [Experimental]\n"
+                        "\te: int\n"
+                        ")\n"), EUCLEAN);
+        ASSERT_ERROR(parse_and_check_consistent(
+                        "interface xyz.bad\n"
+                        "method StableMethod(\n"
+                        "\t# [Experimental]\n"
+                        "\te: []string\n"
+                        ") -> ()\n"), EUCLEAN);
+        ASSERT_ERROR(parse_and_check_consistent(
+                        "interface xyz.bad\n"
+                        "type Stable (anon: ?(\n"
+                        "\t# [Experimental]\n"
+                        "\te: int\n"
+                        "))\n"), EUCLEAN);
+
+        /* Experimental enum values are not permitted in non-experimental enums */
+        ASSERT_ERROR(parse_and_check_consistent(
+                        "interface xyz.bad\n"
+                        "type Values (\n"
+                        "\tstable,\n"
+                        "\t# [Experimental]\n"
+                        "\texp\n"
+                        ")\n"), EUCLEAN);
+        ASSERT_ERROR(parse_and_check_consistent(
+                        "interface xyz.bad\n"
+                        "method StableMethod() -> (v: (\n"
+                        "\tstable,\n"
+                        "\t# [Experimental]\n"
+                        "\texp\n"
+                        "))\n"), EUCLEAN);
+}
+
+static SD_VARLINK_DEFINE_STRUCT_TYPE_FULL(
+                BadFlagsStructTest,
+                SD_VARLINK_SUPPORTS_MORE,
+                SD_VARLINK_DEFINE_FIELD(x, SD_VARLINK_BOOL, 0));
+
+static SD_VARLINK_DEFINE_INTERFACE(
+                xyz_bad_symbol_flags,
+                "xyz.badsymbolflags",
+                &vl_type_BadFlagsStructTest);
+
+static SD_VARLINK_DEFINE_ENUM_TYPE(
+                BadFlagsEnumTest,
+                SD_VARLINK_DEFINE_ENUM_VALUE_FULL(foo, SD_VARLINK_NULLABLE));
+
+static SD_VARLINK_DEFINE_INTERFACE(
+                xyz_bad_enum_value_flags,
+                "xyz.badenumvalueflags",
+                &vl_type_BadFlagsEnumTest);
+
+static SD_VARLINK_DEFINE_INTERFACE_FULL(
+                xyz_bad_interface_flags,
+                "xyz.badinterfaceflags",
+                1 << 0, /* not a valid interface flag */
+                &vl_type_ExperimentalEnumTest);
+
+TEST(invalid_flags) {
+        ASSERT_ERROR(varlink_idl_consistent(&vl_interface_xyz_bad_symbol_flags, LOG_DEBUG), EUCLEAN);
+        ASSERT_ERROR(varlink_idl_consistent(&vl_interface_xyz_bad_enum_value_flags, LOG_DEBUG), EUCLEAN);
+        ASSERT_ERROR(varlink_idl_consistent(&vl_interface_xyz_bad_interface_flags, LOG_DEBUG), EUCLEAN);
+}
+
+TEST(parse) {
+        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *parsed = NULL;
+
+        /* This one has (nested) enonymous enums and structs */
+        static const char text[] =
+                "interface quu.waa\n"
+                "type Fooenum ( a, b, c )\n"
+                "type Barstruct ( a : (x, y, z), b : (x : int), c: (f, ff, fff), d: object, e : (sub : (subsub: (subsubsub: string, subsubsub2: (iii, ooo)))))"
+                ;
+
+        ASSERT_OK(sd_varlink_idl_parse(text, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+        test_parse_format_one(parsed);
+        parsed = sd_varlink_interface_free(parsed);
+
+        /* Named types referenced from within anonymous types must be resolved too */
+        ASSERT_OK(sd_varlink_idl_parse("interface quu.waa\n"
+                                       "type Foo (a: int)\n"
+                                       "type Bar (b: ?(c: Foo, d: (e: []Foo)))\n"
+                                       "method Baz(f: (g: Foo)) -> ()\n", /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+        test_parse_format_one(parsed);
+        ASSERT_ERROR(sd_varlink_idl_parse("interface quu.waa\n"
+                                          "type Bar (b: (c: Foo))\n", /* reterr_line= */ NULL, /* reterr_column= */ NULL, /* ret= */ NULL), ENETUNREACH); /* unresolved nested type */
+
+        ASSERT_ERROR(sd_varlink_idl_parse("interface org.freedesktop.Foo\n"
+                                          "type Foo (b: bool, c: foo, c: int)", /* reterr_line= */ NULL, /* reterr_column= */ NULL, /* ret= */ NULL), ENETUNREACH); /* unresolved type */
+        ASSERT_ERROR(sd_varlink_idl_parse("interface org.freedesktop.Foo\n"
+                                          "type Foo ()", /* reterr_line= */ NULL, /* reterr_column= */ NULL, /* ret= */ NULL), EBADMSG); /* empty struct/enum */
+}
+
+TEST(interface_name_is_valid) {
+        ASSERT_FALSE(varlink_idl_interface_name_is_valid(/* name= */ NULL));
+        ASSERT_FALSE(varlink_idl_interface_name_is_valid(""));
+        ASSERT_FALSE(varlink_idl_interface_name_is_valid(","));
+        ASSERT_FALSE(varlink_idl_interface_name_is_valid("."));
+        ASSERT_FALSE(varlink_idl_interface_name_is_valid("-"));
+        ASSERT_TRUE(varlink_idl_interface_name_is_valid("a"));
+        ASSERT_TRUE(varlink_idl_interface_name_is_valid("a.a"));
+        ASSERT_FALSE(varlink_idl_interface_name_is_valid("-.a"));
+        ASSERT_FALSE(varlink_idl_interface_name_is_valid("-a.a"));
+        ASSERT_FALSE(varlink_idl_interface_name_is_valid("a-.a"));
+        ASSERT_TRUE(varlink_idl_interface_name_is_valid("a-a.a"));
+        ASSERT_FALSE(varlink_idl_interface_name_is_valid("a-a.a-"));
+        ASSERT_FALSE(varlink_idl_interface_name_is_valid("a-a.-a"));
+        ASSERT_FALSE(varlink_idl_interface_name_is_valid("a-a.-"));
+        ASSERT_TRUE(varlink_idl_interface_name_is_valid("a-a.a-a"));
+        ASSERT_TRUE(varlink_idl_interface_name_is_valid("io.systemd.Foobar"));
+}
+
+TEST(symbol_name_is_valid) {
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid(/* name= */ NULL));
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid(""));
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid("_"));
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid("_foo"));
+        ASSERT_TRUE(varlink_idl_symbol_name_is_valid("Foofoo"));
+        ASSERT_TRUE(varlink_idl_symbol_name_is_valid("Foo"));
+        ASSERT_TRUE(varlink_idl_symbol_name_is_valid("Foo0"));
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid("0Foo"));
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid("foo"));
+        ASSERT_TRUE(varlink_idl_symbol_name_is_valid("Foo0foo"));
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid("bool"));
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid("int"));
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid("float"));
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid("string"));
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid("object"));
+        ASSERT_FALSE(varlink_idl_symbol_name_is_valid("any"));
+}
+
+TEST(field_name_is_valid) {
+        ASSERT_FALSE(varlink_idl_field_name_is_valid(/* name= */ NULL));
+        ASSERT_FALSE(varlink_idl_field_name_is_valid(""));
+        ASSERT_FALSE(varlink_idl_field_name_is_valid("_"));
+        ASSERT_FALSE(varlink_idl_field_name_is_valid("_foo"));
+        ASSERT_FALSE(varlink_idl_field_name_is_valid("_foo_"));
+        ASSERT_FALSE(varlink_idl_field_name_is_valid("foo_"));
+        ASSERT_TRUE(varlink_idl_field_name_is_valid("foo_foo"));
+        ASSERT_TRUE(varlink_idl_field_name_is_valid("f_o_o_f_o_o"));
+        ASSERT_FALSE(varlink_idl_field_name_is_valid("foo__foo"));
+        ASSERT_TRUE(varlink_idl_field_name_is_valid("Foofoo"));
+        ASSERT_TRUE(varlink_idl_field_name_is_valid("Foo"));
+        ASSERT_TRUE(varlink_idl_field_name_is_valid("Foo0"));
+        ASSERT_FALSE(varlink_idl_field_name_is_valid("0Foo"));
+        ASSERT_TRUE(varlink_idl_field_name_is_valid("foo"));
+        ASSERT_TRUE(varlink_idl_field_name_is_valid("Foo0foo"));
+        ASSERT_TRUE(varlink_idl_field_name_is_valid("foo0foo"));
+}
+
+TEST(qualified_symbol_name_is_valid) {
+        ASSERT_OK_EQ(varlink_idl_qualified_symbol_name_is_valid(/* name= */ NULL), 0);
+        ASSERT_OK_EQ(varlink_idl_qualified_symbol_name_is_valid(""), 0);
+        ASSERT_OK_EQ(varlink_idl_qualified_symbol_name_is_valid("x"), 0);
+        ASSERT_OK_EQ(varlink_idl_qualified_symbol_name_is_valid("xxx"), 0);
+        ASSERT_OK_EQ(varlink_idl_qualified_symbol_name_is_valid("xxx.xxx"), 0);
+        ASSERT_OK_POSITIVE(varlink_idl_qualified_symbol_name_is_valid("xxx.Xxx"));
+        ASSERT_OK_POSITIVE(varlink_idl_qualified_symbol_name_is_valid("xxx.xxx.XXX"));
+        ASSERT_OK_EQ(varlink_idl_qualified_symbol_name_is_valid("xxx.xxx.0foo"), 0);
+}
+
+TEST(split_qualified_symbol_name) {
+        _cleanup_free_ char *interface = NULL;
+        const char *name = NULL;
+
+        ASSERT_OK(varlink_idl_split_qualified_symbol_name("io.systemd.Foo.Bar", &interface, &name));
+        ASSERT_STREQ(interface, "io.systemd.Foo");
+        ASSERT_STREQ(name, "Bar");
+
+        interface = mfree(interface);
+        ASSERT_OK(varlink_idl_split_qualified_symbol_name("xxx.Xxx", &interface, /* ret_name= */ NULL));
+        ASSERT_STREQ(interface, "xxx");
+
+        ASSERT_OK(varlink_idl_split_qualified_symbol_name(
+                                  "org.varlink.service.GetInfo",
+                                  /* ret_interface= */ NULL,
+                                  &name));
+        ASSERT_STREQ(name, "GetInfo");
+
+        ASSERT_ERROR(varlink_idl_split_qualified_symbol_name(/* symbol= */ NULL, /* ret_interface= */ NULL, /* ret_name= */ NULL), EINVAL);
+        ASSERT_ERROR(varlink_idl_split_qualified_symbol_name("", /* ret_interface= */ NULL, /* ret_name= */ NULL), EINVAL);
+        ASSERT_ERROR(varlink_idl_split_qualified_symbol_name("Foo", /* ret_interface= */ NULL, /* ret_name= */ NULL), EINVAL);
+        ASSERT_ERROR(varlink_idl_split_qualified_symbol_name("xxx.xxx", /* ret_interface= */ NULL, /* ret_name= */ NULL), EINVAL);
+        ASSERT_ERROR(varlink_idl_split_qualified_symbol_name(".Foo", /* ret_interface= */ NULL, /* ret_name= */ NULL), EINVAL);
+        ASSERT_ERROR(varlink_idl_split_qualified_symbol_name("xxx.xxx.0foo", /* ret_interface= */ NULL, /* ret_name= */ NULL), EINVAL);
+        ASSERT_ERROR(varlink_idl_split_qualified_symbol_name("xxx..Foo", /* ret_interface= */ NULL, /* ret_name= */ NULL), EINVAL);
+}
+
+TEST(validate_json) {
+
+        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *parsed = NULL;
+
+        /* This one has (nested) enonymous enums and structs */
+        static const char text[] =
+                "interface validate.test\n"
+                "method Mymethod ( \n"
+                "# piff   \n"
+                "a:string,\n"
+                "#paff\n"
+                "b:int, c:?bool, d:[]int, e:?[string]bool, f:?(piff, paff), g:(f:float) ) -> ()\n";
+
+        ASSERT_OK(sd_varlink_idl_parse(text, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed));
+        test_parse_format_one(parsed);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+        ASSERT_OK(sd_json_build(&v, SD_JSON_BUILD_OBJECT(
+                                             SD_JSON_BUILD_PAIR_STRING("a", "x"),
+                                             SD_JSON_BUILD_PAIR_UNSIGNED("b", 44),
+                                             SD_JSON_BUILD_PAIR("d", SD_JSON_BUILD_ARRAY(SD_JSON_BUILD_UNSIGNED(5), SD_JSON_BUILD_UNSIGNED(7), SD_JSON_BUILD_UNSIGNED(107))),
+                                             SD_JSON_BUILD_PAIR("g", SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("f", SD_JSON_BUILD_REAL(0.5f)))))));
+
+        sd_json_variant_dump(v, SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO, stdout, /* prefix= */ NULL);
+
+        const sd_varlink_symbol* symbol = ASSERT_PTR(varlink_idl_find_symbol(parsed, SD_VARLINK_METHOD, "Mymethod"));
+
+        ASSERT_OK(varlink_idl_validate_method_call(symbol, v, /* flags= */ 0, /* reterr_bad_field= */ NULL));
+}
+
+static int test_recursive_one(unsigned depth) {
+        _cleanup_(sd_varlink_interface_freep) sd_varlink_interface *parsed = NULL;
+        _cleanup_free_ char *pre = NULL, *post = NULL, *text = NULL;
+        static const char header[] =
+                "interface recursive.test\n"
+                "type Foo (\n";
+
+        /* Generate a chain of nested structures, i.e. a: (a: (... (int))...) */
+        pre = strrep("a:(", depth);
+        post = strrep(")", depth);
+        if (!pre || !post)
+                return log_oom();
+
+        text = strjoin(header, pre, "int", post, ")");
+        if (!text)
+                return log_oom();
+
+        return sd_varlink_idl_parse(text, /* reterr_line= */ NULL, /* reterr_column= */ NULL, &parsed);
+}
+
+TEST(recursive) {
+        ASSERT_OK(test_recursive_one(32));
+        ASSERT_OK(test_recursive_one(64));
+
+        /* We should handle this gracefully without a stack overflow */
+        ASSERT_FAIL(test_recursive_one(65));
+        ASSERT_FAIL(test_recursive_one(20000));
+}
+
+static int test_method(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        sd_json_variant *foo = sd_json_variant_by_key(parameters, "foo"), *bar = sd_json_variant_by_key(parameters, "bar");
+
+        return sd_varlink_replyb(link,
+                              SD_JSON_BUILD_OBJECT(
+                                              SD_JSON_BUILD_PAIR_UNSIGNED("waldo", sd_json_variant_unsigned(foo) * sd_json_variant_unsigned(bar)),
+                                              SD_JSON_BUILD_PAIR_UNSIGNED("quux", sd_json_variant_unsigned(foo) + sd_json_variant_unsigned(bar))));
+}
+
+static int done_method(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
+        ASSERT_OK(sd_event_exit(sd_varlink_get_event(link), /* code= */ 0));
+        return 0;
+}
+
+static SD_VARLINK_DEFINE_METHOD(
+                TestMethod,
+                SD_VARLINK_DEFINE_INPUT(foo, SD_VARLINK_INT, 0),
+                SD_VARLINK_DEFINE_INPUT(bar, SD_VARLINK_INT, 0),
+                SD_VARLINK_DEFINE_INPUT(optional, SD_VARLINK_STRING, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_OUTPUT(waldo, SD_VARLINK_INT, 0),
+                SD_VARLINK_DEFINE_OUTPUT(quux, SD_VARLINK_INT, 0));
+
+static SD_VARLINK_DEFINE_METHOD(Done);
+
+static SD_VARLINK_DEFINE_INTERFACE(
+                xyz,
+                "xyz",
+                &vl_method_TestMethod,
+                &vl_method_Done);
+
+static void* server_thread(void *userdata) {
+        _cleanup_(sd_varlink_server_unrefp) sd_varlink_server *server = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *event = NULL;
+
+        ASSERT_OK(sd_varlink_server_new(&server, /* flags= */ 0));
+        ASSERT_OK(varlink_set_info_systemd(server));
+        ASSERT_OK(sd_varlink_server_add_interface(server, &vl_interface_xyz));
+        ASSERT_OK(sd_varlink_server_bind_method(server, "xyz.TestMethod", test_method));
+        ASSERT_OK(sd_varlink_server_bind_method(server, "xyz.Done", done_method));
+
+        ASSERT_OK(sd_event_new(&event));
+        ASSERT_OK(sd_varlink_server_attach_event(server, event, /* priority= */ 0));
+
+        ASSERT_OK(sd_varlink_server_add_connection(server, PTR_TO_FD(userdata), /* ret= */ NULL));
+
+        ASSERT_OK(sd_event_loop(event));
+        return NULL;
+}
+
+TEST(validate_method_call) {
+        _cleanup_close_pair_ int fd[2] = EBADF_PAIR;
+        _cleanup_(sd_varlink_unrefp) sd_varlink *v = NULL;
+        pthread_t t;
+
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0, fd));
+        ASSERT_EQ(pthread_create(&t, NULL, server_thread, FD_TO_PTR(TAKE_FD(fd[1]))), 0);
+        ASSERT_OK(sd_varlink_connect_fd(&v, TAKE_FD(fd[0])));
+
+        sd_json_variant *reply = NULL;
+        const char *error_id = NULL;
+        ASSERT_OK(sd_varlink_callb(v, "xyz.TestMethod", &reply, &error_id,
+                                SD_JSON_BUILD_OBJECT(
+                                                SD_JSON_BUILD_PAIR_UNSIGNED("foo", 8),
+                                                SD_JSON_BUILD_PAIR_UNSIGNED("bar", 9))));
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *expected_reply = NULL;
+        ASSERT_OK(sd_json_build(&expected_reply,
+                             SD_JSON_BUILD_OBJECT(
+                                             SD_JSON_BUILD_PAIR_UNSIGNED("waldo", 8*9),
+                                             SD_JSON_BUILD_PAIR_UNSIGNED("quux", 8+9))));
+
+        ASSERT_NULL(error_id);
+
+        sd_json_variant_dump(reply, SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO, NULL, /* prefix= */ NULL);
+        sd_json_variant_dump(expected_reply, SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO, NULL, /* prefix= */ NULL);
+        ASSERT_TRUE(sd_json_variant_equal(reply, expected_reply));
+
+        ASSERT_OK(sd_varlink_callb(v, "xyz.TestMethod", &reply, &error_id,
+                                SD_JSON_BUILD_OBJECT(
+                                                SD_JSON_BUILD_PAIR_UNSIGNED("foo", 9),
+                                                SD_JSON_BUILD_PAIR_UNSIGNED("bar", 8),
+                                                SD_JSON_BUILD_PAIR_STRING("optional", "pfft"))));
+
+        ASSERT_NULL(error_id);
+        ASSERT_TRUE(sd_json_variant_equal(reply, expected_reply));
+
+        ASSERT_OK(sd_varlink_callb(v, "xyz.TestMethod", &reply, &error_id,
+                                SD_JSON_BUILD_OBJECT(
+                                                SD_JSON_BUILD_PAIR_UNSIGNED("foo", 8),
+                                                SD_JSON_BUILD_PAIR_UNSIGNED("bar", 9),
+                                                SD_JSON_BUILD_PAIR_STRING("zzz", "pfft"))));
+        ASSERT_STREQ(error_id, SD_VARLINK_ERROR_INVALID_PARAMETER);
+
+        ASSERT_OK(sd_varlink_callb(v, "xyz.TestMethod", &reply, &error_id,
+                                SD_JSON_BUILD_OBJECT(
+                                                SD_JSON_BUILD_PAIR_BOOLEAN("foo", true),
+                                                SD_JSON_BUILD_PAIR_UNSIGNED("bar", 9))));
+        ASSERT_STREQ(error_id, SD_VARLINK_ERROR_INVALID_PARAMETER);
+
+        ASSERT_OK(sd_varlink_send(v, "xyz.Done", /* parameters= */ NULL));
+        ASSERT_OK(sd_varlink_flush(v));
+        ASSERT_EQ(pthread_join(t, NULL), 0);
+}
+
+TEST(enums_idl) {
+        TEST_IDL_ENUM(BootEntryType, boot_entry_type, vl_type_BootEntryType);
+        TEST_IDL_ENUM_TO_STRING(BootEntrySource, boot_entry_source, vl_type_BootEntrySource);
+
+        TEST_IDL_ENUM(PartitionDesignator, partition_designator, vl_type_PartitionDesignator);
+
+        TEST_IDL_ENUM(LinkAddressState, link_address_state, vl_type_LinkAddressState);
+        TEST_IDL_ENUM_TO_STRING(LinkAddressState, link_address_state, vl_type_LinkAddressState);
+        TEST_IDL_ENUM(LinkOnlineState, link_online_state, vl_type_LinkOnlineState);
+        TEST_IDL_ENUM_TO_STRING(LinkOnlineState, link_online_state, vl_type_LinkOnlineState);
+        TEST_IDL_ENUM(AddressFamily, link_required_address_family, vl_type_LinkRequiredAddressFamily);
+        TEST_IDL_ENUM_TO_STRING(AddressFamily, link_required_address_family, vl_type_LinkRequiredAddressFamily);
+
+        TEST_IDL_ENUM(DnsOverTlsMode, dns_over_tls_mode, vl_type_DNSOverTLSMode);
+        TEST_IDL_ENUM(ResolveSupport, resolve_support, vl_type_ResolveSupport);
+
+        TEST_IDL_ENUM(ImageType, image_type, vl_type_ImageType);
+        TEST_IDL_ENUM_TO_STRING(ImageType, image_type, vl_type_ImageType);
+}
+
+static SD_VARLINK_DEFINE_METHOD(
+                AnyTestStrict,
+                SD_VARLINK_DEFINE_INPUT(foo, SD_VARLINK_ANY, 0),
+                SD_VARLINK_DEFINE_INPUT(foo2, SD_VARLINK_ANY, 0),
+                SD_VARLINK_DEFINE_INPUT(foo3, SD_VARLINK_ANY, 0),
+                SD_VARLINK_DEFINE_INPUT(foo4, SD_VARLINK_ANY, 0));
+
+static SD_VARLINK_DEFINE_METHOD(
+                AnyTestNullable,
+                SD_VARLINK_DEFINE_INPUT(foo, SD_VARLINK_ANY, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_INPUT(foo2, SD_VARLINK_ANY, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_INPUT(foo3, SD_VARLINK_ANY, SD_VARLINK_NULLABLE),
+                SD_VARLINK_DEFINE_INPUT(foo4, SD_VARLINK_ANY, SD_VARLINK_NULLABLE));
+
+TEST(any) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+        ASSERT_OK(sd_json_buildo(&v,
+                                 SD_JSON_BUILD_PAIR_STRING("foo", "bar"),
+                                 SD_JSON_BUILD_PAIR_INTEGER("foo2", 47),
+                                 SD_JSON_BUILD_PAIR_NULL("foo3"),
+                                 SD_JSON_BUILD_PAIR_BOOLEAN("foo4", true)));
+
+        /* "any" shall mean any type – but null */
+        const char *bad_field = NULL;
+        ASSERT_ERROR(varlink_idl_validate_method_call(&vl_method_AnyTestStrict, v, /* flags= */ 0, &bad_field), ENOANO);
+        ASSERT_STREQ(bad_field, "foo3");
+
+        /* "any?" shall many truly any type */
+        bad_field = NULL;
+        ASSERT_OK(varlink_idl_validate_method_call(&vl_method_AnyTestNullable, v, /* flags= */ 0, &bad_field));
+        ASSERT_NULL(bad_field);
+}
+
+static SD_VARLINK_DEFINE_METHOD(
+                ArrayTest,
+                SD_VARLINK_DEFINE_INPUT(arr, SD_VARLINK_INT, SD_VARLINK_ARRAY));
+
+static SD_VARLINK_DEFINE_METHOD(
+                MapTest,
+                SD_VARLINK_DEFINE_INPUT(m, SD_VARLINK_STRING, SD_VARLINK_MAP));
+
+TEST(null_array_element) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+        /* Build an array with a null element - this should be rejected gracefully, not crash */
+        ASSERT_OK(sd_json_buildo(&v,
+                                 SD_JSON_BUILD_PAIR("arr", SD_JSON_BUILD_ARRAY(
+                                                 SD_JSON_BUILD_INTEGER(1),
+                                                 SD_JSON_BUILD_NULL,
+                                                 SD_JSON_BUILD_INTEGER(3)))));
+
+        const char *bad_field = NULL;
+        ASSERT_ERROR(varlink_idl_validate_method_call(&vl_method_ArrayTest, v, /* flags= */ 0, &bad_field), EMEDIUMTYPE);
+        ASSERT_STREQ(bad_field, "arr");
+}
+
+TEST(null_map_element) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+        /* Build a map with a null value - this should be rejected gracefully, not crash */
+        ASSERT_OK(sd_json_buildo(&v,
+                                 SD_JSON_BUILD_PAIR("m", SD_JSON_BUILD_OBJECT(
+                                                 SD_JSON_BUILD_PAIR_STRING("key1", "value1"),
+                                                 SD_JSON_BUILD_PAIR_NULL("key2"),
+                                                 SD_JSON_BUILD_PAIR_STRING("key3", "value3")))));
+
+        const char *bad_field = NULL;
+        ASSERT_ERROR(varlink_idl_validate_method_call(&vl_method_MapTest, v, /* flags= */ 0, &bad_field), EMEDIUMTYPE);
+        ASSERT_STREQ(bad_field, "m");
+}
+
+static SD_VARLINK_DEFINE_METHOD_FULL(
+                SupportsMoreMethod,
+                SD_VARLINK_SUPPORTS_MORE,
+                SD_VARLINK_DEFINE_OUTPUT(result, SD_VARLINK_STRING, 0));
+
+TEST(reply_continues_with_more_flag) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+        ASSERT_OK(sd_json_buildo(&v, SD_JSON_BUILD_PAIR_STRING("result", "hello")));
+
+        const char *bad_field = NULL;
+        ASSERT_OK(varlink_idl_validate_method_reply(
+                &vl_method_SupportsMoreMethod, v, SD_VARLINK_REPLY_CONTINUES, &bad_field));
+        ASSERT_NULL(bad_field);
+
+        ASSERT_OK(varlink_idl_validate_method_reply(
+                &vl_method_SupportsMoreMethod, v, /* flags= */ 0, &bad_field));
+        ASSERT_NULL(bad_field);
+}
+
+static SD_VARLINK_DEFINE_METHOD(
+                NoMoreMethod,
+                SD_VARLINK_DEFINE_OUTPUT(result, SD_VARLINK_STRING, 0));
+
+TEST(reply_continues_without_more_flag) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+
+        ASSERT_OK(sd_json_buildo(&v, SD_JSON_BUILD_PAIR_STRING("result", "hello")));
+
+        const char *bad_field = NULL;
+        /* Request a "continues" reply from a method without SD_VARLINK_SUPPORTS_MORE/REQUIRES_MORE - this
+         * should fail the validation with EBADE */
+        ASSERT_ERROR(varlink_idl_validate_method_reply(
+                &vl_method_NoMoreMethod, v, SD_VARLINK_REPLY_CONTINUES, &bad_field), EBADE);
+        ASSERT_NULL(bad_field);
+
+        /* Without the "continues" flag, validation should succeed */
+        ASSERT_OK(varlink_idl_validate_method_reply(
+                &vl_method_NoMoreMethod, v, /* flags= */ 0, &bad_field));
+        ASSERT_NULL(bad_field);
+}
+
+DEFINE_TEST_MAIN(LOG_DEBUG);

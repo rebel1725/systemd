@@ -44,8 +44,8 @@
 #include "time-util.h"
 #include "utf8.h"
 
-/* How much to wait for a reply to a terminal sequence */
-#define CONSOLE_REPLY_WAIT_USEC  (333 * USEC_PER_MSEC)
+/* How much to wait when reading/writing ANSI sequences from/to the console */
+#define CONSOLE_ANSI_SEQUENCE_TIMEOUT_USEC (333 * USEC_PER_MSEC)
 
 static volatile unsigned cached_columns = 0;
 static volatile unsigned cached_lines = 0;
@@ -77,7 +77,7 @@ int chvt(int vt) {
         /* Switch to the specified vt number. If the VT is specified <= 0 switch to the VT the kernel log messages go,
          * if that's configured. */
 
-        fd = open_terminal("/dev/tty0", O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
+        fd = open_terminal("/dev/tty0", O_RDWR|O_NOCTTY|O_NONBLOCK);
         if (fd < 0)
                 return fd;
 
@@ -238,6 +238,8 @@ static CompletionResult pick_completion(const char *string, char *const*completi
         _cleanup_free_ char *found = NULL;
         bool partial = false;
 
+        assert(ret);
+
         string = strempty(string);
 
         STRV_FOREACH(c, completions) {
@@ -283,6 +285,7 @@ static void clear_by_backspace(size_t n) {
 
 int ask_string_full(
                 char **ret,
+                const char *prefill,
                 GetCompletionsCallback get_completions,
                 void *userdata,
                 const char *text, ...) {
@@ -293,29 +296,58 @@ int ask_string_full(
         assert(ret);
         assert(text);
 
+        _cleanup_free_ char *string = NULL;
+        size_t n = 0;
+
+        if (prefill) {
+                /* Prefill query with explicit data if specified */
+
+                string = strdup(prefill);
+                if (!string)
+                        return -ENOMEM;
+
+                n = strlen(string);
+
+        } else if (get_completions) {
+                /* Otherwise, figure out what string to preselect the query with */
+                _cleanup_strv_free_ char **completions = NULL;
+                r = get_completions("", GET_COMPLETIONS_PRESELECT, &completions, userdata);
+                if (r < 0)
+                        return r;
+
+                CompletionResult cr = pick_completion(string, completions, &string);
+                if (cr < 0)
+                        return cr;
+
+                n = strlen_ptr(string);
+        }
+
         /* Output the prompt */
         fputs(ansi_highlight(), stdout);
         va_start(ap, text);
         vprintf(text, ap);
         va_end(ap);
         fputs(ansi_normal(), stdout);
+        if (string)
+                fputs(string, stdout);
         fflush(stdout);
-
-        _cleanup_free_ char *string = NULL;
-        size_t n = 0;
 
         /* Do interactive logic only if stdin + stdout are connected to the same place. And yes, we could use
          * STDIN_FILENO and STDOUT_FILENO here, but let's be overly correct for once, after all libc allows
          * swapping out stdin/stdout. */
         int fd_input = fileno(stdin);
         int fd_output = fileno(stdout);
+        struct termios old_termios = TERMIOS_NULL;
+        CLEANUP_TERMIOS_RESET(fd_input, old_termios);
+
         if (fd_input < 0 || fd_output < 0 || same_fd(fd_input, fd_output) <= 0)
                 goto fallback;
 
         /* Try to disable echo, which also tells us if this even is a terminal */
-        struct termios old_termios;
-        if (tcgetattr(fd_input, &old_termios) < 0)
+        if (tcgetattr(fd_input, &old_termios) < 0) {
+                old_termios = TERMIOS_NULL;
                 goto fallback;
+        }
 
         struct termios new_termios = old_termios;
         termios_disable_echo(&new_termios);
@@ -340,17 +372,15 @@ int ask_string_full(
 
                         _cleanup_strv_free_ char **completions = NULL;
                         if (get_completions) {
-                                r = get_completions(string, &completions, userdata);
+                                r = get_completions(string, /* flags= */ 0, &completions, userdata);
                                 if (r < 0)
-                                        goto fail;
+                                        return r;
                         }
 
                         _cleanup_free_ char *new_string = NULL;
                         CompletionResult cr = pick_completion(string, completions, &new_string);
-                        if (cr < 0) {
-                                r = cr;
-                                goto fail;
-                        }
+                        if (cr < 0)
+                                return cr;
                         if (IN_SET(cr, COMPLETION_PARTIAL, COMPLETION_FULL)) {
                                 /* Output the new suffix we learned */
                                 fputs(ASSERT_PTR(startswith(new_string, strempty(string))), stdout);
@@ -369,10 +399,8 @@ int ask_string_full(
                                 fputc('\n', stdout);
 
                                 _cleanup_strv_free_ char **filtered = strv_filter_prefix(completions, string);
-                                if (!filtered) {
-                                        r = -ENOMEM;
-                                        goto fail;
-                                }
+                                if (!filtered)
+                                        return -ENOMEM;
 
                                 r = show_menu(filtered,
                                               /* n_columns= */ SIZE_MAX,
@@ -381,7 +409,7 @@ int ask_string_full(
                                               /* grey_prefix= */ string,
                                               /* with_numbers= */ false);
                                 if (r < 0)
-                                        goto fail;
+                                        return r;
 
                                 /* Show the prompt again */
                                 fputs(ansi_highlight(), stdout);
@@ -419,8 +447,7 @@ int ask_string_full(
                 } else if (c == 4) {
                         /* Ctrl-d → cancel this field input */
 
-                        r = -ECANCELED;
-                        goto fail;
+                        return -ECANCELED;
 
                 } else if (char_is_cc(c) || n >= LINE_MAX)
                         /* refuse control characters and too long strings */
@@ -428,10 +455,8 @@ int ask_string_full(
                 else {
                         /* Regular char */
 
-                        if (!GREEDY_REALLOC(string, n+2)) {
-                                r = -ENOMEM;
-                                goto fail;
-                        }
+                        if (!GREEDY_REALLOC(string, n+2))
+                                return -ENOMEM;
 
                         string[n++] = (char) c;
                         string[n] = 0;
@@ -442,9 +467,6 @@ int ask_string_full(
                 fflush(stdout);
         }
 
-        if (tcsetattr(fd_input, TCSANOW, &old_termios) < 0)
-                return -errno;
-
         if (!string) {
                 string = strdup("");
                 if (!string)
@@ -454,12 +476,9 @@ int ask_string_full(
         *ret = TAKE_PTR(string);
         return 0;
 
-fail:
-        (void) tcsetattr(fd_input, TCSANOW, &old_termios);
-        return r;
-
 fallback:
         /* A simple fallback without TTY magic */
+        string = mfree(string);
         r = read_line(stdin, LONG_LINE_MAX, &string);
         if (r < 0)
                 return r;
@@ -511,6 +530,7 @@ int show_menu(char **x,
               bool with_numbers) {
 
         assert(n_columns > 0);
+        assert(column_width > 0);
 
         if (n_columns == SIZE_MAX)
                 n_columns = 3;
@@ -522,18 +542,20 @@ int show_menu(char **x,
                 size_t column_max = (columns()-1) / n_columns;
 
                 /* Subtract room for numbers */
-                if (with_numbers && column_max > 6)
-                        column_max -= 6;
+                if (with_numbers)
+                        column_max = LESS_BY(column_max, 6U);
 
                 /* If columns would get too tight let's make this a linear list instead. */
                 if (column_max < 10 && widest > 10) {
                         n_columns = 1;
                         column_max = columns()-1;
 
-                        if (with_numbers && column_max > 6)
-                                column_max -= 6;
+                        if (with_numbers)
+                                column_max = LESS_BY(column_max, 6U);
                 }
 
+                /* Never make this narrower than 10 characters */
+                column_max = MAX(column_max, 10U);
                 column_width = CLAMP(widest+1, 10U, column_max);
         }
 
@@ -544,8 +566,7 @@ int show_menu(char **x,
         if (break_lines > 2)
                 break_lines--;
 
-        /* The first page gets two extra lines, since we want to show
-         * a title */
+        /* The first page gets two extra lines, since we want to show a title */
         size_t break_modulo = break_lines;
         if (break_modulo > 3)
                 break_modulo -= 3;
@@ -555,17 +576,18 @@ int show_menu(char **x,
                 for (size_t j = 0; j < n_columns; j++) {
                         _cleanup_free_ char *e = NULL;
 
-                        if (j * per_column + i >= n)
+                        size_t p = j * per_column + i;
+                        if (p >= n)
                                 break;
 
-                        e = ellipsize(x[j * per_column + i], column_width, ellipsize_percentage);
+                        e = ellipsize(x[p], column_width, ellipsize_percentage);
                         if (!e)
                                 return -ENOMEM;
 
                         if (with_numbers)
                                 printf("%s%4zu)%s ",
                                        ansi_grey(),
-                                       j * per_column + i + 1,
+                                       p + 1,
                                        ansi_normal());
 
                         if (grey_prefix && startswith(e, grey_prefix)) {
@@ -602,15 +624,16 @@ int open_terminal(const char *name, int mode) {
          * https://bugs.launchpad.net/ubuntu/+source/linux/+bug/554172/comments/245
          */
 
+        assert(name);
         assert((mode & (O_CREAT|O_PATH|O_DIRECTORY|O_TMPFILE)) == 0);
 
         for (unsigned c = 0;; c++) {
-                fd = open(name, mode, 0);
+                fd = xopenat(AT_FDCWD, name, mode);
                 if (fd >= 0)
                         break;
 
-                if (errno != EIO)
-                        return -errno;
+                if (fd != -EIO)
+                        return fd;
 
                 /* Max 1s in total */
                 if (c >= 20)
@@ -679,7 +702,7 @@ int acquire_terminal(
 
                 /* We pass here O_NOCTTY only so that we can check the return value TIOCSCTTY and have a reliable way
                  * to figure out if we successfully became the controlling process of the tty */
-                fd = open_terminal(name, O_RDWR|O_NOCTTY|O_CLOEXEC);
+                fd = open_terminal(name, O_RDWR|O_NOCTTY);
                 if (fd < 0)
                         return fd;
 
@@ -772,9 +795,9 @@ int release_terminal(void) {
         _cleanup_close_ int fd = -EBADF;
         int r;
 
-        fd = open("/dev/tty", O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
+        fd = xopenat(AT_FDCWD, "/dev/tty", O_RDWR|O_NOCTTY|O_NONBLOCK);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         /* Temporarily ignore SIGHUP, so that we don't get SIGHUP'ed
          * by our own TIOCNOTTY */
@@ -819,7 +842,7 @@ int terminal_vhangup(const char *tty) {
 
         assert(tty);
 
-        fd = open_terminal(tty, O_RDWR|O_NOCTTY|O_CLOEXEC);
+        fd = open_terminal(tty, O_RDWR|O_NOCTTY);
         if (fd < 0)
                 return fd;
 
@@ -834,7 +857,7 @@ int vt_disallocate(const char *tty_path) {
 
         int ttynr = vtnr_from_tty(tty_path);
         if (ttynr > 0) {
-                _cleanup_close_ int fd = open_terminal("/dev/tty0", O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
+                _cleanup_close_ int fd = open_terminal("/dev/tty0", O_RDWR|O_NOCTTY|O_NONBLOCK);
                 if (fd < 0)
                         return fd;
 
@@ -848,7 +871,7 @@ int vt_disallocate(const char *tty_path) {
         /* So this is not a VT (in which case we cannot deallocate it), or we failed to deallocate. Let's at
          * least clear the screen. */
 
-        _cleanup_close_ int fd2 = open_terminal(tty_path, O_WRONLY|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
+        _cleanup_close_ int fd2 = open_terminal(tty_path, O_WRONLY|O_NOCTTY|O_NONBLOCK);
         if (fd2 < 0)
                 return fd2;
 
@@ -858,20 +881,12 @@ int vt_disallocate(const char *tty_path) {
                                "\033[3J"  /* clear screen including scrollback, requires Linux 2.6.40 */
                                "\033c",   /* reset to initial state */
                                SIZE_MAX,
-                               100 * USEC_PER_MSEC);
+                               CONSOLE_ANSI_SEQUENCE_TIMEOUT_USEC);
 }
 
 static int vt_default_utf8(void) {
-        _cleanup_free_ char *b = NULL;
-        int r;
-
         /* Read the default VT UTF8 setting from the kernel */
-
-        r = read_one_line_file("/sys/module/vt/parameters/default_utf8", &b);
-        if (r < 0)
-                return r;
-
-        return parse_boolean(b);
+        return read_boolean_file("/sys/module/vt/parameters/default_utf8");
 }
 
 static int vt_reset_keyboard(int fd) {
@@ -957,18 +972,21 @@ finish:
 }
 
 int terminal_reset_ansi_seq(int fd) {
-        int r, k;
+        _cleanup_(nonblock_resetp) int nonblock_reset = -EBADF;
+        int r;
 
         assert(fd >= 0);
 
         if (getenv_terminal_is_dumb())
                 return 0;
 
-        r = fd_nonblock(fd, true);
+        r = fd_nonblock(fd, /* nonblock= */ true);
         if (r < 0)
                 return log_debug_errno(r, "Failed to set terminal to non-blocking mode: %m");
+        if (r > 0)
+                nonblock_reset = fd;
 
-        k = loop_write_full(fd,
+        r = loop_write_full(fd,
                             "\033[!p"              /* soft terminal reset */
                             ANSI_OSC "104" ANSI_ST /* reset color palette via OSC 104 */
                             ANSI_NORMAL            /* reset colors */
@@ -976,17 +994,11 @@ int terminal_reset_ansi_seq(int fd) {
                             "\033[1G"              /* place cursor at beginning of current line */
                             "\033[0J",             /* erase till end of screen */
                             SIZE_MAX,
-                            100 * USEC_PER_MSEC);
-        if (k < 0)
-                log_debug_errno(k, "Failed to reset terminal through ANSI sequences: %m");
+                            CONSOLE_ANSI_SEQUENCE_TIMEOUT_USEC);
+        if (r < 0)
+                log_debug_errno(r, "Failed to reset terminal through ANSI sequences: %m");
 
-        if (r > 0) {
-                r = fd_nonblock(fd, false);
-                if (r < 0)
-                        log_debug_errno(r, "Failed to set terminal back to blocking mode: %m");
-        }
-
-        return k < 0 ? k : r;
+        return r;
 }
 
 void reset_dev_console_fd(int fd, bool switch_to_text) {
@@ -1007,7 +1019,7 @@ void reset_dev_console_fd(int fd, bool switch_to_text) {
         if (r < 0)
                 log_warning_errno(r, "Failed to get /dev/console size, ignoring: %m");
         else if (r > 0) {
-                r = terminal_set_size_fd(fd, NULL, rows, cols);
+                r = terminal_set_size_fd(fd, /* ident= */ NULL, rows, cols);
                 if (r < 0)
                         log_warning_errno(r, "Failed to set configured terminal size on /dev/console, ignoring: %m");
         } else
@@ -1024,7 +1036,7 @@ int lock_dev_console(void) {
 
         /* NB: We do not use O_NOFOLLOW here, because some container managers might place a symlink to some
          * pty in /dev/console, in which case it should be fine to lock the target TTY. */
-        fd = open_terminal("/dev/console", O_RDONLY|O_CLOEXEC|O_NOCTTY);
+        fd = open_terminal("/dev/console", O_RDONLY|O_NOCTTY);
         if (fd < 0)
                 return fd;
 
@@ -1035,7 +1047,7 @@ int lock_dev_console(void) {
         return TAKE_FD(fd);
 }
 
-int make_console_stdio(void) {
+int make_console_stdio(bool switch_to_text) {
         int fd, r;
 
         /* Make /dev/console the controlling terminal and stdin/stdout/stderr, if we can. If we can't use
@@ -1051,7 +1063,7 @@ int make_console_stdio(void) {
                         return log_error_errno(r, "Failed to make /dev/null stdin/stdout/stderr: %m");
 
         } else {
-                reset_dev_console_fd(fd, /* switch_to_text= */ true);
+                reset_dev_console_fd(fd, switch_to_text);
 
                 r = rearrange_stdio(fd, fd, fd); /* This invalidates 'fd' both on success and on failure. */
                 if (r < 0)
@@ -1186,7 +1198,7 @@ int get_kernel_consoles(char ***ret) {
         for (const char *p = line;;) {
                 _cleanup_free_ char *tty = NULL, *path = NULL;
 
-                r = extract_first_word(&p, &tty, NULL, 0);
+                r = extract_first_word(&p, &tty, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return r;
                 if (r == 0)
@@ -1476,12 +1488,14 @@ int getttyname_harder(int fd, char **ret) {
         _cleanup_free_ char *s = NULL;
         int r;
 
+        assert(ret);
+
         r = getttyname_malloc(fd, &s);
         if (r < 0)
                 return r;
 
         if (streq(s, "tty"))
-                return get_ctty(0, NULL, ret);
+                return get_ctty(/* pid= */ 0, /* ret_devnr= */ NULL, ret);
 
         *ret = TAKE_PTR(s);
         return 0;
@@ -1665,6 +1679,8 @@ int openpt_allocate_in_namespace(
         _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         int r;
 
+        assert(pidref);
+
         r = pidref_namespace_open(pidref, &pidnsfd, &mntnsfd, /* ret_netns_fd= */ NULL, &usernsfd, &rootfd);
         if (r < 0)
                 return log_debug_errno(r, "Failed to open namespaces of PID "PID_FMT": %m", pidref->pid);
@@ -1699,7 +1715,7 @@ int openpt_allocate_in_namespace(
 
         pair[1] = safe_close(pair[1]);
 
-        fd = receive_one_fd(pair[0], 0);
+        fd = receive_one_fd(pair[0], /* flags= */ 0);
         if (fd < 0)
                 return fd;
 
@@ -1724,6 +1740,16 @@ static bool on_dev_null(void) {
                 cached_on_dev_null = stat_inode_same(&dst, &ost) && stat_inode_same(&dst, &est);
 
         return cached_on_dev_null;
+}
+
+bool term_env_valid(const char *term) {
+        /* Checks if the specified $TERM value is suitable for propagation, i.e. is not empty, not set to
+         * "unknown" (as is common in CI), and only contains characters valid in terminal type names.
+         * Valid $TERM values are things like "xterm-256color", "linux", "screen.xterm-256color", i.e.
+         * alphanumeric characters, hyphens, underscores, dots, and plus signs. */
+        return !isempty(term) &&
+                !streq(term, "unknown") &&
+                in_charset(term, ALPHANUMERICAL "-_+.");
 }
 
 bool getenv_terminal_is_dumb(void) {
@@ -1762,7 +1788,7 @@ bool dev_console_colors_enabled(void) {
                 return false;
 
         if (getenv_for_pid(1, "TERM", &s) <= 0)
-                (void) proc_cmdline_get_key("TERM", 0, &s);
+                (void) proc_cmdline_get_key("TERM", /* flags= */ 0, &s);
 
         return !streq_ptr(s, "dumb");
 }
@@ -1790,7 +1816,7 @@ int vt_restore(int fd) {
         if (ioctl(fd, VT_SETMODE, &mode) < 0)
                 RET_GATHER(ret, log_debug_errno(errno, "Failed to set VT_AUTO mode, ignoring: %m"));
 
-        r = fchmod_and_chown(fd, TTY_MODE, 0, GID_INVALID);
+        r = fchmod_and_chown(fd, TTY_MODE, /* uid= */ 0, GID_INVALID);
         if (r < 0)
                 RET_GATHER(ret, log_debug_errno(r, "Failed to chmod()/chown() VT, ignoring: %m"));
 
@@ -1864,6 +1890,8 @@ int terminal_set_cursor_position(int fd, unsigned row, unsigned column) {
 }
 
 static int terminal_verify_same(int input_fd, int output_fd) {
+        int r;
+
         assert(input_fd >= 0);
         assert(output_fd >= 0);
 
@@ -1874,15 +1902,17 @@ static int terminal_verify_same(int input_fd, int output_fd) {
                 if (fstat(input_fd, &sti) < 0)
                         return -errno;
 
-                if (!S_ISCHR(sti.st_mode)) /* TTYs are character devices */
-                        return -ENOTTY;
+                r = stat_verify_char(&sti); /* TTYs are character devices */
+                if (r < 0)
+                        return r;
 
                 struct stat sto;
                 if (fstat(output_fd, &sto) < 0)
                         return -errno;
 
-                if (!S_ISCHR(sto.st_mode))
-                        return -ENOTTY;
+                r = stat_verify_char(&sto);
+                if (r < 0)
+                        return r;
 
                 if (sti.st_rdev != sto.st_rdev)
                         return -ENOLINK;
@@ -1986,14 +2016,18 @@ int terminal_get_cursor_position(
         assert(input_fd >= 0);
         assert(output_fd >= 0);
 
-        if (terminal_is_dumb())
+        if (getenv_terminal_is_dumb())
                 return -EOPNOTSUPP;
 
         r = terminal_verify_same(input_fd, output_fd);
         if (r < 0)
                 return log_debug_errno(r, "Called with distinct input/output fds: %m");
 
-        struct termios old_termios;
+        /* Failure to reset the terminal is ignored here and in similar cases below.
+         * We already have our result; if cleanup fails it doesn't change the validity of the result. */
+        struct termios old_termios = TERMIOS_NULL;
+        CLEANUP_TERMIOS_RESET(input_fd, old_termios);
+
         if (tcgetattr(input_fd, &old_termios) < 0)
                 return log_debug_errno(errno, "Failed to get terminal settings: %m");
 
@@ -2006,16 +2040,16 @@ int terminal_get_cursor_position(
         /* Request cursor position (DSR/CPR) */
         r = loop_write(output_fd, "\x1B[6n", SIZE_MAX);
         if (r < 0)
-                goto finish;
+                return r;
 
         /* Open a 2nd input fd, in non-blocking mode, so that we won't ever hang in read() should someone
          * else process the POLLIN. */
 
-        nonblock_input_fd = r = fd_reopen(input_fd, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+        nonblock_input_fd = r = fd_reopen(input_fd, O_RDONLY|O_NONBLOCK|O_NOCTTY);
         if (r < 0)
-                goto finish;
+                return r;
 
-        usec_t end = usec_add(now(CLOCK_MONOTONIC), CONSOLE_REPLY_WAIT_USEC);
+        usec_t end = usec_add(now(CLOCK_MONOTONIC), CONSOLE_ANSI_SEQUENCE_TIMEOUT_USEC);
         char buf[STRLEN("\x1B[1;1R")]; /* The shortest valid reply possible */
         size_t buf_full = 0;
         CursorPositionContext context = {};
@@ -2023,18 +2057,14 @@ int terminal_get_cursor_position(
         for (bool first = true;; first = false) {
                 if (buf_full == 0) {
                         usec_t n = now(CLOCK_MONOTONIC);
-                        if (n >= end) {
-                                r = -EOPNOTSUPP;
-                                goto finish;
-                        }
+                        if (n >= end)
+                                return -EOPNOTSUPP;
 
                         r = fd_wait_for_event(nonblock_input_fd, POLLIN, usec_sub_unsigned(end, n));
                         if (r < 0)
-                                goto finish;
-                        if (r == 0) {
-                                r = -EOPNOTSUPP;
-                                goto finish;
-                        }
+                                return r;
+                        if (r == 0)
+                                return -EOPNOTSUPP;
 
                         /* On the first try, read multiple characters, i.e. the shortest valid
                          * reply. Afterwards read byte-wise, since we don't want to read too much, and
@@ -2044,8 +2074,7 @@ int terminal_get_cursor_position(
                                 if (errno == EAGAIN)
                                         continue;
 
-                                r = -errno;
-                                goto finish;
+                                return -errno;
                         }
 
                         assert((size_t) l <= sizeof(buf));
@@ -2055,7 +2084,7 @@ int terminal_get_cursor_position(
                 size_t processed;
                 r = scan_cursor_position_response(&context, buf, buf_full, &processed);
                 if (r < 0)
-                        goto finish;
+                        return r;
 
                 assert(processed <= buf_full);
                 buf_full -= processed;
@@ -2063,26 +2092,17 @@ int terminal_get_cursor_position(
 
                 if (r > 0) {
                         /* Superficial validity check */
-                        if (context.row >= 32766 || context.column >= 32766) {
-                                r = -ENODATA;
-                                goto finish;
-                        }
+                        if (context.row >= 32766 || context.column >= 32766)
+                                return -ENODATA;
 
                         if (ret_row)
                                 *ret_row = context.row;
                         if (ret_column)
                                 *ret_column = context.column;
 
-                        r = 0;
-                        goto finish;
+                        return 0;
                 }
         }
-
-finish:
-        /* We ignore failure here and in similar cases below. We already got a reply and if cleanup fails,
-         * this doesn't change the validity of the result. */
-        (void) tcsetattr(input_fd, TCSANOW, &old_termios);
-        return r;
 }
 
 int terminal_reset_defensive(int fd, TerminalResetFlags flags) {
@@ -2122,6 +2142,25 @@ void termios_disable_echo(struct termios *termios) {
         termios->c_lflag &= ~(ICANON|ECHO);
         termios->c_cc[VMIN] = 1;
         termios->c_cc[VTIME] = 0;
+}
+
+static bool termios_is_null(const struct termios *t) {
+        if (!t)
+                return true;
+
+        return t->c_iflag == UINT_MAX &&
+               t->c_oflag == UINT_MAX &&
+               t->c_cflag == UINT_MAX &&
+               t->c_lflag == UINT_MAX;
+}
+
+void termios_reset(const TermiosResetContext *c) {
+        assert(c);
+
+        PROTECT_ERRNO;
+
+        if (c->fd && *c->fd >= 0 && !termios_is_null(c->termios))
+                (void) tcsetattr(*c->fd, TCSANOW, c->termios);
 }
 
 typedef enum BackgroundColorState {
@@ -2291,11 +2330,13 @@ int get_default_background_color(double *ret_red, double *ret_green, double *ret
 
         /* Open a 2nd input fd, in non-blocking mode, so that we won't ever hang in read()
          * should someone else process the POLLIN. Do all subsequent operations on the new fd. */
-        _cleanup_close_ int nonblock_input_fd = r = fd_reopen(STDIN_FILENO, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+        _cleanup_close_ int nonblock_input_fd = r = fd_reopen(STDIN_FILENO, O_RDONLY|O_NONBLOCK|O_NOCTTY);
         if (r < 0)
                 return r;
 
-        struct termios old_termios;
+        struct termios old_termios = TERMIOS_NULL;
+        CLEANUP_TERMIOS_RESET(nonblock_input_fd, old_termios);
+
         if (tcgetattr(nonblock_input_fd, &old_termios) < 0)
                 return -errno;
 
@@ -2307,9 +2348,9 @@ int get_default_background_color(double *ret_red, double *ret_green, double *ret
 
         r = loop_write(STDOUT_FILENO, ANSI_OSC "11;?" ANSI_ST, SIZE_MAX);
         if (r < 0)
-                goto finish;
+                return r;
 
-        usec_t end = usec_add(now(CLOCK_MONOTONIC), CONSOLE_REPLY_WAIT_USEC);
+        usec_t end = usec_add(now(CLOCK_MONOTONIC), CONSOLE_ANSI_SEQUENCE_TIMEOUT_USEC);
         char buf[STRLEN(ANSI_OSC "11;rgb:0/0/0" ANSI_ST)]; /* shortest possible reply */
         size_t buf_full = 0;
         BackgroundColorContext context = {};
@@ -2317,18 +2358,14 @@ int get_default_background_color(double *ret_red, double *ret_green, double *ret
         for (bool first = true;; first = false) {
                 if (buf_full == 0) {
                         usec_t n = now(CLOCK_MONOTONIC);
-                        if (n >= end) {
-                                r = -EOPNOTSUPP;
-                                goto finish;
-                        }
+                        if (n >= end)
+                                return -EOPNOTSUPP;
 
                         r = fd_wait_for_event(nonblock_input_fd, POLLIN, usec_sub_unsigned(end, n));
                         if (r < 0)
-                                goto finish;
-                        if (r == 0) {
-                                r = -EOPNOTSUPP;
-                                goto finish;
-                        }
+                                return r;
+                        if (r == 0)
+                                return -EOPNOTSUPP;
 
                         /* On the first try, read multiple characters, i.e. the shortest valid
                          * reply. Afterwards read byte-wise, since we don't want to read too much, and
@@ -2337,8 +2374,7 @@ int get_default_background_color(double *ret_red, double *ret_green, double *ret
                         if (l < 0) {
                                 if (errno == EAGAIN)
                                         continue;
-                                r = -errno;
-                                goto finish;
+                                return -errno;
                         }
 
                         assert((size_t) l <= sizeof(buf));
@@ -2348,7 +2384,7 @@ int get_default_background_color(double *ret_red, double *ret_green, double *ret
                 size_t processed;
                 r = scan_background_color_response(&context, buf, buf_full, &processed);
                 if (r < 0)
-                        goto finish;
+                        return r;
 
                 assert(processed <= buf_full);
                 buf_full -= processed;
@@ -2361,71 +2397,41 @@ int get_default_background_color(double *ret_red, double *ret_green, double *ret
                         *ret_green = (double) context.green / ((UINT64_C(1) << context.green_bits) - 1);
                         assert(context.blue_bits > 0);
                         *ret_blue = (double) context.blue / ((UINT64_C(1) << context.blue_bits) - 1);
-                        r = 0;
-                        goto finish;
+                        return 0;
                 }
         }
-
-finish:
-        (void) tcsetattr(nonblock_input_fd, TCSANOW, &old_termios);
-        return r;
 }
 
-int terminal_get_size_by_dsr(
-                int input_fd,
+/* Determine terminal dimensions by means of ANSI sequences: save the cursor via DECSC, position it far
+ * to the bottom right (clamped to actual terminal dimensions), read back via DSR where we ended up, and
+ * restore cursor via DECRC. Only needs a single DSR round-trip, and always restores the cursor regardless
+ * of whether the response is received.
+ *
+ * Caller must have already opened a non-blocking input fd and configured termios (echo/icanon off). */
+static int terminal_query_size_by_dsr(
+                int nonblock_input_fd,
                 int output_fd,
                 unsigned *ret_rows,
                 unsigned *ret_columns) {
 
         int r;
 
-        assert(input_fd >= 0);
+        assert(nonblock_input_fd >= 0);
         assert(output_fd >= 0);
 
-        /* Tries to determine the terminal dimension by means of ANSI sequences.
-         *
-         * We position the cursor briefly at an absolute location very far down and very far to the right,
-         * and then read back where we actually ended up. Because cursor locations are capped at the terminal
-         * width/height we should then see the right values. In order to not risk integer overflows in
-         * terminal applications we'll use INT16_MAX-1 as location to jump to — hopefully a value that is
-         * large enough for any real-life terminals, but small enough to not overflow anything or be
-         * recognized as a "niche" value. (Note that the dimension fields in "struct winsize" are 16bit only,
-         * too). */
-
-        if (terminal_is_dumb())
-                return -EOPNOTSUPP;
-
-        r = terminal_verify_same(input_fd, output_fd);
-        if (r < 0)
-                return log_debug_errno(r, "Called with distinct input/output fds: %m");
-
-        /* Open a 2nd input fd, in non-blocking mode, so that we won't ever hang in read()
-         * should someone else process the POLLIN. Do all subsequent operations on the new fd. */
-        _cleanup_close_ int nonblock_input_fd = r = fd_reopen(input_fd, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+        /* Use DECSC/DECRC to save/restore cursor instead of querying position via DSR. This way the cursor
+         * is always restored — even on timeout — and we only need one DSR response instead of two. */
+        r = loop_write_full(output_fd,
+                            "\x1B" "7"              /* DECSC: save cursor position */
+                            "\x1B[32766;32766H"     /* CUP: position cursor far to the right and to the bottom, staying within 16bit signed range */
+                            "\x1B[6n"               /* DSR: request cursor position (CPR) */
+                            "\x1B" "8",             /* DECRC: restore cursor position */
+                            SIZE_MAX,
+                            CONSOLE_ANSI_SEQUENCE_TIMEOUT_USEC);
         if (r < 0)
                 return r;
 
-        struct termios old_termios;
-        if (tcgetattr(nonblock_input_fd, &old_termios) < 0)
-                return log_debug_errno(errno, "Failed to get terminal settings: %m");
-
-        struct termios new_termios = old_termios;
-        termios_disable_echo(&new_termios);
-
-        if (tcsetattr(nonblock_input_fd, TCSANOW, &new_termios) < 0)
-                return log_debug_errno(errno, "Failed to set new terminal settings: %m");
-
-        unsigned saved_row = 0, saved_column = 0;
-
-        r = loop_write(output_fd,
-                       "\x1B[6n"           /* Request cursor position (DSR/CPR) */
-                       "\x1B[32766;32766H" /* Position cursor really far to the right and to the bottom, but let's stay within the 16bit signed range */
-                       "\x1B[6n",          /* Request cursor position again */
-                       SIZE_MAX);
-        if (r < 0)
-                goto finish;
-
-        usec_t end = usec_add(now(CLOCK_MONOTONIC), CONSOLE_REPLY_WAIT_USEC);
+        usec_t end = usec_add(now(CLOCK_MONOTONIC), CONSOLE_ANSI_SEQUENCE_TIMEOUT_USEC);
         char buf[STRLEN("\x1B[1;1R")]; /* The shortest valid reply possible */
         size_t buf_full = 0;
         CursorPositionContext context = {};
@@ -2433,18 +2439,14 @@ int terminal_get_size_by_dsr(
         for (bool first = true;; first = false) {
                 if (buf_full == 0) {
                         usec_t n = now(CLOCK_MONOTONIC);
-                        if (n >= end) {
-                                r = -EOPNOTSUPP;
-                                goto finish;
-                        }
+                        if (n >= end)
+                                return -EOPNOTSUPP;
 
                         r = fd_wait_for_event(nonblock_input_fd, POLLIN, usec_sub_unsigned(end, n));
                         if (r < 0)
-                                goto finish;
-                        if (r == 0) {
-                                r = -EOPNOTSUPP;
-                                goto finish;
-                        }
+                                return r;
+                        if (r == 0)
+                                return -EOPNOTSUPP;
 
                         /* On the first try, read multiple characters, i.e. the shortest valid
                          * reply. Afterwards read byte-wise, since we don't want to read too much, and
@@ -2454,8 +2456,7 @@ int terminal_get_size_by_dsr(
                                 if (errno == EAGAIN)
                                         continue;
 
-                                r = -errno;
-                                goto finish;
+                                return -errno;
                         }
 
                         assert((size_t) l <= sizeof(buf));
@@ -2465,60 +2466,71 @@ int terminal_get_size_by_dsr(
                 size_t processed;
                 r = scan_cursor_position_response(&context, buf, buf_full, &processed);
                 if (r < 0)
-                        goto finish;
+                        return r;
 
                 assert(processed <= buf_full);
                 buf_full -= processed;
                 memmove(buf, buf + processed, buf_full);
 
                 if (r > 0) {
-                        if (saved_row == 0) {
-                                assert(saved_column == 0);
+                        /* Superficial validity checks (no particular reason to check for < 4, it's
+                         * just a way to look for unreasonably small values) */
+                        if (context.row < 4 || context.column < 4 || context.row >= 32766 || context.column >= 32766)
+                                return -ENODATA;
 
-                                /* First sequence, this is the cursor position before we set it somewhere
-                                 * into the void at the bottom right. Let's save where we are so that we can
-                                 * return later. */
+                        if (ret_rows)
+                                *ret_rows = context.row;
+                        if (ret_columns)
+                                *ret_columns = context.column;
 
-                                /* Superficial validity checks */
-                                if (context.row <= 0 || context.column <= 0 || context.row >= 32766 || context.column >= 32766) {
-                                        r = -ENODATA;
-                                        goto finish;
-                                }
-
-                                saved_row = context.row;
-                                saved_column = context.column;
-
-                                /* Reset state */
-                                context = (CursorPositionContext) {};
-                        } else {
-                                /* Second sequence, this is the cursor position after we set it somewhere
-                                 * into the void at the bottom right. */
-
-                                /* Superficial validity checks (no particular reason to check for < 4, it's
-                                 * just a way to look for unreasonably small values) */
-                                if (context.row < 4 || context.column < 4 || context.row >= 32766 || context.column >= 32766) {
-                                        r = -ENODATA;
-                                        goto finish;
-                                }
-
-                                if (ret_rows)
-                                        *ret_rows = context.row;
-                                if (ret_columns)
-                                        *ret_columns = context.column;
-
-                                r = 0;
-                                goto finish;
-                        }
+                        return 0;
                 }
         }
+}
 
-finish:
-        /* Restore cursor position */
-        if (saved_row > 0 && saved_column > 0)
-                (void) terminal_set_cursor_position(output_fd, saved_row, saved_column);
-        (void) tcsetattr(nonblock_input_fd, TCSANOW, &old_termios);
+/* Common setup for ANSI terminal queries: validate the fds, open a non-blocking input fd, and configure
+ * termios with echo and canonical mode disabled. Caller must restore termios and close the fd when done. */
+static int terminal_prepare_query(
+                int input_fd,
+                int output_fd,
+                int *ret_nonblock_fd,
+                struct termios *ret_saved_termios) {
 
-        return r;
+        int r;
+
+        assert(input_fd >= 0);
+        assert(output_fd >= 0);
+        assert(ret_nonblock_fd);
+        assert(ret_saved_termios);
+
+        /* Use getenv_terminal_is_dumb() instead of terminal_is_dumb() here since we operate on an
+         * explicitly passed fd, not on stdio. terminal_is_dumb() additionally checks on_tty() which
+         * tests whether *stderr* is a tty — that's irrelevant when we're querying a directly opened
+         * terminal such as /dev/console. */
+        if (getenv_terminal_is_dumb())
+                return -EOPNOTSUPP;
+
+        r = terminal_verify_same(input_fd, output_fd);
+        if (r < 0)
+                return log_debug_errno(r, "Called with distinct input/output fds: %m");
+
+        /* Open a 2nd input fd, in non-blocking mode, so that we won't ever hang in read()
+         * should someone else process the POLLIN. Do all subsequent operations on the new fd. */
+        _cleanup_close_ int nonblock_input_fd = r = fd_reopen(input_fd, O_RDONLY|O_NONBLOCK|O_NOCTTY);
+        if (r < 0)
+                return r;
+
+        if (tcgetattr(nonblock_input_fd, ret_saved_termios) < 0)
+                return log_debug_errno(errno, "Failed to get terminal settings: %m");
+
+        struct termios new_termios = *ret_saved_termios;
+        termios_disable_echo(&new_termios);
+
+        if (tcsetattr(nonblock_input_fd, TCSANOW, &new_termios) < 0)
+                return log_debug_errno(errno, "Failed to set new terminal settings: %m");
+
+        *ret_nonblock_fd = TAKE_FD(nonblock_input_fd);
+        return 0;
 }
 
 /*
@@ -2557,63 +2569,38 @@ static int scan_text_area_size_response(
         return 0;
 }
 
-int terminal_get_size_by_csi18(
-                int input_fd,
+/* Determine terminal dimensions by means of an ANSI CSI 18 sequence.
+ *
+ * Caller must have already opened a non-blocking input fd and configured termios (echo/icanon off). */
+static int terminal_query_size_by_csi18(
+                int nonblock_input_fd,
                 int output_fd,
                 unsigned *ret_rows,
                 unsigned *ret_columns) {
+
         int r;
 
-        assert(input_fd >= 0);
+        assert(nonblock_input_fd >= 0);
         assert(output_fd >= 0);
 
-        /* Tries to determine the terminal dimension by means of an ANSI sequence CSI 18. */
-
-        if (terminal_is_dumb())
-                return -EOPNOTSUPP;
-
-        r = terminal_verify_same(input_fd, output_fd);
-        if (r < 0)
-                return log_debug_errno(r, "Called with distinct input/output fds: %m");
-
-        /* Open a 2nd input fd, in non-blocking mode, so that we won't ever hang in read()
-         * should someone else process the POLLIN. Do all subsequent operations on the new fd. */
-        _cleanup_close_ int nonblock_input_fd = r = fd_reopen(input_fd, O_RDONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY);
+        r = loop_write_full(output_fd, CSI18_Q, SIZE_MAX, CONSOLE_ANSI_SEQUENCE_TIMEOUT_USEC);
         if (r < 0)
                 return r;
 
-        struct termios old_termios;
-        if (tcgetattr(nonblock_input_fd, &old_termios) < 0)
-                return log_debug_errno(errno, "Failed to get terminal settings: %m");
-
-        struct termios new_termios = old_termios;
-        termios_disable_echo(&new_termios);
-
-        if (tcsetattr(nonblock_input_fd, TCSANOW, &new_termios) < 0)
-                return log_debug_errno(errno, "Failed to set new terminal settings: %m");
-
-        r = loop_write(output_fd, CSI18_Q, SIZE_MAX);
-        if (r < 0)
-                goto finish;
-
-        usec_t end = usec_add(now(CLOCK_MONOTONIC), CONSOLE_REPLY_WAIT_USEC);
+        usec_t end = usec_add(now(CLOCK_MONOTONIC), CONSOLE_ANSI_SEQUENCE_TIMEOUT_USEC);
         char buf[STRLEN(CSI18_R1)];
         size_t bytes = 0;
 
         for (;;) {
                 usec_t n = now(CLOCK_MONOTONIC);
-                if (n >= end) {
-                        r = -EOPNOTSUPP;
-                        break;
-                }
+                if (n >= end)
+                        return -EOPNOTSUPP;
 
                 r = fd_wait_for_event(nonblock_input_fd, POLLIN, usec_sub_unsigned(end, n));
                 if (r < 0)
-                        break;
-                if (r == 0) {
-                        r = -EOPNOTSUPP;
-                        break;
-                }
+                        return r;
+                if (r == 0)
+                        return -EOPNOTSUPP;
 
                 /* On the first read, read multiple characters, i.e. the shortest valid reply. Afterwards
                  * read byte by byte, since we don't want to read too much and drop characters from the input
@@ -2622,8 +2609,7 @@ int terminal_get_size_by_csi18(
                 if (l < 0) {
                         if (errno == EAGAIN)
                                 continue;
-                        r = -errno;
-                        break;
+                        return -errno;
                 }
 
                 assert((size_t) l <= sizeof(buf) - bytes);
@@ -2631,47 +2617,103 @@ int terminal_get_size_by_csi18(
 
                 r = scan_text_area_size_response(buf, bytes, ret_rows, ret_columns);
                 if (r != -EAGAIN)
-                        break;
+                        return r;
 
-                if (bytes == sizeof(buf)) {
-                        r = -EOPNOTSUPP; /* The response has the right prefix, but we didn't find a valid
-                                          * answer with a terminator in the allotted space. Something is
-                                          * wrong, possibly some unrelated bytes got injected into the
-                                          * answer. */
-                        break;
-                }
+                if (bytes == sizeof(buf))
+                        return -EOPNOTSUPP; /* The response has the right prefix, but we didn't find a valid
+                                             * answer with a terminator in the allotted space. Something is
+                                             * wrong, possibly some unrelated bytes got injected into the
+                                             * answer. */
+        }
+}
+
+int terminal_get_size(
+                int input_fd,
+                int output_fd,
+                unsigned *ret_rows,
+                unsigned *ret_columns,
+                bool try_dsr,
+                bool try_csi18) {
+
+        _cleanup_close_ int nonblock_input_fd = -EBADF;
+        struct termios old_termios = TERMIOS_NULL;
+        CLEANUP_TERMIOS_RESET(nonblock_input_fd, old_termios);
+        _cleanup_(nonblock_resetp) int nonblock_reset = -EBADF;
+        int r;
+
+        assert(try_dsr || try_csi18);
+
+        r = terminal_prepare_query(input_fd, output_fd, &nonblock_input_fd, &old_termios);
+        if (r < 0)
+                return r;
+
+        /* Put the output fd in non-blocking mode with a write timeout, to avoid blocking indefinitely on
+         * write if the terminal is not consuming data (e.g. serial console with flow control). */
+        r = fd_nonblock(output_fd, /* nonblock= */ true);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to set terminal to non-blocking mode: %m");
+        if (r > 0)
+                nonblock_reset = output_fd;
+
+        /* Flush any stale input that might confuse the response parsers. */
+        (void) tcflush(nonblock_input_fd, TCIFLUSH);
+
+        if (try_csi18) {
+                r = terminal_query_size_by_csi18(nonblock_input_fd, output_fd, ret_rows, ret_columns);
+                if (r >= 0)
+                        return r;
+
+                /* Query failed. Flush any outstanding input. */
+                (void) tcflush(nonblock_input_fd, TCIFLUSH);
+
+                if (!IN_SET(r, -EOPNOTSUPP, -EINVAL))
+                        return r;
         }
 
-finish:
-        (void) tcsetattr(nonblock_input_fd, TCSANOW, &old_termios);
+        if (try_dsr) {
+                r = terminal_query_size_by_dsr(nonblock_input_fd, output_fd, ret_rows, ret_columns);
+                if (r >= 0)
+                        return r;
+
+                /* Query failed. Flush any outstanding input. */
+                (void) tcflush(nonblock_input_fd, TCIFLUSH);
+        }
+
         return r;
+}
+
+static int fd_is_vc(int fd) {
+        _cleanup_free_ char *name = NULL;
+        int r;
+
+        assert(fd >= 0);
+
+        r = getttyname_harder(fd, &name);
+        if (r < 0)
+                return r;
+
+        return tty_is_vc_resolve(name);
 }
 
 int terminal_fix_size(int input_fd, int output_fd) {
         unsigned rows, columns;
         int r;
 
-        /* Tries to update the current terminal dimensions to the ones reported via ANSI sequences.
-         *
-         * Why bother with this? The ioctl() information is often incorrect on serial terminals (since
-         * there's no handshake or protocol to determine the right dimensions in RS232), but since the ANSI
-         * sequences are interpreted by the final terminal instead of an intermediary tty driver they should
-         * be more accurate.
-         */
-        r = terminal_verify_same(input_fd, output_fd);
+        /* Don't ask a virtual console at all. There is no intermediary here that could be wrong about the
+         * dimensions: the kernel renders the screen itself, so its winsize is authoritative. */
+        r = fd_is_vc(input_fd);
         if (r < 0)
-                return r;
+                log_debug_errno(r, "Failed to determine whether terminal is a virtual console, assuming it is not: %m");
+        else if (r > 0) {
+                log_debug("Not querying dimensions of a virtual console, kernel dimensions are authoritative.");
+                return 0;
+        }
 
         struct winsize ws = {};
         if (ioctl(output_fd, TIOCGWINSZ, &ws) < 0)
                 return log_debug_errno(errno, "Failed to query terminal dimensions, ignoring: %m");
 
-        r = terminal_get_size_by_csi18(input_fd, output_fd, &rows, &columns);
-        if (IN_SET(r, -EOPNOTSUPP, -EINVAL))
-                /* We get -EOPNOTSUPP if the query fails and -EINVAL when the received answer is invalid.
-                 * Try the fallback method. It is more involved and moves the cursor, but seems to have wider
-                 * support. */
-                r = terminal_get_size_by_dsr(input_fd, output_fd, &rows, &columns);
+        r = terminal_get_size(input_fd, output_fd, &rows, &columns, /* try_dsr= */ true, /* try_csi18= */ true);
         if (r < 0)
                 return log_debug_errno(r, "Failed to acquire terminal dimensions via ANSI sequences, not adjusting terminal dimensions: %m");
 
@@ -2730,7 +2772,7 @@ static int scan_terminfo_response(
                 return r;
 
         assert(((const char *) dec)[dec_size] == '\0'); /* unhexmem appends NUL for our convenience */
-        if (memchr(dec, '\0', dec_size) || string_has_cc(dec, NULL) || !filename_is_valid(dec))
+        if (memchr(dec, '\0', dec_size) || string_has_cc(dec, /* ok= */ NULL) || !filename_is_valid(dec))
                 return -EUCLEAN;
 
         *ret_name = TAKE_PTR(dec);
@@ -2745,7 +2787,9 @@ int terminal_get_terminfo_by_dcs(int fd, char **ret_name) {
 
         /* Note: fd must be in non-blocking read-write mode! */
 
-        struct termios old_termios;
+        struct termios old_termios = TERMIOS_NULL;
+        CLEANUP_TERMIOS_RESET(fd, old_termios);
+
         if (tcgetattr(fd, &old_termios) < 0)
                 return -errno;
 
@@ -2757,26 +2801,22 @@ int terminal_get_terminfo_by_dcs(int fd, char **ret_name) {
 
         r = loop_write(fd, DCS_TERMINFO_Q, SIZE_MAX);
         if (r < 0)
-                goto finish;
+                return r;
 
-        usec_t end = usec_add(now(CLOCK_MONOTONIC), CONSOLE_REPLY_WAIT_USEC);
+        usec_t end = usec_add(now(CLOCK_MONOTONIC), CONSOLE_ANSI_SEQUENCE_TIMEOUT_USEC);
         char buf[STRLEN(DCS_TERMINFO_R1) + MAX_TERMINFO_LENGTH + STRLEN(ANSI_ST)];
         size_t bytes = 0;
 
         for (;;) {
                 usec_t n = now(CLOCK_MONOTONIC);
-                if (n >= end) {
-                        r = -EOPNOTSUPP;
-                        break;
-                }
+                if (n >= end)
+                        return -EOPNOTSUPP;
 
                 r = fd_wait_for_event(fd, POLLIN, usec_sub_unsigned(end, n));
                 if (r < 0)
-                        break;
-                if (r == 0) {
-                        r = -EOPNOTSUPP;
-                        break;
-                }
+                        return r;
+                if (r == 0)
+                        return -EOPNOTSUPP;
 
                 /* On the first read, read multiple characters, i.e. the shortest valid reply. Afterwards
                  * read byte by byte, since we don't want to read too much and drop characters from the input
@@ -2785,8 +2825,7 @@ int terminal_get_terminfo_by_dcs(int fd, char **ret_name) {
                 if (l < 0) {
                         if (errno == EAGAIN)
                                 continue;
-                        r = -errno;
-                        break;
+                        return -errno;
                 }
 
                 assert((size_t) l <= sizeof(buf) - bytes);
@@ -2794,20 +2833,14 @@ int terminal_get_terminfo_by_dcs(int fd, char **ret_name) {
 
                 r = scan_terminfo_response(buf, bytes, ret_name);
                 if (r != -EAGAIN)
-                        break;
+                        return r;
 
-                if (bytes == sizeof(buf)) {
-                        r = -EOPNOTSUPP; /* The response has the right prefix, but we didn't find a valid
-                                          * answer with a terminator in the allotted space. Something is
-                                          * wrong, possibly some unrelated bytes got injected into the
-                                          * answer. */
-                        break;
-                }
+                if (bytes == sizeof(buf))
+                        return -EOPNOTSUPP; /* The response has the right prefix, but we didn't find a valid
+                                             * answer with a terminator in the allotted space. Something is
+                                             * wrong, possibly some unrelated bytes got injected into the
+                                             * answer. */
         }
-
-finish:
-        (void) tcsetattr(fd, TCSANOW, &old_termios);
-        return r;
 }
 
 int have_terminfo_file(const char *name) {
@@ -2842,7 +2875,7 @@ int query_term_for_tty(const char *tty, char **ret_term) {
         /* Try to query the terminal implementation that we're on. This will not work in all
          * cases, which is fine, since this is intended to be used as a fallback. */
 
-        _cleanup_close_ int tty_fd = open_terminal(tty, O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
+        _cleanup_close_ int tty_fd = open_terminal(tty, O_RDWR|O_NOCTTY|O_NONBLOCK);
         if (tty_fd < 0)
                 return log_debug_errno(tty_fd, "Failed to open %s to query terminfo: %m", tty);
 
@@ -2871,7 +2904,7 @@ int terminal_is_pty_fd(int fd) {
         if (!isatty_safe(fd))
                 return false;
 
-        r = is_fs_type_at(fd, NULL, DEVPTS_SUPER_MAGIC);
+        r = is_fs_type_at(fd, /* path= */ NULL, DEVPTS_SUPER_MAGIC);
         if (r != 0)
                 return r;
 
@@ -2894,9 +2927,13 @@ int pty_open_peer(int fd, int mode) {
 
         /* Opens the peer PTY using the new race-free TIOCGPTPEER ioctl() (kernel 4.13).
          *
-         * This is safe to be called on TTYs from other namespaces. */
+         * This is safe to be called on TTYs from other namespaces.
+         *
+         * O_CLOEXEC is always set. */
 
         assert((mode & (O_CREAT|O_PATH|O_DIRECTORY|O_TMPFILE)) == 0);
+
+        mode |= O_CLOEXEC;
 
         /* This replicates the EIO retry logic of open_terminal() in a modified way. */
         for (unsigned c = 0;; c++) {

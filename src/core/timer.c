@@ -86,12 +86,12 @@ static int timer_add_default_dependencies(Timer *t) {
         if (!UNIT(t)->default_dependencies)
                 return 0;
 
-        r = unit_add_dependency_by_name(UNIT(t), UNIT_BEFORE, SPECIAL_TIMERS_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
+        r = unit_add_dependency_by_name(UNIT(t), UNIT_BEFORE, SPECIAL_TIMERS_TARGET, /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
         if (r < 0)
                 return r;
 
         if (MANAGER_IS_SYSTEM(UNIT(t)->manager)) {
-                r = unit_add_two_dependencies_by_name(UNIT(t), UNIT_AFTER, UNIT_REQUIRES, SPECIAL_SYSINIT_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
+                r = unit_add_two_dependencies_by_name(UNIT(t), UNIT_AFTER, UNIT_REQUIRES, SPECIAL_SYSINIT_TARGET, /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
                 if (r < 0)
                         return r;
 
@@ -100,7 +100,7 @@ static int timer_add_default_dependencies(Timer *t) {
                                 continue;
 
                         FOREACH_STRING(target, SPECIAL_TIME_SYNC_TARGET, SPECIAL_TIME_SET_TARGET) {
-                                r = unit_add_dependency_by_name(UNIT(t), UNIT_AFTER, target, true, UNIT_DEPENDENCY_DEFAULT);
+                                r = unit_add_dependency_by_name(UNIT(t), UNIT_AFTER, target, /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
                                 if (r < 0)
                                         return r;
                         }
@@ -109,7 +109,7 @@ static int timer_add_default_dependencies(Timer *t) {
                 }
         }
 
-        return unit_add_two_dependencies_by_name(UNIT(t), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_SHUTDOWN_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
+        return unit_add_two_dependencies_by_name(UNIT(t), UNIT_BEFORE, UNIT_CONFLICTS, SPECIAL_SHUTDOWN_TARGET, /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
 }
 
 static int timer_add_trigger_dependencies(Timer *t) {
@@ -125,7 +125,7 @@ static int timer_add_trigger_dependencies(Timer *t) {
         if (r < 0)
                 return r;
 
-        return unit_add_two_dependencies(UNIT(t), UNIT_BEFORE, UNIT_TRIGGERS, x, true, UNIT_DEPENDENCY_IMPLICIT);
+        return unit_add_two_dependencies(UNIT(t), UNIT_BEFORE, UNIT_TRIGGERS, x, /* add_reference= */ true, UNIT_DEPENDENCY_IMPLICIT);
 }
 
 static int timer_setup_persistent(Timer *t) {
@@ -204,7 +204,7 @@ static int timer_load(Unit *u) {
 
         assert(u->load_state == UNIT_STUB);
 
-        r = unit_load_fragment_and_dropin(u, true);
+        r = unit_load_fragment_and_dropin(u, /* fragment_required= */ true);
         if (r < 0)
                 return r;
 
@@ -285,7 +285,7 @@ static void timer_set_state(Timer *t, TimerState state) {
         assert(t);
 
         if (t->state != state)
-                bus_unit_send_pending_change_signal(UNIT(t), false);
+                bus_unit_send_pending_change_signal(UNIT(t), /* including_new= */ false);
 
         old_state = t->state;
         t->state = state;
@@ -314,7 +314,7 @@ static int timer_coldplug(Unit *u) {
                 return 0;
 
         if (t->deserialized_state == TIMER_WAITING)
-                timer_enter_waiting(t, false);
+                timer_enter_waiting(t, /* time_change= */ false);
         else
                 timer_set_state(t, t->deserialized_state);
 
@@ -402,12 +402,7 @@ static void timer_enter_waiting(Timer *t, bool time_change) {
                         /* If DeferReactivation= is enabled, schedule the job based on the last time
                          * the trigger unit entered inactivity. Otherwise, if we know the last time
                          * this was triggered, schedule the job based relative to that. If we don't,
-                         * just start from the activation time or realtime.
-                         *
-                         * Unless we have a real last-trigger time, we subtract the random_offset because
-                         * any event that elapsed within the last random_offset has actually been delayed
-                         * and thus hasn't truly elapsed yet. */
-
+                         * just start from the activation time or realtime. */
                         if (t->defer_reactivation &&
                             dual_timestamp_is_set(&trigger->inactive_enter_timestamp)) {
                                 if (dual_timestamp_is_set(&t->last_trigger))
@@ -425,11 +420,33 @@ static void timer_enter_waiting(Timer *t, bool time_change) {
                                 if (t->last_trigger.monotonic < boot_monotonic)
                                         rebase_after_boot_time = true;
                         } else if (dual_timestamp_is_set(&UNIT(t)->inactive_exit_timestamp))
-                                b = UNIT(t)->inactive_exit_timestamp.realtime - random_offset;
+                                b = UNIT(t)->inactive_exit_timestamp.realtime;
                         else {
-                                b = ts.realtime - random_offset;
+                                b = ts.realtime;
                                 rebase_after_boot_time = true;
                         }
+
+                        if (b > ts.realtime) {
+                                /* The base we picked is in the future relative to the current realtime. This
+                                 * happens when the wall clock is set backwards while the timer is already
+                                 * waiting: the base was recorded from the old, later time. Feeding a future
+                                 * base to calendar_spec_next_usec() would schedule the next elapse relative to
+                                 * that stale time instead of now, so systemctl list-timers keeps showing the
+                                 * pre-adjustment elapse and the timer never catches up (see #6036). Clamp to
+                                 * now so we recalculate from the current time. */
+                                log_unit_debug(UNIT(t),
+                                               "Calendar timer base time %s is in the future, recalculating from the current time.",
+                                               FORMAT_TIMESTAMP(b));
+                                b = ts.realtime;
+                        }
+
+                        /* We always subtract random_offset from the base time because
+                         * calendar_spec_next_usec() finds the next calendar event, and then we add the
+                         * offset back afterwards (see below). The base time needs to be in "pre-offset"
+                         * space so the next calendar match is computed correctly. Without this, a timer
+                         * that fires late (e.g. persistent catch-up) would skip the next scheduled
+                         * activation. */
+                        b = usec_sub_unsigned(b, random_offset);
 
                         r = calendar_spec_next_usec(v->calendar_spec, b, &v->next_elapse);
                         if (r < 0)
@@ -498,16 +515,23 @@ static void timer_enter_waiting(Timer *t, bool time_change) {
                                 assert_not_reached();
                         }
 
-                        if (!time_change)
-                                v->next_elapse = usec_add(usec_shift_clock(base, CLOCK_MONOTONIC, TIMER_MONOTONIC_CLOCK(t)), v->value);
+                        if (!time_change) {
+                                bool is_oneshot = IN_SET(v->base, TIMER_ACTIVE, TIMER_BOOT, TIMER_STARTUP);
 
-                        if (dual_timestamp_is_set(&t->last_trigger) &&
-                            !time_change &&
-                            v->next_elapse < triple_timestamp_by_clock(&ts, TIMER_MONOTONIC_CLOCK(t)) &&
-                            IN_SET(v->base, TIMER_ACTIVE, TIMER_BOOT, TIMER_STARTUP)) {
-                                /* This is a one time trigger, disable it now */
-                                v->disabled = true;
-                                continue;
+                                /* Skip recalculating the next elapse timestamp for one-shot timers for which
+                                 * we've already calculated the value in this activation cycle. */
+                                if (!(v->next_elapse > 0 &&
+                                      t->last_trigger.monotonic > base &&
+                                      is_oneshot))
+                                        v->next_elapse = usec_add(usec_shift_clock(base, CLOCK_MONOTONIC, TIMER_MONOTONIC_CLOCK(t)), v->value);
+
+                                if (dual_timestamp_is_set(&t->last_trigger) &&
+                                    v->next_elapse < triple_timestamp_by_clock(&ts, TIMER_MONOTONIC_CLOCK(t)) &&
+                                    is_oneshot) {
+                                        /* This is a one time trigger, disable it now. */
+                                        v->disabled = true;
+                                        continue;
+                                }
                         }
 
                         if (!found_monotonic)
@@ -653,7 +677,7 @@ static void timer_enter_running(Timer *t) {
         job_set_activation_details(job, details);
 
         if (t->stamp_path)
-                touch_file(t->stamp_path, true, t->last_trigger.realtime, UID_INVALID, GID_INVALID, MODE_INVALID);
+                touch_file(t->stamp_path, /* parents= */ true, t->last_trigger.realtime, UID_INVALID, GID_INVALID, MODE_INVALID);
 
         timer_set_state(t, TIMER_RUNNING);
         return;
@@ -695,11 +719,11 @@ static int timer_start(Unit *u) {
 
                 } else if (errno == ENOENT)
                         /* The timer has never run before, make sure a stamp file exists. */
-                        (void) touch_file(t->stamp_path, true, USEC_INFINITY, UID_INVALID, GID_INVALID, MODE_INVALID);
+                        (void) touch_file(t->stamp_path, /* parents= */ true, USEC_INFINITY, UID_INVALID, GID_INVALID, MODE_INVALID);
         }
 
         t->result = TIMER_SUCCESS;
-        timer_enter_waiting(t, false);
+        timer_enter_waiting(t, /* time_change= */ false);
         return 1;
 }
 
@@ -807,14 +831,14 @@ static void timer_trigger_notify(Unit *u, Unit *other) {
         case TIMER_ELAPSED:
 
                 /* Recalculate sleep time */
-                timer_enter_waiting(t, false);
+                timer_enter_waiting(t, /* time_change= */ false);
                 break;
 
         case TIMER_RUNNING:
 
                 if (UNIT_IS_INACTIVE_OR_FAILED(unit_active_state(other))) {
                         log_unit_debug(UNIT(t), "Got notified about unit deactivation.");
-                        timer_enter_waiting(t, false);
+                        timer_enter_waiting(t, /* time_change= */ false);
                 }
                 break;
 
@@ -856,7 +880,7 @@ static void timer_time_change(Unit *u) {
                 timer_enter_running(t);
         } else {
                 log_unit_debug(u, "Time change, recalculating next elapse.");
-                timer_enter_waiting(t, true);
+                timer_enter_waiting(t, /* time_change= */ true);
         }
 }
 
@@ -871,7 +895,7 @@ static void timer_timezone_change(Unit *u) {
                 timer_enter_running(t);
         } else {
                 log_unit_debug(u, "Timezone change, recalculating next elapse.");
-                timer_enter_waiting(t, false);
+                timer_enter_waiting(t, /* time_change= */ false);
         }
 }
 
@@ -940,6 +964,7 @@ static int activation_details_timer_deserialize(const char *key, const char *val
 
         assert(key);
         assert(value);
+        POINTER_MAY_BE_NULL(details);
 
         if (!details || !*details)
                 return -EINVAL;

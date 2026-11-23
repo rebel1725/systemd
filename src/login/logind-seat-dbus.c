@@ -100,7 +100,7 @@ static int property_get_idle_hint(
         assert(bus);
         assert(reply);
 
-        return sd_bus_message_append(reply, "b", seat_get_idle_hint(s, NULL) > 0);
+        return sd_bus_message_append(reply, "b", seat_get_idle_hint(s, /* ret_timestamp= */ NULL));
 }
 
 static int property_get_idle_since_hint(
@@ -115,14 +115,11 @@ static int property_get_idle_since_hint(
         Seat *s = ASSERT_PTR(userdata);
         dual_timestamp t;
         uint64_t u;
-        int r;
 
         assert(bus);
         assert(reply);
 
-        r = seat_get_idle_hint(s, &t);
-        if (r < 0)
-                return r;
+        seat_get_idle_hint(s, &t);
 
         u = streq(property, "IdleSinceHint") ? t.realtime : t.monotonic;
 
@@ -150,7 +147,7 @@ int bus_seat_method_terminate(sd_bus_message *message, void *userdata, sd_bus_er
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_activate_session(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -182,7 +179,7 @@ static int method_activate_session(sd_bus_message *message, void *userdata, sd_b
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_switch_to(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -209,7 +206,7 @@ static int method_switch_to(sd_bus_message *message, void *userdata, sd_bus_erro
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_switch_to_next(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -228,7 +225,7 @@ static int method_switch_to_next(sd_bus_message *message, void *userdata, sd_bus
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_switch_to_previous(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -247,7 +244,7 @@ static int method_switch_to_previous(sd_bus_message *message, void *userdata, sd
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int seat_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {

@@ -15,9 +15,15 @@ int binfmt_mounted_and_writable(void) {
         _cleanup_close_ int fd = -EBADF;
         int r;
 
-        fd = RET_NERRNO(open("/proc/sys/fs/binfmt_misc", O_CLOEXEC | O_DIRECTORY | O_PATH));
+        fd = xopenat(AT_FDCWD, "/proc/sys/fs/binfmt_misc", O_DIRECTORY | O_PATH);
         if (fd == -ENOENT)
                 return false;
+        /* ELOOP happens when binfmt_misc is an automount point under a read-only bind mount of /proc —
+         * the kernel cannot trigger the automount and returns ELOOP instead. Common in mock/Koji buildroots. */
+        if (fd == -ELOOP || ERRNO_IS_NEG_PRIVILEGE(fd)) {
+                log_debug_errno(fd, "Failed to open /proc/sys/fs/binfmt_misc, ignoring: %m");
+                return false;
+        }
         if (fd < 0)
                 return fd;
 

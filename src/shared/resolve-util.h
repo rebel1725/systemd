@@ -2,7 +2,7 @@
 #pragma once
 
 #include "conf-parser-forward.h"
-#include "shared-forward.h"
+#include "forward.h"
 
 /* 127.0.0.53 in native endian (The IP address we listen on with the full DNS stub, i.e. that does LLMNR/mDNS, and stuff) */
 #define INADDR_DNS_STUB ((in_addr_t) 0x7f000035U)
@@ -86,3 +86,8 @@ DECLARE_STRING_TABLE_LOOKUP(dns_cache_mode, DnsCacheMode);
 
 /* A static resolv.conf file containing no domains, but only our own DNS server address */
 #define PRIVATE_STATIC_RESOLV_CONF LIBEXECDIR "/resolv.conf"
+
+/* Per-link configuration limits. */
+#define LINK_SEARCH_DOMAINS_MAX 1024
+#define LINK_DNS_SERVERS_MAX 256
+#define LINK_NEGATIVE_TRUST_ANCHORS_MAX 2048

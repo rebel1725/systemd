@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 
 enum action {
         ACTION_SYSTEMCTL,
@@ -65,6 +65,7 @@ extern bool arg_show_transaction;
 extern int arg_force;
 extern bool arg_ask_password;
 extern bool arg_runtime;
+extern bool arg_vendor;
 extern UnitFilePresetMode arg_preset_mode;
 extern char **arg_wall;
 extern const char *arg_kill_whom;
@@ -76,6 +77,8 @@ extern char *arg_image;
 extern usec_t arg_when;
 extern bool arg_stdin;
 extern const char *arg_reboot_argument;
+extern char *arg_kernel_cmdline;
+extern char *arg_reuse_kernel_cmdline;
 extern enum action arg_action;
 extern BusTransport arg_transport;
 extern const char *arg_host;
@@ -96,9 +99,11 @@ extern bool arg_marked;
 extern const char *arg_drop_in;
 extern ImagePolicy *arg_image_policy;
 extern char *arg_kill_subgroup;
+extern usec_t arg_wait_timeout_usec;
 
 static inline const char* arg_job_mode(void) {
         return _arg_job_mode ?: "replace";
 }
 
-int systemctl_dispatch_parse_argv(int argc, char *argv[]);
+int systemctl_dispatch_parse_argv(int argc, char *argv[], int log_level_shift, char ***remaining_args);
+int systemctl_main(char **args);

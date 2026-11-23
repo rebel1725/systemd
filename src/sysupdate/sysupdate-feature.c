@@ -1,13 +1,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
+#include "sd-json.h"
+
 #include "alloc-util.h"
+#include "condition.h"
 #include "conf-parser.h"
 #include "hash-funcs.h"
+#include "json-util.h"
 #include "path-util.h"
+#include "runtime-scope.h"
 #include "string-util.h"
-#include "sysupdate.h"
+#include "strv.h"
+#include "sysupdate-config.h"
 #include "sysupdate-feature.h"
-#include "web-util.h"
+#include "sysupdate-util.h"
 
 static Feature *feature_free(Feature *f) {
         if (!f)
@@ -16,8 +24,10 @@ static Feature *feature_free(Feature *f) {
         free(f->id);
 
         free(f->description);
-        free(f->documentation);
+        strv_free(f->documentation);
         free(f->appstream);
+
+        condition_free_list(f->suggest_on);
 
         return mfree(f);
 }
@@ -31,6 +41,7 @@ Feature *feature_new(void) {
 
         *f = (Feature) {
                 .n_ref = 1,
+                .suggest = -1,
         };
 
         return f;
@@ -42,82 +53,144 @@ DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(feature_hash_ops,
                                       char, string_hash_func, string_compare_func,
                                       Feature, feature_unref);
 
-static int config_parse_url_specifiers(
-                const char *unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-        char **s = ASSERT_PTR(data);
-        _cleanup_free_ char *resolved = NULL;
+int feature_read_definition(Feature *f, const char *root, const char *path, const char *const *dirs) {
         int r;
 
-        assert(rvalue);
-
-        if (isempty(rvalue)) {
-                *s = mfree(*s);
-                return 0;
-        }
-
-        r = specifier_printf(rvalue, NAME_MAX, specifier_table, arg_root, NULL, &resolved);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to expand specifiers in %s=, ignoring: %s", lvalue, rvalue);
-                return 0;
-        }
-
-        if (!http_url_is_valid(resolved)) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "%s= URL is not valid, ignoring: %s", lvalue, rvalue);
-                return 0;
-        }
-
-        return free_and_replace(*s, resolved);
-}
-
-int feature_read_definition(Feature *f, const char *path, const char *const *dirs) {
         assert(f);
-
-        ConfigTableItem table[] = {
-                { "Feature", "Description",   config_parse_string,         0, &f->description },
-                { "Feature", "Documentation", config_parse_url_specifiers, 0, &f->documentation },
-                { "Feature", "AppStream",     config_parse_url_specifiers, 0, &f->appstream },
-                { "Feature", "Enabled",       config_parse_bool,           0, &f->enabled },
-                {}
-        };
-
-        _cleanup_free_ char *filename = NULL;
-        int r;
-
         assert(path);
         assert(dirs);
 
+        _cleanup_free_ char *filename = NULL;
         r = path_extract_filename(path, &filename);
         if (r < 0)
                 return log_error_errno(r, "Failed to extract filename from path '%s': %m", path);
+
+        char *e = endswith(filename, ".feature");
+        if (!e)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Feature file has bad suffix: %s", filename);
+
+        _cleanup_free_ char *id = strndup(filename, e - filename);
+        if (!id)
+                return log_oom();
+
+        if (!feature_name_valid(id))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Malformed feature filename '%s': %m", filename);
+
+        ConfigTableItem table[] = {
+                { "Feature", "Description",                config_parse_string,              0,                             &f->description   },
+                { "Feature", "Documentation",              config_parse_url_specifiers_many, 0,                             &f->documentation },
+                { "Feature", "AppStream",                  config_parse_url_specifiers,      0,                             &f->appstream     },
+                { "Feature", "Enabled",                    config_parse_bool,                0,                             &f->enabled       },
+                { "Feature", "Suggest",                    config_parse_tristate,            0,                             &f->suggest       },
+                { "Feature", "SuggestOnArchitecture",      config_parse_condition,           CONDITION_ARCHITECTURE,        &f->suggest_on    },
+                { "Feature", "SuggestOnFirmware",          config_parse_condition,           CONDITION_FIRMWARE,            &f->suggest_on    },
+                { "Feature", "SuggestOnVirtualization",    config_parse_condition,           CONDITION_VIRTUALIZATION,      &f->suggest_on    },
+                { "Feature", "SuggestOnHost",              config_parse_condition,           CONDITION_HOST,                &f->suggest_on    },
+                { "Feature", "SuggestOnFraction",          config_parse_condition,           CONDITION_FRACTION,            &f->suggest_on    },
+                { "Feature", "SuggestOnKernelCommandLine", config_parse_condition,           CONDITION_KERNEL_COMMAND_LINE, &f->suggest_on    },
+                { "Feature", "SuggestOnVersion",           config_parse_condition,           CONDITION_VERSION,             &f->suggest_on    },
+                { "Feature", "SuggestOnCredential",        config_parse_condition,           CONDITION_CREDENTIAL,          &f->suggest_on    },
+                { "Feature", "SuggestOnSecurity",          config_parse_condition,           CONDITION_SECURITY,            &f->suggest_on    },
+                { "Feature", "SuggestOnOSRelease",         config_parse_condition,           CONDITION_OS_RELEASE,          &f->suggest_on    },
+                { "Feature", "SuggestOnMachineTag",        config_parse_condition,           CONDITION_MACHINE_TAG,         &f->suggest_on    },
+                {}
+        };
 
         r = config_parse_many_full(
                         STRV_MAKE_CONST(path),
                         dirs,
                         strjoina(filename, ".d"),
-                        arg_root,
+                        root,
                         /* root_fd= */ -EBADF,
                         "Feature\0",
                         config_item_table_lookup, table,
                         CONFIG_PARSE_WARN,
-                        /* userdata= */ NULL,
-                        /* stats_by_path= */ NULL,
-                        /* drop_in_files= */ NULL);
+                        (void *) root,
+                        /* ret_stats_by_path= */ NULL,
+                        /* ret_dropin_files= */ NULL);
         if (r < 0)
                 return r;
 
-        *ASSERT_PTR(endswith(filename, ".feature")) = 0; /* Remove the file extension */
-        f->id = TAKE_PTR(filename);
+        f->id = TAKE_PTR(id);
 
         return 0;
+}
+
+static int dispatch_feature_id(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        char **id = ASSERT_PTR(userdata);
+
+        assert(variant);
+
+        if (!sd_json_variant_is_string(variant))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a string.", strna(name));
+
+        if (!feature_name_valid(sd_json_variant_string(variant)))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a valid feature name.", strna(name));
+
+        if (free_and_strdup(id, sd_json_variant_string(variant)) < 0)
+                return json_log_oom(variant, flags);
+
+        return 0;
+}
+
+static int dispatch_feature_appstream(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        char **appstream = ASSERT_PTR(userdata);
+
+        assert(variant);
+
+        /* The field is an array, to leave room for multiple catalogs per feature in the future, but for now
+         * we only support a single one, like the AppStream= setting in .feature files does. */
+
+        if (sd_json_variant_is_null(variant) || sd_json_variant_is_blank_array(variant)) {
+                *appstream = mfree(*appstream);
+                return 0;
+        }
+
+        if (!sd_json_variant_is_array(variant))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not an array.", strna(name));
+
+        if (sd_json_variant_elements(variant) > 1)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' lists more than one URL, which is not supported.", strna(name));
+
+        return json_dispatch_http_url(name, sd_json_variant_by_index(variant, /* index= */ 0), flags, appstream);
+}
+
+int feature_from_json(Feature *f, sd_json_variant *v, const char *origin) {
+        int r;
+
+        assert(f);
+        assert(origin);
+
+        /* Fills in a feature definition from a JSON object, as acquired from a component provider, the
+         * equivalent of feature_read_definition() for .feature files. Note that in contrast to the
+         * configuration files no specifier expansion takes place, and no conditions are supported. 'origin'
+         * identifies where the data came from, for logging purposes. */
+
+        static const sd_json_dispatch_field dispatch_table[] = {
+                { "id",            SD_JSON_VARIANT_STRING,  dispatch_feature_id,        offsetof(Feature, id),            SD_JSON_MANDATORY },
+                { "description",   SD_JSON_VARIANT_STRING,  sd_json_dispatch_string,    offsetof(Feature, description),   SD_JSON_NULLABLE },
+                { "documentation", SD_JSON_VARIANT_ARRAY,   json_dispatch_http_urls,    offsetof(Feature, documentation), SD_JSON_NULLABLE },
+                { "appStream",     SD_JSON_VARIANT_ARRAY,   dispatch_feature_appstream, offsetof(Feature, appstream),     SD_JSON_NULLABLE },
+                { "enabled",       SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_stdbool,   offsetof(Feature, enabled),       SD_JSON_NULLABLE },
+                { "suggested",     SD_JSON_VARIANT_BOOLEAN, sd_json_dispatch_tristate,  offsetof(Feature, suggest),       SD_JSON_NULLABLE },
+                {},
+        };
+
+        r = sd_json_dispatch(v, dispatch_table, SD_JSON_LOG|SD_JSON_ALLOW_EXTENSIONS, f);
+        if (r < 0)
+                return log_error_errno(r, "Failed to parse feature definition from %s: %m", origin);
+
+        return 0;
+}
+
+int feature_is_suggested(const Feature *f) {
+        assert(f);
+
+        if (f->suggest >= 0)
+                return f->suggest;
+
+        if (!f->suggest_on) /* no condition → false */
+                return false;
+
+        return condition_test_list(f->suggest_on, environ, RUNTIME_SCOPE_SYSTEM, suggest_on_type_to_string, /* logger= */ NULL, /* userdata= */ NULL);
 }

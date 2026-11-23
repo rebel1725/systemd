@@ -5,6 +5,7 @@ from csv import reader
 
 # pylint: disable=consider-using-with
 
+
 def read_table(filename):
     table = list(reader(open(filename, newline='')))
     table = table[1:]  # Skip header
@@ -12,8 +13,10 @@ def read_table(filename):
 
     for row in table:
         # Some IDs end with whitespace, while they didn't in the old HTML table, so it's probably
-        # a mistake, strip it.
-        print(f'\nacpi:{row[1].strip()}*:\n ID_VENDOR_FROM_DATABASE={row[0].strip()}')
+        # a mistake, strip it. '#' starts a comment in hwdb files, escape it so that it is kept in the value.
+        name = row[0].strip().replace('#', '\\#')
+        print(f'\nacpi:{row[1].strip()}*:\n ID_VENDOR_FROM_DATABASE={name}')
+
 
 print('''\
 # This file is part of systemd.

@@ -8,11 +8,14 @@
 #include "device-monitor-private.h"
 #include "device-private.h"
 #include "device-util.h"
+#include "fd-util.h"
 #include "io-util.h"
+#include "iovec-util.h"
 #include "mountpoint-util.h"
 #include "path-util.h"
 #include "socket-util.h"
 #include "stat-util.h"
+#include "stdio-util.h"
 #include "string-util.h"
 #include "tests.h"
 #include "time-util.h"
@@ -20,10 +23,12 @@
 static void prepare_loopback(sd_device **ret) {
         _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
 
+        assert(ret);
+
         ASSERT_OK(sd_device_new_from_syspath(&dev, "/sys/class/net/lo"));
         ASSERT_OK(device_add_property(dev, "ACTION", "add"));
         ASSERT_OK(device_add_property(dev, "SEQNUM", "10"));
-        ASSERT_OK(device_add_tag(dev, "TEST_SD_DEVICE_MONITOR", true));
+        ASSERT_OK(device_add_tag(dev, "TEST_SD_DEVICE_MONITOR", /* both= */ true));
 
         *ret = TAKE_PTR(dev);
 }
@@ -31,6 +36,8 @@ static void prepare_loopback(sd_device **ret) {
 static int prepare_sda(sd_device **ret) {
         _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
         int r;
+
+        assert(ret);
 
         r = sd_device_new_from_subsystem_sysname(&dev, "block", "sda");
         if (r < 0)
@@ -55,9 +62,12 @@ static int monitor_handler(sd_device_monitor *m, sd_device *d, void *userdata) {
 static void prepare_monitor(sd_device_monitor **ret_server, sd_device_monitor **ret_client, union sockaddr_union *ret_address) {
         _cleanup_(sd_device_monitor_unrefp) sd_device_monitor *monitor_server = NULL, *monitor_client = NULL;
 
+        assert(ret_server);
+        assert(ret_client);
+
         ASSERT_OK(device_monitor_new_full(&monitor_server, MONITOR_GROUP_NONE, -EBADF));
         ASSERT_OK(sd_device_monitor_set_description(monitor_server, "sender"));
-        ASSERT_OK(sd_device_monitor_start(monitor_server, NULL, NULL));
+        ASSERT_OK(sd_device_monitor_start(monitor_server, /* callback= */ NULL, /* userdata= */ NULL));
 
         ASSERT_OK(device_monitor_new_full(&monitor_client, MONITOR_GROUP_NONE, -EBADF));
         ASSERT_OK(sd_device_monitor_set_description(monitor_client, "client"));
@@ -107,7 +117,7 @@ TEST(sd_device_monitor_is_running) {
 
         ASSERT_OK(device_monitor_new_full(&m, MONITOR_GROUP_NONE, -EBADF));
         ASSERT_OK_ZERO(sd_device_monitor_is_running(m));
-        ASSERT_OK(sd_device_monitor_start(m, NULL, NULL));
+        ASSERT_OK(sd_device_monitor_start(m, /* callback= */ NULL, /* userdata= */ NULL));
         ASSERT_OK_POSITIVE(sd_device_monitor_is_running(m));
         ASSERT_OK(sd_device_monitor_stop(m));
         ASSERT_OK_ZERO(sd_device_monitor_is_running(m));
@@ -131,7 +141,7 @@ TEST(sd_device_monitor_start_stop) {
         send_by_enumerator(monitor_server, &sa, e, 5, syspath);
 
         /* sd_device_monitor_start() can be called multiple times. */
-        ASSERT_OK(sd_device_monitor_start(monitor_client, NULL, NULL));
+        ASSERT_OK(sd_device_monitor_start(monitor_client, /* callback= */ NULL, /* userdata= */ NULL));
         ASSERT_OK(sd_device_monitor_start(monitor_client, monitor_handler, (void *) syspath));
 
         /* Sending devices after client being started. */
@@ -166,7 +176,7 @@ TEST(refuse_invalid_device) {
 
         ASSERT_OK(sd_device_monitor_start(monitor_client, monitor_handler, (void *) syspath));
         ASSERT_OK(device_monitor_send(monitor_server, &sa, loopback));
-        ASSERT_OK(sd_event_run(sd_device_monitor_get_event(monitor_client), 0));
+        ASSERT_OK(sd_event_run(sd_device_monitor_get_event(monitor_client), /* timeout= */ 0));
 }
 
 static void test_send_receive_one(sd_device *device, bool subsystem_filter, bool tag_filter, bool use_bpf) {
@@ -204,25 +214,25 @@ TEST(sd_device_monitor_send_receive) {
         int r;
 
         prepare_loopback(&loopback);
-        test_send_receive_one(loopback, false, false, false);
-        test_send_receive_one(loopback,  true, false, false);
-        test_send_receive_one(loopback, false,  true, false);
-        test_send_receive_one(loopback,  true,  true, false);
-        test_send_receive_one(loopback,  true, false,  true);
-        test_send_receive_one(loopback, false,  true,  true);
-        test_send_receive_one(loopback,  true,  true,  true);
+        test_send_receive_one(loopback, /* subsystem_filter= */ false, /* tag_filter= */ false, /* use_bpf= */ false);
+        test_send_receive_one(loopback,  /* subsystem_filter= */ true, /* tag_filter= */ false, /* use_bpf= */ false);
+        test_send_receive_one(loopback, /* subsystem_filter= */ false,  /* tag_filter= */ true, /* use_bpf= */ false);
+        test_send_receive_one(loopback,  /* subsystem_filter= */ true,  /* tag_filter= */ true, /* use_bpf= */ false);
+        test_send_receive_one(loopback,  /* subsystem_filter= */ true, /* tag_filter= */ false,  /* use_bpf= */ true);
+        test_send_receive_one(loopback, /* subsystem_filter= */ false,  /* tag_filter= */ true,  /* use_bpf= */ true);
+        test_send_receive_one(loopback,  /* subsystem_filter= */ true,  /* tag_filter= */ true,  /* use_bpf= */ true);
 
         r = prepare_sda(&sda);
         if (r < 0)
                 return (void) log_tests_skipped_errno(r, "Failed to create sd_device for sda");
 
-        test_send_receive_one(sda, false, false, false);
-        test_send_receive_one(sda,  true, false, false);
-        test_send_receive_one(sda, false,  true, false);
-        test_send_receive_one(sda,  true,  true, false);
-        test_send_receive_one(sda,  true, false,  true);
-        test_send_receive_one(sda, false,  true,  true);
-        test_send_receive_one(sda,  true,  true,  true);
+        test_send_receive_one(sda, /* subsystem_filter= */ false, /* tag_filter= */ false, /* use_bpf= */ false);
+        test_send_receive_one(sda,  /* subsystem_filter= */ true, /* tag_filter= */ false, /* use_bpf= */ false);
+        test_send_receive_one(sda, /* subsystem_filter= */ false,  /* tag_filter= */ true, /* use_bpf= */ false);
+        test_send_receive_one(sda,  /* subsystem_filter= */ true,  /* tag_filter= */ true, /* use_bpf= */ false);
+        test_send_receive_one(sda,  /* subsystem_filter= */ true, /* tag_filter= */ false,  /* use_bpf= */ true);
+        test_send_receive_one(sda, /* subsystem_filter= */ false,  /* tag_filter= */ true,  /* use_bpf= */ true);
+        test_send_receive_one(sda,  /* subsystem_filter= */ true,  /* tag_filter= */ true,  /* use_bpf= */ true);
 }
 
 TEST(sd_device_monitor_filter_add_match_subsystem_devtype) {
@@ -239,12 +249,12 @@ TEST(sd_device_monitor_filter_add_match_subsystem_devtype) {
 
         prepare_monitor(&monitor_server, &monitor_client, &sa);
 
-        ASSERT_OK(sd_device_monitor_filter_add_match_subsystem_devtype(monitor_client, subsystem, NULL));
+        ASSERT_OK(sd_device_monitor_filter_add_match_subsystem_devtype(monitor_client, subsystem, /* devtype= */ NULL));
         ASSERT_OK(sd_device_monitor_start(monitor_client, monitor_handler, (void *) syspath));
 
         ASSERT_OK(sd_device_enumerator_new(&e));
-        ASSERT_OK(sd_device_enumerator_add_match_subsystem(e, subsystem, false));
-        send_by_enumerator(monitor_server, &sa, e, SIZE_MAX, NULL);
+        ASSERT_OK(sd_device_enumerator_add_match_subsystem(e, subsystem, /* match= */ false));
+        send_by_enumerator(monitor_server, &sa, e, SIZE_MAX, /* syspath_filter= */ NULL);
 
         log_device_info(device, "Sending device subsystem:%s syspath:%s", subsystem, syspath);
         ASSERT_OK(device_monitor_send(monitor_server, &sa, device));
@@ -268,11 +278,26 @@ TEST(sd_device_monitor_filter_add_match_tag) {
         ASSERT_OK(sd_device_monitor_start(monitor_client, monitor_handler, (void *) syspath));
 
         ASSERT_OK(sd_device_enumerator_new(&e));
-        send_by_enumerator(monitor_server, &sa, e, SIZE_MAX, NULL);
+        send_by_enumerator(monitor_server, &sa, e, SIZE_MAX, /* syspath_filter= */ NULL);
 
         log_device_info(device, "Sending device syspath:%s", syspath);
         ASSERT_OK(device_monitor_send(monitor_server, &sa, device));
         ASSERT_EQ(sd_event_loop(sd_device_monitor_get_event(monitor_client)), 100);
+}
+
+TEST(sd_device_monitor_filter_update_bounds) {
+        _cleanup_(sd_device_monitor_unrefp) sd_device_monitor *m = NULL;
+
+        ASSERT_OK(device_monitor_new_full(&m, MONITOR_GROUP_NONE, -EBADF));
+
+        /* Each tag emits 6 BPF instructions into a fixed 512-entry array, too many must be refused */
+        for (unsigned u = 0; u < 200; u++) {
+                char t[32];
+                xsprintf(t, "tag%u", u);
+                ASSERT_OK(sd_device_monitor_filter_add_match_tag(m, t));
+        }
+
+        ASSERT_ERROR(sd_device_monitor_filter_update(m), E2BIG);
 }
 
 TEST(sd_device_monitor_filter_add_match_sysattr) {
@@ -290,12 +315,12 @@ TEST(sd_device_monitor_filter_add_match_sysattr) {
 
         prepare_monitor(&monitor_server, &monitor_client, &sa);
 
-        ASSERT_OK(sd_device_monitor_filter_add_match_sysattr(monitor_client, sysattr, sysattr_value, true));
+        ASSERT_OK(sd_device_monitor_filter_add_match_sysattr(monitor_client, sysattr, sysattr_value, /* match= */ true));
         ASSERT_OK(sd_device_monitor_start(monitor_client, monitor_handler, (void *) syspath));
 
         ASSERT_OK(sd_device_enumerator_new(&e));
-        ASSERT_OK(sd_device_enumerator_add_match_sysattr(e, sysattr, sysattr_value, false));
-        send_by_enumerator(monitor_server, &sa, e, 5, NULL);
+        ASSERT_OK(sd_device_enumerator_add_match_sysattr(e, sysattr, sysattr_value, /* match= */ false));
+        send_by_enumerator(monitor_server, &sa, e, 5, /* syspath_filter= */ NULL);
 
         log_device_info(device, "Sending device syspath:%s", syspath);
         ASSERT_OK(device_monitor_send(monitor_server, &sa, device));
@@ -325,7 +350,7 @@ TEST(sd_device_monitor_add_match_parent) {
 
         prepare_monitor(&monitor_server, &monitor_client, &sa);
 
-        ASSERT_OK(sd_device_monitor_filter_add_match_parent(monitor_client, parent, true));
+        ASSERT_OK(sd_device_monitor_filter_add_match_parent(monitor_client, parent, /* match= */ true));
         ASSERT_OK(sd_device_monitor_start(monitor_client, monitor_handler, (void *) syspath));
 
         ASSERT_OK(sd_device_enumerator_new(&e));
@@ -348,11 +373,11 @@ TEST(sd_device_monitor_filter_remove) {
 
         prepare_monitor(&monitor_server, &monitor_client, &sa);
 
-        ASSERT_OK(sd_device_monitor_filter_add_match_subsystem_devtype(monitor_client, "hoge", NULL));
+        ASSERT_OK(sd_device_monitor_filter_add_match_subsystem_devtype(monitor_client, "hoge", /* devtype= */ NULL));
         ASSERT_OK(sd_device_monitor_start(monitor_client, monitor_handler, (void *) syspath));
 
         ASSERT_OK(device_monitor_send(monitor_server, &sa, device));
-        ASSERT_OK(sd_event_run(sd_device_monitor_get_event(monitor_client), 0));
+        ASSERT_OK(sd_event_run(sd_device_monitor_get_event(monitor_client), /* timeout= */ 0));
 
         ASSERT_OK(sd_device_monitor_filter_remove(monitor_client));
 
@@ -399,6 +424,33 @@ TEST(sd_device_monitor_receive) {
         const char *s;
         ASSERT_OK(sd_device_get_syspath(dev, &s));
         ASSERT_STREQ(s, syspath);
+}
+
+TEST(sd_device_monitor_receive_bad_properties_off) {
+        _cleanup_(sd_device_monitor_unrefp) sd_device_monitor *monitor_server = NULL, *monitor_client = NULL;
+        union sockaddr_union sa;
+
+        prepare_monitor(&monitor_server, &monitor_client, &sa);
+
+        monitor_netlink_header nlh = {
+                .prefix = "libudev",
+                .magic = htobe32(UDEV_MONITOR_MAGIC),
+                .header_size = sizeof nlh,
+                .properties_off = UINT32_MAX - 10,
+        };
+        struct iovec iov = IOVEC_MAKE(&nlh, sizeof nlh);
+        struct msghdr smsg = {
+                .msg_iov = &iov,
+                .msg_iovlen = 1,
+                .msg_name = &sa,
+                .msg_namelen = sizeof(struct sockaddr_nl),
+        };
+
+        int fd = ASSERT_FD(sd_device_monitor_get_fd(monitor_server));
+        ASSERT_OK_ERRNO(sendmsg(fd, &smsg, 0));
+
+        _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
+        ASSERT_ERROR(sd_device_monitor_receive(monitor_client, &dev), EAGAIN);
 }
 
 static int intro(void) {

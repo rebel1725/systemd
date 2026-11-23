@@ -24,7 +24,7 @@ TEST_RET(add_acls_for_user) {
         int r;
 
         FOREACH_STRING(s, "capsh", "getfacl", "ls") {
-                r = find_executable(s, NULL);
+                r = find_executable(s, /* ret_filename= */ NULL);
                 if (r < 0)
                         return log_tests_skipped_errno(r, "Could not find %s binary: %m", s);
         }
@@ -41,8 +41,7 @@ TEST_RET(add_acls_for_user) {
         ASSERT_OK_ZERO_ERRNO(system(cmd));
 
         if (getuid() == 0 && !userns_has_single_user()) {
-                const char *nobody = NOBODY_USER_NAME;
-                r = get_user_creds(&nobody, &uid, NULL, NULL, NULL, 0);
+                r = get_user_creds(NOBODY_USER_NAME, /* flags= */ 0, /* ret_username= */ NULL, &uid, /* ret_gid= */ NULL, /* ret_home= */ NULL, /* ret_shell= */ NULL);
                 if (r < 0)
                         uid = 0;
         } else
@@ -53,7 +52,7 @@ TEST_RET(add_acls_for_user) {
                 return log_tests_skipped("no ACL support on /tmp");
 
         log_info_errno(r, "fd_add_uid_acl_permission(%i, "UID_FMT", ACL_READ): %m", fd, uid);
-        assert_se(r >= 0);
+        ASSERT_OK(r);
 
         cmd = strjoina("ls -l ", fn);
         ASSERT_OK_ZERO_ERRNO(system(cmd));
@@ -81,7 +80,7 @@ TEST_RET(fd_acl_make_read_only) {
         int r;
 
         FOREACH_STRING(s, "capsh", "getfacl", "ls", "stat") {
-                r = find_executable(s, NULL);
+                r = find_executable(s, /* ret_filename= */ NULL);
                 if (r < 0)
                         return log_tests_skipped_errno(r, "Could not find %s binary: %m", s);
         }

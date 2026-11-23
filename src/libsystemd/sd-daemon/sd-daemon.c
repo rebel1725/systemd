@@ -96,7 +96,7 @@ _public_ int sd_listen_fds(int unset_environment) {
         }
 
         for (int fd = SD_LISTEN_FDS_START; fd < SD_LISTEN_FDS_START + n; fd++) {
-                r = fd_cloexec(fd, true);
+                r = fd_cloexec(fd, /* cloexec= */ true);
                 if (r < 0)
                         goto finish;
         }
@@ -210,6 +210,7 @@ _public_ int sd_is_special(int fd, const char *path) {
 
 static int is_socket_internal(int fd, int type, int listening) {
         struct stat st_fd;
+        int r;
 
         assert_return(fd >= 0, -EBADF);
         assert_return(type >= 0, -EINVAL);
@@ -221,28 +222,22 @@ static int is_socket_internal(int fd, int type, int listening) {
                 return 0;
 
         if (type != 0) {
-                int other_type = 0;
-                socklen_t l = sizeof(other_type);
+                int other_type;
 
-                if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &other_type, &l) < 0)
-                        return -errno;
-
-                if (l != sizeof(other_type))
-                        return -EINVAL;
+                r = getsockopt_int(fd, SOL_SOCKET, SO_TYPE, &other_type);
+                if (r < 0)
+                        return r;
 
                 if (other_type != type)
                         return 0;
         }
 
         if (listening >= 0) {
-                int accepting = 0;
-                socklen_t l = sizeof(accepting);
+                int accepting;
 
-                if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &l) < 0)
-                        return -errno;
-
-                if (l != sizeof(accepting))
-                        return -EINVAL;
+                r = getsockopt_int(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting);
+                if (r < 0)
+                        return r;
 
                 if (!accepting != !listening)
                         return 0;
@@ -603,6 +598,8 @@ static int pid_notify_with_fds_internal(
                                 return log_debug_errno(errno, "Failed to send notify message to '%s': %m", e);
 
                         /* If that failed, try with our own ucred instead */
+                        /* Silence static analyzers */
+                        assert(msghdr.msg_controllen >= CMSG_SPACE(sizeof(struct ucred)));
                         msghdr.msg_controllen -= CMSG_SPACE(sizeof(struct ucred));
                         if (msghdr.msg_controllen == 0)
                                 msghdr.msg_control = NULL;
@@ -619,7 +616,7 @@ static int pid_notify_with_fds_internal(
                         msghdr.msg_control = NULL;
                         msghdr.msg_controllen = 0;
                 }
-        } while (!iovec_increment(msghdr.msg_iov, msghdr.msg_iovlen, n));
+        } while (!iovec_inc_many(msghdr.msg_iov, msghdr.msg_iovlen, n));
 
         if (address.sockaddr.sa.sa_family == AF_VSOCK && IN_SET(type, SOCK_STREAM, SOCK_SEQPACKET)) {
                 /* For AF_VSOCK, we need to close the socket to signal the end of the message. */
@@ -635,8 +632,8 @@ static int pid_notify_with_fds_internal(
         }
 
         if (DEBUG_LOGGING) {
-                _cleanup_free_ char *escaped = xescape_full(state, "\"", /* console_width = */ SIZE_MAX, XESCAPE_8_BIT);
-                log_debug("Notify message sent to '%s': \"%s\"", e, escaped ?: state);
+                _cleanup_free_ char *escaped = shell_escape(state, "\"");
+                log_debug("Notify message sent to '%s': \"%s\"", e, strnull(escaped));
         }
 
         return 1;
@@ -677,7 +674,7 @@ _public_ int sd_pid_notify_barrier(pid_t pid, int unset_environment, uint64_t ti
 
         pipe_fd[1] = safe_close(pipe_fd[1]);
 
-        r = fd_wait_for_event(pipe_fd[0], 0 /* POLLHUP is implicit */, timeout);
+        r = fd_wait_for_event(pipe_fd[0], /* event= */ 0 /* POLLHUP is implicit */, timeout);
         if (r < 0)
                 goto finish;
         if (r == 0) {
@@ -692,15 +689,15 @@ finish:
 }
 
 _public_ int sd_notify_barrier(int unset_environment, uint64_t timeout) {
-        return sd_pid_notify_barrier(0, unset_environment, timeout);
+        return sd_pid_notify_barrier(/* pid= */ 0, unset_environment, timeout);
 }
 
 _public_ int sd_pid_notify(pid_t pid, int unset_environment, const char *state) {
-        return sd_pid_notify_with_fds(pid, unset_environment, state, NULL, 0);
+        return sd_pid_notify_with_fds(pid, unset_environment, state, /* fds= */ NULL, /* n_fds= */ 0);
 }
 
 _public_ int sd_notify(int unset_environment, const char *state) {
-        return sd_pid_notify_with_fds(0, unset_environment, state, NULL, 0);
+        return sd_pid_notify_with_fds(/* pid= */ 0, unset_environment, state, /* fds= */ NULL, /* n_fds= */ 0);
 }
 
 _public_ int sd_pid_notifyf(pid_t pid, int unset_environment, const char *format, ...) {

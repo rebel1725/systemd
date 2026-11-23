@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <stdio.h>
 #include <sys/stat.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "binfmt-util.h"
@@ -19,10 +20,19 @@
 #include "pretty-print.h"
 #include "string-util.h"
 #include "strv.h"
+#include "verbs.h"
 
 static CatFlags arg_cat_flags = CAT_CONFIG_OFF;
 static PagerFlags arg_pager_flags = 0;
 static bool arg_unregister = false;
+
+COMMAND(
+        "systemd-binfmt\0",
+        "Register binary formats with the kernel.",
+        .argspec = "[CONFIGURATION FILE…]\0",
+        .man_page = "systemd-binfmt.service(8)",
+        .pager_flags = &arg_pager_flags,
+);
 
 static int delete_rule(const char *rulename) {
         const char *fn = strjoina("/proc/sys/fs/binfmt_misc/", rulename);
@@ -70,7 +80,7 @@ static int apply_file(const char *filename, bool ignore_enoent) {
 
         assert(filename);
 
-        r = search_and_fopen(filename, "re", NULL, (const char**) CONF_PATHS_STRV("binfmt.d"), &f, &pp);
+        r = search_and_fopen(filename, "re", /* root= */ NULL, (const char**) CONF_PATHS_STRV("binfmt.d"), &f, &pp);
         if (r < 0) {
                 if (ignore_enoent && r == -ENOENT)
                         return 0;
@@ -103,93 +113,51 @@ static int apply_file(const char *filename, bool ignore_enoent) {
 static int cat_config(char **files) {
         pager_open(arg_pager_flags);
 
-        return cat_files(NULL, files, arg_cat_flags);
+        return cat_files(/* file= */ NULL, files, arg_cat_flags);
 }
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-binfmt.service", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] [CONFIGURATION FILE...]\n\n"
-               "Registers binary formats with the kernel.\n\n"
-               "  -h --help             Show this help\n"
-               "     --version          Show package version\n"
-               "     --cat-config       Show configuration files\n"
-               "     --tldr             Show non-comment parts of configuration\n"
-               "     --no-pager         Do not pipe output into a pager\n"
-               "     --unregister       Unregister all existing entries\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               link);
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_CAT_CONFIG,
-                ARG_TLDR,
-                ARG_NO_PAGER,
-                ARG_UNREGISTER,
-        };
-
-        static const struct option options[] = {
-                { "help",       no_argument, NULL, 'h'            },
-                { "version",    no_argument, NULL, ARG_VERSION    },
-                { "cat-config", no_argument, NULL, ARG_CAT_CONFIG },
-                { "tldr",       no_argument, NULL, ARG_TLDR       },
-                { "no-pager",   no_argument, NULL, ARG_NO_PAGER   },
-                { "unregister", no_argument, NULL, ARG_UNREGISTER },
-                {}
-        };
-
-        int c;
-
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
         assert(argc >= 0);
         assert(argv);
+        assert(ret_args);
 
-        while ((c = getopt_long(argc, argv, "h", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case 'h':
-                        return help();
-
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_CAT_CONFIG:
+                OPTION_COMMON_CAT_CONFIG:
                         arg_cat_flags = CAT_CONFIG_ON;
                         break;
 
-                case ARG_TLDR:
+                OPTION_COMMON_TLDR:
                         arg_cat_flags = CAT_TLDR;
                         break;
 
-                case ARG_NO_PAGER:
+                OPTION_COMMON_NO_PAGER:
                         arg_pager_flags |= PAGER_DISABLE;
                         break;
 
-                case ARG_UNREGISTER:
+                OPTION_LONG("unregister", NULL, "Unregister all existing entries"):
                         arg_unregister = true;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
-        if ((arg_unregister || arg_cat_flags != CAT_CONFIG_OFF) && argc > optind)
+        char **args = option_parser_get_args(&opts);
+
+        if ((arg_unregister || arg_cat_flags != CAT_CONFIG_OFF) && !strv_isempty(args))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Positional arguments are not allowed with --cat-config/--tldr or --unregister.");
 
+        *ret_args = args;
         return 1;
 }
 
@@ -208,7 +176,8 @@ static int binfmt_mounted_and_writable_warn(void) {
 static int run(int argc, char *argv[]) {
         int r;
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
@@ -221,13 +190,13 @@ static int run(int argc, char *argv[]) {
         if (arg_unregister)
                 return disable_binfmt();
 
-        if (argc > optind) {
+        if (!strv_isempty(args)) {
                 r = binfmt_mounted_and_writable_warn();
                 if (r <= 0)
                         return r;
 
-                for (int i = optind; i < argc; i++)
-                        RET_GATHER(r, apply_file(argv[i], false));
+                STRV_FOREACH(f, args)
+                        RET_GATHER(r, apply_file(*f, /* ignore_enoent= */ false));
 
         } else {
                 _cleanup_strv_free_ char **files = NULL;
@@ -250,8 +219,10 @@ static int run(int argc, char *argv[]) {
                 else
                         log_debug("Flushed all binfmt_misc rules.");
 
+                r = 0;
+
                 STRV_FOREACH(f, files)
-                        RET_GATHER(r, apply_file(*f, true));
+                        RET_GATHER(r, apply_file(*f, /* ignore_enoent= */ true));
         }
 
         return r;

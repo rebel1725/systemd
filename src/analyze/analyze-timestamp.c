@@ -26,15 +26,11 @@ static int test_timestamp_one(const char *p) {
         if (!table)
                 return log_oom();
 
-        assert_se(cell = table_get_cell(table, 0, 0));
-        r = table_set_ellipsize_percent(table, cell, 100);
-        if (r < 0)
-                return r;
+        assert_se(cell = table_get_cell(table, /* row= */ 0, /* column= */ 0));
+        (void) table_set_ellipsize_percent(table, cell, 100);
 
-        assert_se(cell = table_get_cell(table, 0, 1));
-        r = table_set_ellipsize_percent(table, cell, 100);
-        if (r < 0)
-                return r;
+        assert_se(cell = table_get_cell(table, /* row= */ 0, 1));
+        (void) table_set_ellipsize_percent(table, cell, 100);
 
         r = table_add_many(table,
                            TABLE_FIELD, "Original form",
@@ -53,7 +49,7 @@ static int test_timestamp_one(const char *p) {
                         return table_log_add_error(r);
         }
 
-        r = table_add_cell(table, NULL, TABLE_FIELD, "UNIX seconds");
+        r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_FIELD, "UNIX seconds");
         if (r < 0)
                 return table_log_add_error(r);
 
@@ -65,7 +61,7 @@ static int test_timestamp_one(const char *p) {
                                            usec / USEC_PER_SEC,
                                            usec % USEC_PER_SEC);
         if (r < 0)
-                return r;
+                return table_log_add_error(r);
 
         r = table_add_many(table,
                            TABLE_FIELD, "From now",
@@ -73,7 +69,7 @@ static int test_timestamp_one(const char *p) {
         if (r < 0)
                 return table_log_add_error(r);
 
-        return table_print(table, NULL);
+        return table_print_or_warn(table);
 }
 
 int verb_timestamp(int argc, char *argv[], uintptr_t _data, void *userdata) {

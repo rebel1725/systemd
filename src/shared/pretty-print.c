@@ -1,6 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <math.h>
 #include <stdio.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -100,6 +99,7 @@ int terminal_urlify(const char *url, const char *text, char **ret) {
         char *n;
 
         assert(url);
+        assert(ret);
 
         /* Takes a URL and a pretty string and formats it as clickable link for the terminal. See
          * https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda for details. */
@@ -125,6 +125,8 @@ int file_url_from_path(const char *path, char **ret) {
         struct utsname u;
         char *url = NULL;
         int r;
+
+        assert(ret);
 
         if (uname(&u) < 0)
                 return -errno;
@@ -175,11 +177,16 @@ int terminal_urlify_path(const char *path, const char *text, char **ret) {
         return terminal_urlify(url, text, ret);
 }
 
-int terminal_urlify_man(const char *page, const char *section, char **ret) {
+int terminal_urlify_man_full(const char *page, const char *section, const char *suffix, char **ret) {
         const char *url, *text;
 
-        url = strjoina("man:", page, "(", section, ")");
-        text = strjoina(page, "(", section, ") man page");
+        if (section) {
+                url = strjoina("man:", page, "(", section, ")");
+                text = strjoina(page, "(", section, ")", suffix);
+        } else {
+                url = strjoina("man:", page);
+                text = strjoina(page, suffix);
+        }
 
         return terminal_urlify(url, text, ret);
 }
@@ -202,7 +209,7 @@ static int cat_file(const ConfFile *c, bool *newline, CatFlags flags) {
 
         bool resolved = !path_equal(c->original_path, c->resolved_path);
 
-        r = terminal_urlify_path(c->resolved_path, NULL, &urlified);
+        r = terminal_urlify_path(c->resolved_path, /* text= */ NULL, &urlified);
         if (r < 0)
                 return log_error_errno(r, "Failed to urlify path \"%s\": %m", c->resolved_path);
 
@@ -388,6 +395,12 @@ static int guess_type(const char **name, char ***ret_prefixes, bool *ret_is_coll
         _cleanup_free_ char *n = NULL;
         bool run = false, coll = false;
         const char *ext = ".conf";
+
+        assert(name);
+        assert(ret_prefixes);
+        assert(ret_is_collection);
+        assert(ret_extension);
+
         /* This is static so that the array doesn't get deallocated when we exit the function */
         static const char* const std_prefixes[] = { CONF_PATHS(""), NULL };
         static const char* const run_prefixes[] = { "/run/", NULL };
@@ -414,7 +427,10 @@ static int guess_type(const char **name, char ***ret_prefixes, bool *ret_is_coll
                 ext = ".rules";
         else if (path_equal(n, "kernel/install.d"))
                 ext = ".install";
-        else if (path_equal(n, "systemd/ntp-units.d")) {
+        else if (path_equal(n, "machine-tags.d")) {
+                coll = true;
+                ext = ".tags";
+        } else if (path_equal(n, "systemd/ntp-units.d")) {
                 coll = true;
                 ext = ".list";
         } else if (path_equal(n, "systemd/relabel-extra.d")) {
@@ -433,9 +449,9 @@ static int guess_type(const char **name, char ***ret_prefixes, bool *ret_is_coll
 
 int conf_files_cat(const char *root, const char *name, CatFlags flags) {
         _cleanup_strv_free_ char **dirs = NULL;
-        char **prefixes = NULL; /* explicit initialization to appease gcc */
-        bool is_collection;
-        const char *extension;
+        char **prefixes = NULL;       /* explicit initialization to appease gcc */
+        bool is_collection = false;   /* explicit initialization to appease gcc */
+        const char *extension = NULL; /* explicit initialization to appease gcc */
         int r;
 
         r = guess_type(&name, &prefixes, &is_collection, &extension);
@@ -485,7 +501,7 @@ int conf_files_cat(const char *root, const char *name, CatFlags flags) {
         /* Then locate the drop-ins, if any */
         ConfFile **dropins = NULL;
         size_t n_dropins = 0;
-        CLEANUP_ARRAY(dropins, n_dropins, conf_file_free_many);
+        CLEANUP_ARRAY(dropins, n_dropins, conf_file_free_array);
         r = conf_files_list_strv_full(extension, root, CONF_FILES_REGULAR | CONF_FILES_FILTER_MASKED | CONF_FILES_WARN, (const char* const*) dirs, &dropins, &n_dropins);
         if (r < 0)
                 return log_error_errno(r, "Failed to query file list: %m");
@@ -558,7 +574,10 @@ void draw_progress_bar_unbuffered(const char *prefix, double percentage) {
                  * https://conemu.github.io/en/AnsiEscapeCodes.html#ConEmu_specific_OSC
                  * https://github.com/microsoft/terminal/pull/8055
                  */
-                fprintf(stderr, ANSI_OSC "9;4;1;%u" ANSI_ST, (unsigned) ceil(percentage));
+                unsigned percentage_ceil = (unsigned) percentage;
+                if ((double) percentage_ceil < percentage)
+                        percentage_ceil++;
+                fprintf(stderr, ANSI_OSC "9;4;1;%u" ANSI_ST, percentage_ceil);
 
                 size_t cols = columns();
                 size_t prefix_width = utf8_console_width(prefix) + 1 /* space */;

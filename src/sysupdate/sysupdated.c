@@ -24,7 +24,6 @@
 #include "escape.h"
 #include "event-util.h"
 #include "fd-util.h"
-#include "fileio.h"
 #include "format-util.h"
 #include "hashmap.h"
 #include "log.h"
@@ -33,7 +32,6 @@
 #include "notify-recv.h"
 #include "os-util.h"
 #include "parse-util.h"
-#include "path-util.h"
 #include "pidref.h"
 #include "process-util.h"
 #include "runtime-scope.h"
@@ -41,8 +39,9 @@
 #include "signal-util.h"
 #include "string-table.h"
 #include "strv.h"
+#include "sysupdate-target.h"
 #include "sysupdate-util.h"
-#include "utf8.h"
+#include "verbs.h"
 
 #define FEATURES_DROPIN_NAME "systemd-sysupdate-enabled"
 
@@ -64,25 +63,6 @@ typedef struct Manager {
 
 /* Forward declare so that jobs can call it on exit */
 static void manager_check_idle(Manager *m);
-
-typedef enum TargetClass {
-        /* These should try to match ImageClass from src/basic/os-util.h */
-        TARGET_MACHINE  = IMAGE_MACHINE,
-        TARGET_PORTABLE = IMAGE_PORTABLE,
-        TARGET_SYSEXT   = IMAGE_SYSEXT,
-        TARGET_CONFEXT  = IMAGE_CONFEXT,
-        _TARGET_CLASS_IS_IMAGE_CLASS_MAX,
-
-        /* sysupdate-specific classes */
-        TARGET_HOST = _TARGET_CLASS_IS_IMAGE_CLASS_MAX,
-        TARGET_COMPONENT,
-
-        _TARGET_CLASS_MAX,
-        _TARGET_CLASS_INVALID = -EINVAL,
-} TargetClass;
-
-/* Let's ensure when the number of classes is updated things are updated here too */
-assert_cc((int) _IMAGE_CLASS_MAX == (int) _TARGET_CLASS_IS_IMAGE_CLASS_MAX);
 
 typedef struct Target {
         Manager *manager;
@@ -138,17 +118,6 @@ struct Job {
         sd_bus_message *dbus_msg;
         JobReady detach_cb; /* Callback called when job has started.  Detaches the job to run in the background */
 };
-
-static const char* const target_class_table[_TARGET_CLASS_MAX] = {
-        [TARGET_MACHINE]   = "machine",
-        [TARGET_PORTABLE]  = "portable",
-        [TARGET_SYSEXT]    = "sysext",
-        [TARGET_CONFEXT]   = "confext",
-        [TARGET_COMPONENT] = "component",
-        [TARGET_HOST]      = "host",
-};
-
-DEFINE_PRIVATE_STRING_TABLE_LOOKUP_TO_STRING(target_class, TargetClass);
 
 static const char* const job_type_table[_JOB_TYPE_MAX] = {
         [JOB_LIST]             = "list",
@@ -246,8 +215,13 @@ static int job_parse_child_output(int _fd, sd_json_variant **ret) {
                 return 0;
         }
 
-        r = sd_json_parse_file_at(/* f= */ NULL, fd, /* path= */ NULL, /* flags= */ 0,
-                                  &v, /* reterr_line= */ NULL, /* reterr_column= */ NULL);
+        r = sd_json_parse_fd(
+                        /* path= */ "stdout",
+                        TAKE_FD(fd),
+                        SD_JSON_PARSE_DONATE_FD|SD_JSON_PARSE_SEEK0,
+                        &v,
+                        /* reterr_line= */ NULL,
+                        /* reterr_column= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse child output as JSON: %m");
 
@@ -288,10 +262,9 @@ static void job_on_errno(Job *j, const char *buf) {
         assert(buf);
 
         r = parse_errno(buf);
-        if (r < 0) {
-                log_warning_errno(r, "Got invalid errno value from job %" PRIu64 ", ignoring: %m", j->id);
-                return;
-        }
+        if (r < 0)
+                return (void) log_warning_errno(r, "Got invalid errno value from job %" PRIu64 ", ignoring: %m",
+                                                j->id);
 
         j->status_errno = r;
 
@@ -306,10 +279,8 @@ static void job_on_progress(Job *j, const char *buf) {
         assert(buf);
 
         r = safe_atou(buf, &progress);
-        if (r < 0 || progress > 100) {
-                log_warning("Got invalid percent value, ignoring.");
-                return;
-        }
+        if (r < 0 || progress > 100)
+                return (void) log_warning("Got invalid percent value, ignoring.");
 
         j->progress_percent = progress;
         (void) sd_bus_emit_properties_changed(j->manager->bus, j->object_path,
@@ -350,13 +321,24 @@ static int job_on_exit(sd_event_source *s, const siginfo_t *si, void *userdata) 
                 sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED,
                                   "Job terminated abnormally with signal %s.",
                                   signal_to_string(si->si_status));
-        } else if (si->si_status != EXIT_SUCCESS)
-                if (j->status_errno != 0)
-                        sd_bus_error_set_errno(&error, j->status_errno);
-                else
-                        sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED,
-                                          "Job failed with exit code %i.", si->si_status);
-        else {
+        } else if (si->si_status != EXIT_SUCCESS) {
+                bool check_new_no_update = false;
+
+                if (j->type == JOB_CHECK_NEW &&
+                    si->si_status == EXIT_FAILURE &&
+                    job_parse_child_output(TAKE_FD(j->stdout_fd), &json) >= 0) {
+                        sd_json_variant *v = sd_json_variant_by_key(json, "available");
+                        check_new_no_update = v && sd_json_variant_is_null(v);
+                }
+
+                if (!check_new_no_update) {
+                        if (j->status_errno != 0)
+                                sd_bus_error_set_errno(&error, j->status_errno);
+                        else
+                                sd_bus_error_setf(&error, SD_BUS_ERROR_FAILED,
+                                                  "Job failed with exit code %i.", si->si_status);
+                }
+        } else {
                 r = job_parse_child_output(TAKE_FD(j->stdout_fd), &json);
                 if (r < 0)
                         sd_bus_error_set_errnof(&error, r, "Failed to parse job worker output: %m");
@@ -446,7 +428,7 @@ static int job_start(Job *j) {
                 return log_error_errno(stdout_fd, "Failed to create memfd: %m");
 
         r = pidref_safe_fork_full("(sd-sysupdate)",
-                                  (int[]) { -EBADF, stdout_fd, STDERR_FILENO }, NULL, 0,
+                                  (int[]) { -EBADF, stdout_fd, STDERR_FILENO }, /* except_fds= */ NULL, /* n_except_fds= */ 0,
                                   FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|
                                   FORK_REARRANGE_STDIO|FORK_LOG|FORK_REOPEN_LOG, &pid);
         if (r < 0)
@@ -475,7 +457,7 @@ static int job_start(Job *j) {
                 if (getenv_bool("SYSTEMD_SYSUPDATE_NO_VERIFY") > 0)
                         cmd[k++] = "--verify=no"; /* For testing */
 
-                r = setenv_systemd_exec_pid(true);
+                r = setenv_systemd_exec_pid(/* update_only= */ true);
                 if (r < 0)
                         log_warning_errno(r, "Failed to update $SYSTEMD_EXEC_PID, ignoring: %m");
 
@@ -553,7 +535,7 @@ static int job_start(Job *j) {
         if (r < 0)
                 return log_error_errno(r, "Failed to add child process to event loop: %m");
 
-        r = sd_event_source_set_child_process_own(j->child, true);
+        r = sd_event_source_set_child_process_own(j->child, /* own= */ true);
         if (r < 0)
                 return log_error_errno(r, "Event loop failed to take ownership of child process: %m");
         pidref_done(&pid); /* disarm sigkill_wait */
@@ -572,7 +554,7 @@ static int job_cancel(Job *j) {
         assert(j);
 
         r = sd_event_source_send_child_signal(j->child, j->n_cancelled < 3 ? SIGTERM : SIGKILL,
-                                              NULL, 0);
+                                              /* si= */ NULL, /* flags= */ 0);
         if (r < 0)
                 return r;
 
@@ -591,19 +573,19 @@ static int job_method_cancel(sd_bus_message *msg, void *userdata, sd_bus_error *
         case JOB_LIST:
         case JOB_DESCRIBE:
         case JOB_CHECK_NEW:
-                action = "org.freedesktop.sysupdate1.check";
+                action = "org.freedesktop.sysupdate1.cancel-check";
                 break;
 
         case JOB_ACQUIRE:
         case JOB_INSTALL:
                 if (j->version)
-                        action = "org.freedesktop.sysupdate1.update-to-version";
+                        action = "org.freedesktop.sysupdate1.cancel-update-to-version";
                 else
-                        action = "org.freedesktop.sysupdate1.update";
+                        action = "org.freedesktop.sysupdate1.cancel-update";
                 break;
 
         case JOB_VACUUM:
-                action = "org.freedesktop.sysupdate1.vacuum";
+                action = "org.freedesktop.sysupdate1.cancel-vacuum";
                 break;
 
         case JOB_DESCRIBE_FEATURE:
@@ -631,7 +613,7 @@ static int job_method_cancel(sd_bus_message *msg, void *userdata, sd_bus_error *
         if (r < 0)
                 return r;
 
-        return sd_bus_reply_method_return(msg, NULL);
+        return sd_bus_reply_method_return(msg, /* types= */ NULL);
 }
 
 static BUS_DEFINE_PROPERTY_GET_ENUM(job_property_get_type, job_type, JobType);
@@ -681,6 +663,8 @@ static int job_node_enumerator(
         Manager *m = ASSERT_PTR(userdata);
         Job *j;
         unsigned k = 0;
+
+        assert(nodes);
 
         l = new0(char*, hashmap_size(m->jobs) + 1);
         if (!l)
@@ -771,10 +755,11 @@ static int target_new(Manager *m, TargetClass class, const char *name, const cha
 static int sysupdate_run_simple(sd_json_variant **ret, Target *t, ...) {
         _cleanup_close_pair_ int pipe[2] = EBADF_PAIR;
         _cleanup_(pidref_done_sigkill_wait) PidRef pid = PIDREF_NULL;
-        _cleanup_fclose_ FILE *f = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
         _cleanup_free_ char *target_arg = NULL;
         int r;
+
+        assert(ret);
 
         if (t) {
                 r = target_get_argument(t, &target_arg);
@@ -788,7 +773,7 @@ static int sysupdate_run_simple(sd_json_variant **ret, Target *t, ...) {
 
         r = pidref_safe_fork_full("(sd-sysupdate)",
                                   (int[]) { -EBADF, pipe[1], STDERR_FILENO },
-                                  NULL, 0,
+                                  /* except_fds= */ NULL, /* n_except_fds= */ 0,
                                   FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_DEATHSIG_SIGTERM|
                                   FORK_REARRANGE_STDIO|FORK_LOG|FORK_REOPEN_LOG,
                                   &pid);
@@ -845,11 +830,14 @@ static int sysupdate_run_simple(sd_json_variant **ret, Target *t, ...) {
         }
 
         pipe[1] = safe_close(pipe[1]);
-        f = take_fdopen(&pipe[0], "r");
-        if (!f)
-                return -errno;
 
-        r = sd_json_parse_file(f, "stdout", 0, &v, NULL, NULL);
+        r = sd_json_parse_fd(
+                        "stdout",
+                        TAKE_FD(pipe[0]),
+                        SD_JSON_PARSE_DONATE_FD,
+                        &v,
+                        /* reterr_line= */ NULL,
+                        /* reterr_column= */ NULL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse JSON: %m");
 
@@ -957,7 +945,7 @@ static int target_method_describe_finish(
 
         assert(json);
 
-        r = sd_json_variant_format(json, 0, &text);
+        r = sd_json_variant_format(json, /* flags= */ 0, &text);
         if (r < 0)
                 return r;
 
@@ -977,8 +965,8 @@ static int target_method_describe(sd_bus_message *msg, void *userdata, sd_bus_er
         if (r < 0)
                 return r;
 
-        if (isempty(version))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Version must be specified");
+        if (!version_is_valid(version, VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
 
         if ((flags & ~SD_SYSUPDATE_FLAGS_ALL) != 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid flags specified");
@@ -1126,8 +1114,12 @@ static int target_method_acquire(sd_bus_message *msg, void *userdata, sd_bus_err
          * an update anyway. */
         if (isempty(version))
                 action = "org.freedesktop.sysupdate1.update";
-        else
+        else {
+                if (!version_is_valid(version, VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS))
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
+
                 action = "org.freedesktop.sysupdate1.update-to-version";
+        }
 
         const char *details[] = {
                 "class", target_class_to_string(t->class),
@@ -1210,8 +1202,12 @@ static int target_method_install(sd_bus_message *msg, void *userdata, sd_bus_err
          * an update anyway. */
         if (isempty(version))
                 action = "org.freedesktop.sysupdate1.update";
-        else
+        else {
+                if (!version_is_valid(version, VERSION_ALLOW_UNDERSCORE|VERSION_ALLOW_PLUS))
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid version");
+
                 action = "org.freedesktop.sysupdate1.update-to-version";
+        }
 
         const char *details[] = {
                 "class", target_class_to_string(t->class),
@@ -1326,7 +1322,9 @@ static int target_method_get_version(sd_bus_message *msg, void *userdata, sd_bus
 
         version_json = sd_json_variant_by_key(v, "current");
         if (!version_json)
-                return log_sysupdate_bad_json(SYNTHETIC_ERRNO(EPROTO), "list", "Missing key 'current'");
+                version_json = sd_json_variant_by_key(v, "current+pending");
+        if (!version_json)
+                return log_sysupdate_bad_json(SYNTHETIC_ERRNO(EPROTO), "list", "Missing key 'current' or 'current+pending'");
 
         if (sd_json_variant_is_null(version_json))
                 return sd_bus_reply_method_return(msg, "s", "");
@@ -1346,13 +1344,13 @@ static int target_get_appstream(Target *t, char ***ret) {
         if (r < 0)
                 return log_error_errno(r, "Failed to run 'systemd-sysupdate list': %m");
 
-        appstream_url_json = sd_json_variant_by_key(v, "appstreamUrls");
+        appstream_url_json = sd_json_variant_by_key(v, "appStream");
         if (!appstream_url_json)
-                return log_sysupdate_bad_json(SYNTHETIC_ERRNO(EPROTO), "list", "Missing key 'appstreamUrls'");
+                return log_sysupdate_bad_json(SYNTHETIC_ERRNO(EPROTO), "list", "Missing key 'appStream'");
 
         r = sd_json_variant_strv(appstream_url_json, ret);
         if (r < 0)
-                return log_sysupdate_bad_json(SYNTHETIC_ERRNO(EPROTO), "list", "Key 'appstreamUrls' should be strv");
+                return log_sysupdate_bad_json(SYNTHETIC_ERRNO(EPROTO), "list", "Key 'appStream' should be strv");
 
         return 0;
 }
@@ -1395,7 +1393,7 @@ static int target_method_list_features(sd_bus_message *msg, void *userdata, sd_b
         if (flags != 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Flags must be 0");
 
-        r = sysupdate_run_simple(&json, t, "features", NULL);
+        r = sysupdate_run_simple(&json, t, "--offline", "features", NULL);
         if (r < 0)
                 return r;
 
@@ -1430,8 +1428,8 @@ static int target_method_describe_feature(sd_bus_message *msg, void *userdata, s
         if (r < 0)
                 return r;
 
-        if (isempty(feature))
-                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Feature must be specified");
+        if (!feature_name_valid(feature))
+                return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid feature name");
 
         if (flags != 0)
                 return sd_bus_error_setf(error, SD_BUS_ERROR_INVALID_ARGS, "Flags must be 0");
@@ -1452,19 +1450,6 @@ static int target_method_describe_feature(sd_bus_message *msg, void *userdata, s
         return 1;
 }
 
-static bool feature_name_is_valid(const char *name) {
-        if (isempty(name))
-                return false;
-
-        if (!ascii_is_valid(name))
-                return false;
-
-        if (!filename_is_valid(strjoina(name, ".feature.d")))
-                return false;
-
-        return true;
-}
-
 static int target_method_set_feature_enabled(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
         _cleanup_free_ char *feature_ext = NULL;
         Target *t = ASSERT_PTR(userdata);
@@ -1483,7 +1468,7 @@ static int target_method_set_feature_enabled(sd_bus_message *msg, void *userdata
         r = sd_bus_message_read(msg, "sit", &feature, &enabled, &flags);
         if (r < 0)
                 return r;
-        if (!feature_name_is_valid(feature))
+        if (!feature_name_valid(feature))
                 return sd_bus_reply_method_errorf(msg,
                                                   SD_BUS_ERROR_INVALID_ARGS,
                                                   "The specified feature is invalid");
@@ -1520,7 +1505,7 @@ static int target_method_set_feature_enabled(sd_bus_message *msg, void *userdata
         if (enabled < 0) { /* Reset -> delete the drop-in file */
                 _cleanup_free_ char *path = NULL;
 
-                r = drop_in_file(SYSCONF_DIR "/sysupdate.d", feature, 50, FEATURES_DROPIN_NAME, NULL, &path);
+                r = drop_in_file(SYSCONF_DIR "/sysupdate.d", feature, 50, FEATURES_DROPIN_NAME, /* ret_unit_dir= */ NULL, &path);
                 if (r < 0)
                         return r;
 
@@ -1536,7 +1521,7 @@ static int target_method_set_feature_enabled(sd_bus_message *msg, void *userdata
                         return r;
         }
 
-        return sd_bus_reply_method_return(msg, NULL);
+        return sd_bus_reply_method_return(msg, /* types= */ NULL);
 }
 
 static int target_list_components(Target *t, char ***ret_components, bool *ret_have_default) {
@@ -1633,6 +1618,8 @@ static int target_node_enumerator(
         Target *t;
         unsigned k = 0;
         int r;
+
+        assert(nodes);
 
         r = manager_ensure_targets(m);
         if (r < 0)
@@ -1830,12 +1817,12 @@ static int manager_new(Manager **ret) {
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, (SIGRTMIN+18) | SD_EVENT_SIGNAL_PROCMASK,
-                                sigrtmin18_handler, NULL);
+        r = sd_event_add_signal(m->event, /* ret= */ NULL, (SIGRTMIN+18) | SD_EVENT_SIGNAL_PROCMASK,
+                                sigrtmin18_handler, /* userdata= */ NULL);
         if (r < 0)
                 return r;
 
-        r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
+        r = sd_event_add_memory_pressure(m->event, /* ret= */ NULL, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to allocate memory pressure event source, ignoring: %m");
 
@@ -1861,7 +1848,7 @@ static int manager_enumerate_image_class(Manager *m, TargetClass class) {
         Image *image;
         int r;
 
-        r = image_discover(m->runtime_scope, (ImageClass) class, NULL, &images);
+        r = image_discover(m->runtime_scope, (ImageClass) class, /* root= */ NULL, &images);
         if (r < 0)
                 return r;
 
@@ -1872,12 +1859,15 @@ static int manager_enumerate_image_class(Manager *m, TargetClass class) {
                 if (image_is_host(image))
                         continue; /* We already enroll the host ourselves */
 
+                if (image->type == IMAGE_MSTACK)
+                        continue; /* systemd-sysupdate doesn't support mstack images yet */
+
                 r = target_new(m, class, image->name, image->path, &t);
                 if (r < 0)
                         return r;
                 t->image_type = image->type;
 
-                r = target_list_components(t, NULL, &have);
+                r = target_list_components(t, /* ret_components= */ NULL, &have);
                 if (r < 0)
                         return r;
                 if (!have) {
@@ -2130,11 +2120,11 @@ static int manager_add_bus_objects(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_bus_request_name_async(m->bus, NULL, "org.freedesktop.sysupdate1", 0, NULL, NULL);
+        r = sd_bus_request_name_async(m->bus, /* ret_slot= */ NULL, "org.freedesktop.sysupdate1", /* flags= */ 0, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request name: %m");
 
-        r = sd_bus_attach_event(m->bus, m->event, 0);
+        r = sd_bus_attach_event(m->bus, m->event, /* priority= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach bus to event loop: %m");
 
@@ -2168,15 +2158,24 @@ static int manager_run(Manager *m) {
                                         m);
 }
 
+COMMAND(
+        "systemd-sysupdated\0",
+        "Manage system updates.",
+        .man_page = "systemd-sysupdated.service(8)",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0",
+        .flags = COMMAND_EXPERIMENTAL,
+);
+
 static int run(int argc, char *argv[]) {
         _cleanup_(manager_freep) Manager *m = NULL;
         int r;
 
         log_setup();
 
-        r = service_parse_argv("systemd-sysupdated.service",
-                               "System update management service.",
-                               BUS_IMPLEMENTATIONS(&manager_object,
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object,
                                                    &log_control_object),
                                /* runtime_scope= */ NULL,
                                argc, argv);

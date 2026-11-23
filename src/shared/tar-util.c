@@ -14,7 +14,6 @@
 #include "chattr-util.h"
 #include "fd-util.h"
 #include "fs-util.h"
-#include "hexdecoct.h"
 #include "iovec-util.h"
 #include "libarchive-util.h"
 #include "mountpoint-util.h"
@@ -69,14 +68,7 @@ static void xattr_done(XAttr *xa) {
         iovec_done(&xa->data);
 }
 
-static void xattr_done_many(XAttr *xa, size_t n) {
-        assert(xa || n == 0);
-
-        FOREACH_ARRAY(i, xa, n)
-                xattr_done(i);
-
-        free(xa);
-}
+static DEFINE_ARRAY_FREE_FUNC(xattr_free_array, XAttr, xattr_done);
 
 static void open_inode_done(OpenInode *of) {
         assert(of);
@@ -87,23 +79,18 @@ static void open_inode_done(OpenInode *of) {
                 of->fd = safe_close(of->fd);
                 of->path = mfree(of->path);
         }
-        xattr_done_many(of->xattr, of->n_xattr);
+
+        xattr_free_array(of->xattr, of->n_xattr);
+        of->xattr = NULL;
+        of->n_xattr = 0;
+
 #if HAVE_ACL
-        if (of->acl_access)
-                sym_acl_free(of->acl_access);
-        if (of->acl_default)
-                sym_acl_free(of->acl_default);
+        acl_freep(&of->acl_access);
+        acl_freep(&of->acl_default);
 #endif
 }
 
-static void open_inode_done_many(OpenInode *array, size_t n) {
-        assert(array || n == 0);
-
-        FOREACH_ARRAY(i, array, n)
-                open_inode_done(i);
-
-        free(array);
-}
+static DEFINE_ARRAY_FREE_FUNC(open_inode_free_array, OpenInode, open_inode_done);
 
 static int open_inode_apply_acl(OpenInode *of) {
         int r = 0;
@@ -219,6 +206,38 @@ static int open_inode_finalize_many(OpenInode **array, size_t *n) {
         return r;
 }
 
+static const struct {
+        int libarchive;
+        acl_tag_t libacl;
+} acl_tag_map[] = {
+        { ARCHIVE_ENTRY_ACL_USER,      ACL_USER      },
+        { ARCHIVE_ENTRY_ACL_GROUP,     ACL_GROUP     },
+        { ARCHIVE_ENTRY_ACL_USER_OBJ,  ACL_USER_OBJ  },
+        { ARCHIVE_ENTRY_ACL_GROUP_OBJ, ACL_GROUP_OBJ },
+        { ARCHIVE_ENTRY_ACL_MASK,      ACL_MASK      },
+        { ARCHIVE_ENTRY_ACL_OTHER,     ACL_OTHER     },
+};
+
+static acl_tag_t libarchive_acl_tag_to_libacl_tag(int libarchive_tag) {
+        FOREACH_ELEMENT(t, acl_tag_map)
+                if (t->libarchive == libarchive_tag)
+                        return t->libacl;
+
+        return ACL_UNDEFINED_TAG;
+}
+
+#if HAVE_ACL
+#define _ARCHIVE_ENTRY_ACL_UNDEFINED 0
+
+static int libacl_tag_to_libarchive_acl_tag(acl_tag_t libacl_tag) {
+        FOREACH_ELEMENT(t, acl_tag_map)
+                if (t->libacl == libacl_tag)
+                        return t->libarchive;
+
+        return _ARCHIVE_ENTRY_ACL_UNDEFINED;
+}
+#endif
+
 static int archive_unpack_regular(
                 struct archive *a,
                 struct archive_entry *entry,
@@ -236,7 +255,7 @@ static int archive_unpack_regular(
         assert(path);
 
         _cleanup_free_ char *tmp = NULL;
-        _cleanup_close_ int fd = open_tmpfile_linkable_at(parent_fd, filename, O_CLOEXEC|O_WRONLY, &tmp);
+        _cleanup_close_ int fd = open_tmpfile_linkable_at(parent_fd, filename, O_WRONLY, &tmp);
         if (fd < 0)
                 return log_error_errno(fd, "Failed to create regular file '%s': %m", path);
 
@@ -323,7 +342,7 @@ static int archive_unpack_whiteout(
         assert(path);
 
         _cleanup_free_ char *tmp = NULL;
-        _cleanup_close_ int fd = open_tmpfile_linkable_at(parent_fd, filename, O_CLOEXEC|O_WRONLY, &tmp);
+        _cleanup_close_ int fd = open_tmpfile_linkable_at(parent_fd, filename, O_WRONLY, &tmp);
         if (fd < 0)
                 return log_error_errno(fd, "Failed to create whiteout file for '%s': %m", path);
 
@@ -382,7 +401,7 @@ static int archive_unpack_directory(
          * they are more of a "shared" concept, and we try to reuse existing inodes. Note that we create the
          * dir inode in mode 0700, so that we can fully access it (but others cannot). We'll adjust the modes
          * right before closing the inode. */
-        _cleanup_close_ int fd = open_mkdir_at(parent_fd, filename, O_CLOEXEC, 0700);
+        _cleanup_close_ int fd = open_mkdir_at(parent_fd, filename, /* flags= */ 0, 0700);
         if (fd < 0)
                 return log_error_errno(fd, "Failed to create directory '%s': %m", path);
 
@@ -426,9 +445,9 @@ static int archive_unpack_symlink(
         if (r < 0)
                 return log_error_errno(r, "Failed to create symlink '%s' → '%s': %m", path, target);
 
-        _cleanup_close_ int fd = openat(parent_fd, filename, O_CLOEXEC|O_PATH|O_NOFOLLOW);
+        _cleanup_close_ int fd = xopenat(parent_fd, filename, O_PATH|O_NOFOLLOW);
         if (fd < 0)
-                return log_error_errno(errno, "Failed to open symlink '%s' we just created: %m", path);
+                return log_error_errno(fd, "Failed to open symlink '%s' we just created: %m", path);
 
         r = fd_verify_symlink(fd);
         if (r < 0)
@@ -463,9 +482,9 @@ static int archive_unpack_special_inode(
         if (r < 0)
                 return log_error_errno(r, "Failed to create special node '%s': %m", path);
 
-        _cleanup_close_ int fd = openat(parent_fd, filename, O_CLOEXEC|O_PATH|O_NOFOLLOW);
+        _cleanup_close_ int fd = xopenat(parent_fd, filename, O_PATH|O_NOFOLLOW);
         if (fd < 0)
-                return log_error_errno(errno, "Failed to open special node '%s' we just created: %m", path);
+                return log_error_errno(fd, "Failed to open special node '%s' we just created: %m", path);
 
         struct stat st;
         if (fstat(fd, &st) < 0)
@@ -525,11 +544,9 @@ static int archive_entry_read_acl(
         assert(c > 0);
 
 #if HAVE_ACL
-        r = dlopen_libacl();
-        if (r < 0) {
-                log_debug_errno(r, "Not restoring ACL data on inode as libacl is not available: %m");
+        r = dlopen_libacl(LOG_DEBUG);
+        if (r < 0)
                 return 0;
-        }
 
         _cleanup_(acl_freep) acl_t a = NULL;
         a = sym_acl_init(c);
@@ -556,24 +573,7 @@ static int archive_entry_read_acl(
 
                 assert(rtype == type);
 
-                static const struct {
-                        int libarchive;
-                        acl_tag_t libacl;
-                } tag_map[] = {
-                        { ARCHIVE_ENTRY_ACL_USER,      ACL_USER      },
-                        { ARCHIVE_ENTRY_ACL_GROUP,     ACL_GROUP     },
-                        { ARCHIVE_ENTRY_ACL_USER_OBJ,  ACL_USER_OBJ  },
-                        { ARCHIVE_ENTRY_ACL_GROUP_OBJ, ACL_GROUP_OBJ },
-                        { ARCHIVE_ENTRY_ACL_MASK,      ACL_MASK      },
-                        { ARCHIVE_ENTRY_ACL_OTHER,     ACL_OTHER     },
-                };
-
-                acl_tag_t ntag = ACL_UNDEFINED_TAG;
-                FOREACH_ELEMENT(t, tag_map)
-                        if (t->libarchive == tag) {
-                                ntag = t->libacl;
-                                break;
-                        }
+                acl_tag_t ntag = libarchive_acl_tag_to_libacl_tag(tag);
                 if (ntag == ACL_UNDEFINED_TAG)
                         continue;
 
@@ -674,6 +674,8 @@ static int archive_entry_read_stat(
         int r;
 
         assert(entry);
+        assert(xa);
+        assert(n_xa);
 
         /* Fills in all fields that are present in the archive entry. Doesn't change the fields if the entry
          * doesn't contain the relevant data */
@@ -762,6 +764,10 @@ int tar_x(int input_fd, int tree_fd, TarFlags flags) {
         assert(input_fd >= 0);
         assert(tree_fd >= 0);
 
+        r = dlopen_libarchive(LOG_DEBUG);
+        if (r < 0)
+                return r;
+
         _cleanup_(archive_read_freep) struct archive *a = NULL;
         a = sym_archive_read_new();
         if (!a)
@@ -792,7 +798,7 @@ int tar_x(int input_fd, int tree_fd, TarFlags flags) {
                 return log_oom();
 
         size_t n_open_inodes = 0;
-        CLEANUP_ARRAY(open_inodes, n_open_inodes, open_inode_done_many);
+        CLEANUP_ARRAY(open_inodes, n_open_inodes, open_inode_free_array);
 
         /* Fill in the root inode. (Note: we leave the .path field as NULL to mark it as root inode.) */
         open_inodes[0] = (OpenInode) {
@@ -860,11 +866,10 @@ int tar_x(int input_fd, int tree_fd, TarFlags flags) {
 
                 /* Finalize all inodes we won't need anymore now (go backwards, i.e. close inner fds first) */
                 while (n_open_inodes > i) {
-                        r = open_inode_finalize(open_inodes + n_open_inodes - 1);
+                        n_open_inodes--;
+                        r = open_inode_finalize(open_inodes + n_open_inodes);
                         if (r < 0)
                                 return r;
-
-                        n_open_inodes--;
                 }
 
                 /* And now create all remaining components */
@@ -913,7 +918,7 @@ int tar_x(int input_fd, int tree_fd, TarFlags flags) {
                                 acl_t acl_access = NULL, acl_default = NULL;
                         XAttr *xa = NULL;
                         size_t n_xa = 0;
-                        CLEANUP_ARRAY(xa, n_xa, xattr_done_many);
+                        CLEANUP_ARRAY(xa, n_xa, xattr_free_array);
 
                         if (isempty(rest)) {
                                 /* This is the final node in the path, create it */
@@ -934,8 +939,8 @@ int tar_x(int input_fd, int tree_fd, TarFlags flags) {
                                                                 "Invalid hardlink path name '%s' in entry, refusing.", target);
 
                                         _cleanup_close_ int target_fd = -EBADF;
-                                        r = chaseat(tree_fd, target,
-                                                    CHASE_PROHIBIT_SYMLINKS|CHASE_AT_RESOLVE_IN_ROOT|CHASE_NOFOLLOW,
+                                        r = chaseat(tree_fd, tree_fd, target,
+                                                    CHASE_PROHIBIT_SYMLINKS|CHASE_NOFOLLOW,
                                                     /* ret_path= */ NULL, &target_fd);
                                         if (r < 0)
                                                 return log_error_errno(
@@ -965,8 +970,8 @@ int tar_x(int input_fd, int tree_fd, TarFlags flags) {
 
                                                 _cleanup_close_ int target_parent_fd = -EBADF;
                                                 _cleanup_free_ char *target_filename = NULL;
-                                                r = chaseat(tree_fd, target,
-                                                            CHASE_PROHIBIT_SYMLINKS|CHASE_AT_RESOLVE_IN_ROOT|CHASE_PARENT|CHASE_EXTRACT_FILENAME|CHASE_NOFOLLOW,
+                                                r = chaseat(tree_fd, tree_fd, target,
+                                                            CHASE_PROHIBIT_SYMLINKS|CHASE_PARENT|CHASE_EXTRACT_FILENAME|CHASE_NOFOLLOW,
                                                             &target_filename, &target_parent_fd);
                                                 if (r < 0)
                                                         return log_error_errno(r, "Failed to find inode '%s' which shall be hardlinked as '%s': %m",
@@ -1057,7 +1062,7 @@ int tar_x(int input_fd, int tree_fd, TarFlags flags) {
                                 }
                         } else {
                                 /* This is some intermediary node in the path that we haven't opened yet. Create it with default attributes */
-                                fd = open_mkdir_at(parent_fd, e, O_CLOEXEC, 0700);
+                                fd = open_mkdir_at(parent_fd, e, /* flags= */ 0, 0700);
                                 if (fd < 0)
                                         return log_error_errno(fd, "Failed to create directory '%s': %m", j);
 
@@ -1098,7 +1103,7 @@ int tar_x(int input_fd, int tree_fd, TarFlags flags) {
         return 0;
 }
 
-static int make_tmpfs(void) {
+int tar_hardlink_db_new(void) {
         /* Creates a tmpfs superblock to store our hardlink db in. We can do this if we run in our own
          * userns, or if we are privileged. This is preferable, since it means the db is cleaned up
          * automatically once we are done. Moreover, since this is a new superblock owned by us, we do not
@@ -1126,6 +1131,7 @@ struct make_archive_data {
         TarFlags flags;
 
         int hardlink_db_fd;
+        bool hardlink_db_fd_owned; /* Whether we allocated the db ourselves, i.e. whether it is ours to close */
         char *hardlink_db_path;
         int have_unique_mount_id;
 };
@@ -1174,6 +1180,7 @@ static int hardlink_lookup(
         assert(d);
         assert(inode_fd >= 0);
         assert(sx);
+        assert(ret);
 
         /* If we know the hardlink count, and it's 1, then don't bother */
         if (FLAGS_SET(sx->stx_mask, STATX_NLINK) && sx->stx_nlink == 1)
@@ -1197,7 +1204,7 @@ static int hardlink_lookup(
         else
                 assert(d->have_unique_mount_id == (r > 0));
 
-        m = hexmem(SHA256_DIRECT(handle->f_handle, handle->handle_bytes), SHA256_DIGEST_SIZE);
+        m = sha256_direct_hex(handle->f_handle, handle->handle_bytes);
         if (!m)
                 return log_oom();
 
@@ -1213,7 +1220,7 @@ static int hardlink_lookup(
 
                 /* We first try to create our own superblock, which works if we are in a userns, and which
                  * doesn't require explicit clean-up */
-                d->hardlink_db_fd = make_tmpfs();
+                d->hardlink_db_fd = tar_hardlink_db_new();
                 if (d->hardlink_db_fd < 0) {
                         log_debug_errno(d->hardlink_db_fd, "Failed to allocate tmpfs superblock for hardlink db, falling back to temporary directory: %m");
 
@@ -1230,6 +1237,8 @@ static int hardlink_lookup(
                         if (d->hardlink_db_fd < 0)
                                 return log_error_errno(d->hardlink_db_fd, "Failed to make hardlink database directory: %m");
                 }
+
+                d->hardlink_db_fd_owned = true;
         } else {
                 _cleanup_free_ char *p = NULL;
                 r = readlinkat_malloc(d->hardlink_db_fd, n, &p);
@@ -1325,8 +1334,9 @@ static int archive_write_acl(
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Unexpected ACL type");
 
         acl_entry_t e;
-        r = sym_acl_get_entry(acl, ACL_FIRST_ENTRY, &e);
-        for (;;) {
+        for (r = sym_acl_get_entry(acl, ACL_FIRST_ENTRY, &e);
+             ;
+             r = sym_acl_get_entry(acl, ACL_NEXT_ENTRY, &e)) {
                 if (r < 0)
                         return log_error_errno(errno, "Failed to get ACL entry: %m");
                 if (r == 0)
@@ -1336,20 +1346,10 @@ static int archive_write_acl(
                 if (sym_acl_get_tag_type(e, &ntag) < 0)
                         return log_error_errno(errno, "Failed to get ACL entry tag: %m");
 
-                static const int tag_map[] = {
-                        [ACL_USER]      = ARCHIVE_ENTRY_ACL_USER,
-                        [ACL_GROUP]     = ARCHIVE_ENTRY_ACL_GROUP,
-                        [ACL_USER_OBJ]  = ARCHIVE_ENTRY_ACL_USER_OBJ,
-                        [ACL_GROUP_OBJ] = ARCHIVE_ENTRY_ACL_GROUP_OBJ,
-                        [ACL_MASK]      = ARCHIVE_ENTRY_ACL_MASK,
-                        [ACL_OTHER]     = ARCHIVE_ENTRY_ACL_OTHER,
-                };
-                assert_cc(ACL_UNDEFINED_TAG == 0);   /* safety check, we assume that holes are filled with ACL_UNDEFINED_TAG */
-                assert_cc(ELEMENTSOF(tag_map) <= 64); /* safety check, we assume that the tag ids are all packed and low */
+                int tag = libacl_tag_to_libarchive_acl_tag(ntag);
+                if (tag == _ARCHIVE_ENTRY_ACL_UNDEFINED)
+                        continue;
 
-                int tag = ntag >= 0 && ntag <= (acl_tag_t) ELEMENTSOF(tag_map) ? tag_map[ntag] : ACL_UNDEFINED_TAG;
-
-                bool skip = false;
                 id_t qualifier = UID_INVALID;
                 if (IN_SET(ntag, ACL_USER, ACL_GROUP)) {
                         id_t *q = sym_acl_get_qualifier(e);
@@ -1360,37 +1360,34 @@ static int archive_write_acl(
                         sym_acl_free(q);
 
                         /* Suppress invalid UIDs or those that shall be squashed */
-                        skip = !(uid_is_valid(qualifier) &&
-                                 (!FLAGS_SET(flags, TAR_SQUASH_UIDS_ABOVE_64K) || qualifier < NSRESOURCE_UIDS_64K));
+                        if (!uid_is_valid(qualifier) ||
+                            (FLAGS_SET(flags, TAR_SQUASH_UIDS_ABOVE_64K) && qualifier >= NSRESOURCE_UIDS_64K))
+                                continue;
                 }
 
-                if (!skip) {
-                        acl_permset_t p;
-                        if (sym_acl_get_permset(e, &p) < 0)
-                                return log_error_errno(errno, "Failed to get ACL entry permission set: %m");
+                acl_permset_t p;
+                if (sym_acl_get_permset(e, &p) < 0)
+                        return log_error_errno(errno, "Failed to get ACL entry permission set: %m");
 
-                        int permset = 0;
-                        r = sym_acl_get_perm(p, ACL_READ);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to get ACL entry read bit: %m");
-                        SET_FLAG(permset, ARCHIVE_ENTRY_ACL_READ, r);
+                int permset = 0;
+                r = sym_acl_get_perm(p, ACL_READ);
+                if (r < 0)
+                        return log_error_errno(errno, "Failed to get ACL entry read bit: %m");
+                SET_FLAG(permset, ARCHIVE_ENTRY_ACL_READ, r);
 
-                        r = sym_acl_get_perm(p, ACL_WRITE);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to get ACL entry write bit: %m");
-                        SET_FLAG(permset, ARCHIVE_ENTRY_ACL_WRITE, r);
+                r = sym_acl_get_perm(p, ACL_WRITE);
+                if (r < 0)
+                        return log_error_errno(errno, "Failed to get ACL entry write bit: %m");
+                SET_FLAG(permset, ARCHIVE_ENTRY_ACL_WRITE, r);
 
-                        r = sym_acl_get_perm(p, ACL_EXECUTE);
-                        if (r < 0)
-                                return log_error_errno(r, "Failed to get ACL entry execute bit: %m");
-                        SET_FLAG(permset, ARCHIVE_ENTRY_ACL_EXECUTE, r);
+                r = sym_acl_get_perm(p, ACL_EXECUTE);
+                if (r < 0)
+                        return log_error_errno(errno, "Failed to get ACL entry execute bit: %m");
+                SET_FLAG(permset, ARCHIVE_ENTRY_ACL_EXECUTE, r);
 
-                        r = sym_archive_entry_acl_add_entry(entry, type, permset, tag, qualifier, /* name= */ NULL);
-                        if (r != ARCHIVE_OK)
-                                return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to add ACL entry.");
-                }
-
-                r = sym_acl_get_entry(acl, ACL_NEXT_ENTRY, &e);
+                r = sym_archive_entry_acl_add_entry(entry, type, permset, tag, qualifier, /* name= */ NULL);
+                if (r != ARCHIVE_OK)
+                        return log_error_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE), "Failed to add ACL entry.");
         }
 
         return 0;
@@ -1491,10 +1488,8 @@ static int archive_item(
 #if HAVE_ACL
         if (inode_type_can_acl(sx->stx_mode)) {
 
-                r = dlopen_libacl();
-                if (r < 0)
-                        log_debug_errno(r, "No trying to read ACL off inode, as libacl support is not available: %m");
-                else {
+                r = dlopen_libacl(LOG_DEBUG);
+                if (r >= 0) {
                         r = sym_acl_extended_file(FORMAT_PROC_FD_PATH(inode_fd));
                         if (r < 0 && !ERRNO_IS_NOT_SUPPORTED(errno))
                                 return log_error_errno(errno, "Failed check if '%s' has ACLs: %m", path);
@@ -1547,7 +1542,7 @@ static int archive_item(
         _cleanup_close_ int data_fd = -EBADF;
         if (S_ISREG(sx->stx_mode)) {
                 /* Convert the O_PATH fd into a proper fd */
-                data_fd = fd_reopen(inode_fd, O_RDONLY|O_CLOEXEC);
+                data_fd = fd_reopen(inode_fd, O_RDONLY);
                 if (data_fd < 0)
                         return log_error_errno(data_fd, "Failed to open '%s': %m", path);
 
@@ -1601,17 +1596,25 @@ static int archive_item(
 static void make_archive_data_done(struct make_archive_data *d) {
         assert(d);
 
-        if (d->hardlink_db_fd >= 0)
-                (void) rm_rf_children(d->hardlink_db_fd, REMOVE_PHYSICAL, /* root_dev= */ NULL);
+        /* Only tear down a db we allocated ourselves: rm_rf_children() consumes the fd it is given, and one
+         * handed to us by the caller is theirs to close. */
+        if (d->hardlink_db_fd_owned && d->hardlink_db_fd >= 0)
+                (void) rm_rf_children(TAKE_FD(d->hardlink_db_fd), REMOVE_PHYSICAL, /* root_dev= */ NULL);
 
         unlink_and_free(d->hardlink_db_path);
 }
 
-int tar_c(int tree_fd, int output_fd, const char *filename, TarFlags flags) {
+/* The hardlink db fd is borrowed, not consumed: tar_c() neither closes it nor empties it again, so whoever
+ * passed it in stays responsible for both. */
+int tar_c(int tree_fd, int output_fd, const char *filename, int hardlink_db_fd, TarFlags flags) {
         int r;
 
         assert(tree_fd >= 0);
         assert(output_fd >= 0);
+
+        r = dlopen_libarchive(LOG_DEBUG);
+        if (r < 0)
+                return r;
 
         _cleanup_(archive_write_freep) struct archive *a = sym_archive_write_new();
         if (!a)
@@ -1633,7 +1636,7 @@ int tar_c(int tree_fd, int output_fd, const char *filename, TarFlags flags) {
         _cleanup_(make_archive_data_done) struct make_archive_data data = {
                 .archive = a,
                 .flags = flags,
-                .hardlink_db_fd = -EBADF,
+                .hardlink_db_fd = hardlink_db_fd,
                 .have_unique_mount_id = -1,
         };
 
@@ -1664,11 +1667,15 @@ int tar_x(int input_fd, int tree_fd, TarFlags flags) {
         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "libarchive support not available.");
 }
 
-int tar_c(int tree_fd, int output_fd, const char *filename, TarFlags flags) {
+int tar_c(int tree_fd, int output_fd, const char *filename, int hardlink_db_fd, TarFlags flags) {
         assert(tree_fd >= 0);
         assert(output_fd >= 0);
 
         return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "libarchive support not available.");
+}
+
+int tar_hardlink_db_new(void) {
+        return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "libarchive support not available.");
 }
 
 #endif

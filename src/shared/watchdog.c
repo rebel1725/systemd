@@ -14,9 +14,11 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
+#include "fs-util.h"
 #include "log.h"
 #include "path-util.h"
 #include "ratelimit.h"
+#include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
 #include "time-util.h"
@@ -55,6 +57,7 @@ static int saturated_usec_to_sec(usec_t val) {
 
 static int watchdog_get_sysfs_path(const char *filename, char **ret_path) {
         struct stat st;
+        int r;
 
         if (watchdog_fd < 0)
                 return -EBADF;
@@ -62,8 +65,9 @@ static int watchdog_get_sysfs_path(const char *filename, char **ret_path) {
         if (fstat(watchdog_fd, &st))
                 return -errno;
 
-        if (!S_ISCHR(st.st_mode))
-                return -EBADF;
+        r = stat_verify_char(&st);
+        if (r < 0)
+                return r;
 
         if (asprintf(ret_path, "/sys/dev/char/"DEVNUM_FORMAT_STR"/%s", DEVNUM_FORMAT_VAL(st.st_rdev), filename) < 0)
                 return -ENOMEM;
@@ -75,13 +79,15 @@ static int watchdog_get_pretimeout_governor(char **ret_gov) {
         _cleanup_free_ char *sys_fn = NULL;
         int r;
 
+        assert(ret_gov);
+
         r = watchdog_get_sysfs_path("pretimeout_governor", &sys_fn);
         if (r < 0)
                 return r;
 
         log_info("Watchdog: reading from %s", sys_fn);
 
-        r = read_virtual_file(sys_fn, WATCHDOG_GOV_NAME_MAXLEN - 1, ret_gov, NULL);
+        r = read_virtual_file(sys_fn, WATCHDOG_GOV_NAME_MAXLEN - 1, ret_gov, /* ret_size= */ NULL);
         if (r < 0)
                 return r;
 
@@ -241,7 +247,7 @@ static int watchdog_ping_now(void) {
                 watchdog_last_good_ping = now(CLOCK_BOOTTIME);
                 if (watchdog_bad_pings > 0) {
                         log_struct(LOG_INFO,
-                                   LOG_MESSAGE("Successfully pinged hardware watchdog %s after %u attempts: %m",
+                                   LOG_MESSAGE("Successfully pinged hardware watchdog %s after %u attempts.",
                                                watchdog_device, watchdog_bad_pings + 1),
                                    "WATCHDOG_DEVICE=%s", watchdog_device);
                         watchdog_bad_pings = 0;
@@ -345,7 +351,7 @@ static int watchdog_update_timeout(void) {
          * time, we want to configure the pretimeout before it is enabled. */
         (void) watchdog_update_pretimeout();
 
-        r = watchdog_set_enable(true);
+        r = watchdog_set_enable(/* enable= */ true);
         if (r < 0)
                 return r;
 
@@ -377,7 +383,7 @@ static int watchdog_open(bool ignore_ratelimit) {
                 STRV_MAKE("/dev/watchdog0", "/dev/watchdog") : STRV_MAKE(watchdog_device);
 
         STRV_FOREACH(wd, try_order) {
-                watchdog_fd = RET_NERRNO(open(*wd, O_WRONLY|O_CLOEXEC));
+                watchdog_fd = xopenat(AT_FDCWD, *wd, O_WRONLY);
                 if (watchdog_fd >= 0) {
                         if (free_and_strdup(&watchdog_device, *wd) < 0) {
                                 r = log_oom_debug();
@@ -584,7 +590,7 @@ void watchdog_close(bool disarm) {
                 return;
 
         if (disarm) {
-                (void) watchdog_set_enable(false);
+                (void) watchdog_set_enable(/* enable= */ false);
 
                 /* To be sure, use magic close logic, too */
                 for (;;) {

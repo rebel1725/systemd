@@ -19,7 +19,7 @@ static int test_calendar_one(usec_t n, const char *p) {
         TableCell *cell;
         int r;
 
-        r = calendar_spec_from_string(p, &spec);
+        r = calendar_spec_from_string_full(p, &spec, /* warn_on_weekday_mismatch= */ true);
         if (r < 0) {
                 log_error_errno(r, "Failed to parse calendar specification '%s': %m", p);
                 time_parsing_hint(p, /* calendar= */ false, /* timestamp= */ true, /* timespan= */ true);
@@ -34,15 +34,11 @@ static int test_calendar_one(usec_t n, const char *p) {
         if (!table)
                 return log_oom();
 
-        assert_se(cell = table_get_cell(table, 0, 0));
-        r = table_set_ellipsize_percent(table, cell, 100);
-        if (r < 0)
-                return r;
+        assert_se(cell = table_get_cell(table, /* row= */ 0, /* column= */ 0));
+        (void) table_set_ellipsize_percent(table, cell, 100);
 
-        assert_se(cell = table_get_cell(table, 0, 1));
-        r = table_set_ellipsize_percent(table, cell, 100);
-        if (r < 0)
-                return r;
+        assert_se(cell = table_get_cell(table, /* row= */ 0, 1));
+        (void) table_set_ellipsize_percent(table, cell, 100);
 
         if (!streq(t, p)) {
                 r = table_add_many(table,
@@ -91,7 +87,7 @@ static int test_calendar_one(usec_t n, const char *p) {
                         else
                                 k = 0;
 
-                        r = table_add_cell_stringf_full(table, NULL, TABLE_FIELD, "Iteration #%u", i+1);
+                        r = table_add_cell_stringf_full(table, /* ret_cell= */ NULL, TABLE_FIELD, "Iteration #%u", i+1);
                         if (r < 0)
                                 return table_log_add_error(r);
 
@@ -119,7 +115,7 @@ static int test_calendar_one(usec_t n, const char *p) {
                 n = next;
         }
 
-        return table_print(table, NULL);
+        return table_print_or_warn(table);
 }
 
 int verb_calendar(int argc, char *argv[], uintptr_t _data, void *userdata) {

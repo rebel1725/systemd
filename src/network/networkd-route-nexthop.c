@@ -185,9 +185,16 @@ void route_nexthops_hash_func(const Route *route, struct siphash *state) {
                 return;
 
         default: {
+                uint64_t xor_hash = 0;
                 RouteNextHop *nh;
-                ORDERED_SET_FOREACH(nh, route->nexthops)
-                        route_nexthop_hash_func(nh, state);
+                ORDERED_SET_FOREACH(nh, route->nexthops) {
+                        struct siphash nh_state = *ASSERT_PTR(state);
+
+                        route_nexthop_hash_func(nh, &nh_state);
+                        xor_hash ^= siphash24_finalize(&nh_state);
+                }
+
+                siphash24_compress_typesafe(xor_hash, state);
         }}
 }
 
@@ -211,12 +218,15 @@ int route_nexthops_compare_func(const Route *a, const Route *b) {
                 return route_nexthop_compare_func_full(&a->nexthop, &b->nexthop, /* with_weight= */ false);
 
         default: {
+                r = CMP(ordered_set_size(a->nexthops), ordered_set_size(b->nexthops));
+                if (r != 0)
+                        return r;
+
                 RouteNextHop *nh;
-                ORDERED_SET_FOREACH(nh, a->nexthops) {
-                        r = CMP(nh, (RouteNextHop*) ordered_set_get(a->nexthops, nh));
-                        if (r != 0)
-                                return r;
-                }
+                ORDERED_SET_FOREACH(nh, a->nexthops)
+                        if (!ordered_set_get(b->nexthops, nh))
+                                return 1;
+
                 return 0;
         }}
 }
@@ -443,7 +453,7 @@ int route_nexthops_is_ready_to_configure(const Route *route, Manager *manager) {
                         return r;
 
                 HASHMAP_FOREACH(nhg, nh->group) {
-                        r = nexthop_is_ready(manager, nhg->id, NULL);
+                        r = nexthop_is_ready(manager, nhg->id, /* ret= */ NULL);
                         if (r <= 0)
                                 return r;
                 }
@@ -1063,7 +1073,7 @@ int config_parse_multipath_route(
                 return log_oom();
 
         p = rvalue;
-        r = extract_first_word(&p, &word, NULL, 0);
+        r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
         if (r <= 0)
                 return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
@@ -1089,7 +1099,7 @@ int config_parse_multipath_route(
 
         if (isempty(word)) {
                 if (!dev)
-                        return log_syntax_parse_error(unit, filename, line, SYNTHETIC_ERRNO(EINVAL), lvalue, rvalue);
+                        return log_syntax_parse_error(unit, filename, line, 0, lvalue, rvalue);
         } else {
                 r = in_addr_from_string_auto(word, &nh->family, &nh->gw);
                 if (r < 0) {

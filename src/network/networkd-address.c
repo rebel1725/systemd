@@ -10,6 +10,7 @@
 #include "alloc-util.h"
 #include "bitfield.h"
 #include "conf-parser.h"
+#include "env-util.h"
 #include "errno-util.h"
 #include "firewall-util.h"
 #include "in-addr-prefix-util.h"
@@ -19,6 +20,7 @@
 #include "networkd-address.h"
 #include "networkd-address-pool.h"
 #include "networkd-dhcp-prefix-delegation.h"
+#include "networkd-dhcp-relay.h"
 #include "networkd-dhcp-server.h"
 #include "networkd-ipv4acd.h"
 #include "networkd-link.h"
@@ -37,8 +39,46 @@
 #include "string-util.h"
 #include "strv.h"
 
-#define ADDRESSES_PER_LINK_MAX 16384U
-#define STATIC_ADDRESSES_PER_NETWORK_MAX 8192U
+#define DEFAULT_MAX_ADDRESSES_PER_LINK           16384U
+#define DEFAULT_MAX_STATIC_ADDRESSES_PER_NETWORK  8192U
+
+static uint64_t max_addresses_per_link(void) {
+        static uint64_t cached = 0;
+        uint64_t value;
+        int r;
+
+        if (cached > 0)
+                return cached;
+
+        r = secure_getenv_uint64("SYSTEMD_NETWORK_MAX_ADDRESSES_PER_LINK", &value);
+        if (r < 0 && r != -ENXIO)
+                log_warning_errno(r, "Failed to parse environment variable $SYSTEMD_NETWORK_MAX_ADDRESSES_PER_LINK, ignoring: %m");
+        if (r < 0 || value == 0)
+                cached = DEFAULT_MAX_ADDRESSES_PER_LINK;
+        else
+                cached = value;
+
+        return cached;
+}
+
+static uint64_t max_static_addresses_per_network(void) {
+        static uint64_t cached = 0;
+        uint64_t value;
+        int r;
+
+        if (cached > 0)
+                return cached;
+
+        r = secure_getenv_uint64("SYSTEMD_NETWORK_MAX_STATIC_ADDRESSES_PER_NETWORK", &value);
+        if (r < 0 && r != -ENXIO)
+                log_warning_errno(r, "Failed to parse environment variable $SYSTEMD_NETWORK_MAX_STATIC_ADDRESSES_PER_NETWORK, ignoring: %m");
+        if (r < 0 || value == 0)
+                cached = MIN(DEFAULT_MAX_STATIC_ADDRESSES_PER_NETWORK, max_addresses_per_link());
+        else
+                cached = MIN(value, max_addresses_per_link());
+
+        return cached;
+}
 
 #define KNOWN_FLAGS                             \
         (IFA_F_SECONDARY |                      \
@@ -173,6 +213,8 @@ DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
 int address_new(Address **ret) {
         _cleanup_(address_unrefp) Address *address = NULL;
 
+        assert(ret);
+
         address = new(Address, 1);
         if (!address)
                 return -ENOMEM;
@@ -211,7 +253,7 @@ int address_new_static(Network *network, const char *filename, unsigned section_
                 return 0;
         }
 
-        if (ordered_hashmap_size(network->addresses_by_section) >= STATIC_ADDRESSES_PER_NETWORK_MAX)
+        if (ordered_hashmap_size(network->addresses_by_section) >= max_static_addresses_per_network())
                 return -E2BIG;
 
         r = address_new(&address);
@@ -242,6 +284,9 @@ static Address* address_detach_impl(Address *address) {
 
                 if (address->network->dhcp_server_address == address)
                         address->network->dhcp_server_address = NULL;
+
+                if (address->network->dhcp_relay_agent_address == address)
+                        address->network->dhcp_relay_agent_address = NULL;
 
                 address->network = NULL;
                 return address;
@@ -805,8 +850,10 @@ static int address_update(Address *address) {
                 link->ipv6ll_address = address->in_addr.in6;
 
                 r = link_ipv6ll_gained(link);
-                if (r < 0)
+                if (r < 0) {
+                        link->ipv6ll_address = (const struct in6_addr) {};
                         return r;
+                }
         }
 
         if (IN_SET(link->state, LINK_STATE_FAILED, LINK_STATE_LINGER))
@@ -884,12 +931,46 @@ static int address_drop(Address *in, bool removed_by_us) {
 
         address_del_netlabel(address);
 
-        /* FIXME: if the IPv6LL address is dropped, stop DHCPv6, NDISC, RADV. */
         if (address->family == AF_INET6 &&
-            in6_addr_equal(&address->in_addr.in6, &link->ipv6ll_address))
+            in6_addr_equal(&address->in_addr.in6, &link->ipv6ll_address)) {
                 link->ipv6ll_address = (const struct in6_addr) {};
 
+                Address *a;
+                bool has_replacement;
+
+                /* If another ready IPv6LL address exists on this link, use it instead. */
+                SET_FOREACH(a, link->addresses) {
+                        if (a == address)
+                                continue;
+                        if (a->family != AF_INET6)
+                                continue;
+                        if (!in6_addr_is_link_local(&a->in_addr.in6))
+                                continue;
+                        if (!address_is_ready(a))
+                                continue;
+                        link->ipv6ll_address = a->in_addr.in6;
+                        break;
+                }
+
+                has_replacement = in6_addr_is_set(&link->ipv6ll_address);
+
+                /* Stop engines bound to the dropped IPv6LL source address. Do not return early on error.
+                 * address_detach() and link_update_operstate() must run to keep link state consistent. */
+                r = link_ipv6ll_lost(link, &address->in_addr.in6, has_replacement);
+                if (r < 0)
+                        log_link_warning_errno(link, r, "Failed to stop IPv6 services after IPv6LL loss, ignoring: %m");
+
+                /* If another IPv6LL address is available, restart engines with it. */
+                if (has_replacement) {
+                        r = link_ipv6ll_gained(link);
+                        if (r < 0)
+                                log_link_warning_errno(link, r, "Failed to restart IPv6 services with alternate IPv6LL address, ignoring: %m");
+                }
+        }
+
         ipv4acd_detach(link, address);
+
+        (void) link_dhcp_relay_address_dropped(link, address);
 
         address_detach(address);
 
@@ -1265,7 +1346,7 @@ int address_remove(Address *address, Link *link) {
 
         /* The operational state is determined by address state and carrier state. Hence, if we remove
          * an address, the operational state may be changed. */
-        link_update_operstate(link, true);
+        link_update_operstate(link, /* also_update_master= */ true);
         return 0;
 }
 
@@ -1292,6 +1373,9 @@ int address_remove_and_cancel(Address *address, Link *link) {
         /* If we know the address will come or already exists, remove it. */
         if (waiting || (address->link && address_exists(address)))
                 return address_remove(address, link);
+
+        /* Otherwise, the address should be already gone or not configured yet. */
+        ipv4acd_detach(link, address);
 
         return 0;
 }
@@ -1355,11 +1439,11 @@ int link_drop_ipv6ll_addresses(Link *link) {
         if (r < 0)
                 return r;
 
-        r = sd_netlink_message_set_request_dump(req, true);
+        r = sd_netlink_message_set_request_dump(req, /* dump= */ true);
         if (r < 0)
                 return r;
 
-        r = sd_netlink_call(link->manager->rtnl, req, 0, &reply);
+        r = sd_netlink_call(link->manager->rtnl, req, /* timeout= */ 0, &reply);
         if (r < 0)
                 return r;
 
@@ -1391,7 +1475,7 @@ int link_drop_ipv6ll_addresses(Link *link) {
                         continue;
                 }
 
-                if (sd_netlink_message_read_in6_addr(addr, IFA_LOCAL, NULL) >= 0)
+                if (sd_netlink_message_read_in6_addr(addr, IFA_LOCAL, /* ret= */ NULL) >= 0)
                         /* address with peer, ignoring. */
                         continue;
 
@@ -1596,13 +1680,13 @@ static int address_acquire(Link *link, const Address *address, union in_addr_uni
         if (r == 0)
                 return -EBUSY;
 
-        /* Pick first address in range for ourselves. */
-        if (address->family == AF_INET)
-                a.in.s_addr |= htobe32(1);
-        else if (address->family == AF_INET6)
-                a.in6.s6_addr[15] |= 1;
-        else
-                assert_not_reached();
+        /* Pick first address in range for ourselves. A host prefix already identifies the exact address. */
+        if (address->prefixlen < FAMILY_ADDRESS_SIZE(address->family) * 8) {
+                if (address->family == AF_INET)
+                        a.in.s_addr |= htobe32(1);
+                else
+                        a.in6.s6_addr[15] |= 1;
+        }
 
         *ret = a;
         return 0;
@@ -1635,7 +1719,7 @@ static int address_requeue_request(Request *req, Link *link, const Address *addr
 
         tmp->in_addr = a;
 
-        r = link_requeue_request(link, req, tmp, NULL);
+        r = link_requeue_request(link, req, tmp, /* ret= */ NULL);
         if (r < 0)
                 return r;
         if (r == 0)
@@ -1654,11 +1738,11 @@ static int address_process_request(Request *req, Link *link, Address *address) {
         assert(link);
         assert(address);
 
-        if (!link_is_ready_to_configure(link, false))
+        if (!link_is_ready_to_configure(link, /* allow_unmanaged= */ false))
                 return 0;
 
         /* Refuse adding more than the limit */
-        if (set_size(link->addresses) >= ADDRESSES_PER_LINK_MAX)
+        if (set_size(link->addresses) >= max_addresses_per_link())
                 return 0;
 
         r = address_requeue_request(req, link, address);
@@ -1718,7 +1802,7 @@ int link_request_address(
                 /* The requested address is outdated. Let's ignore the request. */
                 return 0;
 
-        if (address_get_request(link, address, NULL) >= 0)
+        if (address_get_request(link, address, /* ret= */ NULL) >= 0)
                 return 0; /* already requested, skipping. */
 
         r = address_dup(address, &tmp);
@@ -1780,7 +1864,7 @@ int link_request_static_address(Link *link, const Address *address) {
         assert(address->source == NETWORK_CONFIG_SOURCE_STATIC);
 
         return link_request_address(link, address, &link->static_address_messages,
-                                    static_address_handler, NULL);
+                                    static_address_handler, /* ret= */ NULL);
 }
 
 int link_request_static_addresses(Link *link) {
@@ -2476,9 +2560,13 @@ int network_drop_invalid_addresses(Network *network) {
                 assert(r > 0);
         }
 
+        /* Detach duplicated entries now. */
+        duplicated_addresses = set_free(duplicated_addresses);
+
         r = network_adjust_dhcp_server(network, &addresses);
         if (r < 0)
                 return r;
 
+        network_adjust_dhcp_relay(network);
         return 0;
 }

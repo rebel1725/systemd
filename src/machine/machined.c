@@ -16,6 +16,7 @@
 #include "constants.h"
 #include "daemon-util.h"
 #include "dirent-util.h"
+#include "dlopen-note.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "hash-funcs.h"
@@ -26,15 +27,16 @@
 #include "machined-dbus.h"
 #include "machined-varlink.h"
 #include "main-func.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "operation.h"
 #include "path-lookup.h"
 #include "service-util.h"
 #include "set.h"
 #include "signal-util.h"
-#include "socket-util.h"
 #include "special.h"
 #include "string-util.h"
+#include "verbs.h"
+#include "vsock-util.h"
 
 static Manager* manager_unref(Manager *m);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_unref);
@@ -75,7 +77,7 @@ static int manager_new(RuntimeScope scope, Manager **ret) {
         if (r < 0)
                 return r;
 
-        r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
+        r = sd_event_add_memory_pressure(m->event, /* ret= */ NULL, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 log_full_errno(ERRNO_IS_NOT_SUPPORTED(r) || ERRNO_IS_PRIVILEGE(r) || r == -EHOSTDOWN ? LOG_DEBUG : LOG_NOTICE, r,
                                "Unable to create memory pressure event source, ignoring: %m");
@@ -207,7 +209,7 @@ static int manager_enumerate_machines(Manager *m) {
                 if (startswith(de->d_name, "unit:"))
                         continue;
 
-                if (!hostname_is_valid(de->d_name, 0))
+                if (!hostname_is_valid(de->d_name, /* flags= */ 0))
                         continue;
 
                 k = manager_add_machine(m, de->d_name, &machine);
@@ -235,7 +237,7 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return log_error_errno(r, "Failed to connect to system bus: %m");
 
-        r = sd_bus_attach_event(m->system_bus, m->event, 0);
+        r = sd_bus_attach_event(m->system_bus, m->event, /* priority= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach system bus to event loop: %m");
 
@@ -248,7 +250,7 @@ static int manager_connect_bus(Manager *m) {
                 if (r < 0)
                         return log_error_errno(r, "Failed to connect to user bus: %m");
 
-                r = sd_bus_attach_event(m->api_bus, m->event, 0);
+                r = sd_bus_attach_event(m->api_bus, m->event, /* priority= */ 0);
                 if (r < 0)
                         return log_error_errno(r, "Failed to attach user bus to event loop: %m");
         }
@@ -257,30 +259,30 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = bus_match_signal_async(m->api_bus, NULL, bus_systemd_mgr, "JobRemoved", match_job_removed, NULL, m);
+        r = bus_match_signal_async(m->api_bus, /* ret_slot= */ NULL, bus_systemd_mgr, "JobRemoved", match_job_removed, /* install_callback= */ NULL, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to add match for JobRemoved: %m");
 
-        r = bus_match_signal_async(m->api_bus, NULL, bus_systemd_mgr, "UnitRemoved", match_unit_removed, NULL, m);
+        r = bus_match_signal_async(m->api_bus, /* ret_slot= */ NULL, bus_systemd_mgr, "UnitRemoved", match_unit_removed, /* install_callback= */ NULL, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to request match for UnitRemoved: %m");
 
         r = sd_bus_match_signal_async(
                         m->api_bus,
-                        NULL,
+                        /* ret= */ NULL,
                         "org.freedesktop.systemd1",
-                        NULL,
+                        /* path= */ NULL,
                         "org.freedesktop.DBus.Properties",
                         "PropertiesChanged",
-                        match_properties_changed, NULL, m);
+                        match_properties_changed, /* install_callback= */ NULL, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to request match for PropertiesChanged: %m");
 
-        r = bus_match_signal_async(m->api_bus, NULL, bus_systemd_mgr, "Reloading", match_reloading, NULL, m);
+        r = bus_match_signal_async(m->api_bus, /* ret_slot= */ NULL, bus_systemd_mgr, "Reloading", match_reloading, /* install_callback= */ NULL, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to request match for Reloading: %m");
 
-        r = bus_call_method_async(m->api_bus, NULL, bus_systemd_mgr, "Subscribe", NULL, NULL, NULL);
+        r = bus_call_method_async(m->api_bus, /* ret_slot= */ NULL, bus_systemd_mgr, "Subscribe", /* callback= */ NULL, /* userdata= */ NULL, /* types= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to enable subscription: %m");
 
@@ -288,7 +290,7 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_bus_request_name_async(m->api_bus, NULL, "org.freedesktop.machine1", 0, NULL, NULL);
+        r = sd_bus_request_name_async(m->api_bus, /* ret_slot= */ NULL, "org.freedesktop.machine1", /* flags= */ 0, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request name: %m");
 
@@ -315,11 +317,11 @@ static int manager_startup(Manager *m) {
         manager_enumerate_machines(m);
 
         /* Remove stale objects before we start them */
-        manager_gc(m, false);
+        manager_gc(m, /* drop_not_started= */ false);
 
         /* And start everything */
         HASHMAP_FOREACH(machine, m->machines)
-                machine_start(machine, NULL, NULL);
+                machine_start(machine, /* properties= */ NULL, /* error= */ NULL);
 
         return 0;
 }
@@ -342,22 +344,40 @@ static bool check_idle(void *userdata) {
         return hashmap_isempty(m->machines);
 }
 
+COMMAND(
+        "systemd-machined\0",
+        "Manage registrations of local VMs and containers.",
+        .man_page = "systemd-machined.service(8)",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0"
+                "Runtime scope\0",
+);
+
 static int run(int argc, char *argv[]) {
         _cleanup_(manager_unrefp) Manager *m = NULL;
         RuntimeScope scope = RUNTIME_SCOPE_SYSTEM;
         int r;
 
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(suggested);
+        LIBMOUNT_NOTE(recommended);
+        LIBSELINUX_NOTE(recommended);
+        TPM2_NOTE(suggested);
+
         log_set_facility(LOG_AUTH);
         log_setup();
 
-        r = service_parse_argv("systemd-machined.service",
-                               "Manage registrations of local VMs and containers.",
-                               BUS_IMPLEMENTATIONS(&manager_object,
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object,
                                                    &log_control_object),
                                &scope,
                                argc, argv);
         if (r <= 0)
                 return r;
+
+        (void) ignore_signals(SIGPIPE);
 
         umask(0022);
 
@@ -375,7 +395,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to fully start up daemon: %m");
 
-        r = sd_notify(false, NOTIFY_READY_MESSAGE);
+        r = sd_notify(/* unset_environment= */ false, NOTIFY_READY_MESSAGE);
         if (r < 0)
                 log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
 

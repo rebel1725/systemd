@@ -1,13 +1,17 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "alloc-util.h"
 #include "creds-util.h"
+#include "env-util.h"
 #include "fileio.h"
 #include "format-util.h"
 #include "hexdecoct.h"
 #include "id128-util.h"
 #include "iovec-util.h"
+#include "memory-util.h"
 #include "path-util.h"
 #include "rm-rf.h"
+#include "string-util.h"
 #include "tests.h"
 #include "tmpfile-util.h"
 #include "tpm2-util.h"
@@ -26,7 +30,7 @@ TEST(read_credential_strings) {
         ASSERT_NULL(x);
         ASSERT_NULL(y);
 
-        ASSERT_OK(mkdtemp_malloc(NULL, &tmp));
+        ASSERT_OK(mkdtemp_malloc(/* template= */ NULL, &tmp));
 
         ASSERT_OK_ERRNO(setenv("CREDENTIALS_DIRECTORY", tmp, /* override= */ true));
 
@@ -71,6 +75,209 @@ TEST(read_credential_strings) {
                 ASSERT_OK_ERRNO(setenv("CREDENTIALS_DIRECTORY", saved, /* override= */ 1));
         else
                 ASSERT_OK_ERRNO(unsetenv("CREDENTIALS_DIRECTORY"));
+}
+
+TEST(read_credential_with_decryption) {
+        static const struct iovec binary = CONST_IOVEC_MAKE_STRING("foo\0bar\n");
+        _cleanup_(rm_rf_physical_and_freep) char *plain_dir = NULL, *encrypted_dir = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *secret_dir = NULL;
+        _cleanup_free_ char *saved_plain = NULL, *saved_encrypted = NULL, *saved_secret = NULL;
+        _cleanup_free_ char *plain_path = NULL, *encrypted_path = NULL, *secret_path = NULL;
+        void *missing = POINTER_MAX;
+        size_t missing_size = SIZE_MAX;
+
+        ASSERT_OK(free_and_strdup(&saved_plain, getenv("CREDENTIALS_DIRECTORY")));
+        ASSERT_OK(free_and_strdup(&saved_encrypted, getenv("ENCRYPTED_CREDENTIALS_DIRECTORY")));
+        ASSERT_OK(free_and_strdup(&saved_secret, getenv("SYSTEMD_CREDENTIAL_SECRET")));
+        ASSERT_OK(mkdtemp_malloc(/* template= */ NULL, &plain_dir));
+        ASSERT_OK(mkdtemp_malloc(/* template= */ NULL, &encrypted_dir));
+        ASSERT_OK(mkdtemp_malloc(/* template= */ NULL, &secret_dir));
+        ASSERT_NOT_NULL(secret_path = path_join(secret_dir, "secret"));
+        ASSERT_OK_ERRNO(setenv("CREDENTIALS_DIRECTORY", plain_dir, /* overwrite= */ true));
+        ASSERT_OK_ERRNO(setenv("ENCRYPTED_CREDENTIALS_DIRECTORY", encrypted_dir, /* overwrite= */ true));
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_CREDENTIAL_SECRET", secret_path, /* overwrite= */ true));
+
+        ASSERT_OK_ZERO(read_credential_with_decryption("missing", &missing, &missing_size));
+        ASSERT_NULL(missing);
+        ASSERT_EQ(missing_size, 0U);
+
+        ASSERT_NOT_NULL(encrypted_path = path_join(encrypted_dir, "foo"));
+        ASSERT_OK(write_string_file(encrypted_path, "!", WRITE_STRING_FILE_CREATE));
+        {
+                _cleanup_(iovec_done_erase) struct iovec result = {};
+
+                ASSERT_ERROR(read_credential_with_decryption("foo", &result.iov_base, &result.iov_len),
+                             EINVAL);
+        }
+
+        /* Reject oversized decoded data even when the Base64 encoding is well-formed. */
+        {
+                _cleanup_free_ void *oversized = NULL;
+
+                ASSERT_NOT_NULL(oversized = malloc0(CREDENTIAL_ENCRYPTED_SIZE_MAX + 1));
+                FOREACH_ELEMENT(line_break, ((const size_t[]) { SIZE_MAX, 79 })) {
+                        _cleanup_free_ char *encoded = NULL;
+                        _cleanup_(iovec_done_erase) struct iovec result = {};
+
+                        ASSERT_OK(base64mem_full(oversized, CREDENTIAL_ENCRYPTED_SIZE_MAX + 1,
+                                                 *line_break, &encoded));
+                        ASSERT_OK(write_string_file(encrypted_path, encoded, WRITE_STRING_FILE_TRUNCATE));
+                        ASSERT_ERROR(read_credential_with_decryption("foo", &result.iov_base,
+                                                                    &result.iov_len), E2BIG);
+                }
+        }
+
+        /* Plaintext takes precedence over the invalid encrypted credential and is not Base64-decoded. */
+        ASSERT_NOT_NULL(plain_path = path_join(plain_dir, "foo"));
+        ASSERT_OK(write_string_file(plain_path, "Zm9v",
+                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_AVOID_NEWLINE));
+        {
+                _cleanup_(iovec_done_erase) struct iovec result = {};
+
+                ASSERT_OK_EQ(read_credential_with_decryption("foo", &result.iov_base, &result.iov_len), 1);
+                ASSERT_EQ(result.iov_len, STRLEN("Zm9v"));
+                ASSERT_STREQ(result.iov_base, "Zm9v");
+        }
+        {
+                _cleanup_(erase_and_freep) char *text = NULL;
+
+                ASSERT_OK_EQ(read_credential_with_decryption("foo", (void**) &text,
+                                                             /* ret_size= */ NULL), 1);
+                ASSERT_STREQ(text, "Zm9v");
+        }
+
+        /* Asking for a string must reject embedded NUL bytes, without falling back to the encrypted file. */
+        ASSERT_OK(write_data_file_atomic_at(AT_FDCWD, plain_path, &binary, /* flags= */ 0));
+        {
+                _cleanup_(iovec_done_erase) struct iovec result = {};
+
+                ASSERT_OK_EQ(read_credential_with_decryption("foo", &result.iov_base, &result.iov_len), 1);
+                ASSERT_IOVEC_EQ(&binary, &result);
+        }
+        {
+                _cleanup_(erase_and_freep) char *text = NULL;
+
+                ASSERT_ERROR(read_credential_with_decryption("foo", (void**) &text, /* ret_size= */ NULL),
+                             EBADMSG);
+                ASSERT_NULL(text);
+        }
+
+        ASSERT_OK(set_unset_env("CREDENTIALS_DIRECTORY", saved_plain, /* overwrite= */ true));
+        ASSERT_OK(set_unset_env("ENCRYPTED_CREDENTIALS_DIRECTORY", saved_encrypted, /* overwrite= */ true));
+        ASSERT_OK(set_unset_env("SYSTEMD_CREDENTIAL_SECRET", saved_secret, /* overwrite= */ true));
+}
+
+TEST(read_credential_with_decryption_encrypted) {
+        static const struct iovec plaintext = CONST_IOVEC_MAKE_STRING("foo\0bar\n");
+        _cleanup_(rm_rf_physical_and_freep) char *plain_dir = NULL, *encrypted_dir = NULL;
+        _cleanup_(rm_rf_physical_and_freep) char *secret_dir = NULL;
+        _cleanup_free_ char *saved_plain = NULL, *saved_encrypted = NULL, *saved_secret = NULL;
+        _cleanup_free_ char *secret_path = NULL, *credential_path = NULL;
+        _cleanup_(iovec_done_erase) struct iovec large_plaintext = {};
+        int r;
+
+        if (geteuid() != 0)
+                return (void) log_tests_skipped("reading encrypted credentials directly requires root");
+
+        ASSERT_OK(free_and_strdup(&saved_plain, getenv("CREDENTIALS_DIRECTORY")));
+        ASSERT_OK(free_and_strdup(&saved_encrypted, getenv("ENCRYPTED_CREDENTIALS_DIRECTORY")));
+        ASSERT_OK(free_and_strdup(&saved_secret, getenv("SYSTEMD_CREDENTIAL_SECRET")));
+        ASSERT_OK(mkdtemp_malloc(/* template= */ NULL, &plain_dir));
+        ASSERT_OK(mkdtemp_malloc(/* template= */ NULL, &encrypted_dir));
+        ASSERT_OK(mkdtemp_malloc(/* template= */ NULL, &secret_dir));
+        ASSERT_NOT_NULL(secret_path = path_join(secret_dir, "secret"));
+        ASSERT_NOT_NULL(credential_path = path_join(encrypted_dir, "foo"));
+        ASSERT_OK_ERRNO(setenv("CREDENTIALS_DIRECTORY", plain_dir, /* overwrite= */ true));
+        ASSERT_OK_ERRNO(setenv("ENCRYPTED_CREDENTIALS_DIRECTORY", encrypted_dir, /* overwrite= */ true));
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_CREDENTIAL_SECRET", secret_path, /* overwrite= */ true));
+
+        ASSERT_NOT_NULL(large_plaintext.iov_base = malloc0(CREDENTIAL_SIZE_MAX));
+        large_plaintext.iov_len = CREDENTIAL_SIZE_MAX;
+
+        const struct {
+                struct iovec data;
+                bool contains_nul;
+        } inputs[] = {
+                { .data = CONST_IOVEC_MAKE_STRING("Zm9v"), .contains_nul = false },
+                { .data = CONST_IOVEC_MAKE_STRING(""), .contains_nul = false },
+                { .data = plaintext, .contains_nul = true },
+                { .data = large_plaintext, .contains_nul = true },
+        };
+
+        FOREACH_ELEMENT(input, inputs) {
+                _cleanup_(iovec_done_erase) struct iovec encrypted = {};
+
+                r = encrypt_credential_and_warn(
+                                CRED_AES256_GCM_BY_HOST,
+                                "foo",
+                                /* timestamp= */ USEC_INFINITY,
+                                /* not_after= */ USEC_INFINITY,
+                                /* tpm2_device= */ NULL,
+                                /* tpm2_hash_pcr_mask= */ 0,
+                                /* tpm2_pubkey_path= */ NULL,
+                                /* tpm2_pubkey_pcr_mask= */ 0,
+                                /* uid= */ UID_INVALID,
+                                &input->data,
+                                /* flags= */ 0,
+                                &encrypted);
+                if (ERRNO_IS_NEG_NOT_SUPPORTED(r)) {
+                        (void) log_tests_skipped("encrypted credentials are not supported");
+                        goto finish;
+                }
+                if (ERRNO_IS_NEG_MACHINE_ID_UNSET(r)) {
+                        (void) log_tests_skipped("machine ID is not initialized");
+                        goto finish;
+                }
+                ASSERT_OK(r);
+
+                /* Exercise both single-line Base64 and the line wrapping used by systemd-creds. */
+                FOREACH_ELEMENT(line_break, ((const size_t[]) { SIZE_MAX, 79 })) {
+                        _cleanup_(erase_and_freep) char *encoded = NULL;
+                        _cleanup_(iovec_done_erase) struct iovec result = {};
+                        _cleanup_(erase_and_freep) char *text = NULL;
+
+                        ASSERT_OK(base64mem_full(encrypted.iov_base, encrypted.iov_len,
+                                                 *line_break, &encoded));
+                        if (input->data.iov_len == CREDENTIAL_SIZE_MAX)
+                                ASSERT_GT(strlen(encoded), (size_t) CREDENTIAL_ENCRYPTED_SIZE_MAX);
+                        ASSERT_OK(write_string_file(credential_path, encoded,
+                                                    WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_TRUNCATE));
+                        ASSERT_OK_EQ(read_credential_with_decryption("foo", &result.iov_base,
+                                                                     &result.iov_len), 1);
+                        ASSERT_IOVEC_EQ(&input->data, &result);
+
+                        r = read_credential_with_decryption("foo", (void**) &text, /* ret_size= */ NULL);
+                        if (input->contains_nul) {
+                                ASSERT_ERROR(r, EBADMSG);
+                                ASSERT_NULL(text);
+                        } else {
+                                ASSERT_OK_EQ(r, 1);
+                                ASSERT_STREQ(text, input->data.iov_base);
+                        }
+                }
+        }
+
+        /* At and just below the size limit, valid Base64 still reaches the credential-format parser. */
+        {
+                _cleanup_free_ void *invalid = NULL;
+
+                ASSERT_NOT_NULL(invalid = malloc0(CREDENTIAL_ENCRYPTED_SIZE_MAX));
+                FOREACH_ELEMENT(delta, ((const size_t[]) { 1, 0 })) {
+                        _cleanup_free_ char *encoded = NULL;
+                        _cleanup_(iovec_done_erase) struct iovec result = {};
+
+                        ASSERT_OK(base64mem_full(invalid, CREDENTIAL_ENCRYPTED_SIZE_MAX - *delta,
+                                                 79, &encoded));
+                        ASSERT_OK(write_string_file(credential_path, encoded, WRITE_STRING_FILE_TRUNCATE));
+                        ASSERT_ERROR(read_credential_with_decryption("foo", &result.iov_base,
+                                                                    &result.iov_len), EOPNOTSUPP);
+                }
+        }
+
+finish:
+        ASSERT_OK(set_unset_env("CREDENTIALS_DIRECTORY", saved_plain, /* overwrite= */ true));
+        ASSERT_OK(set_unset_env("ENCRYPTED_CREDENTIALS_DIRECTORY", saved_encrypted, /* overwrite= */ true));
+        ASSERT_OK(set_unset_env("SYSTEMD_CREDENTIAL_SECRET", saved_secret, /* overwrite= */ true));
 }
 
 TEST(credential_name_valid) {
@@ -143,14 +350,13 @@ static void test_encrypt_decrypt_with(sd_id128_t mode, uid_t uid) {
                         &plaintext,
                         CREDENTIAL_ALLOW_NULL,
                         &encrypted);
-        if (ERRNO_IS_NEG_MACHINE_ID_UNSET(r)) {
-                log_notice_errno(r, "Skipping test encryption mode " SD_ID128_FORMAT_STR ", because /etc/machine-id is not initialized.", SD_ID128_FORMAT_VAL(mode));
-                return;
-        }
-        if (ERRNO_IS_NEG_NOT_SUPPORTED(r)) {
-                log_notice_errno(r, "Skipping test encryption mode " SD_ID128_FORMAT_STR ", because encrypted credentials are not supported.", SD_ID128_FORMAT_VAL(mode));
-                return;
-        }
+        if (ERRNO_IS_NEG_MACHINE_ID_UNSET(r))
+                return (void) log_notice_errno(r, "Skipping test encryption mode " SD_ID128_FORMAT_STR ", because /etc/machine-id is not initialized.",
+                                               SD_ID128_FORMAT_VAL(mode));
+
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                return (void) log_notice_errno(r, "Skipping test encryption mode " SD_ID128_FORMAT_STR ", because encrypted credentials are not supported.",
+                                               SD_ID128_FORMAT_VAL(mode));
 
         ASSERT_OK(r);
 
@@ -177,7 +383,7 @@ static void test_encrypt_decrypt_with(sd_id128_t mode, uid_t uid) {
                         &decrypted);
         ASSERT_OK(r);
 
-        ASSERT_EQ(iovec_memcmp(&plaintext, &decrypted), 0);
+        ASSERT_IOVEC_EQ(&plaintext, &decrypted);
 }
 
 static bool try_tpm2(void) {
@@ -203,7 +409,7 @@ TEST(credential_encrypt_decrypt) {
 
         test_encrypt_decrypt_with(CRED_AES256_GCM_BY_NULL, UID_INVALID);
 
-        ASSERT_OK(mkdtemp_malloc(NULL, &d));
+        ASSERT_OK(mkdtemp_malloc(/* template= */ NULL, &d));
         j = path_join(d, "secret");
         ASSERT_NOT_NULL(j);
 
@@ -216,16 +422,48 @@ TEST(credential_encrypt_decrypt) {
         ASSERT_OK_ERRNO(setenv("SYSTEMD_CREDENTIAL_SECRET", j, true));
 
         test_encrypt_decrypt_with(CRED_AES256_GCM_BY_HOST, UID_INVALID);
-        test_encrypt_decrypt_with(CRED_AES256_GCM_BY_HOST_SCOPED, 0);
+        test_encrypt_decrypt_with(CRED_AES256_GCM_BY_HOST_SCOPED, /* uid= */ 0);
 
         if (try_tpm2()) {
                 test_encrypt_decrypt_with(CRED_AES256_GCM_BY_TPM2_HMAC, UID_INVALID);
                 test_encrypt_decrypt_with(CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC, UID_INVALID);
-                test_encrypt_decrypt_with(CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED, 0);
+                test_encrypt_decrypt_with(CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED, /* uid= */ 0);
+                test_encrypt_decrypt_with(CRED_AES256_GCM_BY_TPM2_HMAC_PINNED_SRK, UID_INVALID);
+                test_encrypt_decrypt_with(CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_PINNED_SRK, UID_INVALID);
+                test_encrypt_decrypt_with(CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED_PINNED_SRK, /* uid= */ 0);
         }
 
         if (ec)
                 ASSERT_OK_ERRNO(setenv("SYSTEMD_CREDENTIAL_SECRET", ec, true));
+}
+
+TEST(credential_boot_policy) {
+
+        /* String table round-trip */
+        for (CredentialBootPolicy p = 0; p < _CRED_BOOT_POLICY_MAX; p++) {
+                const char *s = credential_boot_policy_to_string(p);
+                ASSERT_NOT_NULL(s);
+                ASSERT_EQ(credential_boot_policy_from_string(s), p);
+        }
+        ASSERT_STREQ(credential_boot_policy_to_string(CRED_BOOT_TOFU), "tofu");
+        ASSERT_TRUE(credential_boot_policy_from_string("bogus") < 0);
+
+        /* Exhaustively check the accept decision against every (first_boot, have_tpm2, secure_boot) state */
+        for (int first_boot = 0; first_boot < 2; first_boot++)
+                for (int have_tpm2 = 0; have_tpm2 < 2; have_tpm2++)
+                        for (int secure_boot = 0; secure_boot < 2; secure_boot++) {
+                                /* strict never accepts a null key, off always does */
+                                ASSERT_FALSE(credential_boot_policy_accepts_null(CRED_BOOT_STRICT, first_boot, have_tpm2, secure_boot));
+                                ASSERT_TRUE(credential_boot_policy_accepts_null(CRED_BOOT_OFF, first_boot, have_tpm2, secure_boot));
+
+                                /* tofu accepts when first boot, or no TPM2 */
+                                ASSERT_EQ(credential_boot_policy_accepts_null(CRED_BOOT_TOFU, first_boot, have_tpm2, secure_boot),
+                                          first_boot || !have_tpm2);
+
+                                /* relaxed accepts when SecureBoot off, or no TPM2 */
+                                ASSERT_EQ(credential_boot_policy_accepts_null(CRED_BOOT_RELAXED, first_boot, have_tpm2, secure_boot),
+                                          !secure_boot || !have_tpm2);
+                        }
 }
 
 TEST(mime_type_matches) {
@@ -239,6 +477,12 @@ TEST(mime_type_matches) {
                 CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED,
                 CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK,
                 CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED,
+                CRED_AES256_GCM_BY_TPM2_HMAC_PINNED_SRK,
+                CRED_AES256_GCM_BY_TPM2_HMAC_WITH_PK_PINNED_SRK,
+                CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_PINNED_SRK,
+                CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_SCOPED_PINNED_SRK,
+                CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_PINNED_SRK,
+                CRED_AES256_GCM_BY_HOST_AND_TPM2_HMAC_WITH_PK_SCOPED_PINNED_SRK,
                 CRED_AES256_GCM_BY_NULL,
         };
 
@@ -256,6 +500,43 @@ TEST(mime_type_matches) {
 
                 printf("<match type=\"string\" value=\"%s\" offset=\"0\"/>\n", encoded);
         }
+}
+
+TEST(credentials_varlink_error) {
+        /* The errno lookup answers with the first row that matches, so two rows sharing an errno would make
+         * one of them unreachable, and the error the client is told would silently be the wrong one. */
+
+        static const char* const ids[] = {
+                "io.systemd.Credentials.BadFormat",
+                "io.systemd.Credentials.NameMismatch",
+                "io.systemd.Credentials.TimeMismatch",
+                "io.systemd.Credentials.NoSuchUser",
+                "io.systemd.Credentials.BadScope",
+                "io.systemd.Credentials.CantFindPCRSignature",
+                "io.systemd.Credentials.NullKeyNotAllowed",
+                "io.systemd.Credentials.KeyBelongsToOtherTPM",
+                "io.systemd.Credentials.TPMInDictionaryLockout",
+                "io.systemd.Credentials.UnexpectedPCRState",
+                "io.systemd.Credentials.PCRsKeptChanging",
+                "io.systemd.Credentials.NVIndexUnusable",
+        };
+
+        FOREACH_ELEMENT(id, ids) {
+                const CredentialsVarlinkError *e = ASSERT_PTR(credentials_varlink_error_by_id(*id));
+
+                ASSERT_NOT_NULL(e->msg);
+                ASSERT_STREQ(ASSERT_PTR(credentials_varlink_error_by_errno(e->errnum))->id, *id);
+                ASSERT_PTR_EQ(credentials_varlink_error_by_errno(-e->errnum), e);
+        }
+
+        /* The two errnos the PCR diagnosis hangs on */
+        ASSERT_STREQ(ASSERT_PTR(credentials_varlink_error_by_errno(EPERM))->id,
+                     "io.systemd.Credentials.UnexpectedPCRState");
+        ASSERT_STREQ(ASSERT_PTR(credentials_varlink_error_by_errno(EUCLEAN))->id,
+                     "io.systemd.Credentials.PCRsKeptChanging");
+
+        ASSERT_NULL(credentials_varlink_error_by_id("io.systemd.Credentials.NoSuchError"));
+        ASSERT_NULL(credentials_varlink_error_by_errno(EDOM));
 }
 
 DEFINE_TEST_MAIN(LOG_INFO);

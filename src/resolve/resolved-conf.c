@@ -8,6 +8,7 @@
 #include "ordered-set.h"
 #include "proc-cmdline.h"
 #include "resolved-conf.h"
+#include "resolved-dns-cache.h"
 #include "resolved-dns-search-domain.h"
 #include "resolved-dns-server.h"
 #include "resolved-dns-stub.h"
@@ -43,11 +44,8 @@ int config_parse_dns_servers(
         else {
                 /* Otherwise, add to the list */
                 r = manager_parse_dns_server_string_and_warn(m, ltype, rvalue);
-                if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Failed to parse DNS server string '%s', ignoring.", rvalue);
-                        return 0;
-                }
+                if (r < 0)
+                        return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
         }
 
         /* If we have a manual setting, then we stop reading
@@ -85,11 +83,8 @@ int config_parse_search_domains(
         else {
                 /* Otherwise, add to the list */
                 r = manager_parse_search_domains_and_warn(m, rvalue);
-                if (r < 0) {
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Failed to parse search domains string '%s', ignoring.", rvalue);
-                        return 0;
-                }
+                if (r < 0)
+                        return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
         }
 
         /* If we have a manual setting, then we stop reading
@@ -143,13 +138,9 @@ int config_parse_dns_stub_listener_extra(
                 }
         }
 
-        r = in_addr_port_ifindex_name_from_string_auto(p, &stub->family, &stub->address, &stub->port, NULL, NULL);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse address in %s=%s, ignoring assignment: %m",
-                           lvalue, rvalue);
-                return 0;
-        }
+        r = in_addr_port_ifindex_name_from_string_auto(p, &stub->family, &stub->address, &stub->port, /* ret_ifindex= */ NULL, /* ret_server_name= */ NULL);
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
         r = ordered_set_ensure_put(&m->dns_extra_stub_listeners, &dns_stub_listener_extra_hash_ops, stub);
         if (r == -ENOMEM)
@@ -260,7 +251,7 @@ static void read_proc_cmdline(Manager *m) {
 
         assert(m);
 
-        r = proc_cmdline_parse(proc_cmdline_callback, &(struct ProcCmdlineInfo) { .manager = m }, 0);
+        r = proc_cmdline_parse(proc_cmdline_callback, &(struct ProcCmdlineInfo) { .manager = m }, /* flags= */ 0);
         if (r < 0)
                 log_warning_errno(r, "Failed to read kernel command line, ignoring: %m");
 }
@@ -304,6 +295,28 @@ int manager_parse_config_file(Manager *m) {
         return 0;
 }
 
+int config_parse_dns_cache_max(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        Manager *m = ASSERT_PTR(userdata);
+
+        assert(ltype >= 0 && ltype < _DNS_PROTOCOL_MAX);
+
+        return config_parse_unsigned_bounded(
+                        unit, filename, line, section, section_line, lvalue, rvalue,
+                        /* min= */ 0, CACHE_MAX_UPPER_LIMIT, /* ignoring= */ true,
+                        &m->cache_max[ltype]);
+}
+
 int config_parse_record_types(
                 const char *unit,
                 const char *filename,
@@ -326,7 +339,7 @@ int config_parse_record_types(
 
         for (const char *p = rvalue;;) {
                 _cleanup_free_ char *word = NULL;
-                r = extract_first_word(&p, &word, NULL, 0);
+                r = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (r < 0)
                         return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
                 if (r == 0)
@@ -338,7 +351,7 @@ int config_parse_record_types(
                         continue;
                 }
 
-                r = set_ensure_put(types, NULL, INT_TO_PTR(r));
+                r = set_ensure_put(types, /* hash_ops= */ NULL, INT_TO_PTR(r));
                 if (r < 0)
                         return log_oom();
         }

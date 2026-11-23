@@ -12,12 +12,15 @@
 #include "device-private.h"
 #include "device-util.h"
 #include "errno-util.h"
+#include "format-util.h"
 #include "hashmap.h"
 #include "log.h"
+#include "parse-util.h"
 #include "path-util.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
+#include "time-util.h"
 #include "udev-util.h"
 #include "utf8.h"
 
@@ -113,7 +116,7 @@ static int device_monitor_handler(sd_device_monitor *monitor, sd_device *device,
 
 found:
         data->device = sd_device_ref(device);
-        return sd_event_exit(sd_device_monitor_get_event(monitor), 0);
+        return sd_event_exit(sd_device_monitor_get_event(monitor), /* code= */ 0);
 }
 
 static int device_wait_for_initialization_internal(
@@ -168,7 +171,7 @@ static int device_wait_for_initialization_internal(
         }
 
         if (subsystem) {
-                r = sd_device_monitor_filter_add_match_subsystem_devtype(monitor, subsystem, NULL);
+                r = sd_device_monitor_filter_add_match_subsystem_devtype(monitor, subsystem, /* devtype= */ NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to add %s subsystem match to monitor: %m", subsystem);
         }
@@ -192,9 +195,9 @@ static int device_wait_for_initialization_internal(
 
         if (timeout_usec != USEC_INFINITY) {
                 r = sd_event_add_time_relative(
-                                event, NULL,
-                                CLOCK_MONOTONIC, timeout_usec, 0,
-                                NULL, INT_TO_PTR(-ETIMEDOUT));
+                                event, /* ret= */ NULL,
+                                CLOCK_MONOTONIC, timeout_usec, /* accuracy= */ 0,
+                                /* callback= */ NULL, INT_TO_PTR(-ETIMEDOUT));
                 if (r < 0)
                         return log_error_errno(r, "Failed to add timeout event source: %m");
         }
@@ -221,11 +224,11 @@ static int device_wait_for_initialization_internal(
 }
 
 int device_wait_for_initialization(sd_device *device, const char *subsystem, usec_t timeout_usec, sd_device **ret) {
-        return device_wait_for_initialization_internal(device, NULL, subsystem, timeout_usec, ret);
+        return device_wait_for_initialization_internal(device, /* devlink= */ NULL, subsystem, timeout_usec, ret);
 }
 
 int device_wait_for_devlink(const char *devlink, const char *subsystem, usec_t timeout_usec, sd_device **ret) {
-        return device_wait_for_initialization_internal(NULL, devlink, subsystem, timeout_usec, ret);
+        return device_wait_for_initialization_internal(/* _device= */ NULL, devlink, subsystem, timeout_usec, ret);
 }
 
 int device_is_renaming(sd_device *dev) {
@@ -278,21 +281,56 @@ bool device_for_action(sd_device *dev, sd_device_action_t a) {
 }
 
 void log_device_uevent(sd_device *device, const char *str) {
-        sd_device_action_t action = _SD_DEVICE_ACTION_INVALID;
-        sd_id128_t event_id = SD_ID128_NULL;
-        uint64_t seqnum = 0;
-
         if (!DEBUG_LOGGING)
                 return;
 
-        (void) sd_device_get_seqnum(device, &seqnum);
-        (void) sd_device_get_action(device, &action);
-        (void) sd_device_get_trigger_uuid(device, &event_id);
-        log_device_debug(device, "%s%s(SEQNUM=%"PRIu64", ACTION=%s%s%s)",
-                         strempty(str), isempty(str) ? "" : " ",
-                         seqnum, strna(device_action_to_string(action)),
-                         sd_id128_is_null(event_id) ? "" : ", UUID=",
-                         sd_id128_is_null(event_id) ? "" : SD_ID128_TO_UUID_STRING(event_id));
+        _cleanup_free_ char *msg = NULL;
+
+        uint64_t seqnum;
+        if (sd_device_get_seqnum(device, &seqnum) >= 0)
+                (void) strextendf_with_separator(&msg, ", ", "SEQNUM=%"PRIu64, seqnum);
+
+        sd_device_action_t action;
+        if (sd_device_get_action(device, &action) >= 0)
+                (void) strextendf_with_separator(&msg, ", ", "ACTION=%s", device_action_to_string(action));
+
+        sd_id128_t id;
+        if (sd_device_get_trigger_uuid(device, &id) >= 0)
+                (void) strextendf_with_separator(&msg, ", ", "UUID=%s", SD_ID128_TO_UUID_STRING(id));
+
+        const char *s;
+        pid_t pid;
+        if (sd_device_get_property_value(device, "SYNTH_ARG_PID", &s) >= 0 &&
+            parse_pid(s, &pid) >= 0)
+                (void) strextendf_with_separator(&msg, ", ", "PID="PID_FMT, pid);
+
+        uint64_t pidfdid;
+        if (sd_device_get_property_value(device, "SYNTH_ARG_PIDFDID", &s) >= 0 &&
+            safe_atou64(s, &pidfdid) >= 0)
+                (void) strextendf_with_separator(&msg, ", ", "PIDFDID=%"PRIu64, pidfdid);
+
+        if (sd_device_get_property_value(device, "SYNTH_ARG_Comm", &s) >= 0)
+                (void) strextendf_with_separator(&msg, ", ", "Comm=%s", s);
+
+        if (sd_device_get_property_value(device, "SYNTH_ARG_InvocationID", &s) >= 0 &&
+            sd_id128_from_string(s, &id) >= 0)
+                (void) strextendf_with_separator(&msg, ", ", "InvocationID=%s", SD_ID128_TO_STRING(id));
+
+        usec_t u;
+        if (sd_device_get_property_value(device, "SYNTH_ARG_TimestampRealtime", &s) >= 0 &&
+            safe_atou64(s, &u) >= 0 &&
+            (s = FORMAT_TIMESTAMP(u)))
+                (void) strextendf_with_separator(&msg, ", ", "TimestampRealtime='%s'", s);
+
+        if (sd_device_get_property_value(device, "SYNTH_ARG_TimestampMonotonic", &s) >= 0 &&
+            safe_atou64(s, &u) >= 0)
+                (void) strextendf_with_separator(&msg, ", ", "TimestampMonotonic="USEC_FMT, u);
+
+        if (sd_device_get_property_value(device, "SYNTH_ARG_TimestampBoottime", &s) >= 0 &&
+            safe_atou64(s, &u) >= 0)
+                (void) strextendf_with_separator(&msg, ", ", "TimestampBoottime="USEC_FMT, u);
+
+        log_device_debug(device, "%s%s(%s)", strempty(str), isempty(str) ? "" : " ", strna(msg));
 }
 
 size_t udev_replace_whitespace(const char *str, char *to, size_t len) {
@@ -315,7 +353,9 @@ size_t udev_replace_whitespace(const char *str, char *to, size_t len) {
          *
          * Note that only 'len' characters are read from 'str'. */
 
-        i = strspn(str, WHITESPACE);
+        /* Skip leading whitespace, but read at most 'len' bytes: 'str' is not necessarily NUL
+         * terminated within 'len' (e.g. the space padded ATA IDENTIFY fields ata_id passes in). */
+        i = strnspn(str, WHITESPACE, len);
 
         for (j = 0; j < len && i < len && str[i] != '\0'; i++) {
                 if (isspace(str[i])) {

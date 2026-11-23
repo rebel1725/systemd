@@ -9,24 +9,50 @@ set -o pipefail
 # Make sure the binary name fits into 15 characters
 CORE_TEST_BIN="/tmp/test-dump"
 CORE_TEST_UNPRIV_BIN="/tmp/test-usr-dump"
+CORE_TEST_TID_BIN="/tmp/test-tid"
 MAKE_DUMP_SCRIPT="/tmp/make-dump"
 # Unset $PAGER so we don't have to use --no-pager everywhere
 export PAGER=
 
 at_exit() {
-    rm -fv -- "$CORE_TEST_BIN" "$CORE_TEST_UNPRIV_BIN" "$MAKE_DUMP_SCRIPT"
+    rm -fv -- "$CORE_TEST_BIN" "$CORE_TEST_UNPRIV_BIN" "$CORE_TEST_TID_BIN" "$MAKE_DUMP_SCRIPT"
+}
+
+maybe_reload_coredumpd() {
+    if systemctl -q is-active systemd-coredumpd.service; then
+        systemctl reload systemd-coredumpd.service
+    fi
 }
 
 (! systemd-detect-virt -cq)
 
 trap at_exit EXIT
 
-# Sync and rotate journal to make all coredump entries stored in system.journal.
-journalctl --sync
-journalctl --rotate
+if /usr/lib/systemd/systemd-coredump --check-requirements && systemctl is-enabled systemd-coredumpd.service; then
+    systemctl is-active systemd-coredumpd.service
+fi
 
 # Check that we're the ones to receive coredumps
-sysctl kernel.core_pattern | grep systemd-coredump
+if systemctl -q is-active systemd-coredumpd.service; then
+    systemctl is-active systemd-coredump-register.service
+    [[ -e /run/sysctl.d/60-coredump.conf ]]
+    sysctl kernel.core_pattern | grep '@@/run/systemd/coredumpd/kernel'
+
+    systemctl stop systemd-coredumpd.service
+    (! systemctl is-active systemd-coredump-register.service)
+    [[ ! -e /run/sysctl.d/60-coredump.conf ]]
+    sysctl kernel.core_pattern | grep 'systemd-coredump'
+
+    systemctl start systemd-coredumpd.service
+    timeout 30 bash -xec 'until systemctl -q is-active systemd-coredump-register.service; do sleep 1; done'
+    [[ -e /run/sysctl.d/60-coredump.conf ]]
+    sysctl kernel.core_pattern | grep '@@/run/systemd/coredumpd/kernel'
+else
+    assert_eq "$(systemctl is-active systemd-coredumpd.service ||:)" "inactive"
+    assert_eq "$(systemctl is-active systemd-coredump-register.service ||:)" "inactive"
+    [[ ! -e /run/sysctl.d/60-coredump.conf ]]
+    sysctl kernel.core_pattern | grep 'systemd-coredump'
+fi
 
 # Prepare "fake" binaries for coredumps, so we can properly exercise
 # the matching stuff too
@@ -70,11 +96,15 @@ chmod +x "$MAKE_DUMP_SCRIPT"
 # with Storage=external as well
 mkdir -p /run/systemd/coredump.conf.d/
 printf '[Coredump]\nStorage=external' >/run/systemd/coredump.conf.d/99-external.conf
+maybe_reload_coredumpd
 "$MAKE_DUMP_SCRIPT" "$CORE_TEST_BIN" "SIGTRAP"
 "$MAKE_DUMP_SCRIPT" "$CORE_TEST_BIN" "SIGABRT"
-rm -fv /run/systemd/coredump.conf.d/99-external.conf
 # Wait a bit for the coredumps to get processed
 timeout 30 bash -c "while [[ \$(coredumpctl list -q --no-legend $CORE_TEST_BIN | wc -l) -lt 4 ]]; do sleep 1; done"
+OUT="$(coredumpctl list --field=COREDUMP_PID 'MESSAGE_ID=00000000000000000000000000000000')"
+[[ -z "$OUT" ]]
+rm -fv /run/systemd/coredump.conf.d/99-external.conf
+maybe_reload_coredumpd
 
 if cgroupfs_supports_user_xattrs; then
     # Make sure we can forward crashes back to containers
@@ -84,7 +114,7 @@ if cgroupfs_supports_user_xattrs; then
     mkdir -p "/run/systemd/system/systemd-nspawn@$CONTAINER.service.d"
     # Bind-mounting /etc into the container kinda defeats the purpose of --volatile=,
     # but we need the ASan-related overrides scattered across /etc
-    cat > "/run/systemd/system/systemd-nspawn@$CONTAINER.service.d/override.conf" <<EOF
+    cat >"/run/systemd/system/systemd-nspawn@$CONTAINER.service.d/override.conf" <<EOF
 [Service]
 ExecStart=
 ExecStart=systemd-nspawn --quiet --link-journal=try-guest --keep-unit --machine=%i --boot \
@@ -109,21 +139,12 @@ EOF
     unset CONTAINER
 fi
 
-# Sync and rotate journals (again) to make coredumps stored in archived journal. Otherwise, the main active
-# journal file may be already mostly filled with the coredumps, and may trigger rotation during the sanity
-# checks below. If coredumpctl accesses the main journal currently rotationg, then it warns the following and
-# skips reading the main journal, and cannot find the recent coredumps:
-# TEST-87-AUX-UTILS-VM.sh[839]: + coredumpctl -n 1
-# TEST-87-AUX-UTILS-VM.sh[1172]: Journal file /var/log/journal/a8285330872602d1377cbaaf68869946/system.journal is truncated, ignoring file.
-# TEST-87-AUX-UTILS-VM.sh[1172]: No coredumps found.
-journalctl --sync
-journalctl --rotate
-
 coredumpctl
 SYSTEMD_LOG_LEVEL=debug coredumpctl
 coredumpctl --help
 coredumpctl --version
 coredumpctl --no-pager --no-legend
+coredumpctl --no-pager --no-legend --full
 coredumpctl --all
 coredumpctl -1
 coredumpctl -n 1
@@ -137,6 +158,16 @@ coredumpctl --directory=/var/log/journal
 coredumpctl --file="/var/log/journal/$(</etc/machine-id)"/*.journal
 coredumpctl --since=@0
 coredumpctl --since=yesterday --until=tomorrow
+(! coredumpctl --since=tomorrow -1)
+(! coredumpctl info --since=tomorrow)
+(! coredumpctl dump --since=tomorrow -o /dev/null)
+(! coredumpctl debug --debugger=/bin/true --since=tomorrow)
+(! coredumpctl --until=@0 -1)
+(! coredumpctl info --until=@0)
+(! coredumpctl dump --until=@0 -o /dev/null)
+(! coredumpctl debug --debugger=/bin/true --until=@0)
+# Date bounds must preserve the implicit -1 for info without matches.
+coredumpctl info --since=@0 --until=tomorrow --json=short | jq -se 'length == 1'
 # We should have a couple of externally stored coredumps
 coredumpctl --field=COREDUMP_FILENAME | tee /tmp/coredumpctl.out
 grep "/var/lib/systemd/coredump/core" /tmp/coredumpctl.out
@@ -144,16 +175,68 @@ rm -f /tmp/coredumpctl.out
 
 coredumpctl info
 coredumpctl info "$CORE_TEST_BIN"
+coredumpctl info "$CORE_TEST_BIN" --full
 coredumpctl info /foo /bar/ /baz "$CORE_TEST_BIN"
 coredumpctl info "${CORE_TEST_BIN##*/}"
 coredumpctl info foo bar baz "${CORE_TEST_BIN##*/}"
 coredumpctl info COREDUMP_EXE="$CORE_TEST_BIN"
 coredumpctl info COREDUMP_EXE=aaaaa COREDUMP_EXE= COREDUMP_EXE="$CORE_TEST_BIN"
+# JSON output for info subcommand (issue #38844)
+coredumpctl info --json=short "$CORE_TEST_BIN" | jq
+coredumpctl info --json=pretty "$CORE_TEST_BIN" | jq
+coredumpctl info --json=off "$CORE_TEST_BIN"
+# Verify that mandatory fields are present and have valid values across all matching entries
+coredumpctl info --json=short "$CORE_TEST_BIN" | jq -se 'length > 0'
+coredumpctl info --json=short "$CORE_TEST_BIN" | jq -se 'all(.[]; .PID > 0)'
+coredumpctl info --json=short "$CORE_TEST_BIN" | jq -se 'all(.[]; .Signal > 0)'
+coredumpctl info --json=short "$CORE_TEST_BIN" | jq -se 'all(.[]; has("Executable"))'
+coredumpctl info --json=short "$CORE_TEST_BIN" | jq -se 'all(.[]; has("Command"))'
+coredumpctl info --json=short "$CORE_TEST_BIN" | jq -se 'all(.[]; has("Storage"))'
 
 # Check that COREDUMP_TID= is present and displayed by coredumpctl info
 coredumpctl info "$CORE_TEST_BIN" | grep "TID:" >/dev/null
 # Check the field is queryable in the journal
 coredumpctl -F COREDUMP_TID
+
+# Check that a multithreaded process crashing sets COREDUMP_TID and
+# COREDUMP_THREAD_NAME correctly
+cp -vf /usr/lib/systemd/tests/unit-tests/manual/test-coredump-thread "${CORE_TEST_TID_BIN:?}"
+(
+    ulimit -c unlimited
+    for mode in main thread; do
+        # 128 + SIGABRT
+        assert_rc 134 "$CORE_TEST_TID_BIN" "$mode"
+    done
+)
+timeout 30 bash -c "until [[ \$(coredumpctl list -q --no-legend $CORE_TEST_TID_BIN | wc -l) -ge 2 ]]; do sleep .2; done"
+coredumpctl info --json=short "$CORE_TEST_TID_BIN" |
+    jq -se 'any(.[]; (.CommandLine | endswith(" main")) and
+                     .TID == .PID and .ThreadName == "test-tid-main") and
+            any(.[]; (.CommandLine | endswith(" thread")) and
+                     .TID != .PID and .ThreadName == "test-tid-thread")'
+
+# Test cases for Coredump ID
+LATEST_ID=$(coredumpctl list -1 --json=short "$CORE_TEST_BIN" | jq -r '.[0].id')
+[[ -n "$LATEST_ID" ]]
+[[ "$LATEST_ID" != null ]]
+# Test with explicit COREDUMP_ID= field
+coredumpctl list COREDUMP_ID="$LATEST_ID" | grep "$LATEST_ID" >/dev/null
+coredumpctl info COREDUMP_ID="$LATEST_ID" | grep --fixed-strings "ID: $LATEST_ID" >/dev/null
+coredumpctl info --json=short COREDUMP_ID="$LATEST_ID" | jq -e ".ID == \"$LATEST_ID\""
+coredumpctl info --json=pretty COREDUMP_ID="$LATEST_ID" | jq -e ".ID == \"$LATEST_ID\""
+# Test with bare UUID (without COREDUMP_ID= prefix)
+coredumpctl info "$LATEST_ID" | grep --fixed-strings "ID: $LATEST_ID" >/dev/null
+coredumpctl info --json=short "$LATEST_ID" | jq -e ".ID == \"$LATEST_ID\""
+# Test with dashed UUID format
+LATEST_ID_DASHED="${LATEST_ID:0:8}-${LATEST_ID:8:4}-${LATEST_ID:12:4}-${LATEST_ID:16:4}-${LATEST_ID:20:12}"
+coredumpctl info "$LATEST_ID_DASHED" | grep --fixed-strings "ID: $LATEST_ID" >/dev/null
+coredumpctl info --json=short "$LATEST_ID_DASHED" | jq -e ".ID == \"$LATEST_ID\""
+
+# If COREDUMP_CODE= is present, check that the expected code is SI_USER (0).
+if coredumpctl -F COREDUMP_CODE | grep "^0$" >/dev/null; then
+    coredumpctl info "$CORE_TEST_BIN" | grep --fixed-strings "Signal: 5 (TRAP) si_code: SI_USER" >/dev/null
+    coredumpctl info --json=short "$CORE_TEST_BIN" | jq -se 'any(.[]; .SignalCode == 0)'
+fi
 
 coredumpctl debug --debugger=/bin/true "$CORE_TEST_BIN"
 SYSTEMD_DEBUGGER=/bin/true coredumpctl debug "$CORE_TEST_BIN"
@@ -175,15 +258,13 @@ UNPRIV_CMD=(systemd-run --user --wait --pipe -M "testuser@.host" -E SYSTEMD_PAGE
 # with Storage=external as well
 mkdir -p /run/systemd/coredump.conf.d/
 printf '[Coredump]\nStorage=external' >/run/systemd/coredump.conf.d/99-external.conf
+maybe_reload_coredumpd
 "${UNPRIV_CMD[@]}" "$MAKE_DUMP_SCRIPT" "$CORE_TEST_UNPRIV_BIN" "SIGTRAP"
 "${UNPRIV_CMD[@]}" "$MAKE_DUMP_SCRIPT" "$CORE_TEST_UNPRIV_BIN" "SIGABRT"
-rm -fv /run/systemd/coredump.conf.d/99-external.conf
 # Wait a bit for the coredumps to get processed
 timeout 30 bash -c "while [[ \$(coredumpctl list -q --no-legend $CORE_TEST_UNPRIV_BIN | wc -l) -lt 4 ]]; do sleep 1; done"
-
-# Sync and rotate journal again to make the coredump stored in an archived journal.
-journalctl --sync
-journalctl --rotate
+rm -fv /run/systemd/coredump.conf.d/99-external.conf
+maybe_reload_coredumpd
 
 # root should see coredumps from both binaries
 coredumpctl info "$CORE_TEST_UNPRIV_BIN"
@@ -192,6 +273,8 @@ coredumpctl info "${CORE_TEST_UNPRIV_BIN##*/}"
 "${UNPRIV_CMD[@]}" coredumpctl
 "${UNPRIV_CMD[@]}" coredumpctl info "$CORE_TEST_UNPRIV_BIN"
 "${UNPRIV_CMD[@]}" coredumpctl info "${CORE_TEST_UNPRIV_BIN##*/}"
+# Verify JSON output for unprivileged coredumps
+"${UNPRIV_CMD[@]}" coredumpctl info --json=short "$CORE_TEST_UNPRIV_BIN" | jq
 (! "${UNPRIV_CMD[@]}" coredumpctl info --all "$CORE_TEST_BIN")
 (! "${UNPRIV_CMD[@]}" coredumpctl info --all "${CORE_TEST_BIN##*/}")
 # We should have a couple of externally stored coredumps
@@ -221,6 +304,8 @@ journalctl -b -n 1 --output=export --output-fields=MESSAGE,COREDUMP COREDUMP_EXE
     /usr/lib/systemd/systemd-coredump --backtrace $$ 0 0 6 1679509902 12345 youmachine 1
 # Wait a bit for the coredumps to get processed
 timeout 30 bash -c "while [[ \$(coredumpctl list -q --no-legend $$ | wc -l) -lt 3 ]]; do sleep 1; done"
+OUT="$(coredumpctl list --field=MESSAGE_ID 'MESSAGE_ID=1f4e0a44a88649939aaea34fc6da8c95' | sort -u)"
+[[ "$OUT" == "1f4e0a44a88649939aaea34fc6da8c95" ]]
 coredumpctl info $$
 coredumpctl info COREDUMP_TIMESTAMP=1679509900000000
 coredumpctl info COREDUMP_TIMESTAMP=1679509901000000
@@ -228,6 +313,13 @@ coredumpctl info COREDUMP_HOSTNAME="mymachine"
 coredumpctl info COREDUMP_TIMESTAMP=1679509902000000
 coredumpctl info COREDUMP_HOSTNAME="youmachine"
 coredumpctl info COREDUMP_DUMPABLE="1"
+# Verify that backtrace entries have COREDUMP_ID set
+coredumpctl info --json=short COREDUMP_TIMESTAMP=1679509900000000 | jq -e '.ID != null'
+coredumpctl info --json=short COREDUMP_TIMESTAMP=1679509901000000 | jq -e '.ID != null'
+coredumpctl info --json=short COREDUMP_TIMESTAMP=1679509902000000 | jq -e '.ID != null'
+# Verify that backtrace entries can be queried by ID
+BACKTRACE_ID=$(coredumpctl list -n 1 --json=short COREDUMP_TIMESTAMP=1679509900000000 | jq -r '.[0].id')
+coredumpctl info "$BACKTRACE_ID" | grep --fixed-strings "ID: $BACKTRACE_ID" >/dev/null
 
 # This used to cause a stack overflow
 systemd-run -t --property CoredumpFilter=all ls /tmp
@@ -298,6 +390,7 @@ EOF
 
     mkdir -p /run/systemd/coredump.conf.d/
     printf '[Coredump]\nEnterNamespace=no' >/run/systemd/coredump.conf.d/99-enter-namespace.conf
+    maybe_reload_coredumpd
 
     unshare --pid --fork --mount-proc --mount --uts --ipc --net "$MAKE_STACKTRACE_DUMP" "test-stacktrace-not-symbolized"
     timeout 30 bash -c "until coredumpctl list -q --no-legend /tmp/test-stacktrace-not-symbolized; do sleep .2; done"
@@ -308,6 +401,7 @@ EOF
     (! grep -E "#[0-9]+ .* baz " /tmp/not-symbolized.log)
 
     printf '[Coredump]\nEnterNamespace=yes' >/run/systemd/coredump.conf.d/99-enter-namespace.conf
+    maybe_reload_coredumpd
     unshare --pid --fork --mount-proc --mount --uts --ipc --net "$MAKE_STACKTRACE_DUMP" "test-stacktrace-symbolized"
     timeout 30 bash -c "until coredumpctl list -q --no-legend /tmp/test-stacktrace-symbolized; do sleep .2; done"
     coredumpctl info /tmp/test-stacktrace-symbolized | tee /tmp/symbolized.log
@@ -318,6 +412,7 @@ EOF
 
     test -d /usr/lib/debug/ && umount /usr/lib/debug/
     rm -f "$MAKE_STACKTRACE_DUMP" /run/systemd/coredump.conf.d/99-enter-namespace.conf /tmp/{not-,}symbolized.log
+    maybe_reload_coredumpd
 else
     echo "libdw doesn't not support setting sysroot, skipping EnterNamespace= test"
 fi

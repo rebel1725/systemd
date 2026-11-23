@@ -78,6 +78,145 @@ EOF
     rm -rf /run/systemd/logind.conf.d
 }
 
+teardown_boot_loader_entries_symlink() (
+    set +eux
+
+    rm -rf /run/boot-loader-entries
+
+    return 0
+)
+
+testcase_boot_loader_entries_symlink() {
+    local loader_entries var=/sys/firmware/efi/efivars/LoaderEntries-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+
+    if [[ -e /run/boot-loader-entries ]]; then
+        echo "/run/boot-loader-entries already exists, skipping."
+        return 0
+    fi
+
+    trap teardown_boot_loader_entries_symlink RETURN
+
+    if [[ -e "$var" ]]; then
+        # Skip the attributes, the rest is a list of NUL terminated UTF-16 strings.
+        loader_entries="$(od -An -v -tu2 -j4 "$var" | jq -s -c 'implode | split("\u0000") | map(select(. != "")) | unique')"
+    else
+        loader_entries="[]"
+    fi
+
+    # Symlinks are not allowed in the boot loader entries tree (see #44636). Loading the entries fails,
+    # but reading the properties must not, and the entries reported by the boot loader must be listed.
+    mkdir -p /run/boot-loader-entries/loader.0/entries
+    ln -s loader.0 /run/boot-loader-entries/loader
+
+    assert_eq "$(busctl --json=short get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager BootLoaderEntries | jq -c '.data | unique')" "$loader_entries"
+    busctl call org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.DBus.Properties GetAll s org.freedesktop.login1.Manager >/dev/null
+}
+
+test_kill_user_process() {
+    local su=${1:?}
+    local username=${2:?}
+    local should_kill=${3:?}
+    local pid
+
+    pid=$("$su" -l "$username" -c 'nohup sleep 300 </dev/null >/dev/null 2>&1 & echo $!')
+
+    if "$should_kill"; then
+        timeout 30 bash -c "while ps -p $pid >/dev/null; do sleep .5; done"
+    else
+        sleep 2
+        ps -p "$pid" -o pid,args
+        kill -TERM "$pid"
+    fi
+}
+
+testcase_kill_user_processes() {
+    local su="su"
+
+    # su/runuser -l does not propagate LD_PRELOAD.
+    if [[ -v ASAN_OPTIONS ]]; then
+        echo "ASan is enabled, skipping the testcase."
+        return
+    fi
+
+    # Arch does not use pam_systemd.so in su-l pam setting.
+    if ( . /etc/os-release; [[ "$ID" == "arch" ]] ); then
+        su="runuser"
+    fi
+
+    mkdir -p /run/systemd/logind.conf.d
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root false
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+KillExcludeUsers=
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+KillExcludeUsers=testuser
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser false
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillUserProcesses=yes
+KillExcludeUsers=testuser root
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root false
+    test_kill_user_process "$su" testuser false
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillOnlyUsers=testuser
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root false
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillOnlyUsers=testuser root
+KillExcludeUsers=
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser true
+
+    cat >/run/systemd/logind.conf.d/kill-user-processes.conf <<EOF
+[Login]
+KillOnlyUsers=root
+KillExcludeUsers=
+EOF
+
+    systemctl reload systemd-logind.service
+    test_kill_user_process "$su" root true
+    test_kill_user_process "$su" testuser false
+
+    rm -rf /run/systemd/logind.conf.d
+    systemctl reload systemd-logind.service
+}
+
 testcase_sleep_automated() {
     assert_eq "$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 org.freedesktop.login1.Manager SleepOperation)" 'as 3 "suspend-then-hibernate" "suspend" "hibernate"'
 
@@ -133,6 +272,11 @@ teardown_suspend() (
 
 testcase_suspend_on_lid() {
     local pid input_name lid_dev
+
+    if [[ ! -x /usr/lib/systemd/systemd-sleep ]]; then
+        echo "systemd-sleep is not installed, skipping suspend test"
+        return
+    fi
 
     if systemd-detect-virt --quiet --container; then
         echo "Skipping suspend test in container"
@@ -271,6 +415,9 @@ cleanup_session() (
 
     systemctl stop getty@tty2.service
 
+    rm -rf /run/systemd/system/getty@tty2.service.d
+    systemctl daemon-reload
+
     for s in $(loginctl --no-legend list-sessions | grep -v manager | awk '$3 == "logind-test-user" { print $1 }'); do
         echo "INFO: stopping session $s"
         loginctl terminate-session "$s"
@@ -298,9 +445,6 @@ cleanup_session() (
     if ! timeout 30 bash -c "while systemctl is-active --quiet user-${uid}.slice; do sleep 1; done"; then
         echo "WARNING: user-${uid}.slice is still active, ignoring."
     fi
-
-    rm -rf /run/systemd/system/getty@tty2.service.d
-    systemctl daemon-reload
 
     return 0
 )
@@ -694,7 +838,7 @@ session optional   pam_systemd.so default-capability-ambient-set=CAP_CHOWN,CAP_K
 session required   pam_unix.so
 EOF
 
-    cat > "$SCRIPT" <<'EOF'
+    cat >"$SCRIPT" <<'EOF'
 #!/usr/bin/env bash
 set -ex
 typeset -i AMB MASK
@@ -797,8 +941,323 @@ EOF
     systemctl stop "$RUN0UNIT3"
 }
 
+teardown_varlink() (
+    set +ex
+
+    systemctl stop test-varlink-inhibit.service 2>/dev/null
+    cleanup_session
+
+    return 0
+)
+
 testcase_varlink() {
-    varlinkctl introspect /run/systemd/io.systemd.Login
+    local session uid session_out user_out seat_out self_err inhibitor_out
+
+    if [[ ! -c /dev/tty2 ]]; then
+        echo "/dev/tty2 does not exist, skipping test ${FUNCNAME[0]}."
+        return
+    fi
+
+    trap teardown_varlink RETURN
+
+    local VARLINK_SOCKET="/run/systemd/io.systemd.Login"
+
+    : "--- Introspect ---"
+    varlinkctl introspect "$VARLINK_SOCKET"
+    varlinkctl introspect "$VARLINK_SOCKET" | grep "method ListSessions" >/dev/null
+    varlinkctl introspect "$VARLINK_SOCKET" | grep "method ListUsers" >/dev/null
+    varlinkctl introspect "$VARLINK_SOCKET" | grep "method ListSeats" >/dev/null
+    varlinkctl introspect "$VARLINK_SOCKET" | grep "method ListInhibitors" >/dev/null
+
+    : "--- Setup test session ---"
+    create_session
+    session=$(loginctl --no-legend | grep -v manager | awk '$3 == "logind-test-user" { print $1 }')
+    uid=$(id -ru logind-test-user)
+    local leader_pid
+    leader_pid=$(loginctl show-session "$session" -p Leader --value)
+    loginctl activate "$session"
+
+    : "--- ListSessions: Id filter (single reply) ---"
+    session_out=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListSessions "{\"Id\":\"$session\"}")
+    echo "$session_out" | jq -e ".runtime.Id == \"$session\"" >/dev/null
+    echo "$session_out" | jq -e ".context.UID == $uid" >/dev/null
+    echo "$session_out" | jq -e ".context.PID.pid == $leader_pid" >/dev/null
+    echo "$session_out" | jq -e '.context.TTY == "tty2"' >/dev/null
+    echo "$session_out" | jq -e '.context.Remote == false' >/dev/null
+    echo "$session_out" | jq -e '.context.Type == "tty"' >/dev/null
+    echo "$session_out" | jq -e '.context.Class == "user"' >/dev/null
+    echo "$session_out" | jq -e '.runtime.CanIdle == true' >/dev/null
+    echo "$session_out" | jq -e '.runtime.CanLock == true' >/dev/null
+    echo "$session_out" | jq -e '.runtime.State == "active"' >/dev/null
+    echo "$session_out" | jq -e '.runtime.Active == true' >/dev/null
+    # ExtraDeviceAccess may be absent (empty) but must be an array if present.
+    echo "$session_out" | jq -e '(.context | has("ExtraDeviceAccess") | not) or (.context.ExtraDeviceAccess | type == "array")' >/dev/null
+
+    # nonexistent session id
+    (! varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListSessions '{"Id":"nonexistent"}')
+
+    : "--- ListSessions: PID filter (single reply) ---"
+    # Look up the session containing the session leader's PID.
+    local pid_out
+    pid_out=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListSessions "{\"PID\":{\"pid\":$leader_pid}}")
+    echo "$pid_out" | jq -e ".runtime.Id == \"$session\"" >/dev/null
+
+    : "--- ListSessions: Id+PID consistency check ---"
+    # Same session referenced two ways: must succeed.
+    local ok_out mismatch_err
+    ok_out=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListSessions \
+        "{\"Id\":\"$session\",\"PID\":{\"pid\":$leader_pid}}")
+    echo "$ok_out" | jq -e ".runtime.Id == \"$session\"" >/dev/null
+    # Mismatched Id and PID (PID 1 is not in $session): must fail with NoSuchSession.
+    mismatch_err=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListSessions \
+        "{\"Id\":\"$session\",\"PID\":{\"pid\":1}}" 2>&1 || true)
+    echo "$mismatch_err" | grep NoSuchSession >/dev/null
+
+    : "--- ListSessions: streaming path ---"
+    # varlinkctl --more emits RFC 7464 JSON-seq (each record prefixed with RS/0x1e), so jq --seq is required.
+    varlinkctl call --more "$VARLINK_SOCKET" io.systemd.Login.ListSessions '{}' \
+        | jq --seq -e --arg s "$session" 'select(.runtime.Id == $s)' >/dev/null
+    test "$(varlinkctl call --more "$VARLINK_SOCKET" io.systemd.Login.ListSessions '{}' | wc -l)" -ge 2
+    # without --more and no filter: must fail with ExpectedMore (not assert()) so logind stays running.
+    local list_err
+    list_err=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListSessions '{}' 2>&1 || true)
+    # varlinkctl rewrites SD_VARLINK_ERROR_EXPECTED_MORE to the friendly description
+    # below (see src/varlinkctl/varlinkctl.c), so match on that substring rather than
+    # the raw error id.
+    echo "$list_err" | grep "'more' flag" >/dev/null
+    systemctl is-active systemd-logind.service >/dev/null
+
+    : "--- ListUsers: UID filter (single reply) ---"
+    user_out=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListUsers "{\"UID\":$uid}")
+    echo "$user_out" | jq -e ".context.UID == $uid" >/dev/null
+    echo "$user_out" | jq -e '.context.Name == "logind-test-user"' >/dev/null
+    echo "$user_out" | jq -e '.runtime.State' >/dev/null
+    echo "$user_out" | jq -e '.context.Linger == false' >/dev/null
+    # Sessions is now a flat array of session id strings (no wrapper object).
+    echo "$user_out" | jq -e ".runtime.Sessions[] | select(. == \"$session\")" >/dev/null
+
+    : "--- ListUsers: PID filter (single reply) ---"
+    # PID of a process in the test user's session should map back to the user.
+    local pid_user_out
+    pid_user_out=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListUsers \
+        "{\"PID\":{\"pid\":$leader_pid}}")
+    echo "$pid_user_out" | jq -e --argjson u "$uid" '.context.UID == $u' >/dev/null
+
+    : "--- ListUsers: UID+PID consistency check ---"
+    # Same user referenced two ways: must succeed.
+    local ok_user_out mismatch_user_err
+    ok_user_out=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListUsers \
+        "{\"UID\":$uid,\"PID\":{\"pid\":$leader_pid}}")
+    echo "$ok_user_out" | jq -e --argjson u "$uid" '.context.UID == $u' >/dev/null
+    # Mismatched UID and PID (PID 1 is systemd init, UID 0): must fail with NoSuchUser.
+    mismatch_user_err=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListUsers \
+        "{\"UID\":$uid,\"PID\":{\"pid\":1}}" 2>&1 || true)
+    echo "$mismatch_user_err" | grep NoSuchUser >/dev/null
+
+    : "--- ListUsers: empty input without --more must require --more ---"
+    # The DescribeUser-style caller-UID fallback was removed; a no-filter call without
+    # --more must fail with the EXPECTED_MORE error.
+    local empty_users_err
+    empty_users_err=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListUsers '{}' 2>&1 || true)
+    echo "$empty_users_err" | grep "'more' flag" >/dev/null
+    systemctl is-active systemd-logind.service >/dev/null
+
+    # nonexistent UID
+    (! varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListUsers '{"UID":4294967294}')
+
+    : "--- ListUsers: streaming path ---"
+    varlinkctl call --more "$VARLINK_SOCKET" io.systemd.Login.ListUsers '{}' \
+        | jq --seq -e 'select(.context.Name == "logind-test-user")' >/dev/null
+    test "$(varlinkctl call --more "$VARLINK_SOCKET" io.systemd.Login.ListUsers '{}' | wc -l)" -ge 2
+
+    : "--- ListSeats: Id filter (single reply) ---"
+    seat_out=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListSeats '{"Id":"seat0"}')
+    echo "$seat_out" | jq -e '.context.Id == "seat0"' >/dev/null
+    echo "$seat_out" | jq -e '.runtime.CanTTY == true' >/dev/null
+    # Sessions is a flat array of session id strings.
+    echo "$seat_out" | jq -e ".runtime.Sessions[] | select(. == \"$session\")" >/dev/null
+
+    # nonexistent seat
+    (! varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListSeats '{"Id":"seat-nonexistent"}')
+
+    : "--- ListSeats: empty input without --more must require --more ---"
+    # The caller-seat fallback was removed; no filter + no --more = EXPECTED_MORE.
+    local empty_seats_err
+    empty_seats_err=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListSeats '{}' 2>&1 || true)
+    echo "$empty_seats_err" | grep "'more' flag" >/dev/null
+    systemctl is-active systemd-logind.service >/dev/null
+
+    : "--- ListSeats: self/auto from session-less context yields NoSuchSeat ---"
+    # self/auto still resolves via peer session; running as root outside any session
+    # has no peer session, so we must get NoSuchSeat (not NoSuchSession leaked from
+    # the lookup helper).
+    local self_err
+    for id_arg in '{"Id":"self"}' '{"Id":"auto"}'; do
+        self_err=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListSeats "$id_arg" 2>&1 || true)
+        echo "$self_err" | grep NoSuchSeat >/dev/null
+        (! echo "$self_err" | grep NoSuchSession >/dev/null)
+    done
+
+    : "--- ListSeats: streaming path ---"
+    varlinkctl call --more "$VARLINK_SOCKET" io.systemd.Login.ListSeats '{}' | grep "seat0" >/dev/null
+    test "$(varlinkctl call --more "$VARLINK_SOCKET" io.systemd.Login.ListSeats '{}' | wc -l)" -ge 1
+
+    : "--- ListInhibitors ---"
+    systemd-run --unit=test-varlink-inhibit.service --service-type=exec \
+        systemd-inhibit --what=shutdown --who="varlink-test" --why="testing varlink" --mode=block \
+            sleep infinity
+    timeout 10 bash -c "until varlinkctl call --more '$VARLINK_SOCKET' io.systemd.Login.ListInhibitors '{}' 2>/dev/null | grep varlink-test >/dev/null; do sleep 0.5; done"
+
+    inhibitor_out=$(varlinkctl call --more "$VARLINK_SOCKET" io.systemd.Login.ListInhibitors '{}')
+    # What is now an array of strings; pick our test record and validate fields with jq.
+    echo "$inhibitor_out" | jq --seq -e 'select(.context.Who == "varlink-test") | .context.What | type == "array" and contains(["shutdown"])' >/dev/null
+    echo "$inhibitor_out" | jq --seq -e 'select(.context.Who == "varlink-test") | .context.Mode == "block"' >/dev/null
+    echo "$inhibitor_out" | jq --seq -e 'select(.context.Who == "varlink-test") | .context.Why == "testing varlink"' >/dev/null
+
+    # without --more should fail (ListInhibitors has no filter, --more required)
+    (! varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ListInhibitors '{}')
+
+    systemctl stop test-varlink-inhibit.service
+
+    # Best-effort empty-list check: stopping the test inhibitor doesn't guarantee
+    # zero entries (other system inhibitors may be registered), but the contract
+    # we verify holds regardless — ListInhibitors has no single-lookup path, so
+    # it must never emit a NoSuchInhibitor sentinel. An empty result is just an
+    # empty parameters reply as the stream terminator; the IDL-validation skip
+    # in the sentinel handler ensures this passes validation.
+    local empty_inhibitor_err
+    empty_inhibitor_err=$(varlinkctl call --more "$VARLINK_SOCKET" io.systemd.Login.ListInhibitors '{}' 2>&1 || true)
+    (! echo "$empty_inhibitor_err" | grep NoSuchInhibitor >/dev/null)
+
+    : "--- ReleaseSession: NULL ID resolves to caller's session ---"
+    # A caller with a logind session calling ReleaseSession '{}' (no ID) must
+    # release its own session. We spawn the call inside a transient unit with
+    # PAM so pam_systemd creates a real session for the caller.
+    local PAMSERVICE_REL="pamserv-rel$RANDOM"
+    cat >/etc/pam.d/"$PAMSERVICE_REL" <<EOF
+auth sufficient    pam_unix.so
+auth required      pam_deny.so
+account sufficient pam_unix.so
+account required   pam_permit.so
+session optional   pam_systemd.so debug
+session required   pam_unix.so
+EOF
+    systemd-run --wait --pipe \
+        -p PAMName="$PAMSERVICE_REL" \
+        -p Type=exec \
+        -p User=logind-test-user \
+        varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ReleaseSession '{}'
+    rm -f /etc/pam.d/"$PAMSERVICE_REL"
+
+    # With no caller session (running as root outside any session), the helper
+    # must return NoSuchSession, not PermissionDenied.
+    local no_sess_rel
+    no_sess_rel=$(varlinkctl call "$VARLINK_SOCKET" io.systemd.Login.ReleaseSession '{}' 2>&1 || true)
+    echo "$no_sess_rel" | grep NoSuchSession >/dev/null
+}
+
+teardown_metrics() (
+    set +ex
+
+    systemctl stop metrics-sleeper-background-light.service metrics-sleeper-user.service
+    rm -f /etc/pam.d/"$PAMSERVICE"
+    return 0
+)
+
+login_metric() {
+    # Prints the value of the specified io.systemd.Login metric with the specified field value
+    varlinkctl --more call /run/systemd/report/io.systemd.Login io.systemd.Metrics.List '{}' |
+        jq --seq -r --arg n "io.systemd.Login.$1" --arg k "$2" --arg v "$3" \
+           'select(.name == $n and .fields[$k] == $v) | .value | tostring'
+}
+
+wait_session_gone() {
+    # Waits until no session of the specified class of the test user is known to logind anymore
+    timeout 30 bash -c "while loginctl --no-legend | grep logind-test-user | grep -w -- '$1' >/dev/null; do sleep .5; done"
+}
+
+testcase_metrics() {
+    local uid list c before_started before_current started current
+
+    uid=$(id -u logind-test-user)
+
+    PAMSERVICE="pammetrics$RANDOM"
+    trap teardown_metrics RETURN
+
+    cat >/etc/pam.d/"$PAMSERVICE" <<EOF
+auth sufficient    pam_unix.so
+auth required      pam_deny.so
+account sufficient pam_unix.so
+account required   pam_permit.so
+session optional   pam_systemd.so debug
+session required   pam_unix.so
+EOF
+
+    # Some distros don't enable the socket by default. logind only picks up the socket when it is started, and
+    # PID 1 refuses to start a socket whose service is already running, hence stop logind first.
+    if ! systemctl is-active --quiet systemd-logind-metrics.socket; then
+        systemctl stop systemd-logind.service
+        systemctl start systemd-logind-metrics.socket
+        systemctl start systemd-logind.service
+        systemctl reset-failed systemd-logind.service
+    fi
+    test -S /run/systemd/report/io.systemd.Login
+    test -f /run/systemd/login-counters
+
+    list="$(varlinkctl --more call /run/systemd/report/io.systemd.Login io.systemd.Metrics.Describe '{}')"
+    jq --seq -r '.name' <<<"$list" | grep '^io.systemd.Login.CurrentSessions$' >/dev/null
+    jq --seq -r '.name' <<<"$list" | grep '^io.systemd.Login.SessionsStarted$' >/dev/null
+    jq --seq -r '.name' <<<"$list" | grep '^io.systemd.Login.SuspendCounter$' >/dev/null
+
+    # One row per session class, except for "none"
+    list="$(varlinkctl --more call /run/systemd/report/io.systemd.Login io.systemd.Metrics.List '{}')"
+    for c in user user-early user-incomplete user-light user-early-light greeter lock-screen background background-light manager manager-early; do
+        [[ "$(jq --seq -r --arg c "$c" 'select(.name == "io.systemd.Login.SessionsStarted" and .fields.class == $c) | .name' <<<"$list" | wc -l)" -eq 1 ]]
+        [[ "$(jq --seq -r --arg c "$c" 'select(.name == "io.systemd.Login.CurrentSessions" and .fields.class == $c) | .name' <<<"$list" | wc -l)" -eq 1 ]]
+    done
+    [[ -z "$(jq --seq -r 'select(.fields.class == "none") | .name' <<<"$list")" ]]
+
+    # Start a session without service manager
+    wait_session_gone background-light
+    before_started="$(login_metric SessionsStarted class background-light)"
+    before_current="$(login_metric CurrentSessions class background-light)"
+    systemd-run -u metrics-sleeper-background-light.service -p PAMName="$PAMSERVICE" -p Type=exec \
+        -p Environment=XDG_SESSION_CLASS=background-light -p User=logind-test-user sleep infinity
+    started="$(login_metric SessionsStarted class background-light)"
+    current="$(login_metric CurrentSessions class background-light)"
+    (( started == before_started + 1 ))
+    (( current == before_current + 1 ))
+
+    # A restart of logind neither resets nor increases the counter, and the session is still current. Reset
+    # the start rate limit afterwards, so that later test cases which restart logind don't trip over it.
+    systemctl restart systemd-logind.service
+    systemctl reset-failed systemd-logind.service
+    (( $(login_metric SessionsStarted class background-light) == started ))
+    (( $(login_metric CurrentSessions class background-light) == current ))
+
+    # Logging out decreases the number of current sessions, but not the counter
+    systemctl stop metrics-sleeper-background-light.service
+    wait_session_gone background-light
+    (( $(login_metric SessionsStarted class background-light) == started ))
+    (( $(login_metric CurrentSessions class background-light) == before_current ))
+
+    # A full user session also starts the service manager, which gets its own session
+    systemctl stop user@"$uid".service
+    wait_session_gone manager
+    before_started="$(login_metric SessionsStarted class manager)"
+    systemd-run -u metrics-sleeper-user.service -p PAMName="$PAMSERVICE" -p Type=exec \
+        -p Environment=XDG_SESSION_CLASS=user -p User=logind-test-user sleep infinity
+    (( $(login_metric SessionsStarted class manager) == before_started + 1 ))
+    (( $(login_metric CurrentSessions class manager) >= 1 ))
+    systemctl stop metrics-sleeper-user.service
+
+    # The suspend counters are taken from the kernel as they are, but are suppressed in containers
+    if [[ -e /sys/power/suspend_stats/success ]] && ! systemd-detect-virt --quiet --container; then
+        (( $(login_metric SuspendCounter result success) == $(cat /sys/power/suspend_stats/success) ))
+        (( $(login_metric SuspendCounter result fail) == $(cat /sys/power/suspend_stats/fail) ))
+    else
+        [[ -z "$(varlinkctl --more call /run/systemd/report/io.systemd.Login io.systemd.Metrics.List '{}' | jq --seq -r 'select(.name == "io.systemd.Login.SuspendCounter") | .name')" ]]
+    fi
 }
 
 testcase_restart() {
@@ -821,8 +1280,33 @@ testcase_restart() {
     done
 }
 
+testcase_inhibit_default() {
+    local mode what inhibitor_out
+    local -a args
+
+    for mode in delay block; do
+        args=()
+        what='["idle", "shutdown", "sleep"]'
+        if [[ "$mode" == delay ]]; then
+            args=(--mode=delay)
+            what='["shutdown", "sleep"]'
+        fi
+
+        # Query from the inhibited command so the lock is held throughout the query.
+        inhibitor_out=$(systemd-inhibit "${args[@]}" --who="inhibit-default-$mode" \
+            varlinkctl call --more /run/systemd/io.systemd.Login io.systemd.Login.ListInhibitors '{}')
+        echo "$inhibitor_out" | jq --seq --slurp -e --arg mode "$mode" --argjson what "$what" '
+            map(select(.context.Who == ("inhibit-default-" + $mode))) |
+            length == 1 and all(.[]; .context.Mode == $mode and (.context.What | sort) == $what)
+        ' >/dev/null
+    done
+
+    (! systemd-inhibit --mode=delay --what=idle true)
+}
+
 setup_test_user
 test_write_dropin
 run_testcases
+run_subtests
 
 touch /testok

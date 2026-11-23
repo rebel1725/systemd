@@ -12,6 +12,7 @@
 #include "common-signal.h"
 #include "constants.h"
 #include "daemon-util.h"
+#include "dlopen-note.h"
 #include "hashmap.h"
 #include "log.h"
 #include "main-func.h"
@@ -19,6 +20,7 @@
 #include "portabled.h"
 #include "service-util.h"
 #include "signal-util.h"
+#include "verbs.h"
 
 static Manager* manager_unref(Manager *m);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_unref);
@@ -53,7 +55,7 @@ static int manager_new(RuntimeScope scope, Manager **ret) {
         if (r < 0)
                 return r;
 
-        r = sd_event_add_memory_pressure(m->event, NULL, NULL, NULL);
+        r = sd_event_add_memory_pressure(m->event, /* ret= */ NULL, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 log_debug_errno(r, "Failed to allocate memory pressure event source, ignoring: %m");
 
@@ -98,7 +100,7 @@ static int manager_connect_bus(Manager *m) {
                         return log_error_errno(r, "Failed to connect to user bus: %m");
         }
 
-        r = sd_bus_attach_event(m->bus, m->event, 0);
+        r = sd_bus_attach_event(m->bus, m->event, /* priority= */ 0);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach user bus to event loop: %m");
 
@@ -110,7 +112,7 @@ static int manager_connect_bus(Manager *m) {
         if (r < 0)
                 return r;
 
-        r = sd_bus_request_name_async(m->bus, NULL, "org.freedesktop.portable1", 0, NULL, NULL);
+        r = sd_bus_request_name_async(m->bus, /* ret_slot= */ NULL, "org.freedesktop.portable1", /* flags= */ 0, /* callback= */ NULL, /* userdata= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request name: %m");
 
@@ -138,16 +140,32 @@ static bool check_idle(void *userdata) {
                 hashmap_isempty(m->polkit_registry);
 }
 
+COMMAND(
+        "systemd-portabled\0",
+        "Manage registrations of portable images.",
+        .man_page = "systemd-portabled.service(8)",
+        .option_namespace = "service",
+        .option_groups =
+                "Options\0"
+                "Bus introspection\0"
+                "Runtime scope\0",
+);
+
 static int run(int argc, char *argv[]) {
         _cleanup_(manager_unrefp) Manager *m = NULL;
         RuntimeScope scope = RUNTIME_SCOPE_SYSTEM;
         int r;
 
+        LIBBLKID_NOTE(recommended);
+        LIBCRYPTO_NOTE(suggested);
+        LIBCRYPTSETUP_NOTE(recommended);
+        LIBMOUNT_NOTE(required);
+        LIBSELINUX_NOTE(recommended);
+        TPM2_NOTE(suggested);
+
         log_setup();
 
-        r = service_parse_argv("systemd-portabled.service",
-                               "Manage registrations of portable images.",
-                               BUS_IMPLEMENTATIONS(&manager_object,
+        r = service_parse_argv(BUS_IMPLEMENTATIONS(&manager_object,
                                                    &log_control_object),
                                &scope,
                                argc, argv);
@@ -164,7 +182,7 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 return log_error_errno(r, "Failed to fully start up daemon: %m");
 
-        r = sd_notify(false, NOTIFY_READY_MESSAGE);
+        r = sd_notify(/* unset_environment= */ false, NOTIFY_READY_MESSAGE);
         if (r < 0)
                 log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
 

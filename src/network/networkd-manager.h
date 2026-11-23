@@ -3,6 +3,7 @@
 
 #include "networkd-forward.h"
 #include "networkd-network.h"
+#include "tlv-util.h"
 
 typedef enum ManagerState {
         MANAGER_RUNNING,
@@ -21,6 +22,7 @@ typedef struct Manager {
         sd_event *event;
         sd_resolve *resolve;
         sd_bus *bus;
+        sd_bus_slot *timezone_slot;
         sd_varlink_server *varlink_server;
         sd_varlink_server *varlink_resolve_hook_server;
         sd_varlink_server *varlink_metrics_server;
@@ -74,8 +76,19 @@ typedef struct Manager {
         bool has_product_uuid;
         bool product_uuid_requested;
 
+        /* DHCP relay agent */
+        sd_dhcp_relay *dhcp_relay;
+        struct in_addr dhcp_relay_server_address;
+        bool dhcp_relay_override_server_id;
+        struct iovec dhcp_relay_remote_id;
+        TLV dhcp_relay_extra_options;
+
         char* dynamic_hostname;
         char* dynamic_timezone;
+
+        /* For updating the hostname sent by DHCP clients */
+        sd_event_source *hostname_event_source;
+        char *kernel_hostname;
 
         Set *rules;
 
@@ -151,7 +164,7 @@ int manager_enumerate(Manager *m);
 int manager_set_hostname(Manager *m, const char *hostname);
 int manager_set_timezone(Manager *m, const char *tz);
 
-int manager_reload(Manager *m, sd_bus_message *message, sd_varlink *varlink);
+int manager_reload(Manager *m, sd_bus_message *message, sd_varlink *varlink, bool reconfigure_links);
 
 static inline Hashmap** manager_get_sysctl_shadow(Manager *manager) {
 #if ENABLE_SYSCTL_BPF

@@ -20,9 +20,11 @@
     <refname>systemd-sysext</refname>
     <refname>systemd-sysext.service</refname>
     <refname>systemd-sysext-initrd.service</refname>
+    <refname>systemd-sysext-sysroot.service</refname>
     <refname>systemd-confext</refname>
     <refname>systemd-confext.service</refname>
     <refname>systemd-confext-initrd.service</refname>
+    <refname>systemd-confext-sysroot.service</refname>
     <refpurpose>Activates System Extension Images</refpurpose>
   </refnamediv>
 
@@ -99,7 +101,11 @@
     <citerefentry><refentrytitle>systemd-nspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>
     supports via its <option>--directory=</option>/<option>--image=</option> switches and those that the
     service manager supports via <option>RootDirectory=</option>/<option>RootImage=</option>. Similar to
-    them they may optionally carry Verity authentication information.</para>
+    them they may optionally carry Verity authentication information. LUKS encrypted extension images
+    carrying a TPM2 token (as enrolled via the <option>--tpm2-device=</option> option of
+    <citerefentry><refentrytitle>systemd-cryptenroll</refentrytitle><manvolnum>1</manvolnum></citerefentry>)
+    are unlocked via the local TPM2 automatically, without any passphrase. This may be turned off via the
+    <varname>$SYSTEMD_DISSECT_TPM2_UNLOCK</varname> environment variable.</para>
 
     <para>System extensions are searched for in the directories
     <filename>/etc/extensions/</filename>, <filename>/run/extensions/</filename> and
@@ -114,27 +120,50 @@
     <citerefentry><refentrytitle>systemd-stub</refentrytitle><manvolnum>7</manvolnum></citerefentry> with
     extension images found in the system's EFI System Partition.</para>
 
-    <para>During boot OS extension images are activated automatically, if the
-    <filename>systemd-sysext.service</filename> is enabled. Note that this service runs only after the
-    underlying file systems where system extensions may be located have been mounted. This means they are not
-    suitable for shipping resources that are processed by subsystems running in earliest boot. Specifically,
-    OS extension images are not suitable for shipping system services or
+    <para>During boot, system and configuration extension images are activated automatically if the
+    <filename>systemd-sysext.service</filename> and <filename>systemd-confext.service</filename> services are
+    enabled. Note that these services run only after the underlying file systems where system and configuration
+    extensions may be located have been mounted. To make it possible to ship resources that are processed by
+    subsystems running in the earliest boot stages (for example, system services or
     <citerefentry><refentrytitle>systemd-sysusers</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    definitions. See the <ulink url="https://systemd.io/PORTABLE_SERVICES">Portable Services</ulink> page
-    for a simple mechanism for shipping system services in disk images, in a similar fashion to OS
-    extensions. Note the different isolation on these two mechanisms: while system extension directly extend
-    the underlying OS image with additional files that appear in a way very similar to as if they were
-    shipped in the OS image itself and thus imply no security isolation, portable services imply service
-    level sandboxing in one way or another. The <filename>systemd-sysext.service</filename> service is
-    guaranteed to finish start-up before <filename>basic.target</filename> is reached; i.e. at the time
+    definitions), the <filename>systemd-sysext-sysroot.service</filename> and
+    <filename>systemd-confext-sysroot.service</filename> initrd services are provided. Currently, these
+    services cannot be used to merge system extensions from <filename>/sysroot/var/lib/extensions/</filename>
+    and configuration extensions from <filename>/sysroot/var/lib/confexts/</filename> when the
+    <filename>/var/</filename> partition is split off. These extensions are later merged by the
+    <filename>systemd-sysext.service</filename> and <filename>systemd-confext.service</filename> services
+    during the main OS boot process.</para>
+
+    <para>Also, see the <ulink url="https://systemd.io/PORTABLE_SERVICES">Portable Services</ulink>
+    page for a simple mechanism for shipping system services in disk images, in a similar fashion to OS
+    extensions. Note the differences in isolation between these two mechanisms: while system extensions directly extend
+    the underlying OS image with additional files that appear as if they were shipped in the OS image itself
+    and thus imply no security isolation, portable services imply service-level sandboxing in one way or another.
+    Binaries shipped in system extensions can only link against libraries from the host if the extension is
+    bound to the version of the host OS (see further below) or otherwise have to use static linking.
+    Portable services, however, are fully decoupled from the host as they ship their own library dependencies.</para>
+
+    <para>The <filename>systemd-sysext.service</filename> and <filename>systemd-confext.service</filename>
+    services are guaranteed to finish start-up before <filename>basic.target</filename> is reached; i.e., by the time
     regular services initialize (those which do not use <varname>DefaultDependencies=no</varname>), the files
-    and directories system extensions provide are available in <filename>/usr/</filename> and
-    <filename>/opt/</filename> and may be accessed.</para>
+    and directories provided by system and configuration extensions are available in <filename>/usr/</filename>,
+    <filename>/opt/</filename>, and <filename>/etc/</filename> and may be accessed.</para>
+
+    <para>System and configuration extensions can also be used to extend the initrd, and the
+    <filename>systemd-sysext-initrd.service</filename> and <filename>systemd-confext-initrd.service</filename>
+    initrd services are provided. Note that some limitations apply: resources that are used in the earliest boot
+    stages of the initrd (e.g. system services) cannot be updated.</para>
 
     <para>Note that there is no concept of enabling/disabling installed system extension images: all
     installed extension images are automatically activated at boot. However, you can place an empty directory
     named like the extension (no <filename>.raw</filename>) in <filename>/etc/extensions/</filename> to "mask"
-    an extension with the same name in a system folder with lower precedence.</para>
+    an extension with the same name in a system folder with lower precedence. It is also possible to disable
+    automatic merging altogether using the <varname>rd.systemd.sysext=</varname>, <varname>rd.systemd.confext=</varname>,
+    <varname>systemd.sysext=</varname>, and <varname>systemd.confext=</varname> kernel command line options.
+    Note that <filename>systemd-sysext-sysroot.service</filename> and
+    <filename>systemd-confext-sysroot.service</filename> are controlled by the <varname>systemd.sysext=</varname>
+    and <varname>systemd.confext=</varname> options, as these services merge system and configuration
+    extensions for the main system, not for the initrd.</para>
 
     <para>A simple mechanism for version compatibility is enforced: a system extension image must carry a
     <filename>/usr/lib/extension-release.d/extension-release.<replaceable>NAME</replaceable></filename>
@@ -148,15 +177,48 @@
     but the used architecture identifiers are the same as for <varname>ConditionArchitecture=</varname>
     described in <citerefentry><refentrytitle>systemd.unit</refentrytitle><manvolnum>5</manvolnum></citerefentry>.
     <varname>EXTENSION_RELOAD_MANAGER=</varname> can be set to 1 if the extension requires a service manager reload after application
-    of the extension. Note that for the reasons mentioned earlier,
-    <ulink url="https://systemd.io/PORTABLE_SERVICES">Portable Services</ulink> remain
-    the recommended way to ship system services.
+    of the extension. <varname>EXTENSION_RESTART_UNITS=</varname> and
+    <varname>EXTENSION_RELOAD_OR_RESTART_UNITS=</varname> can be set to a whitespace-separated list of unit
+    names (e.g. <literal>EXTENSION_RESTART_UNITS="my.service other.service"</literal>) that
+    <command>systemd-sysext</command>/<command>systemd-confext</command> should restart resp. reload (or
+    restart, if the unit does not support reloading) after merging or refreshing the extension, and after
+    unmerging it. Use <varname>EXTENSION_RESTART_UNITS=</varname> for units whose binary the extension
+    replaces (a reload would not pick up the new binary), and <varname>EXTENSION_RELOAD_OR_RESTART_UNITS=</varname>
+    for units the extension extends with configuration drop-ins only (so reload-capable services are not
+    needlessly interrupted). If a unit has disappeared, e.g., on unmerge because it was part of the
+    extension, it is stopped instead. If the same unit is listed in both fields,
+    <varname>EXTENSION_RESTART_UNITS=</varname> takes precedence. Listing any unit in either field implies
+    <varname>EXTENSION_RELOAD_MANAGER=1</varname>, as the service manager would otherwise not yet (or no
+    longer) see the unit files shipped by the extension. Note that these settings do not take effect when
+    the extension is merged for the system already from the initrd and extensions should still ship a
+    <literal>.wants/</literal> or <literal>.upholds/</literal> symlink from the unit's install target to
+    ensure the unit starts at boot.
 
     System extensions should not ship a <filename>/usr/lib/os-release</filename> file (as that would be merged
     into the host <filename>/usr/</filename> tree, overriding the host OS version data, which is not desirable).
     The <filename>extension-release</filename> file follows the same format and semantics, and carries the same
     content, as the <filename>os-release</filename> file of the OS, but it describes the resources carried
     in the extension image.</para>
+
+    <para>Extension images may be restricted to specific systems via the <varname>MATCH_HOSTNAME=</varname>,
+    <varname>MATCH_MACHINE_ID=</varname>, <varname>MATCH_MACHINE_TAGS=</varname>,
+    <varname>MATCH_IMAGE_ID=</varname>, <varname>MATCH_IMAGE_VERSION=</varname>,
+    <varname>MATCH_OS_ID=</varname> and <varname>MATCH_OS_VERSION=</varname> fields of their
+    <filename>extension-release</filename> file (see
+    <citerefentry><refentrytitle>os-release</refentrytitle><manvolnum>5</manvolnum></citerefentry>), as well
+    as via the corresponding <literal>user.uapi.match_hostname</literal>,
+    <literal>user.uapi.match_machine_id</literal>, <literal>user.uapi.match_machine_tags</literal>,
+    <literal>user.uapi.match_image_id</literal>, <literal>user.uapi.match_image_version</literal>,
+    <literal>user.uapi.match_os_id</literal> and <literal>user.uapi.match_os_version</literal> extended
+    attributes of the image file or directory itself, as set by
+    <citerefentry><refentrytitle>systemd-sysupdate</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    when installing images (see <varname>MatchXAttr=</varname> in
+    <citerefentry><refentrytitle>sysupdate.d</refentrytitle><manvolnum>5</manvolnum></citerefentry> for
+    their syntax). Images that do not match the local system (or with rules that cannot be parsed) are
+    skipped. Both the fields and the extended attributes are honoured: an image must match all of them. If
+    both the <filename>extension-release</filename> file and the extended attributes carry rules for the
+    same property, they should be identical; a warning is logged if they are not. These checks are
+    skipped if <option>--force</option> is used.</para>
 
     <para>The <command>systemd-confext</command> concept follows the same principle as the
     <citerefentry><refentrytitle>systemd-sysext</refentrytitle><manvolnum>8</manvolnum></citerefentry>
@@ -479,7 +541,9 @@
           <para>When used with <command>merge</command>,
           <command>unmerge</command> or <command>refresh</command>, do not reload daemon
           after executing the changes even if an extension that is applied requires a reload via the
-          <varname>EXTENSION_RELOAD_MANAGER=</varname> set to 1.</para>
+          <varname>EXTENSION_RELOAD_MANAGER=</varname> set to 1. This also skips processing any units
+          listed via <varname>EXTENSION_RESTART_UNITS=</varname> or
+          <varname>EXTENSION_RELOAD_OR_RESTART_UNITS=</varname>.</para>
 
         <xi:include href="version-info.xml" xpointer="v255"/>
         </listitem>

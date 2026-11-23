@@ -9,7 +9,6 @@
 
 #include "alloc-util.h"
 #include "env-file.h"
-#include "errno-util.h"
 #include "escape.h"
 #include "extract-word.h"
 #include "fd-util.h"
@@ -17,12 +16,13 @@
 #include "fs-util.h"
 #include "hashmap.h"
 #include "io-util.h"
+#include "json-util.h"
 #include "log.h"
 #include "logind-session.h"
 #include "logind.h"
 #include "logind-dbus.h"
 #include "logind-inhibit.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "string-table.h"
@@ -95,13 +95,13 @@ static int inhibitor_save(Inhibitor *i) {
 
         assert(i);
 
-        r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0, MKDIR_WARN_MODE);
+        r = mkdir_safe_label("/run/systemd/inhibit", 0755, /* uid= */ 0, /* gid= */ 0, MKDIR_WARN_MODE);
         if (r < 0)
                 return log_error_errno(r, "Failed to create /run/systemd/inhibit/: %m");
 
         _cleanup_(unlink_and_freep) char *temp_path = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        r = fopen_tmpfile_linkable(i->state_file, O_WRONLY|O_CLOEXEC, &temp_path, &f);
+        r = fopen_tmpfile_linkable(i->state_file, O_WRONLY, &temp_path, &f);
         if (r < 0)
                 return log_error_errno(r, "Failed to create state file '%s': %m", i->state_file);
 
@@ -252,7 +252,7 @@ int inhibitor_load(Inhibitor *i) {
         }
 
         if (who) {
-                l = cunescape(who, 0, &cc);
+                l = cunescape(who, /* flags= */ 0, &cc);
                 if (l < 0)
                         return log_debug_errno(l, "Failed to unescape \"who\" of inhibitor: %m");
 
@@ -260,7 +260,7 @@ int inhibitor_load(Inhibitor *i) {
         }
 
         if (why) {
-                l = cunescape(why, 0, &cc);
+                l = cunescape(why, /* flags= */ 0, &cc);
                 if (l < 0)
                         return log_debug_errno(l, "Failed to unescape \"why\" of inhibitor: %m");
 
@@ -298,7 +298,7 @@ int inhibitor_create_fifo(Inhibitor *i) {
 
         /* Create FIFO */
         if (!i->fifo_path) {
-                r = mkdir_safe_label("/run/systemd/inhibit", 0755, 0, 0, MKDIR_WARN_MODE);
+                r = mkdir_safe_label("/run/systemd/inhibit", 0755, /* uid= */ 0, /* gid= */ 0, MKDIR_WARN_MODE);
                 if (r < 0)
                         return r;
 
@@ -312,13 +312,13 @@ int inhibitor_create_fifo(Inhibitor *i) {
 
         /* Open reading side */
         if (i->fifo_fd < 0) {
-                i->fifo_fd = open(i->fifo_path, O_RDONLY|O_CLOEXEC|O_NONBLOCK);
+                i->fifo_fd = xopenat(AT_FDCWD, i->fifo_path, O_RDONLY|O_NONBLOCK);
                 if (i->fifo_fd < 0)
-                        return -errno;
+                        return i->fifo_fd;
         }
 
         if (!i->event_source) {
-                r = sd_event_add_io(i->manager->event, &i->event_source, i->fifo_fd, 0, inhibitor_dispatch_fifo, i);
+                r = sd_event_add_io(i->manager->event, &i->event_source, i->fifo_fd, /* events= */ 0, inhibitor_dispatch_fifo, i);
                 if (r < 0)
                         return r;
 
@@ -330,7 +330,7 @@ int inhibitor_create_fifo(Inhibitor *i) {
         }
 
         /* Open writing side */
-        return RET_NERRNO(open(i->fifo_path, O_WRONLY|O_CLOEXEC|O_NONBLOCK));
+        return xopenat(AT_FDCWD, i->fifo_path, O_WRONLY|O_NONBLOCK);
 }
 
 static void inhibitor_remove_fifo(Inhibitor *i) {
@@ -459,7 +459,7 @@ const char* inhibit_what_to_string(InhibitWhat w) {
             "handle-suspend-key:"
             "handle-hibernate-key:"
             "handle-lid-switch:"
-            "handle-reboot-key")+1];
+            "handle-reboot-key:")+1];
         char *p;
 
         if (!inhibit_what_is_valid(w))
@@ -526,6 +526,67 @@ int inhibit_what_from_string(const char *s) {
                 else
                         return _INHIBIT_WHAT_INVALID;
         }
+}
+
+static int inhibit_what_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
+        InhibitWhat *what = ASSERT_PTR(userdata);
+        int r;
+
+        assert(ret);
+        assert(inhibit_what_is_valid(*what));
+
+        for (unsigned bit = 0; (1U << bit) < (unsigned) _INHIBIT_WHAT_MAX; bit++) {
+                InhibitWhat w = 1U << bit;
+
+                if (!FLAGS_SET(*what, w))
+                        continue;
+
+                r = sd_json_variant_append_arrayb(&v, JSON_BUILD_STRING_UNDERSCORIFY(inhibit_what_to_string(w)));
+                if (r < 0)
+                        return r;
+        }
+
+        *ret = TAKE_PTR(v);
+        return 0;
+}
+
+static int inhibitor_context_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Inhibitor *i = ASSERT_PTR(userdata);
+
+        assert(ret);
+        assert(i->mode >= 0 && i->mode < _INHIBIT_MODE_MAX);
+        assert(inhibit_what_is_valid(i->what));
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_STRING("Id", i->id),
+                        SD_JSON_BUILD_PAIR_CALLBACK("What", inhibit_what_build_json, &i->what),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Who", i->who),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Why", i->why),
+                        JSON_BUILD_PAIR_ENUM("Mode", inhibit_mode_to_string(i->mode)),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("UID", i->uid));
+}
+
+static int inhibitor_runtime_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Inhibitor *i = ASSERT_PTR(userdata);
+
+        assert(ret);
+
+        return sd_json_buildo(
+                        ret,
+                        JSON_BUILD_PAIR_PIDREF_NON_NULL("PID", &i->pid),
+                        JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("Since", &i->since));
+}
+
+int inhibitor_build_json(Inhibitor *i, sd_json_variant **ret) {
+        assert(i);
+        assert(ret);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_CALLBACK("context", inhibitor_context_build_json, i),
+                        SD_JSON_BUILD_PAIR_CALLBACK("runtime", inhibitor_runtime_build_json, i));
 }
 
 static const char* const inhibit_mode_table[_INHIBIT_MODE_MAX] = {

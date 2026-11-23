@@ -966,6 +966,79 @@
       </varlistentry>
 
       <varlistentry>
+        <term><varname>systemd.import_credentials_filter=</varname></term>
+
+        <listitem><para>Takes a comma-separated list of shell-style glob patterns (as understood by
+        <citerefentry project='man-pages'><refentrytitle>fnmatch</refentrytitle><manvolnum>3</manvolnum></citerefentry>).
+        If specified, only credentials whose names match at least one of the patterns are imported from the
+        DMI/SMBIOS OEM string table, the qemu_fw_cfg subsystem, the EFI kernel stub (i.e. from the ESP) or
+        the <filename>/.extra/system_credentials/</filename> directory in the initrd (as for example supplied
+        by
+        <citerefentry><refentrytitle>systemd-vmspawn</refentrytitle><manvolnum>1</manvolnum></citerefentry>);
+        all others are skipped. For credentials picked up by the EFI kernel stub the pattern is matched
+        against the credential name without the <filename>.cred</filename> suffix. May be specified multiple
+        times, in which case the lists are combined. If assigned the empty string, the list is reset, and all
+        credentials are imported again. If not specified, no filtering takes place. Example:
+        <literal>systemd.import_credentials_filter=firstboot.*,ssh.authorized_keys.root</literal>.</para>
+
+        <para>Credentials configured via <varname>systemd.set_credential=</varname> and
+        <varname>systemd.set_credential_binary=</varname> on the kernel command line are always imported,
+        regardless of this filter, as is the filter itself configured on the kernel command line. Note that
+        outside of confidential VMs
+        <citerefentry><refentrytitle>systemd-stub</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+        appends the contents of the <varname>io.systemd.stub.kernel-cmdline-extra=</varname> SMBIOS OEM
+        string to the kernel command line, and
+        <citerefentry><refentrytitle>systemd-boot</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+        similarly appends the contents of the <varname>io.systemd.boot.kernel-cmdline-extra=</varname>
+        SMBIOS OEM string for Type #1 Linux entries. Both may hence be used to set additional credentials or
+        to reset the filter. For the filter to be effective the kernel command line must hence be protected
+        accordingly.</para>
+
+        <para>Note that credentials are imported only once per boot: if the initrd imported any credentials,
+        they are passed on to the host system as they are, and the host does not import any credentials from
+        the sources listed above again. Hence, unlike many other options, this option does not support the
+        <literal>rd.</literal> prefix. Credentials passed from the initrd to the host via
+        <filename>/run/credentials/@initrd/</filename> are not subject to this filter.</para>
+
+        <xi:include href="version-info.xml" xpointer="v263"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>systemd.credentials_boot_policy=</varname></term>
+
+        <listitem><para>Controls under which conditions a credential encrypted with a <literal>null</literal>
+        key (i.e. a credential wrapped in a <command>systemd-creds</command> envelope but offering neither
+        confidentiality nor authenticity, see
+        <citerefentry><refentrytitle>systemd-creds</refentrytitle><manvolnum>1</manvolnum></citerefentry>)
+        is accepted at boot. This provides a fallback for provisioning credentials before a machine has a key
+        to encrypt them against, for example during first boot or on systems without a TPM2 device. Takes
+        one of <option>strict</option>, <option>tofu</option>, <option>relaxed</option> or
+        <option>off</option>:</para>
+
+        <itemizedlist>
+          <listitem><para><option>strict</option> never accepts a <literal>null</literal> key, i.e. always
+          insists on proper encryption.</para></listitem>
+
+          <listitem><para><option>tofu</option> (trust on first use) accepts a <literal>null</literal> key
+          during first boot, or when no TPM2 device is available.</para></listitem>
+
+          <listitem><para><option>relaxed</option> accepts a <literal>null</literal> key when SecureBoot is
+          disabled, or when no TPM2 device is available.</para></listitem>
+
+          <listitem><para><option>off</option> always accepts a <literal>null</literal> key.</para></listitem>
+        </itemizedlist>
+
+        <para>Defaults to <option>relaxed</option>. Note that this policy only applies to the default acceptance
+        decision; it has no effect on credentials encrypted against a host key or TPM2 device, which are
+        always accepted.</para>
+
+        <para>For further information see <ulink url="https://systemd.io/CREDENTIALS">System and Service
+        Credentials</ulink> documentation.</para>
+
+        <xi:include href="version-info.xml" xpointer="v262"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><varname>quiet</varname></term>
 
         <listitem><para>Turn off status output at boot, much like
@@ -994,12 +1067,11 @@
       <varlistentry>
         <term><varname>emergency</varname></term>
         <term><varname>rd.emergency</varname></term>
-        <term><varname>-b</varname></term>
 
-        <listitem><para>Boot into emergency mode. This is equivalent
-        to <varname>systemd.unit=emergency.target</varname> or
-        <varname>rd.systemd.unit=emergency.target</varname>, respectively, and
-        provided for compatibility reasons and to be easier to type.</para>
+        <listitem><para>Boot into emergency mode. Those options are equivalent to
+        <varname>systemd.unit=emergency.target</varname> or
+        <varname>rd.systemd.unit=emergency.target</varname>, respectively. They were initially
+        provided for compatibility with SysV, but are retained as convenient shortcuts.</para>
 
         <xi:include href="version-info.xml" xpointer="v186"/></listitem>
       </varlistentry>
@@ -1008,29 +1080,24 @@
         <term><varname>rescue</varname></term>
         <term><varname>rd.rescue</varname></term>
         <term><varname>single</varname></term>
-        <term><varname>s</varname></term>
-        <term><varname>S</varname></term>
         <term><varname>1</varname></term>
 
-        <listitem><para>Boot into rescue mode. This is equivalent to
-        <varname>systemd.unit=rescue.target</varname> or
-        <varname>rd.systemd.unit=rescue.target</varname>, respectively, and
-        provided for compatibility reasons and to be easier to type.</para>
+        <listitem><para>Boot into rescue mode. Those options are equivalent to either
+        <varname>systemd.unit=rescue.target</varname> or <varname>rd.systemd.unit=rescue.target</varname>.
+        They were initially provided for compatibility with SysV, but are retained as convenient
+        shortcuts.</para>
 
         <xi:include href="version-info.xml" xpointer="v186"/></listitem>
       </varlistentry>
 
       <varlistentry>
-        <term><varname>2</varname></term>
         <term><varname>3</varname></term>
-        <term><varname>4</varname></term>
         <term><varname>5</varname></term>
 
-        <listitem><para>Boot into the specified legacy SysV runlevel.
-        <varname>2</varname>, <varname>3</varname>, and <varname>4</varname> are equivalent to
-        <varname>systemd.unit=multi-user.target</varname>; and <varname>5</varname> is equivalent to
-        <varname>systemd.unit=graphical.target</varname>, and provided for compatibility reasons and to be
-        easier to type.</para>
+        <listitem><para>Shortcuts to boot into specific targets: <varname>3</varname> is equivalent to
+        <varname>systemd.unit=multi-user.target</varname> and <varname>5</varname> is equivalent to
+        <varname>systemd.unit=graphical.target</varname>. Those options were initially provided for
+        compatibility with SysV, but are retained as convenient shortcuts.</para>
 
         <xi:include href="version-info.xml" xpointer="v186"/></listitem>
       </varlistentry>
@@ -1060,6 +1127,16 @@
         </para>
 
         <xi:include href="version-info.xml" xpointer="v186"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>systemd.minimum_uptime_sec=</varname></term>
+
+        <listitem><para>Takes a time in seconds. Specifies the minimum uptime of the system before the system
+        shuts down. For more information see the <varname>MinimumUptimeSec=</varname> setting described in
+        <citerefentry><refentrytitle>systemd-system.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v261"/></listitem>
       </varlistentry>
     </variablelist>
 

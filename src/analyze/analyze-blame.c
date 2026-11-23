@@ -16,7 +16,7 @@ int verb_blame(int argc, char *argv[], uintptr_t _data, void *userdata) {
         TableCell *cell;
         int n, r;
 
-        r = acquire_bus(&bus, NULL);
+        r = acquire_bus(&bus, /* use_full_bus= */ NULL);
         if (r < 0)
                 return bus_log_connect_error(r, arg_transport, arg_runtime_scope);
 
@@ -28,29 +28,21 @@ int verb_blame(int argc, char *argv[], uintptr_t _data, void *userdata) {
         if (!table)
                 return log_oom();
 
-        table_set_header(table, false);
+        assert_se(cell = table_get_cell(table, /* row= */ 0, /* column= */ 0));
+        (void) table_set_ellipsize_percent(table, cell, 100);
 
-        assert_se(cell = table_get_cell(table, 0, 0));
-        r = table_set_ellipsize_percent(table, cell, 100);
-        if (r < 0)
-                return r;
+        (void) table_set_align_percent(table, cell, 100);
 
-        r = table_set_align_percent(table, cell, 100);
-        if (r < 0)
-                return r;
-
-        assert_se(cell = table_get_cell(table, 0, 1));
-        r = table_set_ellipsize_percent(table, cell, 100);
-        if (r < 0)
-                return r;
+        assert_se(cell = table_get_cell(table, /* row= */ 0, 1));
+        (void) table_set_ellipsize_percent(table, cell, 100);
 
         r = table_set_sort(table, (size_t) 0);
         if (r < 0)
-                return r;
+                return table_log_sort_error(r);
 
-        r = table_set_reverse(table, 0, true);
+        r = table_set_reverse(table, /* column= */ 0, true);
         if (r < 0)
-                return r;
+                return table_log_sort_error(r);
 
         for (UnitTimes *u = times; u->has_data; u++) {
                 if (u->time <= 0)
@@ -63,11 +55,5 @@ int verb_blame(int argc, char *argv[], uintptr_t _data, void *userdata) {
                         return table_log_add_error(r);
         }
 
-        pager_open(arg_pager_flags);
-
-        r = table_print(table, NULL);
-        if (r < 0)
-                return r;
-
-        return 0;
+        return table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, /* show_header= */ false);
 }

@@ -5,8 +5,10 @@
 set -eux
 set -o pipefail
 
-SYSUPDATE=/lib/systemd/systemd-sysupdate
+SYSUPDATE=/usr/lib/systemd/systemd-sysupdate
 SYSUPDATED=/lib/systemd/systemd-sysupdated
+UPDATECTL=""
+VARLINK_SOCKET=/run/systemd/io.systemd.SysUpdate
 SECTOR_SIZES=(512 4096)
 WORKDIR="$(mktemp -d /var/tmp/test-72-XXXXXX)"
 CONFIGDIR="/run/sysupdate.d"
@@ -21,7 +23,9 @@ if [[ ! -x "$SYSUPDATE" ]]; then
     exit 77
 fi
 
-have_updatectl=$([[ -x "$SYSUPDATED" ]] && command -v updatectl)
+if [[ -x "$SYSUPDATED" ]]; then
+    UPDATECTL="$(command -v updatectl || true)"
+fi
 
 # Loopback devices may not be supported. They are used because sfdisk cannot
 # change the sector size of a file, and we want to test both 512 and 4096 byte
@@ -32,8 +36,8 @@ if [[ ! -e /dev/loop-control ]]; then
     SECTOR_SIZES=(512)
 fi
 
-# Set up sysupdated drop-in pointing at the correct definitions and setting
-# no verification of images.
+# Set up sysupdated and varlink drop-ins pointing at the correct definitions and
+# setting no verification of images.
 mkdir -p /run/systemd/system/systemd-sysupdated.service.d
 cat >/run/systemd/system/systemd-sysupdated.service.d/override.conf<<EOF
 [Service]
@@ -41,31 +45,84 @@ Environment=SYSTEMD_SYSUPDATE_NO_VERIFY=1
 Environment=SYSTEMD_ESP_PATH=${SYSTEMD_ESP_PATH}
 Environment=SYSTEMD_XBOOTLDR_PATH=${SYSTEMD_XBOOTLDR_PATH}
 EOF
+
+mkdir -p /run/systemd/system/systemd-sysupdate@.service.d
+cat >/run/systemd/system/systemd-sysupdate@.service.d/override.conf<<EOF
+[Service]
+Environment=SYSTEMD_SYSUPDATE_NO_VERIFY=1
+Environment=SYSTEMD_ESP_PATH=${SYSTEMD_ESP_PATH}
+Environment=SYSTEMD_XBOOTLDR_PATH=${SYSTEMD_XBOOTLDR_PATH}
+EOF
+
 systemctl daemon-reload
+
+SIGTEST_GPGHOME=
+SIGTEST_OTHERHOME=
+ZEROFILL_LOOP=
+ZEROFILL_MOUNT=
+RPTEST_GPGHOME=
 
 at_exit() {
     set +e
 
+    systemctl stop test-sysupdate-notify-recorder.socket
+    rm -f /run/systemd/system/test-sysupdate-notify-recorder.socket \
+          /run/systemd/system/test-sysupdate-notify-recorder@.service
+
+    systemctl stop test-sysupdate-provider-a.socket test-sysupdate-provider-b.socket
+    rm -f /run/systemd/system/test-sysupdate-provider-{a,b}.socket \
+          /run/systemd/system/test-sysupdate-provider-{a,b}@.service
+    systemctl stop test-sysupdate-provider-c.service
+    rm -rf /run/systemd/sysupdate/provider /tmp/test-sysupdate-provider-c /etc/sysupdate.bonly.d /run/sysupdate.bonly.component
+    systemctl stop test-sysupdate-resource-provider.socket test-sysupdate-provider-d.socket
+    rm -f /run/systemd/system/test-sysupdate-resource-provider.socket \
+          /run/systemd/system/test-sysupdate-resource-provider@.service \
+          /run/systemd/system/test-sysupdate-provider-d.socket \
+          /run/systemd/system/test-sysupdate-provider-d@.service
+    if [ "${RPTEST_GPGHOME:-}" != "" ]; then
+        gpgconf --homedir "$RPTEST_GPGHOME" --kill all 2>/dev/null
+    fi
+
     losetup -n --output NAME --associated "$BACKING_FILE" | while read -r loop_dev; do
         losetup --detach "$loop_dev"
     done
+
+    if [ "$SIGTEST_GPGHOME" != "" ]; then
+        gpgconf --homedir "$SIGTEST_GPGHOME" --kill all 2>/dev/null
+    fi
+    if [ "$SIGTEST_OTHERHOME" != "" ]; then
+        gpgconf --homedir "$SIGTEST_OTHERHOME" --kill all 2>/dev/null
+    fi
+    if [ "$ZEROFILL_MOUNT" != "" ]; then
+        umount "$ZEROFILL_MOUNT"
+    fi
+    if [ "$ZEROFILL_LOOP" != "" ]; then
+        losetup --detach "$ZEROFILL_LOOP"
+    fi
 
     rm -rf "$WORKDIR"
 }
 
 trap at_exit EXIT
 
+# Don't crash when no targets are defined
+if [[ -x "$UPDATECTL" ]]; then
+    (! "$UPDATECTL" update |& tee "$WORKDIR"/updatectl-update-no-targets)
+    grep "No targets found" "$WORKDIR"/updatectl-update-no-targets >/dev/null
+fi
+
 update_checksums() {
-    (cd "$WORKDIR/source" && rm -f BEST-BEFORE-* && sha256sum uki* part* dir-*.tar.gz >SHA256SUMS)
+    (cd "$WORKDIR/source" && rm -f BEST-BEFORE-* && sha256sum uki* part* dir-*.tar.gz linux* >SHA256SUMS)
 }
 
 update_checksums_with_best_before() {
-    (cd "$WORKDIR/source" && rm -f BEST-BEFORE-* && touch "BEST-BEFORE-$1" && sha256sum uki* part* dir-*.tar.gz "BEST-BEFORE-$1" >SHA256SUMS)
+    (cd "$WORKDIR/source" && rm -f BEST-BEFORE-* && touch "BEST-BEFORE-$1" && sha256sum uki* part* dir-*.tar.gz linux* "BEST-BEFORE-$1" >SHA256SUMS)
 }
 
 new_version() {
     local sector_size="${1:?}"
     local version="${2:?}"
+    local corrupt="${3:-}"
 
     # Create a pair of random partition payloads, and compress one.
     # To make not the initial bytes of part1-xxx.raw accidentally match one of the compression header,
@@ -74,6 +131,10 @@ new_version() {
     dd if=/dev/urandom of="$WORKDIR/source/part1-$version.raw" bs="$sector_size" count=2047 conv=notrunc oflag=append
     dd if=/dev/urandom of="$WORKDIR/source/part2-$version.raw" bs="$sector_size" count=2048
     gzip -k -f "$WORKDIR/source/part2-$version.raw"
+
+    # Create a file payload and a suffixed version
+    echo $RANDOM >"$WORKDIR/source/linux-$version.erofs"
+    echo $RANDOM >"$WORKDIR/source/linux-$version.erofs.caibx"
 
     # Create a random "UKI" payload
     echo $RANDOM >"$WORKDIR/source/uki-$version.efi"
@@ -90,11 +151,58 @@ new_version() {
     echo $RANDOM >"$WORKDIR/source/dir-$version/bar.txt"
     tar --numeric-owner -C "$WORKDIR/source/dir-$version/" -czf "$WORKDIR/source/dir-$version.tar.gz" .
 
-    update_checksums
+    if [[ "$corrupt" == "corrupt-checksum" ]]; then
+        # As requested, add a deliberately corrupt checksum for this file. This
+        # will get overwritten next time update_checksums() is called, but the
+        # integration test will probably have moved on to other things by then.
+        {
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  part1-$version.raw"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  part2-$version.raw"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  part2-$version.raw.gz"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  linux-$version.erofs"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  linux-$version.erofs.caibx"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  uki-$version.efi"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  uki-extra-$version.efi"
+            echo "abad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1deaabad1dea  dir-$version.tar.gz"
+        } >> "$WORKDIR/source/SHA256SUMS"
+    else
+        update_checksums
+    fi
+}
+
+check_no_new_update_available() {
+    local client="${1:?}"
+    local output
+
+    if [[ "$client" == "sysupdate-cli" ]]; then
+        (! "$SYSUPDATE" --verify=no check-new)
+        if output="$("$SYSUPDATE" --verify=no --json=short check-new)"; then
+            exit 1
+        fi
+        [[ "$output" == '{"available":null}' ]]
+    elif [[ "$client" == "varlink" ]]; then
+        (! varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.CheckNew '{"target":{"class":"host"}}') |& grep io.systemd.SysUpdate.NoUpdateNeeded >/dev/null
+    else
+        exit 1
+    fi
+}
+
+check_new_update_available() {
+    local client="${1:?}"
+
+    if [[ "$client" == "sysupdate-cli" ]]; then
+        "$SYSUPDATE" --verify=no check-new
+    elif [[ "$client" == "varlink" ]]; then
+        varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.CheckNew '{"target":{"class":"host"}}' | grep available
+    else
+        exit 1
+    fi
 }
 
 update_now() {
     local update_type="${1:?}"
+    local client="${2:?}"
+    local checks="${3:-}"
 
     # Update to newest version. First there should be an update ready, then we
     # do the update, and then there should not be any ready anymore
@@ -105,7 +213,10 @@ update_now() {
     # modes. Some updates in the test suite need to be monolithic (e.g. when
     # repairing an installation), so that can be overridden via the local.
 
-    "$SYSUPDATE" --verify=no check-new
+    if [[ "$checks" != "no-checks" ]]; then
+        check_new_update_available "$client"
+    fi
+
     if [[ "$update_type" == "monolithic" ]]; then
         "$SYSUPDATE" --verify=no update
     elif [[ "$update_type" == "split-offline" ]]; then
@@ -115,9 +226,9 @@ update_now() {
         "$SYSUPDATE" --verify=no acquire
         "$SYSUPDATE" --verify=no update
     elif [[ "$update_type" == "updatectl" ]]; then
-        if $have_updatectl; then
+        if [[ -x "$UPDATECTL" ]]; then
             systemctl start systemd-sysupdated
-            updatectl update
+            "$UPDATECTL" update
         else
             # Gracefully fall back to sysupdate
             "$SYSUPDATE" --verify=no update
@@ -125,7 +236,10 @@ update_now() {
     else
         exit 1
     fi
-    (! "$SYSUPDATE" --verify=no check-new)
+
+    if [[ "$checks" != "no-checks" ]]; then
+        check_no_new_update_available "$client"
+    fi
 }
 
 verify_version() {
@@ -150,6 +264,10 @@ verify_version() {
 
     # Check the extra efi
     cmp "$WORKDIR/source/uki-extra-$version.efi" "$WORKDIR/xbootldr/EFI/Linux/uki_$version.efi.extra.d/extra.addon.efi"
+
+    # Check the regular file and its suffixed version
+    cmp "$WORKDIR/source/linux-$version.erofs" "$WORKDIR/system/linux-$version.erofs"
+    cmp "$WORKDIR/source/linux-$version.erofs.caibx" "$WORKDIR/system/linux-$version.erofs.caibx"
 }
 
 verify_version_current() {
@@ -165,10 +283,14 @@ verify_version_current() {
 verify_object_fields() {
     local updatectl_output="${1:?}"
 
-    [[ "${updatectl_output}" != *"Unrecognized object field"* ]] || exit 1
+    [[ "${updatectl_output}" != *"Unexpected object field"* &&
+       "${updatectl_output}" != *"Missing object field"* &&
+       "${updatectl_output}" != *"Failed to dispatch JSON"* &&
+       "${updatectl_output}" != *"Failed to parse JSON"* ]]
 }
 
 for sector_size in "${SECTOR_SIZES[@]}"; do
+for client in sysupdate-cli varlink; do
 for update_type in monolithic split-offline split updatectl; do
     # Disk size of:
     # - 1MB for GPT
@@ -201,6 +323,10 @@ EOF
     done
 
     cat >"$CONFIGDIR/01-first.transfer" <<EOF
+[Transfer]
+AppStream=https://example.com/appstream/main.xml
+AppStream=https://example.com/appstream/second.xml
+
 [Source]
 Type=regular-file
 Path=$WORKDIR/source
@@ -214,6 +340,9 @@ MatchPartitionType=root-x86-64
 EOF
 
     cat >"$CONFIGDIR/02-second.transfer" <<EOF
+[Transfer]
+AppStream=https://example.com/appstream/main.xml
+
 [Source]
 Type=regular-file
 Path=$WORKDIR/source
@@ -241,6 +370,9 @@ InstancesMax=3
 EOF
 
     cat >"$CONFIGDIR/04-fourth.transfer" <<EOF
+[Transfer]
+AppStream=https://example.com/appstream/fourth.xml
+
 [Source]
 Type=regular-file
 Path=$WORKDIR/source
@@ -274,9 +406,59 @@ Mode=0444
 InstancesMax=2
 EOF
 
+    # Test with a transfer which contains one of the other transfers as a prefix
+    # of its files, to check pattern matching can distinguish the two.
+    cat >"$CONFIGDIR/06-sixth.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=linux-@v.erofs
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/system
+MatchPattern=linux-@v.erofs
+ReadOnly=yes
+InstancesMax=4
+EOF
+
+    cat >"$CONFIGDIR/07-seventh.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=linux-@v.erofs.caibx
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/system
+MatchPattern=linux-@v.erofs.caibx
+ReadOnly=yes
+InstancesMax=4
+EOF
+
     cat >"$CONFIGDIR/optional.feature" <<EOF
 [Feature]
 Description=Optional Feature
+Documentation=https://example.com/optional
+Documentation=https://example.com/optional-more
+AppStream=https://example.com/appstream/optional.appstream-%o.xml
+EOF
+
+    cat >"$CONFIGDIR/undocumented.feature" <<EOF
+[Feature]
+Description=Feature Without Documentation
+EOF
+
+    cat >"$CONFIGDIR/malformed.feature" <<EOF
+[Feature]
+Description=Feature With Invalid Suggest Condition
+SuggestOnFirmware=smbios-field(malformed)
+EOF
+
+    cat >"$CONFIGDIR/suggested.feature" <<EOF
+[Feature]
+Description=Suggested Feature
+Suggest=yes
 EOF
 
     cat >"$CONFIGDIR/99-optional.transfer" <<EOF
@@ -297,23 +479,23 @@ Mode=0444
 InstancesMax=2
 EOF
 
-    rm -rf "${WORKDIR:?}"/{esp,xbootldr,source}
-    mkdir -p "$WORKDIR"/{source,esp/EFI/Linux,xbootldr/EFI/Linux}
+    rm -rf "${WORKDIR:?}"/{esp,xbootldr,source,system}
+    mkdir -p "$WORKDIR"/{source,esp/EFI/Linux,xbootldr/EFI/Linux,system}
 
     # Install initial version and verify
     new_version "$sector_size" v1
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version_current "$blockdev" "$sector_size" v1 1
 
     # Create second version, update and verify that it is added
     new_version "$sector_size" v2
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version "$blockdev" "$sector_size" v1 1
     verify_version_current "$blockdev" "$sector_size" v2 2
 
     # Create third version, update and verify it replaced the first version
     new_version "$sector_size" v3
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version_current "$blockdev" "$sector_size" v3 1
     verify_version "$blockdev" "$sector_size" v2 2
     test ! -f "$WORKDIR/xbootldr/EFI/Linux/uki_v1+3-0.efi"
@@ -325,12 +507,12 @@ EOF
     new_version "$sector_size" v4
     rm "$WORKDIR/source/uki-extra-v4.efi"
     update_checksums
-    (! "$SYSUPDATE" --verify=no check-new)
+    check_no_new_update_available "$client"
 
     # Create a fifth version, that's complete on the server side. We should
     # completely skip the incomplete v4 and install v5 instead.
     new_version "$sector_size" v5
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version "$blockdev" "$sector_size" v3 1
     verify_version_current "$blockdev" "$sector_size" v5 2
 
@@ -340,19 +522,55 @@ EOF
     # Always do this as a monolithic update for the repair to work.
     rm -r "$WORKDIR/xbootldr/EFI/Linux/uki_v5.efi.extra.d"
     "$SYSUPDATE" --offline list v5 | grep "incomplete" >/dev/null
-    update_now "monolithic"
+    update_now "monolithic" "$client"
     "$SYSUPDATE" --offline list v5 | grep -v "incomplete" >/dev/null
     verify_version "$blockdev" "$sector_size" v3 1
     verify_version_current "$blockdev" "$sector_size" v5 2
 
     # Now let's try enabling an optional feature
-    "$SYSUPDATE" features | grep "optional"
-    "$SYSUPDATE" features optional | grep "99-optional"
+    if [[ "$client" == "sysupdate-cli" ]]; then
+        "$SYSUPDATE" features | grep "optional"
+        "$SYSUPDATE" features optional | grep "99-optional"
+    elif [[ "$client" == "varlink" ]]; then
+        [[ $(varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListFeatures '{"target":{"class":"host"}}' | jq -r '.features[] | select(.id=="optional") | .description') == "Optional Feature" ]]
+        varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListFeatures '{"target":{"class":"host"}}' | jq -r '.features[] | select(.id=="optional") | .transfers' | grep "99-optional"
+        os_release_id="$(. /etc/os-release; echo "$ID")"
+        [[ $(varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListFeatures '{"target":{"class":"host"}}' | jq -rc '.features[] | select(.id=="optional") | .appStream') == "[\"https://example.com/appstream/optional.appstream-${os_release_id}.xml\"]" ]]
+    else
+        exit 1
+    fi
+
+    feature_json="$("$SYSUPDATE" --json=short features optional)"
+    jq -e '.id == "optional"' <<<"$feature_json" >/dev/null
+    jq -e '
+        .documentation == [
+            "https://example.com/optional",
+            "https://example.com/optional-more"
+        ]
+    ' <<<"$feature_json" >/dev/null
+    jq -e '.enabled == false' <<<"$feature_json" >/dev/null
+    jq -e '.suggested == false' <<<"$feature_json" >/dev/null
+    os_release_id="$(. /etc/os-release; echo "$ID")"
+    jq -e ".appStream == [\"https://example.com/appstream/optional.appstream-${os_release_id}.xml\"]" <<<"$feature_json" >/dev/null
+
+    suggested_json="$("$SYSUPDATE" --json=short features suggested)"
+    jq -e '.id == "suggested" and .suggested == true' <<<"$suggested_json" >/dev/null
+
+    undocumented_json="$("$SYSUPDATE" --json=short features undocumented)"
+    jq -e '.id == "undocumented" and (.documentation == null)' <<<"$undocumented_json" >/dev/null
+    "$SYSUPDATE" features undocumented | grep -F "Feature Without Documentation" >/dev/null
+
+    malformed_json="$("$SYSUPDATE" --json=short features malformed)"
+    jq -e '.id == "malformed" and (has("suggested") | not)' <<<"$malformed_json" >/dev/null
+    "$SYSUPDATE" features malformed | grep -F "error (Invalid argument)" >/dev/null
+    all_features_output="$("$SYSUPDATE" features)"
+    grep -F "malformed" <<<"$all_features_output" >/dev/null
+
     test ! -f "$WORKDIR/xbootldr/EFI/Linux/uki_v5.efi.extra.d/optional.efi"
     mkdir "$CONFIGDIR/optional.feature.d"
     echo -e "[Feature]\nEnabled=true" > "$CONFIGDIR/optional.feature.d/enable.conf"
     "$SYSUPDATE" --offline list v5 | grep "incomplete" >/dev/null
-    update_now "monolithic"
+    update_now "$update_type" "$client"
     "$SYSUPDATE" --offline list v5 | grep -v "incomplete" >/dev/null
     verify_version "$blockdev" "$sector_size" v3 1
     verify_version_current "$blockdev" "$sector_size" v5 2
@@ -360,7 +578,7 @@ EOF
 
     # And now let's disable it and make sure it gets cleaned up
     rm -r "$CONFIGDIR/optional.feature.d"
-    (! "$SYSUPDATE" --verify=no check-new)
+    check_no_new_update_available "$client"
     "$SYSUPDATE" vacuum
     "$SYSUPDATE" --offline list v5 | grep -v "incomplete" >/dev/null
     verify_version "$blockdev" "$sector_size" v3 1
@@ -370,17 +588,19 @@ EOF
     # Create sixth version, update using updatectl and verify it replaced the
     # correct version
     new_version "$sector_size" v6
-    if $have_updatectl; then
+    if [[ -x "$UPDATECTL" ]]; then
         systemctl start systemd-sysupdated
-        "$SYSUPDATE" --verify=no check-new
-        updatectl update
+        check_new_update_available "$client"
+        "$UPDATECTL" update |& tee "$WORKDIR"/updatectl-update-6
+        grep "Done" "$WORKDIR"/updatectl-update-6
+        (! grep "Already up-to-date" "$WORKDIR"/updatectl-update-6)
     else
         # If no updatectl, gracefully fall back to systemd-sysupdate
-        update_now "$update_type"
+        update_now "$update_type" "$client"
     fi
     # User-facing updatectl returns 0 if there's no updates, so use the low-level
     # utility to make sure we did upgrade
-    (! "$SYSUPDATE" --verify=no check-new )
+    check_no_new_update_available "$client"
     verify_version_current "$blockdev" "$sector_size" v6 1
     verify_version "$blockdev" "$sector_size" v5 2
 
@@ -388,13 +608,30 @@ EOF
     # testing for specific output, but this will at least catch obvious crashes
     # and allow updatectl to run under the various sanitizers. We create a
     # component so that updatectl has multiple targets to list.
-    if $have_updatectl; then
+    if [[ -x "$UPDATECTL" ]]; then
         mkdir -p /run/sysupdate.test.d/
         cp "$CONFIGDIR/01-first.transfer" /run/sysupdate.test.d/01-first.transfer
-        verify_object_fields "$(updatectl list 2>&1)"
-        verify_object_fields "$(updatectl list host 2>&1)"
-        verify_object_fields "$(updatectl list host@v6 2>&1)"
-        updatectl check
+        updatectl_output="$("$UPDATECTL" list 2>&1)"
+        verify_object_fields "$updatectl_output"
+        updatectl_output="$("$UPDATECTL" list host 2>&1)"
+        verify_object_fields "$updatectl_output"
+        updatectl_output="$("$UPDATECTL" list host@v6 2>&1)"
+        verify_object_fields "$updatectl_output"
+        features_output="$("$UPDATECTL" features)"
+        grep "optional" <<<"$features_output" >/dev/null
+        grep "undocumented" <<<"$features_output" >/dev/null
+        feature_output="$("$UPDATECTL" features optional)"
+        grep "Optional Feature" <<<"$feature_output" >/dev/null
+        grep "Suggested: no" <<<"$feature_output" >/dev/null
+        grep "https://example.com/optional-more" <<<"$feature_output" >/dev/null
+        os_release_id="$(. /etc/os-release; echo "$ID")"
+        grep "https://example.com/appstream/optional.appstream-${os_release_id}.xml" <<<"$feature_output" >/dev/null
+        grep -F "99-optional" <<<"$feature_output" >/dev/null
+        grep "malformed" <<<"$features_output" >/dev/null
+        verify_object_fields "$features_output"
+        malformed_feature_output="$("$UPDATECTL" features malformed)"
+        (! grep -F "Suggested:" <<<"$malformed_feature_output")
+        "$UPDATECTL" check
         rm -r /run/sysupdate.test.d
     fi
 
@@ -407,6 +644,9 @@ EOF
     new_version "$sector_size" v7
 
     cat >"$CONFIGDIR/02-second.transfer" <<EOF
+[Transfer]
+AppStream=https://example.com/appstream/main.xml
+
 [Source]
 Type=url-file
 Path=file://$WORKDIR/source
@@ -433,7 +673,7 @@ MatchPattern=dir-@v
 InstancesMax=3
 EOF
 
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version "$blockdev" "$sector_size" v6 1
     verify_version_current "$blockdev" "$sector_size" v7 2
 
@@ -456,14 +696,2765 @@ EOF
     # (what .transfer files were called before v257)
     for i in "$CONFIGDIR/"*.conf; do echo mv "$i" "${i%.conf}.transfer"; done
     new_version "$sector_size" v8
-    update_now "$update_type"
+    update_now "$update_type" "$client"
     verify_version_current "$blockdev" "$sector_size" v8 1
     verify_version "$blockdev" "$sector_size" v7 2
+
+    # Create a 9th version but corrupt the checksum in SHA256SUMS so pulling it
+    # fails when verifying the checksum, in order to create a current+partial
+    # state. Try to update again and verify that this results in an error.
+    # Vacuum the partial version, regenerate it on the server, try updating
+    # again and it should succeed.
+    new_version "$sector_size" v9 "corrupt-checksum"
+    (! update_now "$update_type" "$client")
+    "$SYSUPDATE" --offline list v9 | grep "partial" >/dev/null
+    verify_version_current "$blockdev" "$sector_size" v8 1
+    # don’t verify the other part of the block device as it’s in an indeterminate state
+    (! update_now "$update_type" "$client" "no-checks") |& tee "$WORKDIR"/update_now-9
+    cat "$WORKDIR"/update_now-9
+    grep "is already acquired and partially installed. Vacuum it to try installing again." "$WORKDIR"/update_now-9
+    "$SYSUPDATE" --offline vacuum |& grep "Removing old partial" >/dev/null
+    verify_version_current "$blockdev" "$sector_size" v8 1
+    # don’t verify the other part of the block device as it’s in an indeterminate state
+    "$SYSUPDATE" --verify=no list v9 | grep "candidate" >/dev/null
+    new_version "$sector_size" v9
+    update_now "$update_type" "$client"
+    verify_version "$blockdev" "$sector_size" v8 1
+    verify_version_current "$blockdev" "$sector_size" v9 2
+
+    # Test that checking for an update on a non-existent target fails
+    # (for backwards compatibility reasons, the validation in sysupdate-cli is
+    # less strict)
+    if [[ "$client" == "sysupdate-cli" ]]; then
+        (! "$SYSUPDATE" --verify=no check-new --component=../) |& grep "Component name invalid" >/dev/null
+    elif [[ "$client" == "varlink" ]]; then
+        (! varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.CheckNew '{"target":{"class":"component","name":"../"}}') |& grep org.varlink.service.InvalidParameter >/dev/null
+        (! varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.CheckNew '{"target":{"class":"component","name":"doesnotexist"}}') |& grep io.systemd.SysUpdate.NoSuchTarget >/dev/null
+    else
+        exit 1
+    fi
+
+    # Check that the target versions are listed correctly.
+    [[ $("$SYSUPDATE" --verify=no --json=short list | jq -cr '.all') == '["v9","v8","v7","v6","v5","v3","v2","v1"]' ]]
+    [[ $("$SYSUPDATE" --verify=no --offline --json=short list | jq -cr '.all') == '["v9","v8","v7","v6"]' ]]
+    [[ $("$SYSUPDATE" --verify=no --offline --json=short list | jq -cr '.current') == 'v9' ]]
+    [[ $("$SYSUPDATE" --verify=no --offline --json=short list | jq -cr '.appStream') == '["https://example.com/appstream/main.xml","https://example.com/appstream/second.xml","https://example.com/appstream/fourth.xml"]' ]]
+    host="$(varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -c '.targets[] | select(.id.class=="host")')"
+    [[ $(jq -cr '.allVersions' <<<"$host") == '["v9","v8","v7","v6"]' ]]
+    [[ $(jq -cr '.currentVersion' <<<"$host") == 'v9' ]]
+    [[ $(jq -cr '.appStream' <<<"$host") == '["https://example.com/appstream/main.xml","https://example.com/appstream/second.xml","https://example.com/appstream/fourth.xml"]' ]]
 
     # Cleanup
     [[ -b "$blockdev" ]] && losetup --detach "$blockdev"
     rm "$BACKING_FILE"
 done
 done
+done
+
+# Regression test for https://github.com/systemd/systemd/issues/41501 — check
+# that a ‘default’ component is only listed by sysupdate if it’s fully configured
+mv "$CONFIGDIR" "$CONFIGDIR.backup"
+mkdir -p /run/sysupdate.some-component.d
+cat >/run/sysupdate.some-component.component <<EOF
+[Component]
+Documentation=https://example.com/some-component
+Documentation=https://example.com/some-component-more
+EOF
+tee /run/sysupdate.some-component.d/portable.transfer << EOF
+[Transfer]
+ChangeLog=https://example.com/changelog/@v
+Verify=no
+
+[Source]
+Type=url-tar
+Path=https://example.com/does-not-matter/@v.tar.xz
+MatchPattern=some-component_@v-portable.tar.xz
+
+[Target]
+Type=directory
+Path=/var/lib/portables
+MatchPattern=some-component_@v
+CurrentSymlink=some-component
+EOF
+"$SYSUPDATE" --json=short components | jq -e '.default == false and .components == ["some-component"]' >/dev/null
+component_output="$("$SYSUPDATE" components)"
+grep -F "https://example.com/some-component" <<<"$component_output" >/dev/null
+grep -F "https://example.com/some-component-more" <<<"$component_output" >/dev/null
+varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -e '.targets | all(.id.class != "host")' >/dev/null
+mkdir /run/sysupdate.d
+"$SYSUPDATE" --json=short components | jq -e '.default == false and .components == ["some-component"]' >/dev/null
+varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -e '.targets | all(.id.class != "host")' >/dev/null
+[[ $(varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -r '.targets[0].id.name') == "some-component" ]]
+
+# Regression test for https://github.com/systemd/systemd/issues/42330 — the
+# 'pending'/'reboot' verbs and the '--reboot' switch compare the newest installed
+# version against the booted OS version (IMAGE_VERSION= from os-release), which is
+# unrelated to component versions. Selecting a component must therefore be refused
+# rather than silently performing a bogus comparison.
+(! "$SYSUPDATE" --component=some-component pending) |& grep -F 'may not be combined' >/dev/null
+(! "$SYSUPDATE" --component=some-component reboot) |& grep -F 'may not be combined' >/dev/null
+(! "$SYSUPDATE" --component=some-component update --reboot) |& grep -F 'may not be combined' >/dev/null
+
+# Clean up regression test
+rmdir /run/sysupdate.d
+rm -rf /run/sysupdate.some-component.d
+rm -f /run/sysupdate.some-component.component
+mv "$CONFIGDIR.backup" "$CONFIGDIR"
+
+# Test --loop=: the first transfer installs a second transfer file into the definitions directory, which in
+# turn installs the payload. Hence it takes two update iterations to install everything, and a third one to
+# notice that nothing is left to do.
+LOOPDIR="$WORKDIR/loop"
+loop_reset() {
+    rm -rf "$LOOPDIR"
+    mkdir -p "$LOOPDIR/definitions" "$LOOPDIR/source" "$LOOPDIR/target"
+    cat >"$LOOPDIR/source/payload-1.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$LOOPDIR/source
+MatchPattern=payload-@v.bin
+
+[Target]
+Type=regular-file
+Path=$LOOPDIR/target
+MatchPattern=payload-@v.bin
+EOF
+    echo "payload" >"$LOOPDIR/source/payload-1.bin"
+    cat >"$LOOPDIR/definitions/01-definitions.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$LOOPDIR/source
+MatchPattern=payload-@v.transfer
+
+[Target]
+Type=regular-file
+Path=$LOOPDIR/definitions
+MatchPattern=02-payload-@v.transfer
+EOF
+}
+
+loop_reset
+(! "$SYSUPDATE" --definitions="$LOOPDIR/definitions" --verify=no --loop=0 update) |& grep -F 'must be greater than zero' >/dev/null
+(! "$SYSUPDATE" --definitions="$LOOPDIR/definitions" --verify=no --loop=2 acquire) |& grep -F 'not supported' >/dev/null
+
+# Without --loop= only a single iteration is done, which only installs the second transfer file
+"$SYSUPDATE" --definitions="$LOOPDIR/definitions" --verify=no update
+cmp "$LOOPDIR/source/payload-1.transfer" "$LOOPDIR/definitions/02-payload-1.transfer"
+test ! -e "$LOOPDIR/target/payload-1.bin"
+# … and the next invocation picks up the new transfer file
+"$SYSUPDATE" --definitions="$LOOPDIR/definitions" --verify=no update
+cmp "$LOOPDIR/source/payload-1.bin" "$LOOPDIR/target/payload-1.bin"
+
+# With --loop= everything is installed in one go, and we stop once nothing is left to do
+loop_reset
+"$SYSUPDATE" --definitions="$LOOPDIR/definitions" --verify=no --loop=16 update |& tee "$LOOPDIR/log"
+cmp "$LOOPDIR/source/payload-1.transfer" "$LOOPDIR/definitions/02-payload-1.transfer"
+cmp "$LOOPDIR/source/payload-1.bin" "$LOOPDIR/target/payload-1.bin"
+grep -F 'stable state reached after 3 iterations' "$LOOPDIR/log" >/dev/null
+(! grep -F 'Starting update iteration 4 ' "$LOOPDIR/log" >/dev/null)
+
+# If the iteration limit is hit while updates are still being installed, this is not a failure
+loop_reset
+"$SYSUPDATE" --definitions="$LOOPDIR/definitions" --verify=no --loop=2 update |& tee "$LOOPDIR/log"
+cmp "$LOOPDIR/source/payload-1.bin" "$LOOPDIR/target/payload-1.bin"
+grep -F 'Maximum number of update iterations (2) reached' "$LOOPDIR/log" >/dev/null
+
+rm -rf "$LOOPDIR"
+
+# Test SuccessAction= and FailureAction= in *.component files: two components, the first one is configured
+# to restart the update iteration once it has been updated successfully.
+ACTIONDIR="$WORKDIR/component-actions"
+action_reset() {
+    rm -rf "$ACTIONDIR" /run/sysupdate.act-a.d /run/sysupdate.act-b.d \
+        /run/sysupdate.act-a.component /run/sysupdate.act-b.component \
+        /var/lib/systemd/sysupdate/installdb.act-a /var/lib/systemd/sysupdate/installdb.act-b
+    mkdir -p "$ACTIONDIR/source" /run/sysupdate.act-a.d /run/sysupdate.act-b.d
+
+    for c in a b; do
+        mkdir -p "$ACTIONDIR/target-$c"
+        echo "$c" >"$ACTIONDIR/source/act-$c-1.bin"
+        cat >"/run/sysupdate.act-$c.d/01-act-$c.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$ACTIONDIR/source
+MatchPattern=act-$c-@v.bin
+
+[Target]
+Type=regular-file
+Path=$ACTIONDIR/target-$c
+MatchPattern=act-$c-@v.bin
+EOF
+    done
+}
+
+# Move the default component's definitions out of the way, we only want to update our two components
+mv "$CONFIGDIR" "$CONFIGDIR.backup"
+
+# By default we continue with the next component, hence a single iteration updates both
+action_reset
+"$SYSUPDATE" --component-all --verify=no update
+cmp "$ACTIONDIR/source/act-a-1.bin" "$ACTIONDIR/target-a/act-a-1.bin"
+cmp "$ACTIONDIR/source/act-b-1.bin" "$ACTIONDIR/target-b/act-b-1.bin"
+
+# With SuccessAction=restart the iteration is finished after the first component got updated
+action_reset
+printf '[Component]\nSuccessAction=restart\n' >/run/sysupdate.act-a.component
+"$SYSUPDATE" --component-all --verify=no update |& tee "$ACTIONDIR/log"
+cmp "$ACTIONDIR/source/act-a-1.bin" "$ACTIONDIR/target-a/act-a-1.bin"
+test ! -e "$ACTIONDIR/target-b/act-b-1.bin"
+grep -F "Component 'act-a' updated successfully, finishing update iteration early." "$ACTIONDIR/log" >/dev/null
+# … and the next invocation picks up the second component
+"$SYSUPDATE" --component-all --verify=no update
+cmp "$ACTIONDIR/source/act-b-1.bin" "$ACTIONDIR/target-b/act-b-1.bin"
+
+# With --loop= the restart happens within a single invocation
+action_reset
+printf '[Component]\nSuccessAction=restart\n' >/run/sysupdate.act-a.component
+"$SYSUPDATE" --component-all --verify=no --loop=16 update |& tee "$ACTIONDIR/log"
+cmp "$ACTIONDIR/source/act-a-1.bin" "$ACTIONDIR/target-a/act-a-1.bin"
+cmp "$ACTIONDIR/source/act-b-1.bin" "$ACTIONDIR/target-b/act-b-1.bin"
+grep -F 'stable state reached after 3 iterations' "$ACTIONDIR/log" >/dev/null
+
+# Test FailureAction=: let updating the first component fail, by pointing its source to a non-directory.
+# By default we continue with the next component (and further iterations), but fail at the very end.
+action_reset
+sed -i "s|^Path=$ACTIONDIR/source\$|Path=/dev/null|" /run/sysupdate.act-a.d/01-act-a.transfer
+(! "$SYSUPDATE" --component-all --verify=no --loop=16 update) |& tee "$ACTIONDIR/log"
+cmp "$ACTIONDIR/source/act-b-1.bin" "$ACTIONDIR/target-b/act-b-1.bin"
+grep -F "Failed to update component 'act-a', continuing with next component" "$ACTIONDIR/log" >/dev/null
+grep -F 'stable state reached after 2 iterations' "$ACTIONDIR/log" >/dev/null
+
+# With FailureAction=fail we fail immediately, and do not update the second component
+action_reset
+sed -i "s|^Path=$ACTIONDIR/source\$|Path=/dev/null|" /run/sysupdate.act-a.d/01-act-a.transfer
+printf '[Component]\nFailureAction=fail\n' >/run/sysupdate.act-a.component
+(! "$SYSUPDATE" --component-all --verify=no --loop=16 update) |& tee "$ACTIONDIR/log"
+test ! -e "$ACTIONDIR/target-b/act-b-1.bin"
+grep -F "Failed to update component 'act-a', aborting" "$ACTIONDIR/log" >/dev/null
+
+rm -rf "$ACTIONDIR" /run/sysupdate.act-a.d /run/sysupdate.act-b.d \
+    /run/sysupdate.act-a.component /run/sysupdate.act-b.component \
+    /var/lib/systemd/sysupdate/installdb.act-a /var/lib/systemd/sysupdate/installdb.act-b
+mv "$CONFIGDIR.backup" "$CONFIGDIR"
+
+# Make sure the processing of compressed streams still handles uncompressed streams shorter than
+# COMPRESSION_MAGIC_BYTES_MAX correctly.
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs"
+printf 'xx' >"$WORKDIR/source/tiny-v1.bin"
+(cd "$WORKDIR/source" && sha256sum tiny-v1.bin >SHA256SUMS)
+cat >"$CONFIGDIR/01-tiny-url.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=tiny-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=tiny-@v.bin
+InstancesMax=1
+EOF
+
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/tiny-v1.bin" "$WORKDIR/blobs/tiny-v1.bin"
+
+# Test that listing features when none are configured gives an empty list.
+"$SYSUPDATE" features |& grep "No features." >/dev/null
+[[ $(varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListFeatures '{"target":{"class":"host"}}' | jq -r '.features') == "[]" ]]
+
+# Test that definitions found through --root= are not prefixed twice.
+rm -rf "$WORKDIR/root-definitions"
+mkdir -p "$WORKDIR/root-definitions/etc/sysupdate.d" \
+         "$WORKDIR/root-definitions/etc" \
+         "$WORKDIR/root-definitions/source" \
+         "$WORKDIR/root-definitions/target"
+printf '%s\n' 'ID=repro' 'VERSION_ID=1' >"$WORKDIR/root-definitions/etc/os-release"
+cat >"$WORKDIR/root-definitions/etc/sysupdate.d/rootfeat.feature" <<EOF
+[Feature]
+Description=Root Feature
+EOF
+cat >"$WORKDIR/root-definitions/etc/sysupdate.d/01-root.transfer" <<EOF
+[Transfer]
+
+[Source]
+Type=regular-file
+Path=/source
+MatchPattern=root-@v.bin
+
+[Target]
+Type=regular-file
+Path=/target
+MatchPattern=root-@v.bin
+InstancesMax=2
+EOF
+"$SYSUPDATE" \
+    --root="$WORKDIR/root-definitions" \
+    --verify=no \
+    --offline \
+    features rootfeat \
+    | grep -F "Root Feature" >/dev/null
+rm -rf "$WORKDIR/root-definitions"
+
+# Cleanup
+rm "$CONFIGDIR/01-tiny-url.transfer"
+rm "$WORKDIR/source/tiny-v1.bin"
+rm "$WORKDIR/source/SHA256SUMS"
+
+# ManifestPath= allows serving the manifest from a different location than the payload files, which are
+# still acquired relative to Path=
+MP="$WORKDIR/manifest-path"
+rm -rf "$MP"
+mkdir -p "$MP/definitions" "$MP/bad-definitions" "$MP/payload" "$MP/manifests" "$MP/target"
+head -c 1000 /dev/urandom >"$MP/payload/mp-v1.bin"
+(cd "$MP/payload" && sha256sum mp-v1.bin >"$MP/manifests/SHA256SUMS")
+cat >"$MP/definitions/01-mp.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$MP/payload
+ManifestFormat=sha256sums
+ManifestPath=file://$MP/manifests/SHA256SUMS
+MatchPattern=mp-@v.bin
+
+[Target]
+Type=regular-file
+Path=$MP/target
+MatchPattern=mp-@v.bin
+InstancesMax=2
+EOF
+"$SYSUPDATE" --definitions="$MP/definitions" --verify=no update
+cmp "$MP/payload/mp-v1.bin" "$MP/target/mp-v1.bin"
+# Without ManifestPath= (or with it reset to empty) the manifest is looked for next to the payload, where
+# there is none
+sed 's|^ManifestPath=.*|&\nManifestPath=|' "$MP/definitions/01-mp.transfer" >"$MP/bad-definitions/01-mp.transfer"
+(! "$SYSUPDATE" --definitions="$MP/bad-definitions" --verify=no list)
+# Only SHA256SUMS and UAPI.16 manifests are supported
+sed 's|^ManifestFormat=.*|ManifestFormat=mtree|' "$MP/definitions/01-mp.transfer" >"$MP/bad-definitions/01-mp.transfer"
+(! "$SYSUPDATE" --definitions="$MP/bad-definitions" --verify=no list) |& grep -F "Manifest format 'mtree' not supported" >/dev/null
+# ManifestPath= must be a URL, and is only supported for URL sources
+sed 's|^ManifestPath=.*|ManifestPath=/foo/SHA256SUMS|' "$MP/definitions/01-mp.transfer" >"$MP/bad-definitions/01-mp.transfer"
+(! "$SYSUPDATE" --definitions="$MP/bad-definitions" --verify=no list) |& grep -F "Manifest path is not a valid" >/dev/null
+sed -e 's|^Type=url-file|Type=regular-file|' -e "s|^Path=file://|Path=|" "$MP/definitions/01-mp.transfer" >"$MP/bad-definitions/01-mp.transfer"
+(! "$SYSUPDATE" --definitions="$MP/bad-definitions" --verify=no list) |& grep -F "ManifestPath= is only supported for URL sources" >/dev/null
+rm -rf "$MP"
+
+# Check that the sources listed in the "contents" arrays of a UAPI.16 manifest are honoured: "file"
+# entries are fetched relative to Path= (not relative to ManifestPath=), "url" entries from the specified
+# URL, "literal" and "url" entries may carry the file embedded in more data (at "offset"), and alternative
+# sources are tried in order. Entries without "file", "url" and "literal" refer to a file of the object's
+# name relative to Path=, and an empty "literal" makes an empty file. Files without "contents" are
+# acquired by name, as they are, i.e. without decompression.
+rm -rf "$WORKDIR/uapi16"
+mkdir -p "$WORKDIR/uapi16/payload/blobs" "$WORKDIR/uapi16/manifest/blobs" "$WORKDIR/uapi16/remote" "$WORKDIR/uapi16/target"
+head -c 3000 /dev/urandom >"$WORKDIR/uapi16/alt-v1.bin"
+cp "$WORKDIR/uapi16/alt-v1.bin" "$WORKDIR/uapi16/payload/blobs/alt-v1.bin"
+# A decoy next to the manifest, which must not be used, as "file" entries are not relative to ManifestPath=
+head -c 3000 /dev/urandom >"$WORKDIR/uapi16/manifest/blobs/alt-v1.bin"
+head -c 2000 /dev/urandom >"$WORKDIR/uapi16/implied-v1.bin"
+cp "$WORKDIR/uapi16/implied-v1.bin" "$WORKDIR/uapi16/payload/implied-v1.bin"
+: >"$WORKDIR/uapi16/empty-v1.bin"
+head -c 5000 /dev/urandom >"$WORKDIR/uapi16/remote-v1.bin"
+gzip -k -f "$WORKDIR/uapi16/remote-v1.bin"
+mv "$WORKDIR/uapi16/remote-v1.bin.gz" "$WORKDIR/uapi16/remote/"
+printf 'inline payload\n' >"$WORKDIR/uapi16/inline-v1.bin"
+{ printf 'garbage'; cat "$WORKDIR/uapi16/inline-v1.bin"; printf 'trailing garbage'; } >"$WORKDIR/uapi16/inline-v1.literal"
+head -c 4000 /dev/urandom | gzip >"$WORKDIR/uapi16/plain-v1.bin"
+cp "$WORKDIR/uapi16/plain-v1.bin" "$WORKDIR/uapi16/payload/plain-v1.bin"
+# A disk image like source, which carries the file at an offset, followed by more data
+head -c 6000 /dev/urandom >"$WORKDIR/uapi16/slice-v1.bin"
+cp "$WORKDIR/uapi16/slice-v1.bin" "$WORKDIR/uapi16/rawslice-v1.bin"
+{ head -c 1000 /dev/urandom; cat "$WORKDIR/uapi16/slice-v1.bin"; head -c 2000 /dev/urandom; } >"$WORKDIR/uapi16/remote/disk.raw"
+gzip -k -f "$WORKDIR/uapi16/remote/disk.raw"
+sha256_of() { sha256sum "$1" | cut -d' ' -f1; }
+{
+    printf '\036{"mediaType":"application/vnd.uapi.16.manifest"}\n'
+    # The first source does not exist, the second one is found relative to Path=
+    printf '\036{"name":"alt-v1.bin","size":%s,"sha256":"%s","contents":[{"file":"blobs/missing-v1.bin"},{"file":"blobs/alt-v1.bin"}]}\n' \
+        "$(stat -c %s "$WORKDIR/uapi16/alt-v1.bin")" "$(sha256_of "$WORKDIR/uapi16/alt-v1.bin")"
+    # The source refers to the file of the object's name relative to Path= implicitly
+    printf '\036{"name":"implied-v1.bin","size":%s,"sha256":"%s","contents":[{}]}\n' \
+        "$(stat -c %s "$WORKDIR/uapi16/implied-v1.bin")" "$(sha256_of "$WORKDIR/uapi16/implied-v1.bin")"
+    # An empty file carried inline
+    printf '\036{"name":"empty-v1.bin","size":0,"sha256":"%s","contents":[{"literal":""}]}\n' \
+        "$(sha256_of "$WORKDIR/uapi16/empty-v1.bin")"
+    printf '\036{"name":"remote-v1.bin","size":%s,"sha256":"%s","contents":[{"url":"file://%s/uapi16/remote/remote-v1.bin.gz","encoding":"gzip","encodedSize":%s,"encodedSha256":"%s","originalSize":%s,"originalSha256":"%s"}]}\n' \
+        "$(stat -c %s "$WORKDIR/uapi16/remote-v1.bin")" "$(sha256_of "$WORKDIR/uapi16/remote-v1.bin")" "$WORKDIR" \
+        "$(stat -c %s "$WORKDIR/uapi16/remote/remote-v1.bin.gz")" "$(sha256_of "$WORKDIR/uapi16/remote/remote-v1.bin.gz")" \
+        "$(stat -c %s "$WORKDIR/uapi16/remote-v1.bin")" "$(sha256_of "$WORKDIR/uapi16/remote-v1.bin")"
+    # The file sits at an offset inside the inline data
+    printf '\036{"name":"inline-v1.bin","size":%s,"sha256":"%s","contents":[{"literal":"%s","offset":7,"originalSize":%s,"originalSha256":"%s"}]}\n' \
+        "$(stat -c %s "$WORKDIR/uapi16/inline-v1.bin")" "$(sha256_of "$WORKDIR/uapi16/inline-v1.bin")" "$(base64 -w0 "$WORKDIR/uapi16/inline-v1.literal")" \
+        "$(stat -c %s "$WORKDIR/uapi16/inline-v1.literal")" "$(sha256_of "$WORKDIR/uapi16/inline-v1.literal")"
+    # No sources listed: acquired by name relative to Path=, and must not be decompressed even though it is
+    # gzip data, as the digest covers the file as it is
+    printf '\036{"name":"plain-v1.bin","size":%s,"sha256":"%s"}\n' \
+        "$(stat -c %s "$WORKDIR/uapi16/plain-v1.bin")" "$(sha256_of "$WORKDIR/uapi16/plain-v1.bin")"
+    # The file is a range of the decoded data of a source that is verified as a whole
+    printf '\036{"name":"slice-v1.bin","size":%s,"sha256":"%s","contents":[{"url":"file://%s/uapi16/remote/disk.raw.gz","encoding":"gzip","encodedSha256":"%s","originalSize":%s,"offset":1000}]}\n' \
+        "$(stat -c %s "$WORKDIR/uapi16/slice-v1.bin")" "$(sha256_of "$WORKDIR/uapi16/slice-v1.bin")" "$WORKDIR" \
+        "$(sha256_of "$WORKDIR/uapi16/remote/disk.raw.gz")" "$(stat -c %s "$WORKDIR/uapi16/remote/disk.raw")"
+    # The same, but without a digest of the source, hence only verified against the file's digest
+    printf '\036{"name":"rawslice-v1.bin","size":%s,"sha256":"%s","contents":[{"url":"file://%s/uapi16/remote/disk.raw","originalSize":%s,"offset":1000}]}\n' \
+        "$(stat -c %s "$WORKDIR/uapi16/slice-v1.bin")" "$(sha256_of "$WORKDIR/uapi16/slice-v1.bin")" "$WORKDIR" \
+        "$(stat -c %s "$WORKDIR/uapi16/remote/disk.raw")"
+    # The source matches its digest, but the range at the offset is not the file
+    printf '\036{"name":"badslice-v1.bin","size":%s,"sha256":"%s","contents":[{"url":"file://%s/uapi16/remote/disk.raw.gz","encoding":"gzip","encodedSha256":"%s","originalSize":%s,"offset":999}]}\n' \
+        "$(stat -c %s "$WORKDIR/uapi16/slice-v1.bin")" "$(sha256_of "$WORKDIR/uapi16/slice-v1.bin")" "$WORKDIR" \
+        "$(sha256_of "$WORKDIR/uapi16/remote/disk.raw.gz")" "$(stat -c %s "$WORKDIR/uapi16/remote/disk.raw")"
+    # The encoded data matches its digest, but does not decode to the file
+    printf '\036{"name":"bad-v1.bin","size":%s,"sha256":"%s","contents":[{"url":"file://%s/uapi16/remote/remote-v1.bin.gz","encoding":"gzip","encodedSha256":"%s"}]}\n' \
+        "$(stat -c %s "$WORKDIR/uapi16/remote-v1.bin")" "$(sha256_of "$WORKDIR/uapi16/alt-v1.bin")" "$WORKDIR" \
+        "$(sha256_of "$WORKDIR/uapi16/remote/remote-v1.bin.gz")"
+    printf '\036{"mediaType":"application/vnd.uapi.16.trailer"}\n'
+} >"$WORKDIR/uapi16/manifest/Uapi16Manifest"
+for f in alt implied empty remote inline plain slice rawslice; do
+    cat >"$CONFIGDIR/01-uapi16-$f.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/uapi16/payload
+ManifestFormat=uapi16
+ManifestPath=file://$WORKDIR/uapi16/manifest/Uapi16Manifest
+MatchPattern=$f-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/uapi16/target
+MatchPattern=$f-@v.bin
+InstancesMax=2
+EOF
+done
+"$SYSUPDATE" --verify=no update
+for f in alt implied empty remote inline plain slice rawslice; do
+    cmp "$WORKDIR/uapi16/$f-v1.bin" "$WORKDIR/uapi16/target/$f-v1.bin"
+done
+
+# The decoded data is verified against the file's digest, not just the encoded data against its own
+mkdir -p "$WORKDIR/uapi16/bad-definitions"
+sed 's/^MatchPattern=alt-/MatchPattern=bad-/' "$CONFIGDIR/01-uapi16-alt.transfer" >"$WORKDIR/uapi16/bad-definitions/bad.transfer"
+(! "$SYSUPDATE" --definitions="$WORKDIR/uapi16/bad-definitions" --verify=no update)
+[[ ! -e "$WORKDIR/uapi16/target/bad-v1.bin" ]]
+sed -i 's/^MatchPattern=bad-/MatchPattern=badslice-/' "$WORKDIR/uapi16/bad-definitions/bad.transfer"
+(! "$SYSUPDATE" --definitions="$WORKDIR/uapi16/bad-definitions" --verify=no update)
+[[ ! -e "$WORKDIR/uapi16/target/badslice-v1.bin" ]]
+
+# systemd-pull cannot acquire a tarball that is embedded in a larger source, and we cannot cut into encoded
+# inline data, hence such sources are ignored, and the next source listed is used instead
+mkdir -p "$WORKDIR/uapi16/ranged/definitions" "$WORKDIR/uapi16/ranged/tree" "$WORKDIR/uapi16/ranged/dirs" "$WORKDIR/uapi16/ranged/target"
+printf 'tarball payload\n' >"$WORKDIR/uapi16/ranged/tree/file.txt"
+tar -C "$WORKDIR/uapi16/ranged/tree" -cf "$WORKDIR/uapi16/ranged/tree-v1.tar" .
+{ head -c 512 /dev/zero; cat "$WORKDIR/uapi16/ranged/tree-v1.tar"; } >"$WORKDIR/uapi16/ranged/embedded.raw"
+printf 'encoded inline payload\n' >"$WORKDIR/uapi16/ranged/enc-v1.bin"
+{ printf 'garbage'; cat "$WORKDIR/uapi16/ranged/enc-v1.bin"; } | gzip >"$WORKDIR/uapi16/ranged/enc-v1.literal.gz"
+{
+    printf '\036{"mediaType":"application/vnd.uapi.16.manifest"}\n'
+    printf '\036{"name":"tree-v1.tar","size":%s,"sha256":"%s","contents":[{"url":"file://%s/uapi16/ranged/embedded.raw","offset":512},{"url":"file://%s/uapi16/ranged/tree-v1.tar"}]}\n' \
+        "$(stat -c %s "$WORKDIR/uapi16/ranged/tree-v1.tar")" "$(sha256_of "$WORKDIR/uapi16/ranged/tree-v1.tar")" "$WORKDIR" "$WORKDIR"
+    printf '\036{"name":"enc-v1.bin","size":%s,"sha256":"%s","contents":[{"literal":"%s","encoding":"gzip","offset":7},{"literal":"%s"}]}\n' \
+        "$(stat -c %s "$WORKDIR/uapi16/ranged/enc-v1.bin")" "$(sha256_of "$WORKDIR/uapi16/ranged/enc-v1.bin")" \
+        "$(base64 -w0 "$WORKDIR/uapi16/ranged/enc-v1.literal.gz")" "$(base64 -w0 "$WORKDIR/uapi16/ranged/enc-v1.bin")"
+    printf '\036{"mediaType":"application/vnd.uapi.16.trailer"}\n'
+} >"$WORKDIR/uapi16/ranged/Uapi16Manifest"
+cat >"$WORKDIR/uapi16/ranged/definitions/01-tree.transfer" <<EOF
+[Source]
+Type=url-tar
+Path=file://$WORKDIR/uapi16/ranged
+ManifestFormat=uapi16
+ManifestPath=file://$WORKDIR/uapi16/ranged/Uapi16Manifest
+MatchPattern=tree-@v.tar
+
+[Target]
+Type=directory
+Path=$WORKDIR/uapi16/ranged/dirs
+MatchPattern=tree-@v
+EOF
+cat >"$WORKDIR/uapi16/ranged/definitions/02-enc.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/uapi16/ranged
+ManifestFormat=uapi16
+ManifestPath=file://$WORKDIR/uapi16/ranged/Uapi16Manifest
+MatchPattern=enc-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/uapi16/ranged/target
+MatchPattern=enc-@v.bin
+EOF
+"$SYSUPDATE" --definitions="$WORKDIR/uapi16/ranged/definitions" --verify=no update &>"$WORKDIR/uapi16/ranged/update.log"
+grep -F "File 'tree-v1.tar' has a source that carries more than the file, which is not supported for tarballs, ignoring source." "$WORKDIR/uapi16/ranged/update.log" >/dev/null
+grep -F "File 'enc-v1.bin' has encoded inline data that carries more than the file, ignoring source." "$WORKDIR/uapi16/ranged/update.log" >/dev/null
+cmp "$WORKDIR/uapi16/ranged/tree/file.txt" "$WORKDIR/uapi16/ranged/dirs/tree-v1/file.txt"
+cmp "$WORKDIR/uapi16/ranged/enc-v1.bin" "$WORKDIR/uapi16/ranged/target/enc-v1.bin"
+
+# UAPI.16 manifests carry their signature inline, which is verified against the certificates in the VOA
+# hierarchy (role "manifest", context "sysupdate") if verification is enabled
+if command -v openssl >/dev/null; then
+    VOA_OS="$(. /etc/os-release; echo "${ID:-linux}")"
+    VOA_DIR="/run/voa/$VOA_OS/manifest/sysupdate/x509"
+    S="$WORKDIR/uapi16/signed"
+    mkdir -p "$S/payload" "$S/target" "$S/definitions"
+    head -c 2000 /dev/urandom >"$S/payload/signed-v1.bin"
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$S/good.key" -out "$S/good.crt" -subj /CN=good -days 2 2>/dev/null
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "$S/other.key" -out "$S/other.crt" -subj /CN=other -days 2 2>/dev/null
+    systemd-manifest make --private-key="$S/good.key" --certificate="$S/good.crt" "$S/payload" >"$S/Uapi16Manifest"
+    systemd-manifest make "$S/payload" >"$S/Unsigned.Uapi16Manifest"
+    cat >"$S/definitions/signed.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$S/payload
+ManifestFormat=uapi16
+ManifestPath=file://$S/Uapi16Manifest
+MatchPattern=signed-@v.bin
+
+[Target]
+Type=regular-file
+Path=$S/target
+MatchPattern=signed-@v.bin
+EOF
+    sed "s|^ManifestPath=.*|ManifestPath=file://$S/Unsigned.Uapi16Manifest|" "$S/definitions/signed.transfer" >"$S/unsigned.transfer"
+
+    # No certificates installed: refused
+    (! "$SYSUPDATE" --definitions="$S/definitions" update)
+    # Only a different certificate installed: refused
+    mkdir -p "$VOA_DIR"
+    cp "$S/other.crt" "$VOA_DIR/test-72-other-certificate.pem"
+    (! "$SYSUPDATE" --definitions="$S/definitions" update)
+    [[ ! -e "$S/target/signed-v1.bin" ]]
+    # The right certificate in a different VOA context: refused
+    mkdir -p "/run/voa/$VOA_OS/manifest/default/x509"
+    cp "$S/good.crt" "/run/voa/$VOA_OS/manifest/default/x509/test-72-good-certificate.pem"
+    (! "$SYSUPDATE" --definitions="$S/definitions" update)
+    [[ ! -e "$S/target/signed-v1.bin" ]]
+    rm -r "/run/voa/$VOA_OS/manifest/default"
+    # The right certificate installed too, but masked: refused
+    cp "$S/good.crt" "$VOA_DIR/test-72-good-certificate.pem"
+    mkdir -p "/etc/voa/$VOA_OS/manifest/sysupdate/x509"
+    ln -s /dev/null "/etc/voa/$VOA_OS/manifest/sysupdate/x509/test-72-good-certificate.pem"
+    (! "$SYSUPDATE" --definitions="$S/definitions" update)
+    [[ ! -e "$S/target/signed-v1.bin" ]]
+    rm -r "/etc/voa/$VOA_OS/manifest"
+    # Not masked anymore: works
+    "$SYSUPDATE" --definitions="$S/definitions" update
+    cmp "$S/payload/signed-v1.bin" "$S/target/signed-v1.bin"
+    # systemd-manifest can check against the same certificates
+    systemd-manifest verify --voa-context=sysupdate --field=size,hash "$S/payload" "$S/Uapi16Manifest"
+    (! systemd-manifest verify --field=size,hash "$S/payload" "$S/Uapi16Manifest")
+    # An unsigned manifest is refused, unless verification is turned off
+    rm "$S/target/signed-v1.bin"
+    mv "$S/unsigned.transfer" "$S/definitions/signed.transfer"
+    (! "$SYSUPDATE" --definitions="$S/definitions" update)
+    [[ ! -e "$S/target/signed-v1.bin" ]]
+    "$SYSUPDATE" --definitions="$S/definitions" --verify=no update
+    cmp "$S/payload/signed-v1.bin" "$S/target/signed-v1.bin"
+    rm -r "/run/voa/$VOA_OS/manifest"
+fi
+
+# The download tools decode strictly with the declared algorithm if one is passed to them
+PULL=/usr/lib/systemd/systemd-pull
+IMPORT=/usr/lib/systemd/systemd-import
+"$PULL" raw --direct --verify=no --compression=gzip "file://$WORKDIR/uapi16/remote/remote-v1.bin.gz" "$WORKDIR/uapi16/pull-gzip.bin"
+cmp "$WORKDIR/uapi16/remote-v1.bin" "$WORKDIR/uapi16/pull-gzip.bin"
+"$PULL" raw --direct --verify=no --compression=auto "file://$WORKDIR/uapi16/remote/remote-v1.bin.gz" "$WORKDIR/uapi16/pull-auto.bin"
+cmp "$WORKDIR/uapi16/remote-v1.bin" "$WORKDIR/uapi16/pull-auto.bin"
+"$PULL" raw --direct --verify=no --compression=none "file://$WORKDIR/uapi16/remote/remote-v1.bin.gz" "$WORKDIR/uapi16/pull-none.bin"
+cmp "$WORKDIR/uapi16/remote/remote-v1.bin.gz" "$WORKDIR/uapi16/pull-none.bin"
+(! "$PULL" raw --direct --verify=no --compression=xz "file://$WORKDIR/uapi16/remote/remote-v1.bin.gz" "$WORKDIR/uapi16/pull-xz.bin")
+(! "$PULL" raw --direct --verify=no --compression=foobar "file://$WORKDIR/uapi16/remote/remote-v1.bin.gz" "$WORKDIR/uapi16/pull-foobar.bin")
+"$IMPORT" raw --direct --compression=gzip - "$WORKDIR/uapi16/import-gzip.bin" <"$WORKDIR/uapi16/remote/remote-v1.bin.gz"
+cmp "$WORKDIR/uapi16/remote-v1.bin" "$WORKDIR/uapi16/import-gzip.bin"
+(! "$IMPORT" raw --direct --compression=xz - "$WORKDIR/uapi16/import-xz.bin" <"$WORKDIR/uapi16/remote/remote-v1.bin.gz")
+
+# … and optionally verify the decoded data
+"$PULL" raw --direct --verify=no --compression=gzip --verify-decoded="$(sha256_of "$WORKDIR/uapi16/remote-v1.bin")" \
+        "file://$WORKDIR/uapi16/remote/remote-v1.bin.gz" "$WORKDIR/uapi16/pull-decoded.bin"
+cmp "$WORKDIR/uapi16/remote-v1.bin" "$WORKDIR/uapi16/pull-decoded.bin"
+(! "$PULL" raw --direct --verify=no --compression=gzip --verify-decoded="$(sha256_of "$WORKDIR/uapi16/alt-v1.bin")" \
+        "file://$WORKDIR/uapi16/remote/remote-v1.bin.gz" "$WORKDIR/uapi16/pull-decoded-bad.bin")
+"$IMPORT" raw --direct --compression=gzip --verify-decoded="$(sha256_of "$WORKDIR/uapi16/remote-v1.bin")" \
+        - "$WORKDIR/uapi16/import-decoded.bin" <"$WORKDIR/uapi16/remote/remote-v1.bin.gz"
+cmp "$WORKDIR/uapi16/remote-v1.bin" "$WORKDIR/uapi16/import-decoded.bin"
+(! "$IMPORT" raw --direct --compression=gzip --verify-decoded="$(sha256_of "$WORKDIR/uapi16/alt-v1.bin")" \
+        - "$WORKDIR/uapi16/import-decoded-bad.bin" <"$WORKDIR/uapi16/remote/remote-v1.bin.gz")
+(! "$IMPORT" raw --direct --verify-decoded=foobar - "$WORKDIR/uapi16/import-decoded-invalid.bin" <"$WORKDIR/uapi16/remote-v1.bin")
+
+rm -f "$CONFIGDIR"/01-uapi16-*.transfer
+rm -rf "$WORKDIR/uapi16"
+
+# Check MatchXAttr=: instances restricted to other systems via "user.uapi.match_…" extended attributes are
+# ignored, both when listed in UAPI.16 manifests and when found on disk, and the extended attributes listed
+# in the manifest are applied to the installed instance.
+XM="$WORKDIR/xattr-match"
+rm -rf "$XM"
+mkdir -p "$XM/definitions" "$XM/definitions-all" "$XM/definitions-target" "$XM/payload/blobs" "$XM/manifest" "$XM/target"
+for v in 1 2 3; do
+    echo "xattr match payload v$v" >"$XM/payload/blobs/xm-v$v.bin"
+done
+XM_MID="$(cat /etc/machine-id)"
+XM_OSID="$(. /etc/os-release; echo "$ID")"
+XM_OTHER=0123456789abcdef0123456789abcdef
+xm_object() {
+    local v="${1:?}" xattrs=""
+
+    [[ -n "${2:-}" ]] && xattrs=",\"extendedAttributes\":{\"user\":{$2}}"
+    printf '\036{"name":"xm-v%s.bin","size":%s,"sha256":"%s","contents":[{"file":"blobs/xm-v%s.bin"}]%s}\n' \
+        "$v" "$(stat -c %s "$XM/payload/blobs/xm-v$v.bin")" "$(sha256_of "$XM/payload/blobs/xm-v$v.bin")" "$v" "$xattrs"
+}
+{
+    # Extended attributes may only be listed if the manifest declares the "user-xattr" feature
+    printf '\036{"mediaType":"application/vnd.uapi.16.manifest","features":["sha256","size","user-xattr"]}\n'
+    # Not restricted in any way
+    xm_object 1
+    # Restricted to two machines, one of which is us, and to our OS. Also carries an unrelated attribute.
+    xm_object 2 "$(printf '"uapi.match_machine_id":{"base64":"%s"},"uapi.match_os_id":{"text":"%s"},"foo":{"text":"bar"}' \
+        "$(printf '%s\0%s\0' "$XM_OTHER" "$XM_MID" | base64 -w0)" "$XM_OSID")"
+    # Restricted to some other machine
+    xm_object 3 "$(printf '"uapi.match_machine_id":{"text":"%s"}' "$XM_OTHER")"
+    printf '\036{"mediaType":"application/vnd.uapi.16.trailer"}\n'
+} >"$XM/manifest/Uapi16Manifest"
+for d in definitions definitions-all definitions-target; do
+    cat >"$XM/$d/xm.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$XM/payload
+ManifestFormat=uapi16
+ManifestPath=file://$XM/manifest/Uapi16Manifest
+MatchPattern=xm-@v.bin
+
+[Target]
+Type=regular-file
+Path=$XM/target
+MatchPattern=xm-@v.bin
+InstancesMax=1
+EOF
+done
+# MatchXAttr= is enabled by default in the [Source] section, turn it off for "definitions-all"
+cat >>"$XM/definitions-all/xm.transfer" <<EOF
+
+[Source]
+MatchXAttr=no
+EOF
+cat >>"$XM/definitions-target/xm.transfer" <<EOF
+
+[Target]
+MatchXAttr=yes
+EOF
+[[ $("$SYSUPDATE" --definitions="$XM/definitions-all" --verify=no --json=short list | jq -cr '.all') == '["v3","v2","v1"]' ]]
+[[ $("$SYSUPDATE" --definitions="$XM/definitions" --verify=no --json=short list | jq -cr '.all') == '["v2","v1"]' ]]
+"$SYSUPDATE" --definitions="$XM/definitions" --verify=no update
+cmp "$XM/payload/blobs/xm-v2.bin" "$XM/target/xm-v2.bin"
+[[ ! -e "$XM/target/xm-v3.bin" ]]
+# The extended attributes from the manifest have been applied
+[[ "$(getfattr --absolute-names --only-values -n user.foo "$XM/target/xm-v2.bin")" == bar ]]
+[[ "$(getfattr --absolute-names --only-values -n user.uapi.match_os_id "$XM/target/xm-v2.bin")" == "$XM_OSID" ]]
+cmp <(getfattr --absolute-names --only-values -n user.uapi.match_machine_id "$XM/target/xm-v2.bin") <(printf '%s\0%s\0' "$XM_OTHER" "$XM_MID")
+# Installed instances are only filtered if MatchXAttr= is enabled in the [Target] section too (it is off by
+# default there): an installed instance restricted to some other machine is then neither listed nor vacuumed
+echo foreign >"$XM/target/xm-v4.bin"
+setfattr -n user.uapi.match_machine_id -v "$XM_OTHER" "$XM/target/xm-v4.bin"
+[[ $("$SYSUPDATE" --definitions="$XM/definitions-all" --verify=no --offline --json=short list | jq -cr '.all') == '["v4","v2"]' ]]
+[[ $("$SYSUPDATE" --definitions="$XM/definitions" --verify=no --offline --json=short list | jq -cr '.all') == '["v4","v2"]' ]]
+[[ $("$SYSUPDATE" --definitions="$XM/definitions-target" --verify=no --offline --json=short list | jq -cr '.all') == '["v2"]' ]]
+"$SYSUPDATE" --definitions="$XM/definitions-target" --verify=no vacuum
+[[ -e "$XM/target/xm-v2.bin" ]]
+[[ -e "$XM/target/xm-v4.bin" ]]
+rm -rf "$XM"
+
+# Check that malformed manifest hashes are rejected without aborting.
+rm -rf "$WORKDIR/malformed-manifest"
+mkdir -p "$WORKDIR/malformed-manifest/definitions" "$WORKDIR/malformed-manifest/source" "$WORKDIR/malformed-manifest/target"
+printf 'payload\n' >"$WORKDIR/malformed-manifest/source/malformed-v1.bin"
+hash_64=0000000000000000000000000000000000000000000000000000000000000000
+printf '%s\t\t *malformed-v1.bin\n' "${hash_64%??}" >"$WORKDIR/malformed-manifest/source/SHA256SUMS"
+cat >"$WORKDIR/malformed-manifest/definitions/01-malformed-hash.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/malformed-manifest/source
+MatchPattern=malformed-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/malformed-manifest/target
+MatchPattern=malformed-@v.bin
+InstancesMax=1
+EOF
+set +e
+"$SYSUPDATE" --definitions="$WORKDIR/malformed-manifest/definitions" --verify=no check-new &>"$WORKDIR/malformed-manifest/check-new.log"
+rc=$?
+set -e
+[[ $rc -ne 0 ]]
+[[ $rc -ne 134 ]]
+grep -F "Manifest hash at line 1 decoded to 31 bytes" "$WORKDIR/malformed-manifest/check-new.log" >/dev/null
+
+# Check the "cleanup" verb and the underlying install database. A successful
+# update must record an install database entry for every transfer that installs
+# into the file system, and those entries must cover all installed resources
+# (regular files as well as directories). Once the transfer file owning some
+# resources is removed, "systemd-sysupdate cleanup" must delete the now-orphaned
+# resources (and their install database entries), while leaving resources that
+# are still owned by a transfer file untouched.
+INSTALLDB="/var/lib/systemd/sysupdate/installdb"
+CLEANUP="$WORKDIR/cleanup"
+rm -rf "$CONFIGDIR" "$INSTALLDB" "$CLEANUP"
+mkdir -p "$CONFIGDIR" "$CLEANUP/source" "$CLEANUP/target"
+
+# The "alpha" transfer installs plain regular files, while the "beta" transfer
+# installs whole directories (each populated with a couple of files), to exercise
+# the recursive removal of orphaned directory resources during cleanup.
+cleanup_new_version() {
+    local version="${1:?}"
+    echo "$RANDOM" >"$CLEANUP/source/alpha-$version.bin"
+    rm -rf "$CLEANUP/source/beta-$version"
+    mkdir -p "$CLEANUP/source/beta-$version"
+    echo "$RANDOM" >"$CLEANUP/source/beta-$version/one.txt"
+    echo "$RANDOM" >"$CLEANUP/source/beta-$version/two.txt"
+    (cd "$CLEANUP/source" && sha256sum alpha-* >SHA256SUMS)
+}
+
+# Number of install database entries (symlinks) currently recorded.
+installdb_count() {
+    if [[ -d "$INSTALLDB" ]]; then
+        find "$INSTALLDB" -mindepth 1 -maxdepth 1 -type l | wc -l
+    else
+        echo 0
+    fi
+}
+
+# Assert that every resource (file or directory) currently installed in the
+# target directory is covered by at least one install database entry (i.e. its
+# name matches a recorded pattern that points at the target directory).
+assert_installdb_covers_target() {
+    local f base link tgt path pattern glob covered
+    for f in "$CLEANUP/target"/*; do
+        [[ -e "$f" ]] || continue
+        base="$(basename "$f")"
+        covered=0
+        while read -r link; do
+            tgt="$(readlink "$link")"
+            # Entries are stored as "<path>/./<pattern>".
+            path="${tgt%%/./*}"
+            pattern="${tgt#*/./}"
+            # Translate the sysupdate pattern into a shell glob (only @v is used here).
+            glob="${pattern//@v/*}"
+            # shellcheck disable=SC2053
+            if [[ "$path" == "$CLEANUP/target" && "$base" == $glob ]]; then
+                covered=1
+                break
+            fi
+        done < <(find "$INSTALLDB" -mindepth 1 -maxdepth 1 -type l)
+        [[ "$covered" -eq 1 ]] || { echo "Installed resource '$f' not covered by install database" >&2; exit 1; }
+    done
+}
+
+# Verify the installed beta-<version> directory matches its source.
+verify_beta_synced() {
+    local version="${1:?}"
+    test -d "$CLEANUP/target/beta-$version"
+    cmp "$CLEANUP/source/beta-$version/one.txt" "$CLEANUP/target/beta-$version/one.txt"
+    cmp "$CLEANUP/source/beta-$version/two.txt" "$CLEANUP/target/beta-$version/two.txt"
+}
+
+cat >"$CONFIGDIR/01-alpha.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$CLEANUP/source
+MatchPattern=alpha-@v.bin
+
+[Target]
+Type=regular-file
+Path=$CLEANUP/target
+MatchPattern=alpha-@v.bin
+InstancesMax=2
+EOF
+
+cat >"$CONFIGDIR/02-beta.transfer" <<EOF
+[Source]
+Type=directory
+Path=$CLEANUP/source
+MatchPattern=beta-@v
+
+[Target]
+Type=directory
+Path=$CLEANUP/target
+MatchPattern=beta-@v
+InstancesMax=2
+EOF
+
+# Install two versions; with InstancesMax=2 both are kept for each transfer.
+cleanup_new_version v1
+"$SYSUPDATE" --verify=no update
+cleanup_new_version v2
+"$SYSUPDATE" --verify=no update
+
+# All four resources must be installed, and the directory resources must have
+# been synced over completely.
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+verify_beta_synced v1
+verify_beta_synced v2
+
+# The update must have recorded one install database entry per transfer pattern,
+# and those entries must cover every installed resource.
+[[ "$(installdb_count)" -eq 2 ]]
+assert_installdb_covers_target
+
+# Running cleanup while all transfer files are still in place must be a no-op:
+# nothing is orphaned, so nothing must be removed.
+"$SYSUPDATE" cleanup
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+verify_beta_synced v1
+verify_beta_synced v2
+[[ "$(installdb_count)" -eq 2 ]]
+assert_installdb_covers_target
+
+# Remove the transfer file owning the "beta" directories and clean up. The beta
+# directories (with all their contents) and their install database entry must be
+# removed, while the alpha files must be kept since their transfer file is still
+# in place.
+rm "$CONFIGDIR/02-beta.transfer"
+"$SYSUPDATE" cleanup
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+test ! -e "$CLEANUP/target/beta-v1"
+test ! -e "$CLEANUP/target/beta-v2"
+[[ "$(installdb_count)" -eq 1 ]]
+assert_installdb_covers_target
+
+# Now remove the remaining transfer file and clean up again. The alpha files and
+# the last install database entry must be removed too.
+rm "$CONFIGDIR/01-alpha.transfer"
+"$SYSUPDATE" cleanup
+test ! -f "$CLEANUP/target/alpha-v1.bin"
+test ! -f "$CLEANUP/target/alpha-v2.bin"
+[[ "$(installdb_count)" -eq 0 ]]
+
+rm -rf "$CONFIGDIR" "$INSTALLDB" "$CLEANUP"
+
+# Under --root=, cleanup must compare current transfer target paths in the same
+# root-relative form stored in the install database, and keep still-owned files.
+ROOT_CLEANUP="$WORKDIR/root-cleanup"
+ROOT_CLEANUP_ROOT="$ROOT_CLEANUP/root"
+ROOT_CLEANUP_DB_VALUE="/target/./alpha-@v.bin"
+ROOT_CLEANUP_DB_KEY="$(printf '%s' "$ROOT_CLEANUP_DB_VALUE" | sha256sum | cut -d' ' -f1)"
+rm -rf "$ROOT_CLEANUP"
+mkdir -p "$ROOT_CLEANUP_ROOT/etc/sysupdate.d" \
+         "$ROOT_CLEANUP_ROOT/target" \
+         "$ROOT_CLEANUP_ROOT/var/lib/systemd/sysupdate/installdb"
+
+cat >"$ROOT_CLEANUP_ROOT/etc/sysupdate.d/01-alpha.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=/source
+MatchPattern=alpha-@v.bin
+
+[Target]
+Type=regular-file
+Path=/target
+MatchPattern=alpha-@v.bin
+InstancesMax=2
+EOF
+
+echo "$RANDOM" >"$ROOT_CLEANUP_ROOT/target/alpha-v1.bin"
+ln -s "$ROOT_CLEANUP_DB_VALUE" \
+      "$ROOT_CLEANUP_ROOT/var/lib/systemd/sysupdate/installdb/$ROOT_CLEANUP_DB_KEY"
+
+"$SYSUPDATE" --root="$ROOT_CLEANUP_ROOT" --verify=no cleanup
+test -f "$ROOT_CLEANUP_ROOT/target/alpha-v1.bin"
+test -L "$ROOT_CLEANUP_ROOT/var/lib/systemd/sysupdate/installdb/$ROOT_CLEANUP_DB_KEY"
+
+rm -rf "$ROOT_CLEANUP"
+
+# Briefly check the "--component-all" switch of the "cleanup" verb. Each component
+# keeps its own install database (installdb.<component>), and "cleanup
+# --component-all" must clean up orphaned resources across *all* of them in one
+# go. Set up two components, install a resource into each, then drop both transfer
+# files and run a single "cleanup --component-all" — it must remove both
+# components' resources (and their install database entries).
+COMPALL="$WORKDIR/component-all"
+rm -rf "$COMPALL" /run/sysupdate.comp-a.d /run/sysupdate.comp-b.d \
+    /var/lib/systemd/sysupdate/installdb.comp-a /var/lib/systemd/sysupdate/installdb.comp-b
+mkdir -p "$COMPALL/source" "$COMPALL/target-a" "$COMPALL/target-b" \
+    /run/sysupdate.comp-a.d /run/sysupdate.comp-b.d
+
+echo "$RANDOM" >"$COMPALL/source/comp-a-v1.bin"
+echo "$RANDOM" >"$COMPALL/source/comp-b-v1.bin"
+(cd "$COMPALL/source" && sha256sum comp-* >SHA256SUMS)
+
+cat >/run/sysupdate.comp-a.d/01-comp-a.transfer <<EOF
+[Source]
+Type=regular-file
+Path=$COMPALL/source
+MatchPattern=comp-a-@v.bin
+
+[Target]
+Type=regular-file
+Path=$COMPALL/target-a
+MatchPattern=comp-a-@v.bin
+InstancesMax=1
+EOF
+
+cat >/run/sysupdate.comp-b.d/01-comp-b.transfer <<EOF
+[Source]
+Type=regular-file
+Path=$COMPALL/source
+MatchPattern=comp-b-@v.bin
+
+[Target]
+Type=regular-file
+Path=$COMPALL/target-b
+MatchPattern=comp-b-@v.bin
+InstancesMax=1
+EOF
+
+"$SYSUPDATE" --component=comp-a --verify=no update
+"$SYSUPDATE" --component=comp-b --verify=no update
+test -f "$COMPALL/target-a/comp-a-v1.bin"
+test -f "$COMPALL/target-b/comp-b-v1.bin"
+test -d /var/lib/systemd/sysupdate/installdb.comp-a
+test -d /var/lib/systemd/sysupdate/installdb.comp-b
+
+# --component-all is not supported for every verb, so it must be refused where it isn't (e.g. "vacuum").
+# (It *is* supported for update/acquire/cleanup/enable-*/disable-*, which is exercised further down.)
+(! "$SYSUPDATE" --component-all --verify=no vacuum)
+
+# With the transfer files still in place "cleanup --component-all" is a no-op:
+# nothing is orphaned.
+"$SYSUPDATE" --component-all cleanup
+test -f "$COMPALL/target-a/comp-a-v1.bin"
+test -f "$COMPALL/target-b/comp-b-v1.bin"
+
+# Drop both transfer files and clean up all components at once. Both resources
+# (and their install database entries) must now be gone.
+rm /run/sysupdate.comp-a.d/01-comp-a.transfer /run/sysupdate.comp-b.d/01-comp-b.transfer
+"$SYSUPDATE" --component-all cleanup
+test ! -e "$COMPALL/target-a/comp-a-v1.bin"
+test ! -e "$COMPALL/target-b/comp-b-v1.bin"
+[[ "$(find /var/lib/systemd/sysupdate/installdb.comp-a -type l | wc -l)" -eq 0 ]]
+[[ "$(find /var/lib/systemd/sysupdate/installdb.comp-b -type l | wc -l)" -eq 0 ]]
+
+rm -rf "$COMPALL" /run/sysupdate.comp-a.d /run/sysupdate.comp-b.d \
+    /var/lib/systemd/sysupdate/installdb.comp-a /var/lib/systemd/sysupdate/installdb.comp-b
+
+# Check the "--cleanup=" switch of the "update" verb. With "--cleanup=yes" a
+# successful update must, after installing the new version, run the equivalent of
+# the "cleanup" verb and remove any resources that are no longer owned by a
+# currently defined transfer file. Reuse the "alpha"/"beta" helpers from above.
+rm -rf "$CONFIGDIR" "$INSTALLDB" "$CLEANUP"
+mkdir -p "$CONFIGDIR" "$CLEANUP/source" "$CLEANUP/target"
+
+cat >"$CONFIGDIR/01-alpha.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$CLEANUP/source
+MatchPattern=alpha-@v.bin
+
+[Target]
+Type=regular-file
+Path=$CLEANUP/target
+MatchPattern=alpha-@v.bin
+InstancesMax=2
+EOF
+
+cat >"$CONFIGDIR/02-beta.transfer" <<EOF
+[Source]
+Type=directory
+Path=$CLEANUP/source
+MatchPattern=beta-@v
+
+[Target]
+Type=directory
+Path=$CLEANUP/target
+MatchPattern=beta-@v
+InstancesMax=2
+EOF
+
+# Install a first version with both transfers in place.
+cleanup_new_version v1
+"$SYSUPDATE" --verify=no update --cleanup=yes
+test -f "$CLEANUP/target/alpha-v1.bin"
+verify_beta_synced v1
+[[ "$(installdb_count)" -eq 2 ]]
+assert_installdb_covers_target
+
+# Now drop the "beta" transfer file and install a second version with
+# "--cleanup=yes". The new alpha resource must be installed, and the now-orphaned
+# beta directory (and its install database entry) must be removed as part of the
+# same invocation, without a separate "cleanup" call.
+rm "$CONFIGDIR/02-beta.transfer"
+cleanup_new_version v2
+"$SYSUPDATE" --verify=no update --cleanup=yes
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+test ! -e "$CLEANUP/target/beta-v1"
+[[ "$(installdb_count)" -eq 1 ]]
+assert_installdb_covers_target
+
+# With "--cleanup=no" (the default) orphaned resources must be left in place.
+# Redefine the "alpha" transfer so its patterns no longer match the already
+# installed alpha files (turning them into orphans), while keeping a valid
+# transfer definition in place. Updating with "--cleanup=no" must then install
+# nothing new (there's no matching source) and leave the now-orphaned alpha files
+# and their install database entry untouched.
+cat >"$CONFIGDIR/01-alpha.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$CLEANUP/source
+MatchPattern=gamma-@v.bin
+
+[Target]
+Type=regular-file
+Path=$CLEANUP/target
+MatchPattern=gamma-@v.bin
+InstancesMax=2
+EOF
+"$SYSUPDATE" --verify=no update --cleanup=no
+test -f "$CLEANUP/target/alpha-v1.bin"
+test -f "$CLEANUP/target/alpha-v2.bin"
+[[ "$(installdb_count)" -eq 1 ]]
+
+# Invoking the "cleanup" verb with "--cleanup=no" is contradictory and must be
+# refused.
+(! "$SYSUPDATE" --cleanup=no cleanup) |& grep "contradictory" >/dev/null
+
+# A plain "cleanup" must still remove the orphaned alpha files.
+"$SYSUPDATE" cleanup
+test ! -f "$CLEANUP/target/alpha-v1.bin"
+test ! -f "$CLEANUP/target/alpha-v2.bin"
+[[ "$(installdb_count)" -eq 0 ]]
+
+rm -rf "$CONFIGDIR" "$INSTALLDB" "$CLEANUP"
+
+# Verify the notification callout: after a successful update, sysupdate must connect to every socket in
+# /run/systemd/sysupdate/notify/ and invoke io.systemd.SysUpdate.Notify.OnCompletedUpdate(). We hook a tiny
+# recorder socket into that directory that captures the request and replies with success.
+NOTIFY_LOG="$WORKDIR/notify.log"
+rm -f "$NOTIFY_LOG"
+
+cat >"$WORKDIR/notify-recorder.py" <<EOF
+#!/usr/bin/env python3
+# Minimal Varlink server: read one NUL-terminated request, record it, reply with empty parameters.
+import sys
+buf = b""
+while True:
+    c = sys.stdin.buffer.read(1)
+    if not c or c == b"\x00":
+        break
+    buf += c
+with open("$NOTIFY_LOG", "ab") as f:
+    f.write(buf + b"\n")
+sys.stdout.buffer.write(b'{"parameters":{}}\x00')
+sys.stdout.buffer.flush()
+EOF
+chmod +x "$WORKDIR/notify-recorder.py"
+
+cat >/run/systemd/system/test-sysupdate-notify-recorder.socket <<EOF
+[Socket]
+ListenStream=/run/systemd/sysupdate/notify/io.test.SysUpdateRecorder
+Accept=yes
+EOF
+
+cat >"/run/systemd/system/test-sysupdate-notify-recorder@.service" <<EOF
+[Service]
+ExecStart=$WORKDIR/notify-recorder.py
+StandardInput=socket
+StandardOutput=socket
+EOF
+
+systemctl daemon-reload
+systemctl start test-sysupdate-notify-recorder.socket
+
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs"
+echo "hello" >"$WORKDIR/source/notifytest-v1.bin"
+(cd "$WORKDIR/source" && sha256sum notifytest-v1.bin >SHA256SUMS)
+cat >"$CONFIGDIR/01-notifytest.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=notifytest-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=notifytest-@v.bin
+InstancesMax=1
+EOF
+
+# A real update must trigger exactly one notification carrying the version and the updated resources.
+# The callout is synchronous (sysupdate blocks until the subscriber replied, which happens after the
+# request was recorded), so the log is fully written by the time the update returns.
+"$SYSUPDATE" --verify=no update
+test -s "$NOTIFY_LOG"  # the notification must have been recorded
+notify_line="$(tail -n1 "$NOTIFY_LOG")"
+echo "Recorded notification: $notify_line"
+jq -e '.method == "io.systemd.SysUpdate.Notify.OnCompletedUpdate"' <<<"$notify_line" >/dev/null
+jq -e '.parameters.version == "v1"' <<<"$notify_line" >/dev/null
+jq -e '.parameters.resources | length >= 1' <<<"$notify_line" >/dev/null
+jq -e '.parameters.resources | all(has("transfer"))' <<<"$notify_line" >/dev/null
+
+# A no-op update ("No update needed") must NOT emit a notification.
+rm -f "$NOTIFY_LOG"
+"$SYSUPDATE" --verify=no update
+test ! -s "$NOTIFY_LOG"
+
+systemctl stop test-sysupdate-notify-recorder.socket
+rm -f /run/systemd/system/test-sysupdate-notify-recorder.socket \
+      /run/systemd/system/test-sysupdate-notify-recorder@.service
+systemctl daemon-reload
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs"
+rm -f "$WORKDIR/source/notifytest-v1.bin" "$WORKDIR/source/SHA256SUMS" \
+      "$WORKDIR/notify-recorder.py" "$NOTIFY_LOG"
+
+verify_zero_fill_partition() {
+    local blockdev="${1:?}"
+    local sigfile="${2:?}"
+    local version="${3:?}"
+    local expect_zeroed="${4:?}"
+    local start size dump tail
+
+    start="$(sfdisk --json "$blockdev" | jq -r ".partitiontable.partitions[] | select(.name == \"sig-$version\") | .start")"
+    test -n "$start"
+    size="$(stat -c %s "$sigfile")"
+    dump="$WORKDIR/zerofill-dump"
+
+    dd if="$blockdev" of="$dump" bs=512 skip="$start" count=64 status=none
+
+    # The partition must start with the payload file in any case
+    cmp -n "$size" "$dump" "$sigfile"
+
+    # Everything after it must be NUL bytes if zero filling is on, and must not be if it is off (the tail of
+    # the longer payload of the version previously stored in the partition then survives)
+    tail="$(tail -c +$((size + 1)) "$dump" | tr -d '\0' | wc -c)"
+    if [[ "$expect_zeroed" == "1" ]]; then
+        test "$tail" -eq 0
+    else
+        test "$tail" -gt 0
+    fi
+}
+
+make_zero_fill_payload() {
+    local size="${1:?}"
+    local file="${2:?}"
+
+    # Generates a JSON object resembling a verity signature of precisely the requested size: the fixed part of
+    # the object is 94 bytes, the signature string makes up the rest
+    test "$size" -gt 94
+    printf '{"rootHash":"%s","signature":"%s"}' \
+           "$(head -c 32 /dev/zero | od -An -v -tx1 | tr -d ' \n')" \
+           "$(head -c $((size - 94)) /dev/zero | tr '\0' A)" >"$file"
+    test "$(stat -c %s "$file")" -eq "$size"
+}
+
+test_zero_fill_partition() {
+    local source_type="${1:?}"      # Source Type= to use (regular-file or url-file)
+    local ptype_uuid="${2:?}"       # partition type UUID to create the partitions with
+    local ptype_name="${3:?}"       # matching partition type identifier for MatchPartitionType=
+    local setting="${4}"            # explicit PartitionZeroFill= line, or empty to test the default
+    local expect_zeroed="${5:?}"    # whether the tail of the partition is expected to be zeroed out
+    local in_use="${6:-no}"
+    local sigdir="$WORKDIR/zerofill-source"
+    local defdir="$WORKDIR/zerofill-defs"
+    local backing="$WORKDIR/zerofill-disk.raw"
+    local backing_size=4M
+    local -a losetup_args=() lock=()
+    local blockdev source_path
+
+    rm -rf "$sigdir" "$defdir" "$backing"
+    mkdir -p "$sigdir" "$defdir"
+    if [[ "$in_use" == yes ]]; then
+        backing_size=16M
+        losetup_args+=(--partscan)
+    fi
+    truncate -s "$backing_size" "$backing"
+
+    if [[ -e /dev/loop-control ]]; then
+        blockdev="$(losetup --find --show "${losetup_args[@]}" "$backing")"
+        ZEROFILL_LOOP="$blockdev"
+        # Take the udev lock on the block device while repartitioning, so that udev doesn't probe the
+        # partitions of the previous sfdisk invocation while the next one asks the kernel to re-read the
+        # partition table, which would fail with EBUSY then.
+        lock=(udevadm lock --timeout=30 --device="$blockdev")
+    else
+        blockdev="$backing"
+    fi
+
+    "${lock[@]}" sfdisk "$blockdev" <<EOF
+label: gpt
+unit: sectors
+
+size=64, type=$ptype_uuid, name=_empty
+size=64, type=$ptype_uuid, name=_empty
+EOF
+
+    if [[ "$in_use" == yes ]]; then
+        "${lock[@]}" sfdisk --append "$blockdev" <<EOF
+size=16384, type=0fc63daf-8483-4772-8e79-3d69d8477de4, name=mounted
+EOF
+        udevadm wait --timeout=30 --settle "${blockdev}p3"
+        mkfs.ext4 -q "${blockdev}p3"
+        mkdir -p "$WORKDIR/zerofill-mount"
+        mount -o ro "${blockdev}p3" "$WORKDIR/zerofill-mount"
+        ZEROFILL_MOUNT="$WORKDIR/zerofill-mount"
+    fi
+
+    if [[ "$source_type" == "url-file" ]]; then
+        source_path="file://$sigdir"
+    else
+        source_path="$sigdir"
+    fi
+
+    cat >"$defdir/01-zerofill.transfer" <<EOF
+[Source]
+Type=$source_type
+Path=$source_path
+MatchPattern=sig-@v.raw
+
+[Target]
+Type=partition
+Path=$blockdev
+MatchPattern=sig-@v
+MatchPartitionType=$ptype_name
+$setting
+EOF
+
+    # The partition slots are 64 sectors (32768 bytes) each. Payload sizes and the tail state to expect in the
+    # partition after each version, given that with two slots each version replaces the one two steps before:
+    #
+    #   v1: 3000 bytes into an empty slot, hence nothing can survive after it
+    #   v2: exactly fills the slot, nothing is left to zero out at all
+    #   v3: 130 bytes over the 3000 of v1, the tail of v1 survives unless zero filling is on
+    #   v4: leaves less than a sector free after it over the full slot of v2, i.e. the remainder is too small
+    #       for BLKZEROOUT, and the tail of v2 survives unless zero filling is on
+    local -a versions=(v1 v2 v3 v4)
+    local -A payload_size=([v1]=3000 [v2]=32768 [v3]=130 [v4]=32668)
+    local -A zeroed=([v1]=1 [v2]=1 [v3]="$expect_zeroed" [v4]="$expect_zeroed")
+    local v prev=
+
+    for v in "${versions[@]}"; do
+        make_zero_fill_payload "${payload_size[$v]}" "$sigdir/sig-$v.raw"
+        (cd "$sigdir" && sha256sum sig-*.raw >SHA256SUMS)
+
+        "$SYSUPDATE" --verify=no --definitions="$defdir" update
+        verify_zero_fill_partition "$blockdev" "$sigdir/sig-$v.raw" "$v" "${zeroed[$v]}"
+
+        # The version written in the previous step is in the other slot, and must be untouched, i.e. the zero
+        # filling must not have overshot the partition
+        if [[ -n "$prev" ]]; then
+            verify_zero_fill_partition "$blockdev" "$sigdir/sig-$prev.raw" "$prev" "${zeroed[$prev]}"
+        fi
+        prev="$v"
+    done
+
+    # v3 and v4 must have replaced v1 and v2
+    (! sfdisk --json "$blockdev" | jq -e '.partitiontable.partitions[] | select(.name == "sig-v1" or .name == "sig-v2")' >/dev/null)
+
+    # And the partition table itself (including the backup GPT at the end of the device) must be intact
+    sfdisk --verify "$blockdev"
+
+    if [[ "$ZEROFILL_MOUNT" != "" ]]; then
+        umount "$ZEROFILL_MOUNT"
+        ZEROFILL_MOUNT=
+    fi
+    if [[ "$ZEROFILL_LOOP" != "" ]]; then
+        losetup --detach "$ZEROFILL_LOOP"
+        ZEROFILL_LOOP=
+    fi
+
+    rm -rf "$sigdir" "$defdir" "$backing" "$WORKDIR/zerofill-mount"
+}
+
+test_zero_fill() {
+    # A verity signature partition carries a JSON object that must be followed by NUL bytes only. The split-out
+    # artifact is not padded (so that it's a valid JSON text file), hence sysupdate must make sure that no tail
+    # of a previously installed, longer signature survives when it installs a shorter one into a reused
+    # partition, see https://github.com/systemd/systemd/issues/43567. This is controlled by the
+    # PartitionZeroFill= setting, which defaults to on for verity signature partitions, and off otherwise.
+    local vsig_uuid=41092b05-9fc8-4523-994f-2def0408b176    # root-x86-64-verity-sig
+    local generic_uuid=0fc63daf-8483-4772-8e79-3d69d8477de4 # linux-generic
+
+    # Default for verity signature partitions is on, both for local and URL sources
+    test_zero_fill_partition regular-file "$vsig_uuid" root-x86-64-verity-sig "" 1
+    test_zero_fill_partition url-file "$vsig_uuid" root-x86-64-verity-sig "" 1
+
+    # ... and can be turned off explicitly
+    test_zero_fill_partition regular-file "$vsig_uuid" root-x86-64-verity-sig "PartitionZeroFill=no" 0
+
+    # Default for other partitions is off, but can be turned on explicitly
+    test_zero_fill_partition regular-file "$generic_uuid" linux-generic "" 0
+    test_zero_fill_partition regular-file "$generic_uuid" linux-generic "PartitionZeroFill=yes" 1
+    test_zero_fill_partition url-file "$generic_uuid" linux-generic "PartitionZeroFill=yes" 1
+
+    # A mounted partition prevents BLKZEROOUT from claiming the disk and invalidating dirty pages.
+    # Updating other partitions must still work: https://github.com/systemd/systemd/issues/44317
+    if [[ -e /dev/loop-control ]]; then
+        test_zero_fill_partition regular-file "$vsig_uuid" root-x86-64-verity-sig "" 1 yes
+        test_zero_fill_partition url-file "$vsig_uuid" root-x86-64-verity-sig "" 1 yes
+    else
+        echo "Skipping zero-fill tests with a mounted partition: no loopback device support."
+    fi
+}
+
+gpg_has_working_merge_only() {
+    # Older gpg accepts embedded keys missing from the keyring despite merge-only with --auto-key-import.
+    # Fixed in 2.4.8 and 2.5.5.
+    systemd-analyze compare-versions "$1" ge 2.4.8 &&
+        { systemd-analyze compare-versions "$1" lt 2.5 ||
+          systemd-analyze compare-versions "$1" ge 2.5.5; }
+}
+
+test_signature_verification() {
+    if ! command -v gpg >/dev/null; then
+        echo "gpg not available, skipping signature verification test"
+        return 0
+    fi
+
+    local gpg_version
+    gpg_version="$(gpg --version | sed -n '1p' | awk '{print $NF}')"
+    if ! gpg_has_working_merge_only "$gpg_version"; then
+        echo "gpg $gpg_version has broken merge-only support, skipping signature verification test"
+        return 0
+    fi
+
+    local sigdir="$WORKDIR/sigtest-source"
+    local defdir="$WORKDIR/sigtest-defs"
+    local gpghome="$WORKDIR/sigtest-gpghome"
+    local other_home="$WORKDIR/sigtest-otherhome"
+    local target="$WORKDIR/sigtest-target"
+    local keyring="$WORKDIR/sigtest-keyring"
+    local top_fpr keys
+
+    SIGTEST_GPGHOME="$gpghome"
+    SIGTEST_OTHERHOME="$other_home"
+
+    mkdir -p "$sigdir" "$defdir" "$gpghome" "$other_home" "$target"
+    chmod 700 "$gpghome" "$other_home"
+
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --quick-gen-key 'Test Key <test@example.com>' rsa2048 cert,sign never
+    # Capture gpg output first, then grep from a here-string to avoid grep -m1 causing a SIGPIPE
+    keys="$(GNUPGHOME="$gpghome" gpg --list-keys --with-colons)"
+    top_fpr="$(grep -m1 '^fpr:' <<< "$keys" | cut -d: -f10)"
+    test "$top_fpr" != ""
+
+    GNUPGHOME="$gpghome" gpg --export --output "$keyring"
+
+    dd if=/dev/urandom of="$sigdir/payload-v1.raw" bs=1024 count=8 status=none
+    (cd "$sigdir" && sha256sum payload-v1.raw > SHA256SUMS)
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --detach-sign --include-key-block --yes \
+        --output "$sigdir/SHA256SUMS.gpg" "$sigdir/SHA256SUMS"
+
+    cat >"$defdir/01-sigtest.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$sigdir
+MatchPattern=payload-@v.raw
+
+[Target]
+Type=regular-file
+Path=$target
+MatchPattern=payload-@v.raw
+InstancesMax=3
+EOF
+
+    SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$defdir" check-new
+    SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$defdir" update
+    cmp "$sigdir/payload-v1.raw" "$target/payload-v1.raw"
+
+    # Negative test: Sign with a key not in the keyring
+    GNUPGHOME="$other_home" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --quick-gen-key 'Other Key <other@example.com>' rsa2048 cert,sign never
+    dd if=/dev/urandom of="$sigdir/payload-v2.raw" bs=1024 count=8 status=none
+    (cd "$sigdir" && sha256sum payload-v1.raw payload-v2.raw > SHA256SUMS)
+    GNUPGHOME="$other_home" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --detach-sign --include-key-block --yes \
+        --output "$sigdir/SHA256SUMS.gpg" "$sigdir/SHA256SUMS"
+    if SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$defdir" update; then
+        echo "ERROR: accepted an update signed by a key not in the keyring" >&2
+        exit 1
+    fi
+    if [ -f "$target/payload-v2.raw" ]; then
+        echo "ERROR: payload-v2 should not have been installed" >&2
+        exit 1
+    fi
+
+    # Sub key test: Add a sub key the client does not have and rely on gpg
+    # --auto-key-import to get it from the signature.
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --quick-add-key "$top_fpr" rsa2048 sign 1y
+    # Make it so that only the sub key is available for signing to avoid having
+    # to select it by fingerprint.
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --output "$WORKDIR/sigtest-subkey-secret.gpg" \
+        --export-secret-subkeys
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --yes --delete-secret-keys "$top_fpr"
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --import "$WORKDIR/sigtest-subkey-secret.gpg"
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --detach-sign --include-key-block --yes \
+        --output "$sigdir/SHA256SUMS.gpg" "$sigdir/SHA256SUMS"
+    SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$defdir" update
+    cmp "$sigdir/payload-v2.raw" "$target/payload-v2.raw"
+}
+
+backup_import_keyring() {
+    local path="$1"
+    local backup="$2"
+
+    rm -f "$backup"
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        mv "$path" "$backup"
+    fi
+}
+
+restore_import_keyring() {
+    local path="$1"
+    local backup="$2"
+
+    rm -f "$path"
+    if [ -e "$backup" ] || [ -L "$backup" ]; then
+        mv "$backup" "$path"
+    fi
+}
+
+test_signature_keyring_overlay() (
+    if ! command -v gpg >/dev/null; then
+        echo "gpg not available, skipping signature overlay test"
+        exit 0
+    fi
+
+    local gpg_version
+    gpg_version="$(gpg --version | sed -n '1p' | awk '{print $NF}')"
+    if ! gpg_has_working_merge_only "$gpg_version"; then
+        echo "gpg $gpg_version has broken merge-only support, skipping signature overlay test"
+        exit 0
+    fi
+
+    local sigdir="$WORKDIR/sigtest-overlay-source"
+    local defdir="$WORKDIR/sigtest-overlay-defs"
+    local user_home="$WORKDIR/sigtest-overlay-userhome"
+    local vendor_home="$WORKDIR/sigtest-overlay-vendorhome"
+    local other_home="$WORKDIR/sigtest-overlay-otherhome"
+    local target="$WORKDIR/sigtest-overlay-target"
+    local user_keyring="$WORKDIR/sigtest-overlay-user.gpg"
+    local vendor_keyring="$WORKDIR/sigtest-overlay-vendor.gpg"
+    local other_keyring="$WORKDIR/sigtest-overlay-other.gpg"
+    local etc_pgp_backup="$WORKDIR/import-pubring.etc.pgp.bak"
+    local etc_gpg_backup="$WORKDIR/import-pubring.etc.gpg.bak"
+    local usr_pgp_backup="$WORKDIR/import-pubring.usr.pgp.bak"
+    # Called via trap on EXIT; shellcheck cannot see the indirect invocation.
+    # shellcheck disable=SC2329,SC2317
+    cleanup_overlay_keyrings() {
+        set +e
+        gpgconf --homedir "$user_home" --kill all 2>/dev/null || :
+        gpgconf --homedir "$vendor_home" --kill all 2>/dev/null || :
+        gpgconf --homedir "$other_home" --kill all 2>/dev/null || :
+        restore_import_keyring /etc/systemd/import-pubring.pgp "$etc_pgp_backup"
+        restore_import_keyring /etc/systemd/import-pubring.gpg "$etc_gpg_backup"
+        restore_import_keyring /usr/lib/systemd/import-pubring.pgp "$usr_pgp_backup"
+    }
+
+    mkdir -p "$sigdir" "$defdir" "$user_home" "$vendor_home" "$other_home" "$target" /etc/systemd /usr/lib/systemd
+    chmod 700 "$user_home" "$vendor_home" "$other_home"
+
+    trap cleanup_overlay_keyrings EXIT
+
+    backup_import_keyring /etc/systemd/import-pubring.pgp "$etc_pgp_backup"
+    backup_import_keyring /etc/systemd/import-pubring.gpg "$etc_gpg_backup"
+    backup_import_keyring /usr/lib/systemd/import-pubring.pgp "$usr_pgp_backup"
+
+    GNUPGHOME="$user_home" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --quick-gen-key 'Overlay User <overlay-user@example.com>' rsa2048 cert,sign never
+    GNUPGHOME="$user_home" gpg --export --output "$user_keyring"
+
+    GNUPGHOME="$vendor_home" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --quick-gen-key 'Overlay Vendor <overlay-vendor@example.com>' rsa2048 cert,sign never
+    GNUPGHOME="$vendor_home" gpg --export --output "$vendor_keyring"
+
+    GNUPGHOME="$other_home" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --quick-gen-key 'Overlay Other <overlay-other@example.com>' rsa2048 cert,sign never
+    GNUPGHOME="$other_home" gpg --export --output "$other_keyring"
+
+    install -Dm0644 "$user_keyring" /etc/systemd/import-pubring.gpg
+    install -Dm0644 "$vendor_keyring" /usr/lib/systemd/import-pubring.pgp
+    rm -f /etc/systemd/import-pubring.pgp
+
+    dd if=/dev/urandom of="$sigdir/payload-v1.raw" bs=1024 count=8 status=none
+    (cd "$sigdir" && sha256sum payload-v1.raw > SHA256SUMS)
+    GNUPGHOME="$vendor_home" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --detach-sign --include-key-block --yes \
+        --output "$sigdir/SHA256SUMS.gpg" "$sigdir/SHA256SUMS"
+
+    cat >"$defdir/01-sigtest.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$sigdir
+MatchPattern=payload-@v.raw
+
+[Target]
+Type=regular-file
+Path=$target
+MatchPattern=payload-@v.raw
+InstancesMax=3
+EOF
+
+    "$SYSUPDATE" --definitions="$defdir" check-new
+    "$SYSUPDATE" --definitions="$defdir" update
+    cmp "$sigdir/payload-v1.raw" "$target/payload-v1.raw"
+
+    dd if=/dev/urandom of="$sigdir/payload-v2.raw" bs=1024 count=8 status=none
+    (cd "$sigdir" && sha256sum payload-v1.raw payload-v2.raw > SHA256SUMS)
+    GNUPGHOME="$other_home" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --detach-sign --include-key-block --yes \
+        --output "$sigdir/SHA256SUMS.gpg" "$sigdir/SHA256SUMS"
+    if "$SYSUPDATE" --definitions="$defdir" update; then
+        echo "ERROR: accepted an update signed by a key not in the default keyrings" >&2
+        exit 1
+    fi
+    if [ -f "$target/payload-v2.raw" ]; then
+        echo "ERROR: payload-v2 should not have been installed" >&2
+        exit 1
+    fi
+
+    dd if=/dev/urandom of="$sigdir/payload-v3.raw" bs=1024 count=8 status=none
+    (cd "$sigdir" && sha256sum payload-v1.raw payload-v2.raw payload-v3.raw > SHA256SUMS)
+    GNUPGHOME="$vendor_home" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --detach-sign --include-key-block --yes \
+        --output "$sigdir/SHA256SUMS.gpg" "$sigdir/SHA256SUMS"
+    if SYSTEMD_OPENPGP_KEYRING="$other_keyring" "$SYSUPDATE" --definitions="$defdir" update; then
+        echo "ERROR: accepted an update with an override keyring that lacks the signing key" >&2
+        exit 1
+    fi
+    if [ -f "$target/payload-v3.raw" ]; then
+        echo "ERROR: payload-v3 should not have been installed" >&2
+        exit 1
+    fi
+
+    install -Dm0644 "$user_keyring" /etc/systemd/import-pubring.pgp
+    rm -f /etc/systemd/import-pubring.gpg
+    dd if=/dev/urandom of="$sigdir/payload-v4.raw" bs=1024 count=8 status=none
+    (cd "$sigdir" && sha256sum payload-v1.raw payload-v2.raw payload-v3.raw payload-v4.raw > SHA256SUMS)
+    GNUPGHOME="$user_home" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --detach-sign --include-key-block --yes \
+        --output "$sigdir/SHA256SUMS.gpg" "$sigdir/SHA256SUMS"
+    "$SYSUPDATE" --definitions="$defdir" update
+    cmp "$sigdir/payload-v4.raw" "$target/payload-v4.raw"
+)
+
+test_signature_verification
+test_zero_fill
+test_signature_keyring_overlay
+
+# Test '**/' as prefix in MatchPattern= for subpaths in SHA256SUMS
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/sub"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/sub"
+
+printf '1234567' >"$WORKDIR/source/sub/blob-v10.bin"
+printf 'abcdefg' >"$WORKDIR/source/sub/blob-v11.bin"
+(cd "$WORKDIR/source" && rm -f BEST-BEFORE-* && sha256sum sub/blob-*.bin >SHA256SUMS)
+
+# A regular-file source where '**/' descends into sub/ to match against the basename
+cat >"$CONFIGDIR/01-basename-dir.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=**/blob-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=blob-@v.bin
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/sub/blob-v11.bin" "$WORKDIR/blobs/blob-v11.bin"
+[[ "$("$SYSUPDATE" --verify=no list v11 | grep -c "Version: v11")" == "1" ]]
+rm "$CONFIGDIR/01-basename-dir.transfer"
+
+# A url-file source pulled via file:// using SHA256SUMS with "sub/blob-v1x.bin" entries
+rm -rf "$WORKDIR/blobs"
+mkdir -p "$WORKDIR/blobs"
+cat >"$CONFIGDIR/01-basename-url.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=**/blob-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=blob-@v.bin
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/sub/blob-v11.bin" "$WORKDIR/blobs/blob-v11.bin"
+rm "$CONFIGDIR/01-basename-url.transfer"
+
+# A pattern that spells out the subdir literally should also work for url sources
+# for parity with regular-file sources
+rm -rf "$WORKDIR/blobs"
+mkdir -p "$WORKDIR/blobs"
+cat >"$CONFIGDIR/01-explicit-url.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=sub/blob-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=blob-@v.bin
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/sub/blob-v11.bin" "$WORKDIR/blobs/blob-v11.bin"
+rm "$CONFIGDIR/01-explicit-url.transfer"
+
+# Rejection test for a manifest entry containing ".."
+rm -rf "$WORKDIR/blobs"
+mkdir -p "$WORKDIR/blobs"
+mkdir -p "$WORKDIR/source/sub/nested"
+cp "$WORKDIR/source/SHA256SUMS" "$WORKDIR/source/SHA256SUMS.bak"
+sed -i 's,sub/,sub/nested/../,g' "$WORKDIR/source/SHA256SUMS"
+cat >"$CONFIGDIR/01-basename-url.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=**/blob-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=blob-@v.bin
+EOF
+if "$SYSUPDATE" --verify=no update |& tee "$WORKDIR/traversal.log"; then
+    echo "ERROR: accepted a manifest entry with a '..' path traversal" >&2
+    exit 1
+fi
+grep "Invalid filename" "$WORKDIR/traversal.log" >/dev/null
+mv "$WORKDIR/source/SHA256SUMS.bak" "$WORKDIR/source/SHA256SUMS"
+rm "$CONFIGDIR/01-basename-url.transfer"
+
+# Rejection test for a manifest entry with a percent-encoded ".." which curl would
+# decode when pulling via file://, escaping the source dir past path_is_normalized()
+rm -rf "$WORKDIR/blobs"
+mkdir -p "$WORKDIR/blobs"
+cp "$WORKDIR/source/SHA256SUMS" "$WORKDIR/source/SHA256SUMS.bak"
+sed -i 's,sub/,sub/nested/%2e%2e/,g' "$WORKDIR/source/SHA256SUMS"
+cat >"$CONFIGDIR/01-basename-url.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=**/blob-@v.bin
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=blob-@v.bin
+EOF
+if "$SYSUPDATE" --verify=no update |& tee "$WORKDIR/percent.log"; then
+    echo "ERROR: accepted a manifest entry with a percent-encoded '..' path traversal" >&2
+    exit 1
+fi
+grep "Invalid filename" "$WORKDIR/percent.log" >/dev/null
+mv "$WORKDIR/source/SHA256SUMS.bak" "$WORKDIR/source/SHA256SUMS"
+rm "$CONFIGDIR/01-basename-url.transfer"
+
+# A MatchPattern= with two subdirectory levels must descend beyond the first level
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/depth-v3"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/depth-v3/contents"
+printf 'version-three' >"$WORKDIR/source/depth-v3/contents/image.raw"
+cat >"$CONFIGDIR/01-depth.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=depth-@v/contents/image.raw
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=depth-@v.raw
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/depth-v3/contents/image.raw" "$WORKDIR/blobs/depth-v3.raw"
+rm -rf "$CONFIGDIR/01-depth.transfer" "$WORKDIR/source/depth-v3"
+
+# Pattern matching should not depend on the pattern order. A transfer can list one pattern per repository
+# layout, e.g., when a source switches from one directory per version (bundle-v1/image.raw) to flat files
+# (bundle-v2.raw) and both layouts coexist during a migration.
+# Check that after a subdirectory pattern which descends we still can match a top-level file through a
+# '**/' pattern.
+# Also check that after a non-matching '**/' pattern we still can match a plain top-level file.
+# Then check that after a subdirectory pattern we can still match a plain top-level file.
+# The first and last work because the wildcard field also captures the '.raw' suffix, so the top-level file
+# matches the directory component of the subdirectory pattern and triggers the descend-retry logic.
+# The fourth transfer checks the vice versa migration where one directory per version is the new layout and
+# the old versions are flat files without a suffix: the directory name fully matches the flat pattern but
+# must still be descended into for the subdirectory pattern.
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/bundle-v1" "$WORKDIR/source/pack-v2"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs"/{glob-last,glob-first,subdir-first,yes-and-retry} \
+         "$WORKDIR/source/bundle-v1" "$WORKDIR/source/pack-v2"
+echo 'version-one' >"$WORKDIR/source/bundle-v1/image.raw"
+echo 'version-two' >"$WORKDIR/source/bundle-v2.raw"
+echo 'version-v1' >"$WORKDIR/source/pack-v1"
+echo 'version-v2' >"$WORKDIR/source/pack-v2/image.raw"
+cat >"$CONFIGDIR/01-glob-last.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=bundle-@v/image.raw **/bundle-@v.raw
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs/glob-last
+MatchPattern=bundle-@v.raw
+InstancesMax=1
+EOF
+cat >"$CONFIGDIR/02-glob-first.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=**/bundle-@v.img bundle-@v.raw
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs/glob-first
+MatchPattern=bundle-@v.raw
+InstancesMax=1
+EOF
+cat >"$CONFIGDIR/03-subdir-first.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=bundle-@v/image.raw bundle-@v.raw
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs/subdir-first
+MatchPattern=bundle-@v.raw
+InstancesMax=1
+EOF
+cat >"$CONFIGDIR/04-yes-and-retry.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=$WORKDIR/source
+MatchPattern=pack-@v/image.raw pack-@v
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs/yes-and-retry
+MatchPattern=pack-@v
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+for target in glob-last glob-first subdir-first; do
+    cmp "$WORKDIR/source/bundle-v2.raw" "$WORKDIR/blobs/$target/bundle-v2.raw"
+done
+cmp "$WORKDIR/source/pack-v2/image.raw" "$WORKDIR/blobs/yes-and-retry/pack-v2"
+rm -rf "$CONFIGDIR"/{01-glob-last,02-glob-first,03-subdir-first,04-yes-and-retry}.transfer \
+       "$WORKDIR/source/bundle-v2.raw" "$WORKDIR/source/bundle-v1" \
+       "$WORKDIR/source/pack-v1" "$WORKDIR/source/pack-v2"
+
+# A manifest entry that both directly matches a flat pattern and prefix-matches a subdirectory pattern
+# must be downloaded, here the flat file is the newest version (this exercises YES_AND_RETRY)
+rm -rf "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/pack-v1"
+mkdir -p "$CONFIGDIR" "$WORKDIR/blobs" "$WORKDIR/source/pack-v1"
+echo 'version-v1' >"$WORKDIR/source/pack-v1/image.raw"
+echo 'version-v2' >"$WORKDIR/source/pack-v2"
+(cd "$WORKDIR/source" && sha256sum pack-v1/image.raw pack-v2 >SHA256SUMS)
+cat >"$CONFIGDIR/01-manifest-yes-and-retry.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$WORKDIR/source
+MatchPattern=pack-@v/image.raw pack-@v
+
+[Target]
+Type=regular-file
+Path=$WORKDIR/blobs
+MatchPattern=pack-@v
+InstancesMax=1
+EOF
+"$SYSUPDATE" --verify=no update
+cmp "$WORKDIR/source/pack-v2" "$WORKDIR/blobs/pack-v2"
+rm -rf "$CONFIGDIR/01-manifest-yes-and-retry.transfer" \
+       "$WORKDIR/source/pack-v1" "$WORKDIR/source/pack-v2"
+
+# Test that listing components/targets when none are configured gives an empty list.
+"$SYSUPDATE" components |& grep "No components defined." >/dev/null
+[[ $(varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -r '.targets') == "[]" ]]
+
+# ============================================================================
+# Components & features: enable/disable verbs, the --component-{all,suggested}
+# and --feature-{all,suggested} switches, plus the Suggest=/SuggestOn…=
+# settings. Everything below operates on freshly minted throw-away components
+# and features, and cleans up after itself.
+#
+# Layout used throughout:
+#   * a component <c> is defined by a transfer directory /run/sysupdate.<c>.d/
+#     (which is what makes it show up in the 'components' list) plus an optional
+#     metadata file /run/sysupdate.<c>.component carrying Description=/Suggest=/…
+#   * the enable-component/disable-component verbs write their Enabled= override
+#     into a drop-in below /etc/sysupdate.<c>.component.d/
+#   * the enable-feature/disable-feature verbs write their Enabled= override into
+#     a drop-in below /etc/sysupdate.d/<f>.feature.d/ (default component) or
+#     /etc/sysupdate.<c>.d/<f>.feature.d/ (named component)
+# ============================================================================
+CF="$WORKDIR/compfeat"
+
+# The Suggest…MachineTag= tests below drive the machine tags via /etc/machine-info
+# (which the condition logic reads directly); back up any pre-existing file so we
+# can restore it afterwards, mirroring TEST-74-AUX-UTILS.machine-tags.sh.
+MI_BAK="$WORKDIR/machine-info.orig"
+rm -f "$MI_BAK"
+[[ -e /etc/machine-info ]] && cp -a /etc/machine-info "$MI_BAK"
+
+set_machine_tags() {
+    if [[ -n "${1:-}" ]]; then
+        echo "TAGS=$1" >/etc/machine-info
+    else
+        rm -f /etc/machine-info
+    fi
+}
+
+restore_machine_info() {
+    if [[ -e "$MI_BAK" ]]; then
+        cp -a "$MI_BAK" /etc/machine-info
+    else
+        rm -f /etc/machine-info
+    fi
+}
+
+compfeat_cleanup() {
+    rm -rf /run/sysupdate.d \
+           /run/sysupdate.compx.d /run/sysupdate.compx.component /run/sysupdate.compx.component.d \
+           /run/sysupdate.compy.d /run/sysupdate.compy.component /run/sysupdate.compy.component.d \
+           /run/sysupdate.compz.d /run/sysupdate.compz.component /run/sysupdate.compz.component.d \
+           /etc/sysupdate.d \
+           /etc/sysupdate.compx.d /etc/sysupdate.compx.component.d \
+           /etc/sysupdate.compy.d /etc/sysupdate.compy.component.d \
+           /etc/sysupdate.compz.d /etc/sysupdate.compz.component.d
+    rm -rf "$CF"
+}
+
+compfeat_reset() {
+    compfeat_cleanup
+    mkdir -p "$CF/source" \
+             "$CF/target-default" "$CF/target-compx" "$CF/target-compy" "$CF/target-compz"
+}
+
+# (Re)generate the source payloads + SHA256SUMS for a given version. We create a
+# payload for every component/feature so a single SHA256SUMS covers them all;
+# individual transfers only ever match their own pattern.
+compfeat_source() {
+    local v="${1:?}"
+    local n
+    for n in base compx compy compz feata featb featc; do
+        echo "$n-$v-$RANDOM" >"$CF/source/$n-$v.bin"
+    done
+    (cd "$CF/source" && sha256sum -- *.bin >SHA256SUMS)
+}
+
+# Write a regular-file transfer; optional 4th argument gates it behind a feature.
+compfeat_transfer() {
+    local file="${1:?}" pat="${2:?}" tgt="${3:?}" feature="${4:-}"
+    {
+        if [[ -n "$feature" ]]; then
+            printf '[Transfer]\nFeatures=%s\n\n' "$feature"
+        fi
+        printf '[Source]\nType=regular-file\nPath=%s\nMatchPattern=%s-@v.bin\n\n' "$CF/source" "$pat"
+        printf '[Target]\nType=regular-file\nPath=%s\nMatchPattern=%s-@v.bin\nInstancesMax=2\n' "$tgt" "$pat"
+    } >"$file"
+}
+
+comp_enable_dropin()          { echo "/etc/sysupdate.$1.component.d/50-systemd-sysupdate-enabled.conf"; }
+feat_enable_dropin_default()  { echo "/etc/sysupdate.d/$1.feature.d/50-systemd-sysupdate-enabled.conf"; }
+feat_enable_dropin_comp()     { echo "/etc/sysupdate.$1.d/$2.feature.d/50-systemd-sysupdate-enabled.conf"; }
+
+# Assert a generated Enabled= drop-in exists and carries the expected value.
+assert_dropin() {
+    local file="${1:?}" val="${2:?}"
+    test -f "$file"
+    grep "^Enabled=$val$" "$file" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# enable-component / disable-component: explicit selection + observable effect
+# ---------------------------------------------------------------------------
+compfeat_reset
+compfeat_source v1
+mkdir -p /run/sysupdate.compx.d
+compfeat_transfer /run/sysupdate.compx.d/01-compx.transfer compx "$CF/target-compx"
+# A metadata file carrying a human-readable description (exercises loading of the
+# per-component *.component file from the search dirs).
+cat >/run/sysupdate.compx.component <<EOF
+[Component]
+Description=CompXDescription
+EOF
+
+# The description from the *.component file must surface in the 'components' listing.
+"$SYSUPDATE" --no-legend components | grep -F "CompXDescription" >/dev/null
+
+# A brand new component (no Enabled= override anywhere) is enabled by default and
+# can be updated.
+"$SYSUPDATE" --component=compx --verify=no update
+test -f "$CF/target-compx/compx-v1.bin"
+
+# Disable it: this must drop an Enabled=no override next to the definition, and
+# subsequent updates for that component must be refused.
+"$SYSUPDATE" disable-component compx
+assert_dropin "$(comp_enable_dropin compx)" no
+(! "$SYSUPDATE" --component=compx --verify=no update) |& grep -F "Component is disabled" >/dev/null
+
+# Re-enable via the "--component= + no positional argument" form and verify the
+# update works again.
+"$SYSUPDATE" --component=compx enable-component
+assert_dropin "$(comp_enable_dropin compx)" yes
+rm -f "$CF/target-compx/compx-v1.bin"
+"$SYSUPDATE" --component=compx --verify=no update
+test -f "$CF/target-compx/compx-v1.bin"
+
+# Enabling a component must not conjure a bogus "<c>.component" pseudo-component
+# out of the freshly created sysupdate.compx.component.d/ drop-in directory.
+(! "$SYSUPDATE" --json=short components | grep -F '"compx.component"' >/dev/null)
+"$SYSUPDATE" --json=short components | grep -F '"compx"' >/dev/null
+
+# ---------------------------------------------------------------------------
+# enable-component / disable-component: argument validation & error handling
+# ---------------------------------------------------------------------------
+# Positional argument and --component= are mutually exclusive.
+(! "$SYSUPDATE" --component=compx enable-component compx) |& grep -F "not both" >/dev/null
+# Syntactically invalid component name.
+(! "$SYSUPDATE" enable-component ../nope) |& grep -F "Component name invalid" >/dev/null
+# Unknown component.
+(! "$SYSUPDATE" enable-component doesnotexist) |& grep -F "Component not found" >/dev/null
+# --definitions= is incompatible with component enablement.
+(! "$SYSUPDATE" --definitions="$CF" enable-component compx) |& grep -F "may not be combined" >/dev/null
+# The feature-selection switches make no sense here.
+(! "$SYSUPDATE" --feature-all enable-component compx) |& grep -F "not supported" >/dev/null
+
+# ---------------------------------------------------------------------------
+# --component-all for enable-component / disable-component
+# ---------------------------------------------------------------------------
+compfeat_reset
+compfeat_source v1
+mkdir -p /run/sysupdate.compx.d /run/sysupdate.compy.d
+compfeat_transfer /run/sysupdate.compx.d/01-compx.transfer compx "$CF/target-compx"
+compfeat_transfer /run/sysupdate.compy.d/01-compy.transfer compy "$CF/target-compy"
+
+# Disable *all* components in one go, then re-enable them all.
+"$SYSUPDATE" --component-all disable-component
+assert_dropin "$(comp_enable_dropin compx)" no
+assert_dropin "$(comp_enable_dropin compy)" no
+(! "$SYSUPDATE" --component=compx --verify=no update) |& grep -F "Component is disabled" >/dev/null
+(! "$SYSUPDATE" --component=compy --verify=no update) |& grep -F "Component is disabled" >/dev/null
+
+"$SYSUPDATE" --component-all enable-component
+assert_dropin "$(comp_enable_dropin compx)" yes
+assert_dropin "$(comp_enable_dropin compy)" yes
+"$SYSUPDATE" --component=compx --verify=no update
+"$SYSUPDATE" --component=compy --verify=no update
+test -f "$CF/target-compx/compx-v1.bin"
+test -f "$CF/target-compy/compy-v1.bin"
+
+# ---------------------------------------------------------------------------
+# --component-suggested driven by Suggest= (compx suggested, compy not)
+# ---------------------------------------------------------------------------
+compfeat_reset
+compfeat_source v1
+mkdir -p /run/sysupdate.compx.d /run/sysupdate.compy.d
+compfeat_transfer /run/sysupdate.compx.d/01-compx.transfer compx "$CF/target-compx"
+compfeat_transfer /run/sysupdate.compy.d/01-compy.transfer compy "$CF/target-compy"
+cat >/run/sysupdate.compx.component <<EOF
+[Component]
+Suggest=yes
+EOF
+cat >/run/sysupdate.compy.component <<EOF
+[Component]
+Suggest=no
+EOF
+
+# 'enable-component --component-suggested' acts on the suggested components only.
+"$SYSUPDATE" --component-suggested enable-component
+assert_dropin "$(comp_enable_dropin compx)" yes
+test ! -e "$(comp_enable_dropin compy)"
+
+# 'disable-component --component-suggested' acts on the very same set, i.e. it
+# undoes what the enable above did. The non-suggested compy is left untouched.
+"$SYSUPDATE" --component-suggested disable-component
+assert_dropin "$(comp_enable_dropin compx)" no
+test ! -e "$(comp_enable_dropin compy)"
+
+# Reconciling the system with the current suggestions is a two step operation:
+# disable all components, then enable the suggested ones. Unlike the single
+# 'disable-component --component-suggested' above this makes the non-suggested
+# compy explicitly disabled.
+"$SYSUPDATE" --component-all disable-component
+"$SYSUPDATE" --component-suggested enable-component
+assert_dropin "$(comp_enable_dropin compx)" yes
+assert_dropin "$(comp_enable_dropin compy)" no
+
+# --component-suggested is not supported for the update verb.
+(! "$SYSUPDATE" --component-suggested --verify=no update) |& grep -F "not supported" >/dev/null
+
+# ---------------------------------------------------------------------------
+# SuggestOnMachineTag= for a component
+# ---------------------------------------------------------------------------
+compfeat_reset
+compfeat_source v1
+mkdir -p /run/sysupdate.compz.d
+compfeat_transfer /run/sysupdate.compz.d/01-compz.transfer compz "$CF/target-compz"
+cat >/run/sysupdate.compz.component <<EOF
+[Component]
+SuggestOnMachineTag=sysupdate-test-tag
+EOF
+
+# Without the matching machine tag the component is not suggested, so
+# --component-suggested selects nothing.
+set_machine_tags some-other-tag
+"$SYSUPDATE" --component-suggested enable-component
+test ! -e "$(comp_enable_dropin compz)"
+
+# With the matching tag present it becomes suggested and gets enabled.
+set_machine_tags sysupdate-test-tag:another
+"$SYSUPDATE" --component-suggested enable-component
+assert_dropin "$(comp_enable_dropin compz)" yes
+set_machine_tags ""
+
+# ---------------------------------------------------------------------------
+# enable-feature / disable-feature on the default component + observable effect
+# ---------------------------------------------------------------------------
+compfeat_reset
+compfeat_source v1
+mkdir -p /run/sysupdate.d
+compfeat_transfer /run/sysupdate.d/01-base.transfer base "$CF/target-default"
+compfeat_transfer /run/sysupdate.d/50-feata.transfer feata "$CF/target-default" feata
+cat >/run/sysupdate.d/feata.feature <<EOF
+[Feature]
+Description=Feature A
+EOF
+
+# The feature is listed and disabled by default, so its transfer is not installed.
+"$SYSUPDATE" features | grep -F "feata" >/dev/null
+"$SYSUPDATE" --verify=no update
+test -f "$CF/target-default/base-v1.bin"
+test ! -e "$CF/target-default/feata-v1.bin"
+
+# Enabling the feature must drop an Enabled=yes override and cause the gated
+# transfer to be installed on the next update.
+"$SYSUPDATE" enable-feature feata
+assert_dropin "$(feat_enable_dropin_default feata)" yes
+"$SYSUPDATE" --verify=no update
+test -f "$CF/target-default/feata-v1.bin"
+
+# Disabling it again + vacuum must remove the now-orphaned feature resource.
+"$SYSUPDATE" disable-feature feata
+assert_dropin "$(feat_enable_dropin_default feata)" no
+"$SYSUPDATE" --verify=no vacuum
+test ! -e "$CF/target-default/feata-v1.bin"
+
+# Argument validation for the feature verbs.
+(! "$SYSUPDATE" enable-feature --feature-all feata) |& grep -F "not both" >/dev/null
+(! "$SYSUPDATE" enable-feature 'bad/name') |& grep -F "Feature name invalid" >/dev/null
+(! "$SYSUPDATE" --component-suggested enable-feature feata) |& grep -F "not supported" >/dev/null
+
+# ---------------------------------------------------------------------------
+# --feature-all / --feature-suggested (default component)
+# ---------------------------------------------------------------------------
+compfeat_reset
+compfeat_source v1
+mkdir -p /run/sysupdate.d
+compfeat_transfer /run/sysupdate.d/01-base.transfer base "$CF/target-default"
+# feata: suggested (Suggest=yes); featb: not suggested (Suggest=no);
+# featc: suggested on a machine tag we will set below; featd: malformed
+# suggestion condition, which should be skipped without aborting the operation.
+cat >/run/sysupdate.d/feata.feature <<EOF
+[Feature]
+Suggest=yes
+EOF
+cat >/run/sysupdate.d/featb.feature <<EOF
+[Feature]
+Suggest=no
+EOF
+cat >/run/sysupdate.d/featc.feature <<EOF
+[Feature]
+SuggestOnMachineTag=sysupdate-test-tag
+EOF
+cat >/run/sysupdate.d/featd.feature <<EOF
+[Feature]
+SuggestOnFirmware=smbios-field(malformed)
+EOF
+
+# --feature-all operates on every known feature.
+"$SYSUPDATE" enable-feature --feature-all
+assert_dropin "$(feat_enable_dropin_default feata)" yes
+assert_dropin "$(feat_enable_dropin_default featb)" yes
+assert_dropin "$(feat_enable_dropin_default featc)" yes
+assert_dropin "$(feat_enable_dropin_default featd)" yes
+
+# ... and so does 'disable-feature --feature-all', in the other direction.
+"$SYSUPDATE" disable-feature --feature-all
+assert_dropin "$(feat_enable_dropin_default feata)" no
+assert_dropin "$(feat_enable_dropin_default featb)" no
+assert_dropin "$(feat_enable_dropin_default featc)" no
+assert_dropin "$(feat_enable_dropin_default featd)" no
+
+# --feature-suggested (no machine tag): only the Suggest=yes feature is picked.
+rm -rf /etc/sysupdate.d
+set_machine_tags unrelated
+"$SYSUPDATE" enable-feature --feature-suggested
+assert_dropin "$(feat_enable_dropin_default feata)" yes
+test ! -e "$(feat_enable_dropin_default featb)"
+test ! -e "$(feat_enable_dropin_default featc)"
+test ! -e "$(feat_enable_dropin_default featd)"
+
+# --feature-suggested with the machine tag set: feata + featc are picked.
+rm -rf /etc/sysupdate.d
+set_machine_tags sysupdate-test-tag
+"$SYSUPDATE" enable-feature --feature-suggested
+assert_dropin "$(feat_enable_dropin_default feata)" yes
+assert_dropin "$(feat_enable_dropin_default featc)" yes
+test ! -e "$(feat_enable_dropin_default featb)"
+test ! -e "$(feat_enable_dropin_default featd)"
+
+# 'disable-feature --feature-suggested' selects the same features as the enable
+# above, i.e. it undoes it and leaves the non-suggested featb untouched.
+"$SYSUPDATE" disable-feature --feature-suggested
+assert_dropin "$(feat_enable_dropin_default feata)" no
+assert_dropin "$(feat_enable_dropin_default featc)" no
+test ! -e "$(feat_enable_dropin_default featb)"
+test ! -e "$(feat_enable_dropin_default featd)"
+
+# The same two step reconciliation for features: disable all of them, then
+# enable the suggested ones, leaving the non-suggested featb explicitly off.
+"$SYSUPDATE" disable-feature --feature-all
+"$SYSUPDATE" enable-feature --feature-suggested
+assert_dropin "$(feat_enable_dropin_default feata)" yes
+assert_dropin "$(feat_enable_dropin_default featc)" yes
+assert_dropin "$(feat_enable_dropin_default featb)" no
+set_machine_tags ""
+
+# --component-all must still include the default component when all of its
+# transfers are currently disabled by features.
+compfeat_reset
+compfeat_source v1
+mkdir -p /run/sysupdate.d
+compfeat_transfer /run/sysupdate.d/50-feata.transfer feata "$CF/target-default" feata
+cat >/run/sysupdate.d/feata.feature <<EOF
+[Feature]
+Description=Feature A
+EOF
+"$SYSUPDATE" --component-all enable-feature --feature-all
+assert_dropin "$(feat_enable_dropin_default feata)" yes
+
+# --component-all must include the default component under --root= too.
+ROOT_FEATURE="$WORKDIR/root-feature"
+ROOT_FEATURE_ROOT="$ROOT_FEATURE/root"
+rm -rf "$ROOT_FEATURE"
+mkdir -p "$ROOT_FEATURE_ROOT/etc/sysupdate.d" \
+         "$ROOT_FEATURE_ROOT/source" \
+         "$ROOT_FEATURE_ROOT/target"
+cat >"$ROOT_FEATURE_ROOT/etc/sysupdate.d/50-feata.transfer" <<EOF
+[Transfer]
+Features=feata
+
+[Source]
+Type=regular-file
+Path=/source
+MatchPattern=feata-@v.bin
+
+[Target]
+Type=regular-file
+Path=/target
+MatchPattern=feata-@v.bin
+InstancesMax=2
+EOF
+cat >"$ROOT_FEATURE_ROOT/etc/sysupdate.d/feata.feature" <<EOF
+[Feature]
+Description=Feature A
+EOF
+"$SYSUPDATE" --root="$ROOT_FEATURE_ROOT" --component-all enable-feature --feature-all
+assert_dropin "$ROOT_FEATURE_ROOT$(feat_enable_dropin_default feata)" yes
+
+rm -rf "$ROOT_FEATURE"
+
+# ---------------------------------------------------------------------------
+# Features scoped to a named component, and across all components at once
+# ---------------------------------------------------------------------------
+compfeat_reset
+compfeat_source v1
+mkdir -p /run/sysupdate.d /run/sysupdate.compx.d
+compfeat_transfer /run/sysupdate.d/01-base.transfer base "$CF/target-default"
+compfeat_transfer /run/sysupdate.compx.d/01-compx.transfer compx "$CF/target-compx"
+cat >/run/sysupdate.d/feata.feature <<EOF
+[Feature]
+Description=Default feature A
+EOF
+cat >/run/sysupdate.compx.d/featx.feature <<EOF
+[Feature]
+Description=Component X feature
+EOF
+
+# --component= scopes feature operations to that component: the drop-in must land
+# next to the component's definitions, and the default component is untouched.
+"$SYSUPDATE" --component=compx enable-feature --feature-all
+assert_dropin "$(feat_enable_dropin_comp compx featx)" yes
+test ! -e "$(feat_enable_dropin_default feata)"
+
+# --component-all --feature-all fans out over the default component *and* every
+# named component.
+rm -rf /etc/sysupdate.d /etc/sysupdate.compx.d
+"$SYSUPDATE" --component-all enable-feature --feature-all
+assert_dropin "$(feat_enable_dropin_default feata)" yes
+assert_dropin "$(feat_enable_dropin_comp compx featx)" yes
+
+# ---------------------------------------------------------------------------
+# update --component-all installs every component's update in one invocation
+# ---------------------------------------------------------------------------
+compfeat_reset
+compfeat_source v1
+mkdir -p /run/sysupdate.compx.d /run/sysupdate.compy.d
+compfeat_transfer /run/sysupdate.compx.d/01-compx.transfer compx "$CF/target-compx"
+compfeat_transfer /run/sysupdate.compy.d/01-compy.transfer compy "$CF/target-compy"
+
+"$SYSUPDATE" --component-all --verify=no update
+test -f "$CF/target-compx/compx-v1.bin"
+test -f "$CF/target-compy/compy-v1.bin"
+
+# A second version must likewise be rolled out to every component at once.
+compfeat_source v2
+"$SYSUPDATE" --component-all --verify=no update
+test -f "$CF/target-compx/compx-v2.bin"
+test -f "$CF/target-compy/compy-v2.bin"
+
+# A disabled component must not turn "update --component-all" into a failure:
+# it is skipped, while the remaining enabled components are still updated.
+"$SYSUPDATE" disable-component compy
+compfeat_source v3
+"$SYSUPDATE" --component-all --verify=no update
+test -f "$CF/target-compx/compx-v3.bin"
+test ! -e "$CF/target-compy/compy-v3.bin"
+
+# ---------------------------------------------------------------------------
+# MaxVersion= in transfers, MinVersion=/MaxVersion=/ProtectVersion= in components
+# ---------------------------------------------------------------------------
+compfeat_reset
+compfeat_source v1
+compfeat_source v2
+compfeat_source v3
+mkdir -p /run/sysupdate.compx.d /run/sysupdate.compy.d /run/sysupdate.compz.d
+compfeat_transfer /run/sysupdate.compx.d/01-compx.transfer compx "$CF/target-compx"
+compfeat_transfer /run/sysupdate.compy.d/01-compy.transfer compy "$CF/target-compy"
+compfeat_transfer /run/sysupdate.compz.d/01-compz.transfer compz "$CF/target-compz"
+
+# compx is capped at v2 by its transfer definition, compy by its component file.
+sed -i '1i [Transfer]\nMaxVersion=v2\n' /run/sysupdate.compx.d/01-compx.transfer
+cat >/run/sysupdate.compy.component <<EOF
+[Component]
+MaxVersion=v2
+EOF
+# compz requires at least v2 and protects v2 from vacuuming, via its component file.
+cat >/run/sysupdate.compz.component <<EOF
+[Component]
+MinVersion=v2
+ProtectVersion=v2
+EOF
+
+for c in compx compy; do
+    # v3 is too new: listed and marked as such, never the candidate, refused when requested explicitly.
+    "$SYSUPDATE" --component="$c" --verify=no list | grep -E "v3 .*available\+too-new" >/dev/null
+    "$SYSUPDATE" --component="$c" --verify=no list | grep -E "v2 .*candidate" >/dev/null
+    "$SYSUPDATE" --component="$c" --verify=no --json=short list v3 | jq -e '.tooNew == true and .newest == true' >/dev/null
+    "$SYSUPDATE" --component="$c" --verify=no --json=short list v2 | jq -e '.tooNew == false' >/dev/null
+    "$SYSUPDATE" --component="$c" --verify=no --json=short check-new | grep -F '{"available":"v2"}' >/dev/null
+    (! "$SYSUPDATE" --component="$c" --verify=no update v3) |& grep -F "newer than permitted" >/dev/null
+    "$SYSUPDATE" --component="$c" --verify=no update
+    test -f "$CF/target-$c/$c-v2.bin"
+    test ! -e "$CF/target-$c/$c-v3.bin"
+    "$SYSUPDATE" --component="$c" --verify=no list | grep -E "v2 .*current" >/dev/null
+    # check-new fails when there is nothing to update to, hence don't pipe it
+    if output="$("$SYSUPDATE" --component="$c" --verify=no --json=short check-new)"; then
+        exit 1
+    fi
+    [[ "$output" == '{"available":null}' ]]
+done
+
+# compz: v1 is obsolete due to the component-level MinVersion=.
+"$SYSUPDATE" --component=compz --verify=no list | grep -E "v1 .*available\+obsolete" >/dev/null
+(! "$SYSUPDATE" --component=compz --verify=no update v1) |& grep -F "is obsolete" >/dev/null
+"$SYSUPDATE" --component=compz --verify=no update v2
+"$SYSUPDATE" --component=compz --verify=no update v3
+compfeat_source v4
+"$SYSUPDATE" --component=compz --verify=no update
+# v2 is protected via the component file, hence v3 had to make room for v4 instead (InstancesMax=2).
+test -f "$CF/target-compz/compz-v2.bin"
+test ! -e "$CF/target-compz/compz-v3.bin"
+test -f "$CF/target-compz/compz-v4.bin"
+
+# The component metadata (including the new settings) is exposed via the JSON output and Varlink.
+"$SYSUPDATE" --json=short components | jq -e '.details[] | select(.name == "compy") | .maxVersion == "v2" and .enabled == true and .suggested == false' >/dev/null
+"$SYSUPDATE" --json=short components | jq -e '.details[] | select(.name == "compz") | .minVersion == "v2" and .protectVersion == ["v2"] and (has("maxVersion") | not)' >/dev/null
+varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -e '[.targets[] | select(.id.class == "component") | .id.name] == ["compx", "compy", "compz"]' >/dev/null
+varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -e '.targets[] | select(.id.name == "compz") | .minVersion == "v2" and .protectVersion == ["v2"] and .enabled == true' >/dev/null
+varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -e '[.targets[] | select(.id.class != "component") | has("enabled")] | any | not' >/dev/null
+
+# ---------------------------------------------------------------------------
+# Component providers: io.systemd.SysUpdate.Provider
+# ---------------------------------------------------------------------------
+# Component definitions may also be acquired from services that bind a Varlink socket into
+# /run/systemd/sysupdate/provider/. We run two such providers via socket activation (plus a third one that
+# runs unprivileged, which is fine), all backed by a tiny Python implementation serving a JSON fixture.
+compfeat_reset
+compfeat_source v1
+compfeat_source v2
+compfeat_source v3
+for v in v1 v2 v3; do
+    for n in pcomp extra shared bonly cunpriv; do
+        echo "$n-$v-$RANDOM" >"$CF/source/$n-$v.bin"
+    done
+done
+mkdir -p "$CF/target-pcomp" "$CF/target-shared" "$CF/target-bonly" "$CF/target-cunpriv"
+
+PROVIDER_DIR=/run/systemd/sysupdate/provider
+mkdir -p "$PROVIDER_DIR"
+
+FAKE_PROVIDER=/usr/lib/systemd/tests/integration-tests/TEST-72-SYSUPDATE/TEST-72-SYSUPDATE.units/fake-sysupdate-provider.py
+
+# Emit a regular-file transfer definition in JSON form, the equivalent of compfeat_transfer().
+provider_transfer() {
+    local id="${1:?}" pat="${2:?}" tgt="${3:?}" feature="${4:-}"
+    local features=""
+    if [[ -n "$feature" ]]; then
+        features=", \"features\": [\"$feature\"]"
+    fi
+    printf '{"id": "%s"%s, "source": {"type": "regular_file", "path": "%s", "matchPattern": ["%s-@v.bin"]}, "target": {"type": "regular_file", "path": "%s", "matchPattern": ["%s-@v.bin"], "instancesMax": 2}}' \
+           "$id" "$features" "$CF/source" "$pat" "$tgt" "$pat"
+}
+
+# Provider A: pcomp (capped at v2, with a disabled optional feature), shared, and compx (which also exists
+# in the file system, and must hence be taken from there).
+cat >"$WORKDIR/provider-a.json" <<EOF
+{
+  "targets": [
+    {"id": {"class": "component", "name": "pcomp"}, "description": "Provided component", "enabled": true, "suggested": true, "maxVersion": "v2"},
+    {"id": {"class": "component", "name": "shared"}, "description": "From provider A"},
+    {"id": {"class": "component", "name": "compx"}, "description": "From provider A"}
+  ],
+  "definitions": {
+    "pcomp": {
+      "target": {"id": {"class": "component", "name": "pcomp"}, "description": "Provided component", "enabled": true, "suggested": true, "maxVersion": "v2"},
+      "features": [{"id": "extra", "description": "Extra feature", "enabled": false}],
+      "transfers": [$(provider_transfer 01-main pcomp "$CF/target-pcomp"), $(provider_transfer 02-extra extra "$CF/target-pcomp" extra)]
+    },
+    "shared": {
+      "target": {"id": {"class": "component", "name": "shared"}, "description": "From provider A"},
+      "features": [],
+      "transfers": [$(provider_transfer 01-shared shared "$CF/target-shared")]
+    },
+    "compx": {
+      "target": {"id": {"class": "component", "name": "compx"}, "description": "From provider A"},
+      "features": [],
+      "transfers": [$(provider_transfer 01-compx compx "$CF/target-compx")]
+    }
+  }
+}
+EOF
+# Provider B: shared (loses against A, whose socket name sorts first) and bonly.
+cat >"$WORKDIR/provider-b.json" <<EOF
+{
+  "targets": [
+    {"id": {"class": "component", "name": "shared"}, "description": "From provider B"},
+    {"id": {"class": "component", "name": "bonly"}}
+  ],
+  "definitions": {
+    "shared": {
+      "target": {"id": {"class": "component", "name": "shared"}, "description": "From provider B"},
+      "features": [],
+      "transfers": [$(provider_transfer 01-shared shared "$CF/target-shared")]
+    },
+    "bonly": {
+      "target": {"id": {"class": "component", "name": "bonly"}},
+      "features": [],
+      "transfers": [$(provider_transfer 01-bonly bonly "$CF/target-bonly")]
+    }
+  }
+}
+EOF
+# Provider C: runs unprivileged, and just contributes one more component.
+cat >"$WORKDIR/provider-c.json" <<EOF
+{
+  "targets": [{"id": {"class": "component", "name": "cunpriv"}}],
+  "definitions": {
+    "cunpriv": {"target": {"id": {"class": "component", "name": "cunpriv"}}, "features": [], "transfers": [$(provider_transfer 01-cunpriv cunpriv "$CF/target-cunpriv")]}
+  }
+}
+EOF
+
+for p in a b; do
+    cat >"/run/systemd/system/test-sysupdate-provider-$p.socket" <<EOF
+[Socket]
+ListenStream=$PROVIDER_DIR/io.test.Provider${p^^}
+Accept=yes
+EOF
+    cat >"/run/systemd/system/test-sysupdate-provider-$p@.service" <<EOF
+[Service]
+ExecStart=$FAKE_PROVIDER $WORKDIR/provider-$p.json
+StandardInput=socket
+StandardOutput=socket
+EOF
+done
+systemctl daemon-reload
+systemctl start test-sysupdate-provider-a.socket test-sysupdate-provider-b.socket
+
+# The unprivileged provider listens elsewhere, root symlinks its socket into the directory.
+mkdir -p /tmp/test-sysupdate-provider-c
+install -m 0644 "$WORKDIR/provider-c.json" /tmp/test-sysupdate-provider-c/fixture.json
+chmod 0777 /tmp/test-sysupdate-provider-c
+systemd-run --unit=test-sysupdate-provider-c --uid=nobody \
+    "$FAKE_PROVIDER" /tmp/test-sysupdate-provider-c/fixture.json /tmp/test-sysupdate-provider-c/sock
+timeout 10 bash -c 'until test -S /tmp/test-sysupdate-provider-c/sock; do sleep .1; done'
+ln -s /tmp/test-sysupdate-provider-c/sock "$PROVIDER_DIR/io.test.ProviderC"
+
+# compx exists in the file system as well; that definition must win over provider A's.
+mkdir -p /run/sysupdate.compx.d
+compfeat_transfer /run/sysupdate.compx.d/01-compx.transfer compx "$CF/target-compx"
+cat >/run/sysupdate.compx.component <<EOF
+[Component]
+Description=From the file system
+EOF
+
+# The component list is the union of file system and providers.
+"$SYSUPDATE" --json=short components | jq -e '.components == ["bonly", "compx", "cunpriv", "pcomp", "shared"]' >/dev/null
+"$SYSUPDATE" --json=short components | jq -e '.providers == {"pcomp": "io.test.ProviderA", "shared": "io.test.ProviderA", "bonly": "io.test.ProviderB", "cunpriv": "io.test.ProviderC"}' >/dev/null
+"$SYSUPDATE" --json=short components | jq -e '.details[] | select(.name == "compx") | .description == "From the file system"' >/dev/null
+"$SYSUPDATE" --json=short components | jq -e '.details[] | select(.name == "shared") | .description == "From provider A"' >/dev/null
+"$SYSUPDATE" --json=short components | jq -e '.details[] | select(.name == "pcomp") | .maxVersion == "v2" and .suggested == true' >/dev/null
+"$SYSUPDATE" --no-legend components | grep -F "Provided component" >/dev/null
+varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -e '.targets | map(.id.name) | index("pcomp") != null and index("bonly") != null and index("cunpriv") != null' >/dev/null
+varlinkctl call "$VARLINK_SOCKET" io.systemd.SysUpdate.ListTargets | jq -e '.targets[] | select(.id.name == "pcomp") | .maxVersion == "v2" and .suggested == true' >/dev/null
+
+# Providers are only consulted when operating on the host.
+"$SYSUPDATE" --root=/ --json=short components | jq -e '.components == ["compx"] and (has("providers") | not)' >/dev/null
+
+# An existing but empty directory in the file system defines nothing, hence the provider's definition is
+# still used for the component.
+mkdir -p /etc/sysupdate.bonly.d
+"$SYSUPDATE" --json=short components | jq -e '.components == ["bonly", "compx", "cunpriv", "pcomp", "shared"] and .providers.bonly == "io.test.ProviderB"' >/dev/null
+"$SYSUPDATE" --component=bonly --verify=no list | grep -E "v3 .*candidate" >/dev/null
+rmdir /etc/sysupdate.bonly.d
+# A component file on its own is a definition in the file system though, and hence masks the provider's.
+echo "[Component]" >/run/sysupdate.bonly.component
+"$SYSUPDATE" --json=short components | jq -e '.components == ["bonly", "compx", "cunpriv", "pcomp", "shared"] and (.providers | has("bonly") | not)' >/dev/null
+(! "$SYSUPDATE" --component=bonly --verify=no list) |& grep -F "No transfer definitions" >/dev/null
+rm -f /run/sysupdate.bonly.component
+
+# The provider-supplied definition is used like one from the file system, including MaxVersion= and
+# optional features.
+"$SYSUPDATE" --component=pcomp --verify=no list | grep -E "v3 .*available\+too-new" >/dev/null
+"$SYSUPDATE" --component=pcomp features | grep -F "Extra feature" >/dev/null
+"$SYSUPDATE" --component=pcomp --verify=no update
+test -f "$CF/target-pcomp/pcomp-v2.bin"
+test ! -e "$CF/target-pcomp/pcomp-v3.bin"
+test ! -e "$CF/target-pcomp/extra-v2.bin"   # feature disabled
+"$SYSUPDATE" --component=shared --verify=no update
+test -f "$CF/target-shared/shared-v3.bin"
+
+# The enablement state of provider-backed components and their features lives with the provider.
+(! "$SYSUPDATE" enable-component pcomp) |& grep -F "cannot change its enablement state" >/dev/null
+(! "$SYSUPDATE" --component=pcomp enable-feature extra) |& grep -F "cannot change the enablement state" >/dev/null
+test ! -e "$(feat_enable_dropin_comp pcomp extra)"
+# ... while in the "all" modes they are skipped, and the file system components are still handled.
+"$SYSUPDATE" --component-all disable-component
+assert_dropin "$(comp_enable_dropin compx)" no
+test ! -e "$(comp_enable_dropin pcomp)"
+"$SYSUPDATE" --component-all enable-component
+"$SYSUPDATE" --component-all enable-feature --feature-all
+
+# update --component-all covers provider-backed components too, including the unprivileged provider's.
+"$SYSUPDATE" --component-all --verify=no update
+test -f "$CF/target-bonly/bonly-v3.bin"
+test -f "$CF/target-compx/compx-v3.bin"
+test -f "$CF/target-cunpriv/cunpriv-v3.bin"
+
+if [[ -x "$SYSUPDATED" && -x "$UPDATECTL" ]]; then
+    systemctl start systemd-sysupdated
+    "$UPDATECTL" list | grep -F "pcomp" >/dev/null
+fi
+
+# A stale socket nobody listens on only makes the outcome uncertain for components it might have claimed,
+# i.e. if it sorts before the provider that answered.
+python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])' "$PROVIDER_DIR/io.test.ProviderZ"
+"$SYSUPDATE" --component=pcomp --verify=no list | grep -E "v3 .*available\+too-new" >/dev/null
+mv "$PROVIDER_DIR/io.test.ProviderZ" "$PROVIDER_DIR/io.test.Provider0"
+(! "$SYSUPDATE" --component=pcomp --verify=no list) |& grep -F "not all component providers answered" >/dev/null
+rm "$PROVIDER_DIR/io.test.Provider0"
+
+# A provider that fails to answer must not make its components look removed: cleanup must leave the
+# installed files alone (and fail), and only proceed once the provider answers again.
+installdb_count_pcomp() { find /var/lib/systemd/sysupdate/installdb.pcomp -mindepth 1 -maxdepth 1 -type l 2>/dev/null | wc -l; }
+[[ "$(installdb_count_pcomp)" -ge 1 ]]
+mv "$WORKDIR/provider-a.json" "$WORKDIR/provider-a.json.bak"   # makes the service die without replying
+(! "$SYSUPDATE" cleanup --component-all)
+test -f "$CF/target-pcomp/pcomp-v2.bin"
+[[ "$(installdb_count_pcomp)" -ge 1 ]]
+(! "$SYSUPDATE" --component=pcomp --verify=no update)
+(! "$SYSUPDATE" --component-all --verify=no --cleanup=yes update)
+test -f "$CF/target-pcomp/pcomp-v2.bin"
+mv "$WORKDIR/provider-a.json.bak" "$WORKDIR/provider-a.json"
+"$SYSUPDATE" cleanup --component-all
+test -f "$CF/target-pcomp/pcomp-v2.bin"
+# Once the provider properly denies knowing the component, cleanup removes what's left of it.
+jq 'del(.targets[] | select(.id.name == "pcomp")) | del(.definitions.pcomp)' "$WORKDIR/provider-a.json" >"$WORKDIR/provider-a.json.new"
+mv "$WORKDIR/provider-a.json.new" "$WORKDIR/provider-a.json"
+"$SYSUPDATE" --json=short components | jq -e '.components == ["bonly", "compx", "cunpriv", "shared"]' >/dev/null
+"$SYSUPDATE" cleanup --component-all
+test ! -e "$CF/target-pcomp/pcomp-v2.bin"
+[[ "$(installdb_count_pcomp)" -eq 0 ]]
+
+systemctl stop test-sysupdate-provider-a.socket test-sysupdate-provider-b.socket test-sysupdate-provider-c.service
+rm -f /run/systemd/system/test-sysupdate-provider-{a,b}.socket /run/systemd/system/test-sysupdate-provider-{a,b}@.service
+systemctl daemon-reload
+rm -rf "$PROVIDER_DIR" /tmp/test-sysupdate-provider-c /run/sysupdate.compx.component
+rm -f "$WORKDIR"/provider-*.json
+
+# ---------------------------------------------------------------------------
+# Resource providers: provider:[socket]/resource URLs and io.systemd.ResourceProvider
+# ---------------------------------------------------------------------------
+# systemd-pull (and hence systemd-sysupdate) can acquire resources from a local Varlink service instead
+# of a web server. We run one such service, serving files from a directory, via socket activation.
+RES="$WORKDIR/resources"
+RES_SOCK=/run/test-sysupdate-resource-provider
+rm -rf "$RES"
+mkdir -p "$RES/pool"
+
+FAKE_RESOURCE_PROVIDER=/usr/lib/systemd/tests/integration-tests/TEST-72-SYSUPDATE/TEST-72-SYSUPDATE.units/fake-resource-provider.py
+
+cat >/run/systemd/system/test-sysupdate-resource-provider.socket <<EOF
+[Socket]
+ListenStream=$RES_SOCK
+Accept=yes
+EOF
+cat >/run/systemd/system/test-sysupdate-resource-provider@.service <<EOF
+[Service]
+ExecStart=$FAKE_RESOURCE_PROVIDER $RES
+StandardInput=socket
+StandardOutput=socket
+EOF
+systemctl daemon-reload
+systemctl start test-sysupdate-resource-provider.socket
+
+dd if=/dev/urandom of="$RES/blob.raw" bs=1024 count=64 status=none
+BLOB_HASH="$(sha256sum "$RES/blob.raw" | cut -d' ' -f1)"
+PULL=/usr/lib/systemd/systemd-pull
+
+# systemd-pull acquires resources via the provider, with and without checksum verification.
+"$PULL" raw --direct --verify=no "provider:[$RES_SOCK]/blob.raw" "$WORKDIR/blob-out.raw"
+cmp "$RES/blob.raw" "$WORKDIR/blob-out.raw"
+rm -f "$WORKDIR/blob-out.raw"
+"$PULL" raw --direct --verify="$BLOB_HASH" "provider:[$RES_SOCK]/blob.raw" "$WORKDIR/blob-out.raw"
+cmp "$RES/blob.raw" "$WORKDIR/blob-out.raw"
+rm -f "$WORKDIR/blob-out.raw"
+(! "$PULL" raw --direct --verify=0000000000000000000000000000000000000000000000000000000000000000 "provider:[$RES_SOCK]/blob.raw" "$WORKDIR/blob-out.raw")
+rm -f "$WORKDIR/blob-out.raw"
+# Unknown resources and truncated transfers are detected.
+(! "$PULL" raw --direct --verify=no "provider:[$RES_SOCK]/nope.raw" "$WORKDIR/blob-out.raw") |& grep -F "does not exist" >/dev/null
+(! "$PULL" raw --direct --verify=no "provider:[$RES_SOCK]/trunc/blob.raw" "$WORKDIR/blob-out.raw") |& grep -F "truncated" >/dev/null
+rm -f "$WORKDIR/blob-out.raw"
+# A manifest is fetched and written to stdout like from a web server, and a .sha256/SHA256SUMS lookup works.
+(cd "$RES" && sha256sum blob.raw >SHA256SUMS)
+[[ "$("$PULL" raw --direct --verify=no "provider:[$RES_SOCK]/SHA256SUMS" - 2>/dev/null)" == "$(cat "$RES/SHA256SUMS")" ]]
+"$PULL" raw --direct --verify=checksum "provider:[$RES_SOCK]/blob.raw" "$WORKDIR/blob-out.raw"
+cmp "$RES/blob.raw" "$WORKDIR/blob-out.raw"
+rm -f "$WORKDIR/blob-out.raw"
+
+# A sysupdate transfer whose source lives with the provider: the manifest and the payloads are fetched
+# from it, and verified against the manifest like with a web server.
+for v in v1 v2 v3; do
+    dd if=/dev/urandom of="$RES/pool/res-$v.bin" bs=1024 count=4 status=none
+done
+(cd "$RES/pool" && sha256sum -- *.bin >SHA256SUMS)
+echo corrupted >>"$RES/pool/res-v3.bin"   # no longer matches the manifest
+RPDEFS="$WORKDIR/rp-defs"
+RPTARGET="$WORKDIR/rp-target"
+rm -rf "$RPDEFS" "$RPTARGET"
+mkdir -p "$RPDEFS" "$RPTARGET"
+cat >"$RPDEFS/01-res.transfer" <<EOF
+[Transfer]
+Verify=no
+
+[Source]
+Type=url-file
+Path=provider:[$RES_SOCK]/pool
+MatchPattern=res-@v.bin
+
+[Target]
+Type=regular-file
+Path=$RPTARGET
+MatchPattern=res-@v.bin
+InstancesMax=2
+EOF
+"$SYSUPDATE" --definitions="$RPDEFS" list | grep -E "v3 .*candidate" >/dev/null
+"$SYSUPDATE" --definitions="$RPDEFS" list | grep -E "v1 .*available" >/dev/null
+# The corrupted payload is rejected...
+(! "$SYSUPDATE" --definitions="$RPDEFS" update v3)
+test ! -e "$RPTARGET/res-v3.bin"
+rm -f "$RES/pool/res-v3.bin"
+(cd "$RES/pool" && sha256sum -- *.bin >SHA256SUMS)
+# ... while an intact one is installed.
+"$SYSUPDATE" --definitions="$RPDEFS" update v2
+cmp "$RES/pool/res-v2.bin" "$RPTARGET/res-v2.bin"
+"$SYSUPDATE" --definitions="$RPDEFS" list | grep -E "v2 .*installed|v2 .*current" >/dev/null
+# provider: URLs are only valid for URL sources.
+cat >"$RPDEFS/02-bad.transfer" <<EOF
+[Source]
+Type=regular-file
+Path=provider:[$RES_SOCK]/pool
+MatchPattern=res-@v.bin
+
+[Target]
+Type=regular-file
+Path=$RPTARGET
+MatchPattern=res-@v.bin
+EOF
+(! "$SYSUPDATE" --definitions="$RPDEFS" list)
+rm -f "$RPDEFS/02-bad.transfer"
+
+# The same URLs work through systemd-importd, i.e. via importctl.
+if command -v importctl >/dev/null; then
+    rm -rf /var/lib/confexts/rptest-raw.raw /var/lib/confexts/rptest-tar
+    importctl pull-raw --verify=no --class=confext "provider:[$RES_SOCK]/blob.raw" rptest-raw
+    cmp "$RES/blob.raw" /var/lib/confexts/rptest-raw.raw
+    tar czf "$RES/tree.tar.gz" -C "$RES" pool
+    importctl pull-tar --verify=no --class=confext "provider:[$RES_SOCK]/tree.tar.gz" rptest-tar
+    cmp "$RES/pool/res-v1.bin" /var/lib/confexts/rptest-tar/pool/res-v1.bin
+    (! importctl pull-raw --verify=no --class=confext "provider:[$RES_SOCK]/nope.raw" rptest-nope)
+    test ! -e /var/lib/confexts/rptest-nope.raw
+    rm -rf /var/lib/confexts/rptest-raw.raw /var/lib/confexts/rptest-tar "$RES/tree.tar.gz"
+fi
+
+# With Verify=yes (the default) the provider must also serve the detached signature of the manifest.
+provider_resources_signed() {
+    if ! command -v gpg >/dev/null; then
+        echo "gpg not available, skipping signed resource provider test"
+        return 0
+    fi
+    local gpg_version gpg_rest
+    gpg_version="$(gpg --version | sed -n '1p' | awk '{print $NF}')"
+    gpg_rest="${gpg_version#*.}"
+    if [ "${gpg_version%%.*}" -lt 2 ] || { [ "${gpg_version%%.*}" -eq 2 ] && [ "${gpg_rest%%.*}" -lt 4 ]; }; then
+        echo "gpg $gpg_version too old (need >= 2.4), skipping signed resource provider test"
+        return 0
+    fi
+
+    local gpghome="$WORKDIR/rp-gpghome" keyring="$WORKDIR/rp-keyring"
+    RPTEST_GPGHOME="$gpghome"
+    mkdir -p "$gpghome"
+    chmod 700 "$gpghome"
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --quick-gen-key 'Resource Provider Test Key <rp@example.com>' rsa2048 cert,sign never
+    GNUPGHOME="$gpghome" gpg --export --output "$keyring"
+
+    # Without a signature the update must be refused...
+    sed -i '/^Verify=no$/d' "$RPDEFS/01-res.transfer"
+    rm -f "$RES/pool/SHA256SUMS.gpg"
+    dd if=/dev/urandom of="$RES/pool/res-v4.bin" bs=1024 count=4 status=none
+    (cd "$RES/pool" && sha256sum -- *.bin >SHA256SUMS)
+    (! SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$RPDEFS" update)
+    test ! -e "$RPTARGET/res-v4.bin"
+
+    # ... and accepted once the provider serves a valid one.
+    GNUPGHOME="$gpghome" gpg --batch --pinentry-mode loopback --passphrase '' \
+        --detach-sign --include-key-block --yes \
+        --output "$RES/pool/SHA256SUMS.gpg" "$RES/pool/SHA256SUMS"
+    SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$RPDEFS" update
+    cmp "$RES/pool/res-v4.bin" "$RPTARGET/res-v4.bin"
+
+    # A signed manifest served via ManifestPath= from a different location, under a different name, is
+    # verified with the detached signature next to it, named after it
+    local mp="$WORKDIR/rp-manifest-path"
+    mkdir -p "$mp/manifests" "$mp/definitions" "$mp/target"
+    cp "$RES/pool/SHA256SUMS" "$mp/manifests/res.sha256sums"
+    cp "$RES/pool/SHA256SUMS.gpg" "$mp/manifests/res.sha256sums.gpg"
+    cat >"$mp/definitions/01-mp.transfer" <<EOF
+[Source]
+Type=url-file
+Path=file://$RES/pool
+ManifestPath=file://$mp/manifests/res.sha256sums
+MatchPattern=res-@v.bin
+
+[Target]
+Type=regular-file
+Path=$mp/target
+MatchPattern=res-@v.bin
+InstancesMax=2
+EOF
+    SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$mp/definitions" update
+    cmp "$RES/pool/res-v4.bin" "$mp/target/res-v4.bin"
+    # ... with an .asc signature as fallback
+    rm -r "$mp/target"
+    mkdir "$mp/target"
+    mv "$mp/manifests/res.sha256sums.gpg" "$mp/manifests/res.sha256sums.asc"
+    SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$mp/definitions" update
+    cmp "$RES/pool/res-v4.bin" "$mp/target/res-v4.bin"
+    # ... and refused if the signature named after the manifest is missing, even if there's a
+    # SHA256SUMS.gpg next to it
+    rm -r "$mp/target"
+    mkdir "$mp/target"
+    mv "$mp/manifests/res.sha256sums.asc" "$mp/manifests/SHA256SUMS.gpg"
+    (! SYSTEMD_OPENPGP_KEYRING="$keyring" "$SYSUPDATE" --definitions="$mp/definitions" update)
+    test ! -e "$mp/target/res-v4.bin"
+    rm -rf "$mp"
+
+    gpgconf --homedir "$gpghome" --kill all 2>/dev/null || :
+    RPTEST_GPGHOME=""
+}
+provider_resources_signed
+
+# Finally, a component provider whose transfers point at the resource provider, so that both the definition
+# and the payloads come from local services.
+mkdir -p "$PROVIDER_DIR" "$CF/target-rcomp"
+cat >"$WORKDIR/provider-d.json" <<EOF
+{
+  "targets": [{"id": {"class": "component", "name": "rcomp"}, "description": "Component with provider-served resources"}],
+  "definitions": {
+    "rcomp": {
+      "target": {"id": {"class": "component", "name": "rcomp"}, "description": "Component with provider-served resources"},
+      "features": [],
+      "transfers": [{"id": "01-res", "verify": false,
+                     "source": {"type": "url_file", "path": "provider:[$RES_SOCK]/pool", "matchPattern": ["res-@v.bin"]},
+                     "target": {"type": "regular_file", "path": "$CF/target-rcomp", "matchPattern": ["res-@v.bin"], "instancesMax": 2}}]
+    }
+  }
+}
+EOF
+cat >/run/systemd/system/test-sysupdate-provider-d.socket <<EOF
+[Socket]
+ListenStream=$PROVIDER_DIR/io.test.ProviderD
+Accept=yes
+EOF
+cat >/run/systemd/system/test-sysupdate-provider-d@.service <<EOF
+[Service]
+ExecStart=$FAKE_PROVIDER $WORKDIR/provider-d.json
+StandardInput=socket
+StandardOutput=socket
+EOF
+systemctl daemon-reload
+systemctl start test-sysupdate-provider-d.socket
+
+"$SYSUPDATE" --json=short components | jq -e '.providers == {"rcomp": "io.test.ProviderD"}' >/dev/null
+"$SYSUPDATE" --component=rcomp update
+newest="$(printf '%s\n' "$RES/pool"/res-*.bin | sort -V | tail -n1)"
+cmp "$newest" "$CF/target-rcomp/$(basename "$newest")"
+
+systemctl stop test-sysupdate-provider-d.socket test-sysupdate-resource-provider.socket
+rm -f /run/systemd/system/test-sysupdate-provider-d.socket /run/systemd/system/test-sysupdate-provider-d@.service \
+      /run/systemd/system/test-sysupdate-resource-provider.socket /run/systemd/system/test-sysupdate-resource-provider@.service
+systemctl daemon-reload
+rm -rf "$PROVIDER_DIR" "$RES" "$RPDEFS" "$RPTARGET" "$WORKDIR/rp-gpghome" "$WORKDIR/rp-keyring"
+rm -f "$WORKDIR/provider-d.json"
+
+compfeat_cleanup
+restore_machine_info
 
 touch /testok

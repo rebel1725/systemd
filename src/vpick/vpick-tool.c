@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <dirent.h>
-#include <getopt.h>
+
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "architecture.h"
@@ -9,12 +10,14 @@
 #include "format-table.h"
 #include "log.h"
 #include "main-func.h"
+#include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
-#include "pretty-print.h"
 #include "stat-util.h"
 #include "string-table.h"
 #include "string-util.h"
+#include "strv.h"
+#include "verbs.h"
 #include "vpick.h"
 
 typedef enum {
@@ -41,6 +44,13 @@ STATIC_DESTRUCTOR_REGISTER(arg_filter_basename, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_filter_version, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_filter_suffix, freep);
 
+COMMAND(
+        "systemd-vpick\0",
+        "Pick entry from versioned directory.",
+        .argspec = "PATH…\0",
+        .man_page = "systemd-vpick(1)",
+);
+
 static const char *print_table[_PRINT_MAX] = {
         [PRINT_PATH]         = "path",
         [PRINT_FILENAME]     = "filename",
@@ -53,169 +63,140 @@ static const char *print_table[_PRINT_MAX] = {
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(print, Print);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
+static int parse_argv(int argc, char *argv[], char ***ret_args) {
         int r;
-
-        r = terminal_urlify_man("systemd-vpick", "1", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%1$s [OPTIONS...] PATH...\n"
-               "\n%5$sPick entry from versioned directory.%6$s\n\n"
-               "  -h --help            Show this help\n"
-               "     --version         Show package version\n"
-               "\n%3$sLookup Keys:%4$s\n"
-               "  -B --basename=BASENAME\n"
-               "                       Look for specified basename\n"
-               "  -V VERSION           Look for specified version\n"
-               "  -A ARCH              Look for specified architecture\n"
-               "  -S --suffix=SUFFIX   Look for specified suffix\n"
-               "  -t --type=TYPE       Look for specified inode type\n"
-               "\n%3$sOutput:%4$s\n"
-               "  -p --print=filename  Print selected filename rather than path\n"
-               "  -p --print=version   Print selected version rather than path\n"
-               "  -p --print=type      Print selected inode type rather than path\n"
-               "  -p --print=arch      Print selected architecture rather than path\n"
-               "  -p --print=tries     Print selected tries left/tries done rather than path\n"
-               "  -p --print=all       Print all of the above\n"
-               "     --resolve=yes     Canonicalize the result path\n"
-               "\nSee the %2$s for details.\n",
-               program_invocation_short_name,
-               link,
-               ansi_underline(), ansi_normal(),
-               ansi_highlight(), ansi_normal());
-
-        return 0;
-}
-
-static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_VERSION = 0x100,
-                ARG_RESOLVE,
-        };
-
-        static const struct option options[] = {
-                { "help",         no_argument,       NULL, 'h'          },
-                { "version",      no_argument,       NULL, ARG_VERSION  },
-                { "basename",     required_argument, NULL, 'B'          },
-                { "suffix",       required_argument, NULL, 'S'          },
-                { "type",         required_argument, NULL, 't'          },
-                { "print",        required_argument, NULL, 'p'          },
-                { "resolve",      required_argument, NULL, ARG_RESOLVE  },
-                {}
-        };
-
-        int c, r;
 
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "hB:V:A:S:t:p:", options, NULL)) >= 0) {
+        OptionParser opts = { argc, argv };
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_GROUP("Lookup Keys"): {}
 
-                case ARG_VERSION:
-                        return version();
+                OPTION('B', "basename", "BASENAME", "Look for specified basename"):
+                        if (!filename_part_is_valid(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid basename string: %s", opts.arg);
 
-                case 'B':
-                        if (!filename_part_is_valid(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid basename string: %s", optarg);
-
-                        r = free_and_strdup_warn(&arg_filter_basename, optarg);
+                        r = free_and_strdup_warn(&arg_filter_basename, opts.arg);
                         if (r < 0)
                                 return r;
 
                         break;
 
-                case 'V':
-                        if (!version_is_valid(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid version string: %s", optarg);
+                OPTION_SHORT('V', "VERSION", "Look for specified version"):
+                        if (!version_is_valid(opts.arg, /* flags= */ 0))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid version string: %s", opts.arg);
 
-                        r = free_and_strdup_warn(&arg_filter_version, optarg);
+                        r = free_and_strdup_warn(&arg_filter_version, opts.arg);
                         if (r < 0)
                                 return r;
 
                         break;
 
-                case 'A':
-                        if (streq(optarg, "native"))
+                OPTION_SHORT('A', "ARCH", "Look for specified architecture"):
+                        if (streq(opts.arg, "native"))
                                 arg_filter_architecture = native_architecture();
-                        else if (streq(optarg, "secondary")) {
+                        else if (streq(opts.arg, "secondary")) {
 #ifdef ARCHITECTURE_SECONDARY
                                 arg_filter_architecture = ARCHITECTURE_SECONDARY;
 #else
                                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Local architecture has no secondary architecture.");
 #endif
-                        } else if (streq(optarg, "uname"))
+                        } else if (streq(opts.arg, "uname"))
                                 arg_filter_architecture = uname_architecture();
-                        else if (streq(optarg, "auto"))
+                        else if (streq(opts.arg, "auto"))
                                 arg_filter_architecture = _ARCHITECTURE_INVALID;
                         else {
-                                arg_filter_architecture = architecture_from_string(optarg);
+                                arg_filter_architecture = architecture_from_string(opts.arg);
                                 if (arg_filter_architecture < 0)
-                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unknown architecture: %s", optarg);
+                                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Unknown architecture: %s", opts.arg);
                         }
                         break;
 
-                case 'S':
-                        if (!filename_part_is_valid(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid suffix string: %s", optarg);
+                OPTION('S', "suffix", "SUFFIX", "Look for specified suffix"):
+                        if (!filename_part_is_valid(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid suffix string: %s", opts.arg);
 
-                        r = free_and_strdup_warn(&arg_filter_suffix, optarg);
+                        r = free_and_strdup_warn(&arg_filter_suffix, opts.arg);
                         if (r < 0)
                                 return r;
 
                         break;
 
-                case 't':
-                        if (isempty(optarg))
+                OPTION('t', "type", "TYPE", "Look for specified inode type"):
+                        if (isempty(opts.arg))
                                 arg_filter_type_mask = 0;
                         else {
                                 mode_t m;
 
-                                m = inode_type_from_string(optarg);
+                                m = inode_type_from_string(opts.arg);
                                 if (m == MODE_INVALID)
-                                        return log_error_errno(m, "Unknown inode type: %s", optarg);
+                                        return log_error_errno(m, "Unknown inode type: %s", opts.arg);
 
                                 arg_filter_type_mask |= UINT32_C(1) << IFTODT(m);
                         }
 
                         break;
 
-                case 'p':
-                        if (streq(optarg, "arch")) /* accept abbreviation too */
+                OPTION_LONG("match-xattr", "BOOL", "Skip entries whose user.uapi.match_* xattrs don't match the system (default: yes)"):
+                        r = parse_boolean_argument("--match-xattr=", opts.arg, /* ret= */ NULL);
+                        if (r < 0)
+                                return r;
+
+                        SET_FLAG(arg_flags, PICK_IGNORE_XATTR_MATCH, !r);
+                        break;
+
+                OPTION_GROUP("Output"): {}
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION:
+                        return version();
+
+                OPTION('p', "print", "WHAT",
+                       "Print selected WHAT rather than path"): {}
+                OPTION_LONG_FLAGS(OPTION_HELP_ENTRY, "print", "filename",
+                                  "... print selected filename"): {}
+                OPTION_LONG_FLAGS(OPTION_HELP_ENTRY, "print", "version",
+                                  "... print selected version"): {}
+                OPTION_LONG_FLAGS(OPTION_HELP_ENTRY, "print", "type",
+                                  "... print selected inode type"): {}
+                OPTION_LONG_FLAGS(OPTION_HELP_ENTRY, "print", "arch",
+                                  "... print selected architecture"): {}
+                OPTION_LONG_FLAGS(OPTION_HELP_ENTRY, "print", "tries",
+                                  "... print selected tries left/tries done"): {}
+                OPTION_LONG_FLAGS(OPTION_HELP_ENTRY, "print", "all",
+                                  "... print all of the above"):
+
+                        if (streq(opts.arg, "arch")) /* accept abbreviation too */
                                 arg_print = PRINT_ARCHITECTURE;
                         else
-                                arg_print = print_from_string(optarg);
+                                arg_print = print_from_string(opts.arg);
                         if (arg_print < 0)
-                                        return log_error_errno(arg_print, "Unknown --print= argument: %s", optarg);
+                                return log_error_errno(arg_print, "Unknown --print= argument: %s", opts.arg);
 
                         break;
 
-                case ARG_RESOLVE:
-                        r = parse_boolean(optarg);
+                OPTION_LONG("resolve", "BOOL", "Canonicalize the result path"):
+                        r = parse_boolean(opts.arg);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse --resolve= value: %m");
 
                         SET_FLAG(arg_flags, PICK_RESOLVE, r);
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
-        }
 
         if (arg_print < 0)
                 arg_print = PRINT_PATH;
 
+        *ret_args = option_parser_get_args(&opts);
         return 1;
 }
 
@@ -224,22 +205,24 @@ static int run(int argc, char *argv[]) {
 
         log_setup();
 
-        r = parse_argv(argc, argv);
+        char **args = NULL;
+        r = parse_argv(argc, argv, &args);
         if (r <= 0)
                 return r;
 
-        if (optind >= argc)
+        if (strv_isempty(args))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Path to resolve must be specified.");
 
-        for (int i = optind; i < argc; i++) {
+        STRV_FOREACH(i, args) {
                 _cleanup_free_ char *p = NULL;
-                r = path_make_absolute_cwd(argv[i], &p);
+                r = path_make_absolute_cwd(*i, &p);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to make path '%s' absolute: %m", argv[i]);
+                        return log_error_errno(r, "Failed to make path '%s' absolute: %m", *i);
 
                 _cleanup_(pick_result_done) PickResult result = PICK_RESULT_NULL;
-                r = path_pick(/* toplevel_path= */ NULL,
-                              /* toplevel_fd= */ AT_FDCWD,
+                r = path_pick(/* root_path= */ NULL,
+                              /* root_fd= */ AT_FDCWD,
+                              /* dir_fd= */ AT_FDCWD,
                               p,
                               &(PickFilter) {
                                       .basename = arg_filter_basename,
@@ -249,6 +232,7 @@ static int run(int argc, char *argv[]) {
                                       .type_mask = arg_filter_type_mask,
                               },
                               /* n_filters= */ 1,
+                              /* match_root= */ NULL,
                               arg_flags,
                               &result);
                 if (r < 0)
@@ -301,7 +285,7 @@ static int run(int argc, char *argv[]) {
                         if (result.tries_left == UINT_MAX)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No tries left/tries done information discovered.");
 
-                        printf("+%u-%u", result.tries_left, result.tries_done);
+                        printf("+%u-%u\n", result.tries_left, result.tries_done);
                         break;
 
                 case PRINT_ALL: {
@@ -337,9 +321,9 @@ static int run(int argc, char *argv[]) {
                                         return table_log_add_error(r);
                         }
 
-                        r = table_print(t, stdout);
+                        r = table_print_or_warn(t);
                         if (r < 0)
-                                return table_log_print_error(r);
+                                return r;
 
                         break;
                 }

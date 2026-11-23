@@ -3,11 +3,17 @@
 set -eux
 set -o pipefail
 
+if ! command -v userdbctl >/dev/null; then
+    echo "userdbctl is not installed, skipping the test."
+    exit 77
+fi
+
 # shellcheck source=test/units/util.sh
 . "$(dirname "$0")"/util.sh
 
 cleanup() {
     set +e
+    rm -rf "${NSS_DIR:-}"
     userdel -r test-74-userdbctl
     groupdel test-74-userdbctl
 }
@@ -50,6 +56,9 @@ assert_eq "$(userdbctl user 2147352576 -j | jq -r .userName)" foreign-0
 assert_eq "$(userdbctl user 2147352577 -j | jq -r .userName)" foreign-1
 assert_eq "$(userdbctl user 2147418110 -j | jq -r .userName)" foreign-65534
 
+(! userdbctl --uuid=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa user root)
+(! userdbctl --uuid=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa group root)
+
 # Make sure that -F shows same data as if we'd ask directly
 userdbctl user root -j | userdbctl -F- user | cmp - <(userdbctl user root)
 userdbctl user test-74-userdbctl -j | userdbctl -F- user | cmp - <(userdbctl user test-74-userdbctl)
@@ -85,3 +94,29 @@ systemctl stop "$UNIT"
 # Probe specific user records
 echo '{"userName":"weightmin","cpuWeight":1,"ioWeight":1}' | userdbctl -F -
 echo '{"userName":"weightmax","cpuWeight":10000,"ioWeight":10000}' | userdbctl -F -
+# A disk size of zero must not result in a division by zero
+printf '{"userName":"disksizezero","status":{"%s":{"diskSize":0,"diskUsage":1024,"diskFree":1024}}}' "$(</etc/machine-id)" | userdbctl -F -
+
+# Avoid creating an empty bind mount destination on the host, which would hide openSUSE's fallback
+# /usr/etc/nsswitch.conf and break NSS lookups in subsequent tests.
+NSSWITCH_CONF=/etc/nsswitch.conf
+if [[ ! -e "$NSSWITCH_CONF" && -e /usr/etc/nsswitch.conf ]]; then
+    NSSWITCH_CONF=/usr/etc/nsswitch.conf
+fi
+
+# $SYSTEMD_NSS_SERVER_SIDE_NSS=1 makes nss-systemd resolve users via systemd-userdbd's NSS backend. Hide the
+# test user from nss-files in the sandbox. systemd-userdbd runs outside of the sandbox and still finds the
+# user in the real /etc/passwd.
+NSS_DIR="$(mktemp -d)"
+grep -v '^test-74-userdbctl:' /etc/passwd >"$NSS_DIR/passwd"
+printf 'passwd: files systemd\ngroup: files systemd\n' >"$NSS_DIR/nsswitch.conf"
+TEST_UID="$(userdbctl -j user test-74-userdbctl | jq .uid)"
+SANDBOX=(-q --wait --pipe -p BindReadOnlyPaths="$NSS_DIR/passwd:/etc/passwd $NSS_DIR/nsswitch.conf:$NSSWITCH_CONF")
+
+assert_rc 2 systemd-run "${SANDBOX[@]}" getent passwd test-74-userdbctl
+assert_rc 2 systemd-run "${SANDBOX[@]}" getent passwd "$TEST_UID"
+(! systemd-run "${SANDBOX[@]}" getent passwd | grep '^test-74-userdbctl:' >/dev/null)
+
+systemd-run "${SANDBOX[@]}" -E SYSTEMD_NSS_SERVER_SIDE_NSS=1 getent passwd test-74-userdbctl
+systemd-run "${SANDBOX[@]}" -E SYSTEMD_NSS_SERVER_SIDE_NSS=1 getent passwd "$TEST_UID"
+systemd-run "${SANDBOX[@]}" -E SYSTEMD_NSS_SERVER_SIDE_NSS=1 getent passwd | grep '^test-74-userdbctl:' >/dev/null

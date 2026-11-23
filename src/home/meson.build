@@ -16,7 +16,7 @@ systemd_homed_sources = files(
         'homed.c',
         'user-record-sign.c',
 )
-systemd_homed_extract_sources = files(
+systemd_homed_export_sources = files(
         'home-util.c',
         'user-record-password-quality.c',
         'user-record-util.c',
@@ -39,7 +39,7 @@ systemd_homework_sources = files(
 homed_gperf_c = custom_target(
         input : 'homed-gperf.gperf',
         output : 'homed-gperf.c',
-        command : [gperf, '@INPUT@', '--output-file', '@OUTPUT@'])
+        command : [gperf_cmdline, '@INPUT@', '--output-file', '@OUTPUT@'])
 
 generated_sources += [homed_gperf_c]
 systemd_homed_sources += [homed_gperf_c]
@@ -49,6 +49,10 @@ homectl_sources = files(
         'homectl-pkcs11.c',
         'homectl-recovery-key.c',
         'homectl.c',
+)
+
+homectl_export_sources = files(
+        'homectl-prompts.c',
 )
 
 pam_systemd_home_sources = files(
@@ -62,43 +66,47 @@ executables += [
                 'name' : 'systemd-homed',
                 'dbus' : true,
                 'sources' : systemd_homed_sources,
-                'extract' : systemd_homed_extract_sources,
-                'dependencies' : [
-                        libm,
-                        libopenssl,
-                        threads,
-                ],
+                'export' : systemd_homed_export_sources,
+                'dependencies' : libopenssl_cflags,
         },
         libexec_template + {
                 'name' : 'systemd-homework',
                 'sources' : systemd_homework_sources,
-                'objects' : ['systemd-homed'],
-                'link_with' : [
-                        libshared,
-                        libshared_fdisk
-                ],
+                'import' : ['systemd-homed'],
                 'dependencies' : [
                         libblkid_cflags,
-                        libfdisk,
-                        libopenssl,
+                        libcryptsetup_cflags,
+                        libfdisk_cflags,
+                        libfido2_cflags,
+                        libopenssl_cflags,
                         libp11kit_cflags,
-                        threads,
                 ],
         },
         executable_template + {
                 'name' : 'homectl',
-                'public' : true,
                 'sources' : homectl_sources,
-                'objects' : ['systemd-homed'],
+                'export' : homectl_export_sources,
+                'import' : ['systemd-homed'],
                 'dependencies' : [
-                        libdl,
-                        libopenssl,
+                        libfido2_cflags,
+                        libopenssl_cflags,
                         libp11kit_cflags,
-                        threads,
+                ],
+                'symlinks' : [
+                        { 'name' : 'systemd-home-fallback-shell' },
                 ],
         },
         test_template + {
+                'sources' : files('test-homectl-prompts.c'),
+                'import' : ['homectl'],
+                'type' : 'manual',
+        },
+        test_template + {
                 'sources' : files('test-homed-regression-31896.c'),
+                'type' : 'manual',
+        },
+        test_template + {
+                'sources' : files('test-homed-regression-44837.c'),
                 'type' : 'manual',
         },
 ]
@@ -108,13 +116,7 @@ modules += [
                 'name' : 'pam_systemd_home',
                 'conditions' : ['HAVE_PAM'],
                 'sources' : pam_systemd_home_sources,
-                'dependencies' : [
-                        libintl,
-                        libpam_misc,
-                        libpam,
-                        threads,
-                ],
-                'version-script' : meson.current_source_dir() / 'pam_systemd_home.sym',
+                'version-script' : 'src/home/pam_systemd_home.sym',
         },
 ]
 
@@ -129,7 +131,3 @@ if install_sysconfdir_samples
         install_data('homed.conf',
                      install_dir : pkgconfigfiledir)
 endif
-
-install_symlink('systemd-home-fallback-shell',
-                pointing_to : 'homectl',
-                install_dir : bindir)

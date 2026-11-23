@@ -7,25 +7,29 @@ endif
 systemd_cryptenroll_sources = files(
         'cryptenroll.c',
         'cryptenroll-fido2.c',
+        'cryptenroll-interactive.c',
         'cryptenroll-list.c',
         'cryptenroll-password.c',
         'cryptenroll-pkcs11.c',
         'cryptenroll-recovery.c',
         'cryptenroll-tpm2.c',
+        'cryptenroll-varlink.c',
         'cryptenroll-wipe.c',
 )
 
 executables += [
         executable_template + {
                 'name' : 'systemd-cryptenroll',
-                'public' : true,
                 'sources' : systemd_cryptenroll_sources,
                 'dependencies' : [
-                        libcryptsetup,
-                        libdl,
+                        libcryptsetup_cflags,
                         libfido2_cflags,
-                        libopenssl,
+                        libopenssl_cflags,
                         libp11kit_cflags,
+                        tpm2_cflags,
                 ],
         },
 ]
+
+install_data('io.systemd.cryptenroll.policy',
+             install_dir : polkitpolicydir)

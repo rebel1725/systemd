@@ -11,6 +11,7 @@
 #include "errno-util.h"
 #include "log.h"
 #include "parse-util.h"
+#include "varlink-util.h"
 
 int verb_reboot_to_firmware(int argc, char *argv[], uintptr_t _data, void *userdata) {
         int r;
@@ -61,13 +62,17 @@ int vl_method_set_reboot_to_firmware(sd_varlink *link, sd_json_variant *paramete
         if (r != 0)
                 return r;
 
-        r = efi_set_reboot_to_firmware(b);
-        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                return sd_varlink_error(link, "io.systemd.BootControl.RebootToFirmwareNotSupported", NULL);
+        r = varlink_check_privileged_peer(link);
         if (r < 0)
                 return r;
 
-        return sd_varlink_reply(link, NULL);
+        r = efi_set_reboot_to_firmware(b);
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                return sd_varlink_error(link, "io.systemd.BootControl.RebootToFirmwareNotSupported", /* parameters= */ NULL);
+        if (r < 0)
+                return r;
+
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 int vl_method_get_reboot_to_firmware(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -79,7 +84,7 @@ int vl_method_get_reboot_to_firmware(sd_varlink *link, sd_json_variant *paramete
 
         r = efi_get_reboot_to_firmware();
         if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                return sd_varlink_error(link, "io.systemd.BootControl.RebootToFirmwareNotSupported", NULL);
+                return sd_varlink_error(link, "io.systemd.BootControl.RebootToFirmwareNotSupported", /* parameters= */ NULL);
         if (r < 0)
                 return r;
 

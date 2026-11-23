@@ -12,7 +12,7 @@
 #define __STDC_WANT_IEC_60559_TYPES_EXT__
 #include <float.h>
 
-#include "shared-forward.h"
+#include "forward.h"
 
 /* Print information about various types. Useful when diagnosing
  * gcc diagnostics on an unfamiliar architecture. */
@@ -34,13 +34,13 @@ DISABLE_WARNING_TYPE_LIMITS;
 #define check_no_sign(t, size)                  \
         do {                                    \
                 info_no_sign(t);                \
-                assert_se(sizeof(t) == size);   \
+                assert_cc(sizeof(t) == size);   \
         } while (false)
 
 #define check(t, size)                          \
         do {                                    \
                 info(t);                        \
-                assert_se(sizeof(t) == size);   \
+                assert_cc(sizeof(t) == size);   \
         } while (false)
 
 enum Enum {

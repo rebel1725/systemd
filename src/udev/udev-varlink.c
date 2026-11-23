@@ -2,6 +2,7 @@
 
 #include "bus-polkit.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "json-util.h"
 #include "log.h"
 #include "string-util.h"
@@ -27,7 +28,7 @@ static int vl_method_reload(sd_varlink *link, sd_json_variant *parameters, sd_va
 
         log_debug("Received io.systemd.service.Reload()");
         manager_reload(userdata, /* force= */ true);
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_set_log_level(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -46,7 +47,7 @@ static int vl_method_set_log_level(sd_varlink *link, sd_json_variant *parameters
 
         log_debug("Received io.systemd.service.SetLogLevel(%i)", level);
         manager_set_log_level(userdata, level);
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_set_trace(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -66,7 +67,7 @@ static int vl_method_set_trace(sd_varlink *link, sd_json_variant *parameters, sd
 
         log_debug("Received io.systemd.service.SetTrace(%s)", yes_no(enable));
         manager_set_trace(userdata, enable);
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_set_children_max(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -86,7 +87,7 @@ static int vl_method_set_children_max(sd_varlink *link, sd_json_variant *paramet
 
         log_debug("Received io.systemd.Udev.SetChildrenMax(%u)", n);
         manager_set_children_max(userdata, n);
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_set_environment(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -106,7 +107,7 @@ static int vl_method_set_environment(sd_varlink *link, sd_json_variant *paramete
 
         log_debug("Received io.systemd.Udev.SetEnvironment()");
         manager_set_environment(userdata, v);
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_revert(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -121,7 +122,7 @@ static int vl_method_revert(sd_varlink *link, sd_json_variant *parameters, sd_va
 
         log_debug("Received io.systemd.Udev.Revert()");
         manager_revert(manager);
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_start_stop_exec_queue(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -149,7 +150,7 @@ static int vl_method_start_stop_exec_queue(sd_varlink *link, sd_json_variant *pa
         if (manager->stop_exec_queue)
                 (void) manager_reset_kill_workers_timer(manager);
 
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 static int vl_method_exit(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata) {
@@ -166,7 +167,7 @@ static int vl_method_exit(sd_varlink *link, sd_json_variant *parameters, sd_varl
 
         log_debug("Received io.systemd.udev.Exit()");
         manager_exit(userdata);
-        return sd_varlink_reply(link, NULL);
+        return sd_varlink_reply(link, /* parameters= */ NULL);
 }
 
 int manager_start_varlink_server(Manager *manager, int fd) {
@@ -181,21 +182,29 @@ int manager_start_varlink_server(Manager *manager, int fd) {
         if (r < 0)
                 return log_error_errno(r, "Failed to allocate Varlink server: %m");
 
-        /* This needs to be after the inotify and uevent handling, to make sure that the ping is send back
+        /* This needs to be after the device watch and uevent handling, to make sure that the ping is send back
          * after fully processing the pending uevents (including the synthetic ones we may create due to
-         * inotify events). */
+         * device watch events). */
         r = sd_varlink_server_attach_event(v, manager->event, EVENT_PRIORITY_VARLINK);
         if (r < 0)
                 return log_error_errno(r, "Failed to attach Varlink connection to event loop: %m");
 
         if (fd < 0)
-                r = sd_varlink_server_listen_address(v, UDEV_VARLINK_ADDRESS, 0600);
+                r = sd_varlink_server_listen_address(v, UDEV_VARLINK_ADDRESS, 0644);
         else
                 r = sd_varlink_server_listen_fd(v, fd);
         if (r < 0)
                 return log_error_errno(r, "Failed to bind to Varlink socket: %m");
 
         TAKE_FD(fd_close);
+
+        /* For backward compatibility. The existence of the file is used by udevadm settle, sd-device,
+         * libudev, and many external projects for checking if udevd is running. Note, it may be already
+         * created by PID1 through systemd-udevd-varlink.socket. But, we need to explicitly create it here,
+         * to make it created even in systemd-less systems or systemd-less initrd. */
+        r = symlink_idempotent(UDEV_VARLINK_ADDRESS, "/run/udev/control", /* make_relative= */ false);
+        if (r < 0)
+                log_warning_errno(r, "Failed to create symlink /run/udev/control to "UDEV_VARLINK_ADDRESS", ignoring: %m");
 
         r = sd_varlink_server_add_interface_many(
                         v,
@@ -209,6 +218,7 @@ int manager_start_varlink_server(Manager *manager, int fd) {
                         "io.systemd.service.Ping",           varlink_method_ping,
                         "io.systemd.service.Reload",         vl_method_reload,
                         "io.systemd.service.SetLogLevel",    vl_method_set_log_level,
+                        "io.systemd.service.GetLogLevel",    varlink_method_get_log_level,
                         "io.systemd.service.GetEnvironment", varlink_method_get_environment,
                         "io.systemd.Udev.SetTrace",          vl_method_set_trace,
                         "io.systemd.Udev.SetChildrenMax",    vl_method_set_children_max,

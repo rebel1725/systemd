@@ -1,0 +1,804 @@
+/* SPDX-License-Identifier: LGPL-2.1-or-later */
+
+#include "sd-json.h"
+
+#include "alloc-util.h"
+#include "dns-domain.h"
+#include "dns-packet.h"
+#include "hash-funcs.h"
+#include "in-addr-util.h"
+#include "iovec-util.h"
+#include "json-util.h"
+#include "ordered-set.h"
+#include "resolve-util.h"
+#include "resolve-varlink-util.h"
+#include "set.h"
+#include "string-util.h"
+#include "strv.h"
+
+void resolve_error_done(ResolveError *error) {
+        if (!error)
+                return;
+
+        error->ede_msg = mfree(error->ede_msg);
+        error->query_string = mfree(error->query_string);
+        error->result = mfree(error->result);
+}
+
+int dispatch_resolve_error(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field resolve_error_dispatch_table[] = {
+                { "rcode",                   _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_int,    offsetof(ResolveError, rcode),        0 },
+                { "extendedDNSErrorCode",    _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_int,    offsetof(ResolveError, ede_rcode),    0 },
+                { "extendedDNSErrorMessage", SD_JSON_VARIANT_STRING,        sd_json_dispatch_string, offsetof(ResolveError, ede_msg),      0 },
+                { "queryString",             SD_JSON_VARIANT_STRING,        sd_json_dispatch_string, offsetof(ResolveError, query_string), 0 },
+                { "result",                  SD_JSON_VARIANT_STRING,        sd_json_dispatch_string, offsetof(ResolveError, result),       0 },
+                {},
+        };
+        ResolveError *ret = ASSERT_PTR(userdata);
+        int r;
+
+        _cleanup_(resolve_error_done) ResolveError error = {
+                .rcode = _DNS_RCODE_INVALID,
+                .ede_rcode = _DNS_EDE_RCODE_INVALID,
+        };
+        r = sd_json_dispatch(variant, resolve_error_dispatch_table, flags | SD_JSON_ALLOW_EXTENSIONS, &error);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_STRUCT(error);
+        return 0;
+}
+
+static int dispatch_resolved_address(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field resolved_address_dispatch_table[] = {
+                { "ifindex", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,        offsetof(ResolvedAddress, ifindex), SD_JSON_RELAX     },
+                { "family",  _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_address_family, offsetof(ResolvedAddress, family),  SD_JSON_MANDATORY },
+                { "address", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_in_addr_data,   offsetof(ResolvedAddress, in_addr), SD_JSON_MANDATORY },
+                {},
+        };
+        ResolvedAddress *ret = ASSERT_PTR(userdata);
+        int r;
+
+        ResolvedAddress address = {};
+        r = sd_json_dispatch(variant, resolved_address_dispatch_table, flags & ~SD_JSON_MANDATORY, &address);
+        if (r < 0)
+                return r;
+
+        if (address.family != address.in_addr.family)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "'%s' address and family are inconsistent.", strna(name));
+
+        *ret = TAKE_STRUCT(address);
+        return 0;
+}
+
+static int dispatch_resolved_address_array(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        ResolveHostnameReply *reply = ASSERT_PTR(userdata);
+        int r;
+
+        sd_json_variant *v;
+        JSON_VARIANT_ARRAY_FOREACH(v, variant) {
+                if (!GREEDY_REALLOC0(reply->addresses, reply->n_addresses + 1))
+                        return json_log_oom(variant, flags);
+
+                r = dispatch_resolved_address(name, v, flags, &reply->addresses[reply->n_addresses++]);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+void resolve_hostname_reply_done(ResolveHostnameReply *reply) {
+        if (!reply)
+                return;
+
+        reply->name = mfree(reply->name);
+        reply->addresses = mfree(reply->addresses);
+        reply->n_addresses = 0;
+}
+
+int dispatch_resolve_hostname_reply(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field resolve_hostname_reply_dispatch_table[] = {
+                { "name",      SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,         offsetof(ResolveHostnameReply, name),  SD_JSON_MANDATORY },
+                { "flags",     _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,         offsetof(ResolveHostnameReply, flags), SD_JSON_MANDATORY },
+                { "addresses", SD_JSON_VARIANT_ARRAY,         dispatch_resolved_address_array, 0,                                     SD_JSON_MANDATORY },
+                {},
+        };
+        ResolveHostnameReply *ret = ASSERT_PTR(userdata);
+        int r;
+
+        _cleanup_(resolve_hostname_reply_done) ResolveHostnameReply reply = {};
+        r = sd_json_dispatch(variant, resolve_hostname_reply_dispatch_table, flags | SD_JSON_ALLOW_EXTENSIONS, &reply);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_STRUCT(reply);
+        return 0;
+}
+
+static void resolved_name_done(ResolvedName *name) {
+        if (!name)
+                return;
+
+        name->name = mfree(name->name);
+}
+
+static int dispatch_resolved_name(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field resolved_name_dispatch_table[] = {
+                { "ifindex", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,   offsetof(ResolvedName, ifindex), SD_JSON_RELAX     },
+                { "name",    SD_JSON_VARIANT_STRING,        sd_json_dispatch_string, offsetof(ResolvedName, name),    SD_JSON_MANDATORY },
+                {},
+        };
+        ResolvedName *ret = ASSERT_PTR(userdata);
+        int r;
+
+        _cleanup_(resolved_name_done) ResolvedName resolved_name = {};
+        r = sd_json_dispatch(variant, resolved_name_dispatch_table, flags & ~SD_JSON_MANDATORY, &resolved_name);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_STRUCT(resolved_name);
+        return 0;
+}
+
+static int dispatch_resolved_name_array(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        ResolveAddressReply *reply = ASSERT_PTR(userdata);
+        int r;
+
+        sd_json_variant *v;
+        JSON_VARIANT_ARRAY_FOREACH(v, variant) {
+                if (!GREEDY_REALLOC0(reply->names, reply->n_names + 1))
+                        return json_log_oom(variant, flags);
+
+                r = dispatch_resolved_name(name, v, flags, &reply->names[reply->n_names++]);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+void resolve_address_reply_done(ResolveAddressReply *reply) {
+        if (!reply)
+                return;
+
+        FOREACH_ARRAY(n, reply->names, reply->n_names)
+                resolved_name_done(n);
+        reply->names = mfree(reply->names);
+        reply->n_names = 0;
+}
+
+int dispatch_resolve_address_reply(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field resolve_address_reply_dispatch_table[] = {
+                { "flags", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,      offsetof(ResolveAddressReply, flags), SD_JSON_MANDATORY },
+                { "names", SD_JSON_VARIANT_ARRAY,         dispatch_resolved_name_array, 0,                                    SD_JSON_MANDATORY },
+                {},
+        };
+        ResolveAddressReply *ret = ASSERT_PTR(userdata);
+        int r;
+
+        _cleanup_(resolve_address_reply_done) ResolveAddressReply reply = {};
+        r = sd_json_dispatch(variant, resolve_address_reply_dispatch_table, flags | SD_JSON_ALLOW_EXTENSIONS, &reply);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_STRUCT(reply);
+        return 0;
+}
+
+static void resolved_record_done(ResolvedRecord *record) {
+        if (!record)
+                return;
+
+        iovec_done(&record->raw);
+}
+
+static int dispatch_resolved_record(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field resolved_record_dispatch_table[] = {
+                { "ifindex", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_ifindex,        offsetof(ResolvedRecord, ifindex), SD_JSON_RELAX     },
+                { "raw",     _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_unbase64_iovec, offsetof(ResolvedRecord, raw),     SD_JSON_MANDATORY },
+                { "rr",      _SD_JSON_VARIANT_TYPE_INVALID, NULL,                         0,                                 0                 },
+                {},
+        };
+        ResolvedRecord *ret = ASSERT_PTR(userdata);
+        int r;
+
+        _cleanup_(resolved_record_done) ResolvedRecord record = {};
+        r = sd_json_dispatch(variant, resolved_record_dispatch_table, flags & ~SD_JSON_MANDATORY, &record);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_STRUCT(record);
+        return 0;
+}
+
+static int dispatch_resolved_record_array(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        ResolveRecordReply *reply = ASSERT_PTR(userdata);
+        int r;
+
+        sd_json_variant *v;
+        JSON_VARIANT_ARRAY_FOREACH(v, variant) {
+                if (!GREEDY_REALLOC0(reply->records, reply->n_records + 1))
+                        return json_log_oom(variant, flags);
+
+                r = dispatch_resolved_record(name, v, flags, &reply->records[reply->n_records++]);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+void resolve_record_reply_done(ResolveRecordReply *reply) {
+        if (!reply)
+                return;
+
+        FOREACH_ARRAY(record, reply->records, reply->n_records)
+                resolved_record_done(record);
+        reply->records = mfree(reply->records);
+        reply->n_records = 0;
+}
+
+int dispatch_resolve_record_reply(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field resolve_record_reply_dispatch_table[] = {
+                { "flags", _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,        offsetof(ResolveRecordReply, flags), SD_JSON_MANDATORY },
+                { "rrs",   SD_JSON_VARIANT_ARRAY,         dispatch_resolved_record_array, 0,                                   SD_JSON_MANDATORY },
+                {},
+        };
+        ResolveRecordReply *ret = ASSERT_PTR(userdata);
+        int r;
+
+        _cleanup_(resolve_record_reply_done) ResolveRecordReply reply = {};
+        r = sd_json_dispatch(variant, resolve_record_reply_dispatch_table, flags | SD_JSON_ALLOW_EXTENSIONS, &reply);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_STRUCT(reply);
+        return 0;
+}
+
+static void resolved_service_done(ResolvedService *service) {
+        if (!service)
+                return;
+
+        service->hostname = mfree(service->hostname);
+        service->canonical_name = mfree(service->canonical_name);
+        service->addresses = mfree(service->addresses);
+        service->n_addresses = 0;
+}
+
+static int dispatch_resolved_service_address_array(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        ResolvedService *service = ASSERT_PTR(userdata);
+        int r;
+
+        sd_json_variant *v;
+        JSON_VARIANT_ARRAY_FOREACH(v, variant) {
+                if (!GREEDY_REALLOC0(service->addresses, service->n_addresses + 1))
+                        return json_log_oom(variant, flags);
+
+                r = dispatch_resolved_address(name, v, flags, &service->addresses[service->n_addresses++]);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+static int dispatch_resolved_service(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field resolved_service_dispatch_table[] = {
+                { "priority",      _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint16,                 offsetof(ResolvedService, priority),       SD_JSON_MANDATORY },
+                { "weight",        _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint16,                 offsetof(ResolvedService, weight),         SD_JSON_MANDATORY },
+                { "port",          _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint16,                 offsetof(ResolvedService, port),           SD_JSON_MANDATORY },
+                { "hostname",      SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,                 offsetof(ResolvedService, hostname),       SD_JSON_MANDATORY },
+                { "canonicalName", SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,                 offsetof(ResolvedService, canonical_name), SD_JSON_NULLABLE  },
+                { "addresses",     SD_JSON_VARIANT_ARRAY,         dispatch_resolved_service_address_array, 0,                                         SD_JSON_NULLABLE  },
+                {},
+        };
+        ResolvedService *ret = ASSERT_PTR(userdata);
+        int r;
+
+        _cleanup_(resolved_service_done) ResolvedService service = {};
+        r = sd_json_dispatch(variant, resolved_service_dispatch_table, flags & ~SD_JSON_MANDATORY, &service);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_STRUCT(service);
+        return 0;
+}
+
+static int dispatch_resolved_service_array(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        ResolveServiceReply *reply = ASSERT_PTR(userdata);
+        int r;
+
+        sd_json_variant *v;
+        JSON_VARIANT_ARRAY_FOREACH(v, variant) {
+                if (!GREEDY_REALLOC0(reply->services, reply->n_services + 1))
+                        return json_log_oom(variant, flags);
+
+                r = dispatch_resolved_service(name, v, flags, &reply->services[reply->n_services++]);
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+static void resolved_canonical_done(ResolvedCanonical *canonical) {
+        if (!canonical)
+                return;
+
+        canonical->name = mfree(canonical->name);
+        canonical->type = mfree(canonical->type);
+        canonical->domain = mfree(canonical->domain);
+}
+
+static int dispatch_resolved_canonical(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field resolved_canonical_dispatch_table[] = {
+                { "name",   SD_JSON_VARIANT_STRING, sd_json_dispatch_string, offsetof(ResolvedCanonical, name),   SD_JSON_NULLABLE  },
+                { "type",   SD_JSON_VARIANT_STRING, sd_json_dispatch_string, offsetof(ResolvedCanonical, type),   SD_JSON_MANDATORY },
+                { "domain", SD_JSON_VARIANT_STRING, sd_json_dispatch_string, offsetof(ResolvedCanonical, domain), SD_JSON_MANDATORY },
+                {},
+        };
+        ResolvedCanonical *ret = ASSERT_PTR(userdata);
+        int r;
+
+        _cleanup_(resolved_canonical_done) ResolvedCanonical canonical = {};
+        r = sd_json_dispatch(variant, resolved_canonical_dispatch_table, flags & ~SD_JSON_MANDATORY, &canonical);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_STRUCT(canonical);
+        return 0;
+}
+
+void resolve_service_reply_done(ResolveServiceReply *reply) {
+        if (!reply)
+                return;
+
+        FOREACH_ARRAY(service, reply->services, reply->n_services)
+                resolved_service_done(service);
+        reply->services = mfree(reply->services);
+        reply->n_services = 0;
+        reply->txt = strv_free(reply->txt);
+        resolved_canonical_done(&reply->canonical);
+}
+
+int dispatch_resolve_service_reply(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field resolve_service_reply_dispatch_table[] = {
+                { "services",  SD_JSON_VARIANT_ARRAY,         dispatch_resolved_service_array, 0,                                        SD_JSON_MANDATORY },
+                { "txt",       SD_JSON_VARIANT_ARRAY,         sd_json_dispatch_strv,           offsetof(ResolveServiceReply, txt),       SD_JSON_NULLABLE  },
+                { "canonical", SD_JSON_VARIANT_OBJECT,        dispatch_resolved_canonical,     offsetof(ResolveServiceReply, canonical), SD_JSON_MANDATORY },
+                { "flags",     _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_uint64,         offsetof(ResolveServiceReply, flags),     SD_JSON_MANDATORY },
+                {},
+        };
+        ResolveServiceReply *ret = ASSERT_PTR(userdata);
+        int r;
+
+        _cleanup_(resolve_service_reply_done) ResolveServiceReply reply = {};
+        r = sd_json_dispatch(variant, resolve_service_reply_dispatch_table, flags | SD_JSON_ALLOW_EXTENSIONS, &reply);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_STRUCT(reply);
+        return 0;
+}
+
+DNSServer* dns_server_free(DNSServer *s) {
+        if (!s)
+                return NULL;
+
+        free(s->server_name);
+
+        return mfree(s);
+}
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+        dns_server_hash_ops,
+        void,
+        trivial_hash_func,
+        trivial_compare_func,
+        DNSServer,
+        dns_server_free);
+
+static const sd_json_dispatch_field dns_server_runtime_dispatch_table[] = {
+        /* This table is for runtime, i.e. output */
+        { "address",       SD_JSON_VARIANT_ARRAY,         json_dispatch_in_addr_data,     offsetof(DNSServer, in_addr),     SD_JSON_MANDATORY },
+        { "addressString", _SD_JSON_VARIANT_TYPE_INVALID, NULL,                           0,                                0                 },
+        { "family",        SD_JSON_VARIANT_INTEGER,       json_dispatch_address_family,   offsetof(DNSServer, family),      SD_JSON_MANDATORY },
+        { "port",          SD_JSON_VARIANT_UNSIGNED,      sd_json_dispatch_uint16,        offsetof(DNSServer, port),        0                 },
+        { "ifindex",       SD_JSON_VARIANT_UNSIGNED,      json_dispatch_ifindex,          offsetof(DNSServer, ifindex),     SD_JSON_RELAX     },
+        { "name",          SD_JSON_VARIANT_STRING,        sd_json_dispatch_string,        offsetof(DNSServer, server_name), 0                 },
+        { "accessible",    SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool,       offsetof(DNSServer, accessible),  SD_JSON_MANDATORY },
+        {},
+};
+
+static const sd_json_dispatch_field dns_server_context_dispatch_table[] = {
+        /* This table is for context, i.e. input */
+        { "address", SD_JSON_VARIANT_ARRAY,    json_dispatch_in_addr_data,     offsetof(DNSServer, in_addr),     SD_JSON_MANDATORY                     },
+        { "family",  SD_JSON_VARIANT_INTEGER,  json_dispatch_address_family,   offsetof(DNSServer, family),      SD_JSON_MANDATORY                     },
+        { "port",    SD_JSON_VARIANT_UNSIGNED, sd_json_dispatch_uint16,        offsetof(DNSServer, port),        SD_JSON_NULLABLE|SD_JSON_NULL_TO_ZERO },
+        { "ifindex", SD_JSON_VARIANT_UNSIGNED, json_dispatch_ifindex,          offsetof(DNSServer, ifindex),     SD_JSON_NULLABLE|SD_JSON_RELAX        },
+        { "name",    SD_JSON_VARIANT_STRING,   json_dispatch_string_non_empty, offsetof(DNSServer, server_name), SD_JSON_NULLABLE                      },
+        {},
+};
+
+static int dispatch_dns_server(
+                const sd_json_dispatch_field table[],
+                bool input,
+                const char *name,
+                sd_json_variant *variant,
+                sd_json_dispatch_flags_t flags,
+                void *userdata) {
+
+        DNSServer **ret = ASSERT_PTR(userdata);
+        _cleanup_(dns_server_freep) DNSServer *s = NULL;
+        int r;
+
+        s = new0(DNSServer, 1);
+        if (!s)
+                return log_oom();
+
+        r = sd_json_dispatch(variant, table, flags, s);
+        if (r < 0)
+                return r;
+
+        if (s->family != s->in_addr.family)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "'%s' address and family are inconsistent.", strna(name));
+
+        /* When used as input, refuse the unspecified address and our own stub listeners,
+         * like the D-Bus setters do. When used as output, stay lenient, as the reported
+         * configuration may come from unvalidated sources. */
+        if (input && !dns_server_address_valid(s->family, &s->in_addr.address))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Invalid DNS server address.");
+
+        if (IN_SET(s->port, 53, 853))
+                s->port = 0;
+
+        *ret = TAKE_PTR(s);
+
+        return 0;
+}
+
+static int dispatch_dns_server_runtime(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        return dispatch_dns_server(dns_server_runtime_dispatch_table, /* input= */ false, name, variant, flags, userdata);
+}
+
+static int dispatch_dns_server_array(
+                const sd_json_dispatch_field table[],
+                bool input,
+                const char *name,
+                sd_json_variant *variant,
+                sd_json_dispatch_flags_t flags,
+                void *userdata) {
+
+        OrderedSet **ret = ASSERT_PTR(userdata);
+        _cleanup_ordered_set_free_ OrderedSet *dns_servers = NULL;
+        sd_json_variant *v;
+        int r;
+
+        if (sd_json_variant_elements(variant) > LINK_DNS_SERVERS_MAX)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(E2BIG), "Too many DNS servers for one link.");
+
+        JSON_VARIANT_ARRAY_FOREACH(v, variant) {
+                _cleanup_(dns_server_freep) DNSServer *s = NULL;
+
+                r = dispatch_dns_server(table, input, name, v, flags, &s);
+                if (r < 0)
+                        return json_log(v, flags, r, "JSON array element is not a valid DNSServer.");
+
+                r = ordered_set_ensure_put(&dns_servers, &dns_server_hash_ops, s);
+                if (r < 0)
+                        return r;
+                TAKE_PTR(s);
+        }
+
+        free_and_replace_full(*ret, dns_servers, ordered_set_free);
+
+        return 0;
+}
+
+static int dispatch_dns_server_runtime_array(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        return dispatch_dns_server_array(dns_server_runtime_dispatch_table, /* input= */ false, name, variant, flags, userdata);
+}
+
+int dispatch_dns_server_context_array(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        return dispatch_dns_server_array(dns_server_context_dispatch_table, /* input= */ true, name, variant, flags, userdata);
+}
+
+SearchDomain* search_domain_free(SearchDomain *d) {
+        if (!d)
+                return NULL;
+
+        free(d->name);
+
+        return mfree(d);
+}
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+        search_domain_hash_ops,
+        void,
+        trivial_hash_func,
+        trivial_compare_func,
+        SearchDomain,
+        search_domain_free);
+
+static const sd_json_dispatch_field search_domain_runtime_dispatch_table[] = {
+        { "name",      SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,  offsetof(SearchDomain, name),       SD_JSON_MANDATORY },
+        { "routeOnly", SD_JSON_VARIANT_BOOLEAN,  sd_json_dispatch_stdbool, offsetof(SearchDomain, route_only), SD_JSON_MANDATORY },
+        { "ifindex",   SD_JSON_VARIANT_UNSIGNED, json_dispatch_ifindex,    offsetof(SearchDomain, ifindex),    SD_JSON_RELAX     },
+        {},
+};
+
+static const sd_json_dispatch_field search_domain_context_dispatch_table[] = {
+        { "name",      SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,  offsetof(SearchDomain, name),       SD_JSON_MANDATORY },
+        { "routeOnly", SD_JSON_VARIANT_BOOLEAN,  sd_json_dispatch_stdbool, offsetof(SearchDomain, route_only), SD_JSON_NULLABLE  },
+        {},
+};
+
+static int dispatch_search_domain(const sd_json_dispatch_field table[], const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        SearchDomain **ret = ASSERT_PTR(userdata);
+        int r;
+
+        _cleanup_(search_domain_freep) SearchDomain *d = new0(SearchDomain, 1);
+        if (!d)
+                return log_oom();
+
+        r = sd_json_dispatch(variant, table, flags, d);
+        if (r < 0)
+                return r;
+
+        r = dns_name_is_valid(d->name);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Invalid search domain %s", d->name);
+
+        if (!d->route_only && dns_name_is_root(d->name))
+                return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Root domain is not suitable as search domain %s", d->name);
+
+        _cleanup_free_ char *normalized = NULL;
+        r = dns_name_normalize(d->name, /* flags= */ 0, &normalized);
+        if (r < 0)
+                return r;
+        free_and_replace(d->name, normalized);
+
+        *ret = TAKE_PTR(d);
+
+        return 0;
+}
+
+static int dispatch_search_domain_array(const sd_json_dispatch_field table[], const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        OrderedSet **ret = ASSERT_PTR(userdata);
+        _cleanup_ordered_set_free_ OrderedSet *search_domains = NULL;
+        sd_json_variant *v;
+        int r;
+
+        if (sd_json_variant_elements(variant) > LINK_SEARCH_DOMAINS_MAX)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(E2BIG), "Too many search domains for one link.");
+
+        JSON_VARIANT_ARRAY_FOREACH(v, variant) {
+                _cleanup_(search_domain_freep) SearchDomain *d = NULL;
+
+                r = dispatch_search_domain(table, name, v, flags, &d);
+                if (r < 0)
+                        return json_log(v, flags, r, "JSON array element is not a valid SearchDomain.");
+
+                r = ordered_set_ensure_put(&search_domains, &search_domain_hash_ops, d);
+                if (r < 0)
+                        return r;
+                TAKE_PTR(d);
+        }
+
+        free_and_replace_full(*ret, search_domains, ordered_set_free);
+
+        return 0;
+}
+
+static int dispatch_search_domain_runtime_array(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        return dispatch_search_domain_array(search_domain_runtime_dispatch_table, name, variant, flags, userdata);
+}
+
+int dispatch_search_domain_context_array(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        return dispatch_search_domain_array(search_domain_context_dispatch_table, name, variant, flags, userdata);
+}
+
+static DNSScope* dns_scope_free(DNSScope *s) {
+        if (!s)
+                return NULL;
+
+        free(s->ifname);
+        free(s->protocol);
+        free(s->dnssec_mode_str);
+        free(s->dns_over_tls_mode_str);
+
+        return mfree(s);
+}
+
+DEFINE_TRIVIAL_CLEANUP_FUNC(DNSScope*, dns_scope_free);
+
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+        dns_scope_hash_ops,
+        void,
+        trivial_hash_func,
+        trivial_compare_func,
+        DNSScope,
+        dns_scope_free);
+
+static int dispatch_dns_scope(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dns_scope_dispatch_table[] = {
+                { "protocol",   SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,      offsetof(DNSScope, protocol),              SD_JSON_MANDATORY },
+                { "family",     SD_JSON_VARIANT_INTEGER,  json_dispatch_address_family, offsetof(DNSScope, family),                SD_JSON_RELAX     },
+                { "ifname",     SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,      offsetof(DNSScope, ifname),                0                 },
+                { "ifindex",    SD_JSON_VARIANT_UNSIGNED, json_dispatch_ifindex,        offsetof(DNSScope, ifindex),               SD_JSON_RELAX     },
+                { "dnssec",     SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,      offsetof(DNSScope, dnssec_mode_str),       0                 },
+                { "dnsOverTLS", SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,      offsetof(DNSScope, dns_over_tls_mode_str), 0                 },
+                {},
+        };
+        DNSScope **ret = ASSERT_PTR(userdata);
+        int r;
+
+        _cleanup_(dns_scope_freep) DNSScope *s = new0(DNSScope, 1);
+        if (!s)
+                return log_oom();
+
+        r = sd_json_dispatch(variant, dns_scope_dispatch_table, flags, s);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(s);
+
+        return 0;
+}
+
+static int dispatch_dns_scope_array(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        Set **ret = ASSERT_PTR(userdata);
+        _cleanup_set_free_ Set *dns_scopes = NULL;
+        sd_json_variant *v;
+        int r;
+
+        JSON_VARIANT_ARRAY_FOREACH(v, variant) {
+                _cleanup_(dns_scope_freep) DNSScope *s = NULL;
+
+                r = dispatch_dns_scope(name, v, flags, &s);
+                if (r < 0)
+                        return json_log(v, flags, r, "JSON array element is not a valid DNSScope.");
+
+                r = set_ensure_consume(&dns_scopes, &dns_scope_hash_ops, TAKE_PTR(s));
+                if (r < 0)
+                        return r;
+        }
+
+        set_free_and_replace(*ret, dns_scopes);
+
+        return 0;
+}
+
+int dispatch_negative_trust_anchors(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        char ***ret = ASSERT_PTR(userdata);
+        int r;
+
+        if (sd_json_variant_elements(variant) > LINK_NEGATIVE_TRUST_ANCHORS_MAX)
+                return json_log(variant, flags, SYNTHETIC_ERRNO(E2BIG), "Too many negative trust anchors for one link.");
+
+        _cleanup_strv_free_ char **nta = NULL;
+        r = sd_json_dispatch_strv(name, variant, flags, &nta);
+        if (r < 0)
+                return r;
+
+        STRV_FOREACH(a, nta) {
+                r = dns_name_is_valid(*a);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Invalid negative trust anchor domain: %s", *a);
+        }
+
+        strv_sort(nta);
+        *ret = TAKE_PTR(nta);
+        return 0;
+}
+
+JSON_DISPATCH_ENUM_DEFINE(dispatch_resolve_support_mode, ResolveSupport, resolve_support_from_string);
+JSON_DISPATCH_ENUM_DEFINE(dispatch_dns_over_tls_mode, DnsOverTlsMode, dns_over_tls_mode_from_string);
+
+DNSConfiguration* dns_configuration_free(DNSConfiguration *c) {
+        if (!c)
+                return NULL;
+
+        dns_server_free(c->current_dns_server);
+        ordered_set_free(c->dns_servers);
+        ordered_set_free(c->search_domains);
+        ordered_set_free(c->fallback_dns_servers);
+        set_free(c->dns_scopes);
+        free(c->ifname);
+        free(c->dnssec_mode_str);
+        free(c->dns_over_tls_mode_str);
+        free(c->llmnr_mode_str);
+        free(c->mdns_mode_str);
+        free(c->resolv_conf_mode_str);
+        free(c->delegate);
+        strv_free(c->negative_trust_anchors);
+
+        return mfree(c);
+}
+
+DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(
+        dns_configuration_hash_ops,
+        void,
+        trivial_hash_func,
+        trivial_compare_func,
+        DNSConfiguration,
+        dns_configuration_free);
+
+static int dispatch_dns_configuration(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata) {
+        static const sd_json_dispatch_field dns_configuration_dispatch_table[] = {
+                { "ifname",               SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,              offsetof(DNSConfiguration, ifname),                 0             },
+                { "ifindex",              SD_JSON_VARIANT_UNSIGNED, json_dispatch_ifindex,                offsetof(DNSConfiguration, ifindex),                SD_JSON_RELAX },
+                { "defaultRoute",         SD_JSON_VARIANT_BOOLEAN,  sd_json_dispatch_stdbool,             offsetof(DNSConfiguration, default_route),          0             },
+                { "currentServer",        SD_JSON_VARIANT_OBJECT,   dispatch_dns_server_runtime,          offsetof(DNSConfiguration, current_dns_server),     0             },
+                { "servers",              SD_JSON_VARIANT_ARRAY,    dispatch_dns_server_runtime_array,    offsetof(DNSConfiguration, dns_servers),            0             },
+                { "searchDomains",        SD_JSON_VARIANT_ARRAY,    dispatch_search_domain_runtime_array, offsetof(DNSConfiguration, search_domains),         0             },
+                { "dnssecSupported",      SD_JSON_VARIANT_BOOLEAN,  sd_json_dispatch_stdbool,             offsetof(DNSConfiguration, dnssec_supported),       0             },
+                { "dnssec",               SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,              offsetof(DNSConfiguration, dnssec_mode_str),        0             },
+                { "dnsOverTLS",           SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,              offsetof(DNSConfiguration, dns_over_tls_mode_str),  0             },
+                { "llmnr",                SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,              offsetof(DNSConfiguration, llmnr_mode_str),         0             },
+                { "mDNS",                 SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,              offsetof(DNSConfiguration, mdns_mode_str),          0             },
+                { "fallbackServers",      SD_JSON_VARIANT_ARRAY,    dispatch_dns_server_runtime_array,    offsetof(DNSConfiguration, fallback_dns_servers),   0             },
+                { "negativeTrustAnchors", SD_JSON_VARIANT_ARRAY,    dispatch_negative_trust_anchors,      offsetof(DNSConfiguration, negative_trust_anchors), 0             },
+                { "resolvConfMode",       SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,              offsetof(DNSConfiguration, resolv_conf_mode_str),   0             },
+                { "scopes",               SD_JSON_VARIANT_ARRAY,    dispatch_dns_scope_array,             offsetof(DNSConfiguration, dns_scopes),             0             },
+                { "delegate",             SD_JSON_VARIANT_STRING,   sd_json_dispatch_string,              offsetof(DNSConfiguration, delegate),               0             },
+                {},
+
+        };
+        DNSConfiguration **ret = ASSERT_PTR(userdata);
+        _cleanup_(dns_configuration_freep) DNSConfiguration *c = NULL;
+        int r;
+
+        c = new0(DNSConfiguration, 1);
+        if (!c)
+                return log_oom();
+
+        r = sd_json_dispatch(variant, dns_configuration_dispatch_table, flags, c);
+        if (r < 0)
+                return r;
+
+        *ret = TAKE_PTR(c);
+
+        return 0;
+}
+
+int dns_configuration_from_json(sd_json_variant *variant, DNSConfiguration **ret) {
+        return dispatch_dns_configuration(/* name= */ NULL, variant, SD_JSON_LOG|SD_JSON_ALLOW_EXTENSIONS, ret);
+}
+
+bool dns_is_accessible(DNSConfiguration *c) {
+        DNSServer *s = NULL;
+
+        if (!c)
+                return false;
+
+        if (c->current_dns_server && c->current_dns_server->accessible)
+                return true;
+
+        ORDERED_SET_FOREACH(s, c->dns_servers)
+                if (s->accessible)
+                        return true;
+
+        return false;
+}
+
+bool dns_configuration_contains_search_domain(DNSConfiguration *c, const char *domain) {
+        SearchDomain *d = NULL;
+
+        assert(domain);
+
+        if (!c)
+                return false;
+
+        ORDERED_SET_FOREACH(d, c->search_domains)
+                if (streq(d->name, domain))
+                        return true;
+
+        return false;
+}

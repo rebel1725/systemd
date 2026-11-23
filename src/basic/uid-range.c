@@ -63,6 +63,10 @@ static void uid_range_coalesce(UIDRange *range) {
                                 break;
 
                         begin = MIN(x->start, y->start);
+
+                        /* Silence static analyzers, overflow is prevented by uid_range_add_internal() */
+                        assert(x->start <= UINT32_MAX - x->nr);
+                        assert(y->start <= UINT32_MAX - y->nr);
                         end = MAX(x->start + x->nr, y->start + y->nr);
 
                         x->start = begin;
@@ -71,7 +75,12 @@ static void uid_range_coalesce(UIDRange *range) {
                         if (range->n_entries > j + 1)
                                 memmove(y, y + 1, sizeof(UIDRangeEntry) * (range->n_entries - j - 1));
 
+                        /* Silence static analyzers, n_entries > 0 since j < n_entries holds in the loop condition */
+                        assert(range->n_entries > 0);
                         range->n_entries--;
+
+                        /* Silence static analyzers, j cannot be 0 here since it starts at i + 1, i.e. >= 1 */
+                        assert(j > 0);
                         j--;
                 }
         }
@@ -386,9 +395,18 @@ int uid_range_partition(UIDRange *range, uid_t size) {
         if (n_new_entries > range->n_entries && !GREEDY_REALLOC(range->entries, n_new_entries))
                 return -ENOMEM;
 
-        /* Work backwards to avoid overwriting entries we still need to read */
+        /* Compact in place: drop entries that contribute zero partitions (nr < size). This forward pass
+         * reads each entry once and only writes to lower-or-equal indices, so it cannot alias an unread
+         * source entry. */
+        size_t n_src = 0;
+        for (size_t i = 0; i < range->n_entries; i++)
+                if (range->entries[i].nr >= size)
+                        range->entries[n_src++] = range->entries[i];
+
+        /* Pre-compaction guarantees every surviving entry contributes at least one partition slot, so the
+         * write cursor t stays ahead of the read index. */
         size_t t = n_new_entries;
-        for (size_t i = range->n_entries; i > 0; i--) {
+        for (size_t i = n_src; i > 0; i--) {
                 UIDRangeEntry *e = range->entries + i - 1;
                 unsigned n_parts = e->nr / size;
 
@@ -608,7 +626,6 @@ int uid_map_search_root(pid_t pid, UIDRangeUsernsMode mode, uid_t *ret) {
 }
 
 uid_t uid_range_base(const UIDRange *range) {
-
         /* Returns the lowest UID in the range (notw that elements are sorted, hence we just need to look at
          * the first one that is populated. */
 

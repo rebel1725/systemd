@@ -86,7 +86,7 @@ static void scope_set_state(Scope *s, ScopeState state) {
         assert(s);
 
         if (s->state != state)
-                bus_unit_send_pending_change_signal(UNIT(s), false);
+                bus_unit_send_pending_change_signal(UNIT(s), /* including_new= */ false);
 
         old_state = s->state;
         s->state = state;
@@ -116,7 +116,7 @@ static int scope_add_default_dependencies(Scope *s) {
         r = unit_add_two_dependencies_by_name(
                         UNIT(s),
                         UNIT_BEFORE, UNIT_CONFLICTS,
-                        SPECIAL_SHUTDOWN_TARGET, true,
+                        SPECIAL_SHUTDOWN_TARGET, /* add_reference= */ true,
                         UNIT_DEPENDENCY_DEFAULT);
         if (r < 0)
                 return r;
@@ -192,7 +192,7 @@ static int scope_load(Unit *u) {
         if (r < 0)
                 return r;
 
-        r = unit_load_fragment_and_dropin(u, false);
+        r = unit_load_fragment_and_dropin(u, /* fragment_required= */ false);
         if (r < 0)
                 return r;
 
@@ -344,25 +344,21 @@ static int scope_enter_start_chown(Scope *s) {
                 gid_t gid = GID_INVALID;
 
                 if (!isempty(s->user)) {
-                        const char *user = s->user;
-
-                        r = get_user_creds(&user, &uid, &gid, NULL, NULL, 0);
+                        r = get_user_creds(s->user, /* flags= */ 0, /* ret_username= */ NULL, &uid, &gid, /* ret_home= */ NULL, /* ret_shell= */ NULL);
                         if (r < 0) {
                                 log_unit_error_errno(UNIT(s), r,
                                                      "Failed to resolve user '%s': %s",
-                                                     user, STRERROR_USER(r));
+                                                     s->user, STRERROR_USER(r));
                                 _exit(EXIT_USER);
                         }
                 }
 
                 if (!isempty(s->group)) {
-                        const char *group = s->group;
-
-                        r = get_group_creds(&group, &gid, 0);
+                        r = get_group_creds(s->group, /* flags= */ 0, /* ret_name= */ NULL, &gid);
                         if (r < 0) {
                                 log_unit_error_errno(UNIT(s), r,
                                                      "Failed to resolve group '%s': %s",
-                                                     group, STRERROR_GROUP(r));
+                                                     s->group, STRERROR_GROUP(r));
                                 _exit(EXIT_GROUP);
                         }
                 }
@@ -390,7 +386,7 @@ fail:
 
 static int scope_enter_running(Scope *s) {
         Unit *u = UNIT(ASSERT_PTR(s));
-        int r;
+        int empty, r;
 
         (void) bus_scope_track_controller(s);
 
@@ -400,7 +396,7 @@ static int scope_enter_running(Scope *s) {
 
         unit_export_state_files(u);
 
-        r = unit_attach_pids_to_cgroup(u, u->pids, NULL);
+        r = unit_attach_pids_to_cgroup(u, u->pids, /* suffix_path= */ NULL);
         if (r < 0) {
                 log_unit_warning_errno(u, r, "Failed to add PIDs to scope's control group: %m");
                 goto fail;
@@ -409,6 +405,18 @@ static int scope_enter_running(Scope *s) {
                 r = log_unit_warning_errno(u, SYNTHETIC_ERRNO(ECHILD), "No PIDs left to attach to the scope's control group, refusing.");
                 goto fail;
         }
+
+        /* Writing a zombie PID to cgroup.procs may succeed without moving it. */
+        empty = unit_cgroup_is_empty(u);
+        if (empty < 0) {
+                r = log_unit_warning_errno(u, empty, "Failed to determine whether scope's control group is empty: %m");
+                goto fail;
+        }
+        if (empty > 0) {
+                r = log_unit_warning_errno(u, SYNTHETIC_ERRNO(ECHILD), "Scope's control group is empty after attaching PIDs, refusing.");
+                goto fail;
+        }
+
         log_unit_debug(u, "%i %s added to scope's control group.", r, r == 1 ? "process" : "processes");
 
         s->result = SCOPE_SUCCESS;
@@ -440,6 +448,10 @@ static int scope_start(Unit *u) {
         /* We can't fulfill this right now, please try again later */
         if (IN_SET(s->state, SCOPE_STOP_SIGTERM, SCOPE_STOP_SIGKILL))
                 return -EAGAIN;
+
+        /* Already starting up (waiting for the async cgroup chown helper)? Then there's nothing to do. */
+        if (s->state == SCOPE_START_CHOWN)
+                return 0;
 
         assert(s->state == SCOPE_DEAD);
 
@@ -482,6 +494,8 @@ static int scope_get_timeout(Unit *u, usec_t *timeout) {
         Scope *s = ASSERT_PTR(SCOPE(u));
         usec_t t;
         int r;
+
+        assert(timeout);
 
         if (!s->timer_event_source)
                 return 0;
@@ -606,7 +620,7 @@ static void scope_sigchld_event(Unit *u, pid_t pid, int code, int status) {
         Scope *s = ASSERT_PTR(SCOPE(u));
 
         if (s->state == SCOPE_START_CHOWN) {
-                if (!is_clean_exit(code, status, EXIT_CLEAN_COMMAND, NULL))
+                if (!is_clean_exit(code, status, EXIT_CLEAN_COMMAND, /* success_status= */ NULL))
                         scope_enter_dead(s, SCOPE_FAILURE_RESOURCES);
                 else
                         scope_enter_running(s);
@@ -742,6 +756,7 @@ const UnitVTable scope_vtable = {
         .can_fail = true,
         .once_only = true,
         .can_set_managed_oom = true,
+        .track_orphaned = true,
 
         .init = scope_init,
         .load = scope_load,

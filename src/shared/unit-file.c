@@ -313,7 +313,7 @@ int unit_file_resolve_symlink(
         }
 
         /* Get rid of "." and ".." components in target path */
-        r = chase(target, root_dir, CHASE_NOFOLLOW | CHASE_NONEXISTENT, &simplified, NULL);
+        r = chase(target, root_dir, CHASE_NOFOLLOW | CHASE_NONEXISTENT, &simplified, /* ret_fd= */ NULL);
         if (r < 0)
                 return log_warning_errno(r, "Failed to resolve symlink %s/%s pointing to %s: %m",
                                          dir, filename, target);
@@ -384,6 +384,11 @@ int unit_file_build_name_map(
         uint64_t timestamp_hash;
         int r;
 
+        assert(lp);
+        POINTER_MAY_BE_NULL(cache_timestamp_hash);
+        assert(unit_ids_map);
+        assert(unit_names_map);
+
         /* Before doing anything, check if the timestamp hash that was passed is still valid.
          * If yes, do nothing. */
         if (cache_timestamp_hash &&
@@ -423,7 +428,7 @@ int unit_file_build_name_map(
                 if (r < 0)
                         return log_oom();
 
-                r = chase(*dir, NULL, 0, &resolved_dir, NULL);
+                r = chase(*dir, /* root= */ NULL, /* flags= */ 0, &resolved_dir, /* ret_fd= */ NULL);
                 if (r < 0) {
                         if (r != -ENOENT)
                                 log_warning_errno(r, "Failed to resolve symlink %s, ignoring: %m", *dir);
@@ -635,6 +640,9 @@ int unit_file_remove_from_name_map(
 
         int r;
 
+        assert(lp);
+        assert(unit_ids_map);
+        assert(unit_names_map);
         assert(path);
 
         /* This assumes the specified path is already removed, and drops the relevant entries from the maps. */
@@ -655,7 +663,8 @@ int unit_file_remove_from_name_map(
         _unused_ _cleanup_free_ char *key = NULL;
         free(hashmap_remove2(*unit_ids_map, name, (void**) &key));
         string_strv_hashmap_remove(*unit_names_map, name, name);
-        free(set_remove(*path_cache, path));
+        if (path_cache)
+                free(set_remove(*path_cache, path));
 
         return 0;
 }
@@ -752,6 +761,8 @@ int unit_file_find_fragment(
         _cleanup_set_free_ Set *names = NULL;
         int r;
 
+        assert(ret_fragment_path);
+
         /* Finds a fragment path, and returns the set of names:
          * if we have …/foo.service and …/foo-alias.service→foo.service,
          * and …/foo@.service and …/foo-alias@.service→foo@.service,
@@ -771,7 +782,7 @@ int unit_file_find_fragment(
                 return name_type;
 
         if (ret_names) {
-                r = add_names(unit_ids_map, unit_name_map, unit_name, NULL, name_type, instance, &names, unit_name);
+                r = add_names(unit_ids_map, unit_name_map, unit_name, /* fragment_basename= */ NULL, name_type, instance, &names, unit_name);
                 if (r < 0)
                         return r;
         }

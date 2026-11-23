@@ -64,6 +64,7 @@ static int open_output(RemoteServer *s, Writer *w, const char *host) {
                         UINT64_MAX,
                         &w->metrics,
                         w->mmap,
+                        /* seqnum_id= */ NULL,
                         &w->journal);
         if (r < 0)
                 return log_error_errno(r, "Failed to open output journal %s: %m", filename);
@@ -162,11 +163,12 @@ static int dispatch_raw_connection_event(sd_event_source *event,
                                          void *userdata);
 
 static int get_source_for_fd(RemoteServer *s,
-                             int fd, char *name, RemoteSource **source) {
+                             int fd, char *_name, RemoteSource **source) {
+        _cleanup_free_ char *name = TAKE_PTR(_name);
         Writer *writer;
         int r;
 
-        /* This takes ownership of name, but only on success. */
+        /* This takes ownership of the name in all cases, including on failure. */
 
         assert(s);
         assert(fd >= 0);
@@ -177,11 +179,10 @@ static int get_source_for_fd(RemoteServer *s,
 
         r = journal_remote_get_writer(s, name, &writer);
         if (r < 0)
-                return log_warning_errno(r, "Failed to get writer for source %s: %m",
-                                         name);
+                return log_warning_errno(r, "Failed to get writer for source %s: %m", name);
 
         if (!s->sources[fd]) {
-                s->sources[fd] = source_new(fd, false, name, writer);
+                s->sources[fd] = source_new(fd, /* passive_fd= */ false, TAKE_PTR(name), writer);
                 if (!s->sources[fd]) {
                         writer_unref(writer);
                         return log_oom();
@@ -211,29 +212,29 @@ static int remove_source(RemoteServer *s, int fd) {
         return 0;
 }
 
-int journal_remote_add_source(RemoteServer *s, int fd, char *name, bool own_name) {
+int journal_remote_add_source(RemoteServer *s, int fd, char *_name, bool own_name) {
+        _cleanup_free_ char *name = NULL;
         RemoteSource *source = NULL;
         int r;
 
-        /* This takes ownership of name, even on failure, if own_name is true. */
+        /* This takes ownership of _name, even on failure, if own_name is true. */
 
         assert(s);
         assert(fd >= 0);
-        assert(name);
+        assert(_name);
 
-        if (!own_name) {
-                name = strdup(name);
+        if (own_name)
+                name = TAKE_PTR(_name);
+        else {
+                name = strdup(_name);
                 if (!name)
                         return log_oom();
         }
 
-        r = get_source_for_fd(s, fd, name, &source);
-        if (r < 0) {
-                log_error_errno(r, "Failed to create source for fd:%d (%s): %m",
-                                fd, name);
-                free(name);
-                return r;
-        }
+        /* get_source_for_fd() takes ownership of the name in all cases, so it must not be touched below. */
+        r = get_source_for_fd(s, fd, TAKE_PTR(name), &source);
+        if (r < 0)
+                return log_error_errno(r, "Failed to create source for fd:%d: %m", fd);
 
         r = sd_event_add_io(s->event, &source->event,
                             fd, EPOLLIN|EPOLLRDHUP|EPOLLPRI,
@@ -246,7 +247,7 @@ int journal_remote_add_source(RemoteServer *s, int fd, char *name, bool own_name
                 if (r == 0)
                         r = sd_event_source_set_enabled(source->buffer_event, SD_EVENT_OFF);
         } else if (r == -EPERM) {
-                log_debug("Falling back to sd_event_add_defer for fd:%d (%s)", fd, name);
+                log_debug("Falling back to sd_event_add_defer for fd:%d (%s)", fd, source->importer.name);
                 r = sd_event_add_defer(s->event, &source->event,
                                        dispatch_blocking_source_event, source);
                 if (r == 0)
@@ -258,7 +259,7 @@ int journal_remote_add_source(RemoteServer *s, int fd, char *name, bool own_name
                 goto error;
         }
 
-        r = sd_event_source_set_description(source->event, name);
+        r = sd_event_source_set_description(source->event, source->importer.name);
         if (r < 0) {
                 log_error_errno(r, "Failed to set source name for fd:%d: %m", fd);
                 goto error;
@@ -395,16 +396,15 @@ int journal_remote_handle_raw_source(
                 remove_source(s, source->importer.fd);
                 log_debug("%zu active sources remaining", s->active);
                 return 0;
-        } else if (r == -E2BIG) {
-                log_notice("Entry with too many fields, skipped");
-                return 1;
-        } else if (r == -ENOBUFS) {
-                log_notice("Entry too big, skipped");
-                return 1;
         } else if (r == -EAGAIN) {
                 return 0;
         } else if (r < 0) {
-                log_debug_errno(r, "Closing connection: %m");
+                /* Close the connection on any error, like the HTTP path does: the raw stream has no
+                 * framing to resynchronize on. ENOBUFS (an entry bigger than DATA_SIZE_MAX, or read()
+                 * itself failing) would come straight back, and after E2BIG (too many fields) the
+                 * importer would read the rest of the entry out of step. */
+                log_notice_errno(r, "Failed to process data, closing connection with source %s: %m",
+                                 source->importer.name);
                 remove_source(s, fd);
                 return 0;
         } else
@@ -540,5 +540,5 @@ static int dispatch_raw_connection_event(
         if (fd2 < 0)
                 return fd2;
 
-        return journal_remote_add_source(s, fd2, hostname, true);
+        return journal_remote_add_source(s, fd2, hostname, /* own_name= */ true);
 }

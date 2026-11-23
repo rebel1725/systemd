@@ -25,6 +25,17 @@ static const char *skip_protocol_and_hostname(const char *url) {
         /* Skip slashes after colon */
         d += strspn(d, "/");
 
+        /* The bracketed socket path of a "provider:[…]/…" URL may contain slashes, hence skip it as a whole
+         * first. (IPv6 literals are bracketed too, and are skipped the same way.) */
+        if (*d == '[') {
+                const char *e = strchr(d, ']');
+                if (!e)
+                        return NULL;
+
+                d = e + 1;
+                return d + strcspn(d, "/?#");
+        }
+
         /* Skip everything till next slash or end */
         n = strcspn(d, "/?#");
         if (n == 0)
@@ -142,6 +153,8 @@ int tar_strip_suffixes(const char *name, char **ret) {
         const char *e;
         char *s;
 
+        assert(ret);
+
         e = endswith(name, ".tar");
         if (!e)
                 e = endswith(name, ".tar.xz");
@@ -183,6 +196,8 @@ int raw_strip_suffixes(const char *name, char **ret) {
 
         _cleanup_free_ char *q = NULL;
 
+        assert(ret);
+
         q = strdup(name);
         if (!q)
                 return -ENOMEM;
@@ -214,7 +229,7 @@ int import_assign_pool_quota_and_warn(const char *path) {
 
         assert(path);
 
-        r = btrfs_subvol_auto_qgroup(path, 0, true);
+        r = btrfs_subvol_auto_qgroup(path, /* subvol_id= */ 0, /* create_intermediary_qgroup= */ true);
         if (r == -ENOTTY) {
                 log_debug_errno(r, "Failed to set up quota hierarchy for %s, as directory is not on btrfs or not a subvolume. Ignoring.", path);
                 return 0;

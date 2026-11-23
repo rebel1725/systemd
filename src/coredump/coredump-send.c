@@ -57,7 +57,7 @@ int coredump_send(CoredumpContext *context) {
                                          * what we want to send, and the second one contains
                                          * the trailing dots. */
                                         copy[0] = *iovec;
-                                        copy[1] = IOVEC_MAKE(((const char[]){'.', '.', '.'}), 3);
+                                        copy[1] = IOVEC_MAKE_STRING("...");
 
                                         mh.msg_iov = copy;
                                         mh.msg_iovlen = 2;
@@ -107,7 +107,7 @@ static int can_forward_coredump(PidRef *pidref, PidRef *leader) {
         }
 
         /* Check if the PID1 in the namespace is still running. */
-        r = pidref_kill(leader, 0);
+        r = pidref_kill(leader, /* sig= */ 0);
         if (r < 0)
                 return log_debug_errno(r, "Failed to send kill(0) to the service manager, maybe it is crashed, ignoring: %m");
 
@@ -203,7 +203,7 @@ static int receive_ucred(int transport_fd, struct ucred *ret_ucred) {
         assert(transport_fd >= 0);
         assert(ret_ucred);
 
-        n = recvmsg_safe(transport_fd, &mh, 0);
+        n = recvmsg_safe(transport_fd, &mh, /* flags= */ 0);
         if (n < 0)
                 return n;
 
@@ -260,7 +260,7 @@ int coredump_send_to_container(CoredumpContext *context) {
         if (r < 0)
                 return log_error_errno(r, "Failed to create socket pair: %m");
 
-        r = setsockopt_int(pair[1], SOL_SOCKET, SO_PASSCRED, true);
+        r = setsockopt_int(pair[1], SOL_SOCKET, SO_PASSCRED, /* value= */ true);
         if (r < 0)
                 return log_error_errno(r, "Failed to set SO_PASSCRED: %m");
 
@@ -300,6 +300,16 @@ int coredump_send_to_container(CoredumpContext *context) {
 
                 context->uid = ucred.uid;
                 context->gid = ucred.gid;
+
+                /* Do not leak the TID in the initial PID namespace. */
+                int tidfd = TAKE_FD(context->tidref.fd);
+                pid_t tid = context->tidref.pid;
+                context->tidref = PIDREF_NULL;
+                if (tidfd >= 0) {
+                        r = pidref_set_pidfd_consume(&context->tidref, tidfd);
+                        if (r < 0)
+                                log_warning_errno(r, "Failed to acquire PidRef of TID ["PID_FMT"], ignoring: %m", tid);
+                }
 
                 r = coredump_context_build_iovw(context);
                 if (r < 0)

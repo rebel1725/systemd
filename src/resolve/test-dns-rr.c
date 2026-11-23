@@ -7,6 +7,16 @@
 #include "dns-type.h"
 #include "tests.h"
 
+static void test_to_json_from_json(DnsResourceRecord *rr) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
+        ASSERT_OK(dns_resource_record_to_json(rr, &j));
+
+        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr2 = NULL;
+        ASSERT_OK(dns_resource_record_from_json(j, &rr2));
+
+        ASSERT_TRUE(dns_resource_record_equal(rr, rr2));
+}
+
 /* ================================================================
  * DNS_RESOURCE_RECORD_RDATA()
  * ================================================================ */
@@ -365,7 +375,7 @@ TEST(dns_resource_key_match_rr_simple) {
         rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_A, "www.example.com");
         ASSERT_NOT_NULL(rr);
 
-        ASSERT_TRUE(dns_resource_key_match_rr(key, rr, NULL));
+        ASSERT_TRUE(dns_resource_key_match_rr(key, rr, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_rr_any_class) {
@@ -377,7 +387,7 @@ TEST(dns_resource_key_match_rr_any_class) {
         rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_A, "www.example.com");
         ASSERT_NOT_NULL(rr);
 
-        ASSERT_TRUE(dns_resource_key_match_rr(key, rr, NULL));
+        ASSERT_TRUE(dns_resource_key_match_rr(key, rr, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_rr_any_type) {
@@ -389,7 +399,7 @@ TEST(dns_resource_key_match_rr_any_type) {
         rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_A, "www.example.com");
         ASSERT_NOT_NULL(rr);
 
-        ASSERT_TRUE(dns_resource_key_match_rr(key, rr, NULL));
+        ASSERT_TRUE(dns_resource_key_match_rr(key, rr, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_rr_different_type) {
@@ -401,7 +411,7 @@ TEST(dns_resource_key_match_rr_different_type) {
         rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_AAAA, "www.example.com");
         ASSERT_NOT_NULL(rr);
 
-        ASSERT_FALSE(dns_resource_key_match_rr(key, rr, NULL));
+        ASSERT_FALSE(dns_resource_key_match_rr(key, rr, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_rr_different_name) {
@@ -413,7 +423,7 @@ TEST(dns_resource_key_match_rr_different_name) {
         rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_A, "www.example.com");
         ASSERT_NOT_NULL(rr);
 
-        ASSERT_FALSE(dns_resource_key_match_rr(key, rr, NULL));
+        ASSERT_FALSE(dns_resource_key_match_rr(key, rr, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_rr_case_insensitive_name) {
@@ -425,7 +435,7 @@ TEST(dns_resource_key_match_rr_case_insensitive_name) {
         rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_A, "www.example.com");
         ASSERT_NOT_NULL(rr);
 
-        ASSERT_TRUE(dns_resource_key_match_rr(key, rr, NULL));
+        ASSERT_TRUE(dns_resource_key_match_rr(key, rr, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_rr_escape_error) {
@@ -437,7 +447,7 @@ TEST(dns_resource_key_match_rr_escape_error) {
         rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_A, "www.example.com");
         ASSERT_NOT_NULL(rr);
 
-        ASSERT_ERROR(dns_resource_key_match_rr(key, rr, NULL), EINVAL);
+        ASSERT_ERROR(dns_resource_key_match_rr(key, rr, /* search_domain= */ NULL), EINVAL);
 }
 
 TEST(dns_resource_key_match_rr_search_domain) {
@@ -461,7 +471,7 @@ TEST(dns_resource_key_match_rr_no_search_domain) {
         rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_A, "www.example.com");
         ASSERT_NOT_NULL(rr);
 
-        ASSERT_FALSE(dns_resource_key_match_rr(key, rr, NULL));
+        ASSERT_FALSE(dns_resource_key_match_rr(key, rr, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_rr_different_search_domain) {
@@ -488,7 +498,7 @@ TEST(dns_resource_key_match_cname_or_dname_simple) {
         cname = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_CNAME, "www.example.com");
         ASSERT_NOT_NULL(cname);
 
-        ASSERT_TRUE(dns_resource_key_match_cname_or_dname(key, cname, NULL));
+        ASSERT_TRUE(dns_resource_key_match_cname_or_dname(key, cname, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_cname_or_dname_any_class) {
@@ -499,7 +509,7 @@ TEST(dns_resource_key_match_cname_or_dname_any_class) {
         cname = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_CNAME, "www.example.com");
         ASSERT_NOT_NULL(cname);
 
-        ASSERT_TRUE(dns_resource_key_match_cname_or_dname(key, cname, NULL));
+        ASSERT_TRUE(dns_resource_key_match_cname_or_dname(key, cname, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_cname_or_dname_bad_type) {
@@ -510,7 +520,7 @@ TEST(dns_resource_key_match_cname_or_dname_bad_type) {
         cname = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_CNAME, "www.example.com");
         ASSERT_NOT_NULL(cname);
 
-        ASSERT_FALSE(dns_resource_key_match_cname_or_dname(key, cname, NULL));
+        ASSERT_FALSE(dns_resource_key_match_cname_or_dname(key, cname, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_cname_or_dname_case_insensitive_cname) {
@@ -521,7 +531,7 @@ TEST(dns_resource_key_match_cname_or_dname_case_insensitive_cname) {
         cname = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_CNAME, "www.example.com");
         ASSERT_NOT_NULL(cname);
 
-        ASSERT_TRUE(dns_resource_key_match_cname_or_dname(key, cname, NULL));
+        ASSERT_TRUE(dns_resource_key_match_cname_or_dname(key, cname, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_cname_or_dname_prefix_cname) {
@@ -532,7 +542,7 @@ TEST(dns_resource_key_match_cname_or_dname_prefix_cname) {
         cname = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_CNAME, "example.com");
         ASSERT_NOT_NULL(cname);
 
-        ASSERT_FALSE(dns_resource_key_match_cname_or_dname(key, cname, NULL));
+        ASSERT_FALSE(dns_resource_key_match_cname_or_dname(key, cname, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_cname_or_dname_suffix_cname) {
@@ -543,7 +553,7 @@ TEST(dns_resource_key_match_cname_or_dname_suffix_cname) {
         cname = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_CNAME, "www.example.com");
         ASSERT_NOT_NULL(cname);
 
-        ASSERT_FALSE(dns_resource_key_match_cname_or_dname(key, cname, NULL));
+        ASSERT_FALSE(dns_resource_key_match_cname_or_dname(key, cname, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_cname_or_dname_search_domain_cname_pass) {
@@ -576,7 +586,7 @@ TEST(dns_resource_key_match_cname_or_dname_case_insensitive_dname) {
         cname = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_DNAME, "www.example.com");
         ASSERT_NOT_NULL(cname);
 
-        ASSERT_TRUE(dns_resource_key_match_cname_or_dname(key, cname, NULL));
+        ASSERT_TRUE(dns_resource_key_match_cname_or_dname(key, cname, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_cname_or_dname_prefix_dname) {
@@ -587,7 +597,7 @@ TEST(dns_resource_key_match_cname_or_dname_prefix_dname) {
         cname = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_DNAME, "example.com");
         ASSERT_NOT_NULL(cname);
 
-        ASSERT_TRUE(dns_resource_key_match_cname_or_dname(key, cname, NULL));
+        ASSERT_TRUE(dns_resource_key_match_cname_or_dname(key, cname, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_cname_or_dname_suffix_dname) {
@@ -598,7 +608,7 @@ TEST(dns_resource_key_match_cname_or_dname_suffix_dname) {
         cname = dns_resource_key_new(DNS_CLASS_IN, DNS_TYPE_DNAME, "www.example.com");
         ASSERT_NOT_NULL(cname);
 
-        ASSERT_FALSE(dns_resource_key_match_cname_or_dname(key, cname, NULL));
+        ASSERT_FALSE(dns_resource_key_match_cname_or_dname(key, cname, /* search_domain= */ NULL));
 }
 
 TEST(dns_resource_key_match_cname_or_dname_search_domain_dname_pass) {
@@ -802,6 +812,8 @@ TEST(dns_resource_record_new_address_ipv4) {
         ASSERT_EQ(rr->key->type, DNS_TYPE_A);
         ASSERT_STREQ(dns_resource_key_name(rr->key), "www.example.com");
         ASSERT_EQ(rr->a.in_addr.s_addr, addr.in.s_addr);
+
+        test_to_json_from_json(rr);
 }
 
 TEST(dns_resource_record_new_address_ipv6) {
@@ -817,7 +829,9 @@ TEST(dns_resource_record_new_address_ipv6) {
         ASSERT_EQ(rr->key->class, DNS_CLASS_IN);
         ASSERT_EQ(rr->key->type, DNS_TYPE_AAAA);
         ASSERT_STREQ(dns_resource_key_name(rr->key), "www.example.com");
-        ASSERT_EQ(memcmp(&rr->aaaa.in6_addr, &addr.in6, sizeof(struct in6_addr)), 0);
+        ASSERT_MEMEQ(&rr->aaaa.in6_addr, &addr.in6, sizeof(struct in6_addr));
+
+        test_to_json_from_json(rr);
 }
 
 /* ================================================================
@@ -1003,11 +1017,13 @@ TEST(dns_resource_record_equal_cname_copy) {
 
         a = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_CNAME, "www.example.com");
         ASSERT_NOT_NULL(a);
-        a->cname.name = strdup("example.com");
+        a->cname.name = ASSERT_PTR(strdup("example.com"));
 
         b = dns_resource_record_copy(a);
         ASSERT_NOT_NULL(b);
         ASSERT_TRUE(dns_resource_record_equal(a, b));
+
+        test_to_json_from_json(a);
 }
 
 TEST(dns_resource_record_equal_cname_fail) {
@@ -1220,11 +1236,13 @@ TEST(dns_resource_record_equal_ptr_copy) {
 
         a = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_PTR, "127.1.168.192.in-addr-arpa");
         ASSERT_NOT_NULL(a);
-        a->ptr.name = strdup("example.com");
+        a->ptr.name = ASSERT_PTR(strdup("example.com"));
 
         b = dns_resource_record_copy(a);
         ASSERT_NOT_NULL(b);
         ASSERT_TRUE(dns_resource_record_equal(a, b));
+
+        test_to_json_from_json(a);
 }
 
 TEST(dns_resource_record_equal_ptr_fail) {
@@ -2059,7 +2077,7 @@ TEST(dns_resource_record_equal_svcb_copy) {
         a->svcb.target_name = strdup("sock.example.com");
 
         add_svcb_param(a, DNS_SVC_PARAM_KEY_ALPN, "\x09websocket", 10);
-        add_svcb_param(a, 99, NULL, 0);
+        add_svcb_param(a, 99, /* value= */ NULL, /* len= */ 0);
 
         b = dns_resource_record_copy(a);
         ASSERT_NOT_NULL(b);
@@ -2107,7 +2125,7 @@ TEST(dns_resource_record_equal_svcb_param_missing) {
         ASSERT_NOT_NULL(b);
 
         add_svcb_param(a, DNS_SVC_PARAM_KEY_ALPN, "\x09websocket", 10);
-        add_svcb_param(a, 99, NULL, 0);
+        add_svcb_param(a, 99, /* value= */ NULL, /* len= */ 0);
 
         add_svcb_param(b, DNS_SVC_PARAM_KEY_ALPN, "\x09websocket", 10);
 
@@ -2128,7 +2146,7 @@ TEST(dns_resource_record_equal_svcb_param_extra) {
         add_svcb_param(a, DNS_SVC_PARAM_KEY_ALPN, "\x09websocket", 10);
 
         add_svcb_param(b, DNS_SVC_PARAM_KEY_ALPN, "\x09websocket", 10);
-        add_svcb_param(b, 99, NULL, 0);
+        add_svcb_param(b, 99, /* value= */ NULL, /* len= */ 0);
 
         ASSERT_FALSE(dns_resource_record_equal(a, b));
 }
@@ -2222,6 +2240,46 @@ TEST(dns_resource_record_to_string_soa) {
         ASSERT_STREQ(str, "www.example.com IN SOA ns0.example.com ns0.example.com 1111111111 86400 7200 4000000 3600");
 }
 
+TEST(dns_resource_record_to_json_soa) {
+        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
+
+        rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_SOA, "www.example.com");
+        ASSERT_NOT_NULL(rr);
+        rr->soa.mname = strdup("ns0.example.com");
+        rr->soa.rname = strdup("hostmaster.example.com");
+        rr->soa.serial = 1111111111;
+        rr->soa.refresh = 86400;
+        rr->soa.retry = 7200;
+        rr->soa.expire = 4000000;
+        rr->soa.minimum = 3600;
+
+        ASSERT_OK(dns_resource_record_to_json(rr, &j));
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(j, "mname")), "ns0.example.com");
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(j, "rname")), "hostmaster.example.com");
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(j, "serial")), UINT64_C(1111111111));
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(j, "refresh")), UINT64_C(86400));
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(j, "retry")), UINT64_C(7200));
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(j, "expire")), UINT64_C(4000000));
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(j, "minimum")), UINT64_C(3600));
+}
+
+TEST(dns_resource_record_to_json_openpgpkey) {
+        static const uint8_t data[] = { 0, 1, 2, 3 };
+
+        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr =
+                ASSERT_NOT_NULL(dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_OPENPGPKEY, "www.example.com"));
+        ASSERT_NOT_NULL(rr->generic.data = memdup(data, sizeof(data)));
+        rr->generic.data_size = sizeof(data);
+
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
+        ASSERT_OK(dns_resource_record_to_json(rr, &j));
+
+        sd_json_variant *key = ASSERT_NOT_NULL(sd_json_variant_by_key(j, "key"));
+        ASSERT_EQ(sd_json_variant_unsigned(sd_json_variant_by_key(key, "type")), (uint64_t) DNS_TYPE_OPENPGPKEY);
+        ASSERT_STREQ(sd_json_variant_string(sd_json_variant_by_key(j, "data")), "AAECAw==");
+}
+
 TEST(dns_resource_record_to_string_ptr) {
         _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
         const char *str;
@@ -2290,18 +2348,18 @@ TEST(dns_resource_record_to_string_svcb) {
 
         add_svcb_param(rr, DNS_SVC_PARAM_KEY_MANDATORY, "\x00\x01\x00\x03", 4);
         add_svcb_param(rr, DNS_SVC_PARAM_KEY_ALPN, "\x09websocket", 10);
-        add_svcb_param(rr, DNS_SVC_PARAM_KEY_NO_DEFAULT_ALPN, NULL, 0);
+        add_svcb_param(rr, DNS_SVC_PARAM_KEY_NO_DEFAULT_ALPN, /* value= */ NULL, /* len= */ 0);
         add_svcb_param(rr, DNS_SVC_PARAM_KEY_PORT, "\x01\xbb", 2);
 
-        param = add_svcb_param(rr, DNS_SVC_PARAM_KEY_IPV4HINT, NULL, 2 * sizeof(struct in_addr));
+        param = add_svcb_param(rr, DNS_SVC_PARAM_KEY_IPV4HINT, /* value= */ NULL, 2 * sizeof(struct in_addr));
         param->value_in_addr[0].s_addr = htobe32(0x7284fd3a);
         param->value_in_addr[1].s_addr = htobe32(0x48bcc7c0);
 
-        param = add_svcb_param(rr, DNS_SVC_PARAM_KEY_IPV6HINT, NULL, sizeof(struct in6_addr));
+        param = add_svcb_param(rr, DNS_SVC_PARAM_KEY_IPV6HINT, /* value= */ NULL, sizeof(struct in6_addr));
         param->value_in6_addr[0] = (struct in6_addr) { .s6_addr = { 0xf2, 0x34, 0x32, 0x2e, 0xb8, 0x25, 0x38, 0x35, 0x2f, 0xd7, 0xdb, 0x7b, 0x28, 0x7e, 0x60, 0xbb } };
 
         /* undefined key */
-        add_svcb_param(rr, 99, NULL, 0);
+        add_svcb_param(rr, 99, /* value= */ NULL, /* len= */ 0);
 
         str = dns_resource_record_to_string(rr);
         ASSERT_STREQ(str, "_443._wss.example.com IN SVCB 9 sock.example.com mandatory=\"\\000\\001\\000\\003\" alpn=\"websocket\" no-default-alpn port=443 ipv4hint=114.132.253.58,72.188.199.192 ipv6hint=f234:322e:b825:3835:2fd7:db7b:287e:60bb key99");
@@ -2320,7 +2378,7 @@ TEST(dns_resource_record_to_wire_format) {
         rr->ttl = 3600;
         rr->cname.name = strdup("example.com");
 
-        ASSERT_OK(dns_resource_record_to_wire_format(rr, true));
+        ASSERT_OK(dns_resource_record_to_wire_format(rr, /* canonical= */ true));
 
         const uint8_t data[] = {
         /* name */      0x03, 'w', 'w', 'w',
@@ -2425,18 +2483,29 @@ TEST(dns_resource_record_is_synthetic) {
  * ================================================================ */
 
 TEST(dns_resource_record_clamp_ttl_in_place) {
+        _cleanup_free_ void *wire_format = NULL;
         DnsResourceRecord *rr = NULL, *orig = NULL;
+        size_t wire_format_size;
 
         rr = dns_resource_record_new_full(DNS_CLASS_IN, DNS_TYPE_A, "www.example.com");
         ASSERT_NOT_NULL(rr);
         orig = rr;
         rr->ttl = 3600;
+        rr->a.in_addr.s_addr = htobe32(0xc0a8017f);
 
         ASSERT_FALSE(dns_resource_record_clamp_ttl(&rr, 4800));
         ASSERT_EQ(rr->ttl, 3600u);
 
+        ASSERT_OK(dns_resource_record_to_wire_format(rr, /* canonical= */ false));
+        ASSERT_NOT_NULL(rr->wire_format);
+        wire_format_size = rr->wire_format_size;
+        ASSERT_NOT_NULL(wire_format = memdup(rr->wire_format, wire_format_size));
+
         ASSERT_TRUE(dns_resource_record_clamp_ttl(&rr, 2400));
         ASSERT_EQ(rr->ttl, 2400u);
+        ASSERT_OK(dns_resource_record_to_wire_format(rr, /* canonical= */ false));
+        ASSERT_EQ(rr->wire_format_size, wire_format_size);
+        ASSERT_NE(memcmp(rr->wire_format, wire_format, wire_format_size), 0);
 
         ASSERT_TRUE(rr == orig);
 
@@ -2459,6 +2528,27 @@ TEST(dns_resource_record_clamp_ttl_copy) {
 
         ASSERT_FALSE(rr == orig);
         ASSERT_EQ(orig->ttl, 3600u);
+}
+
+static void test_from_json(const char *text, int expected) {
+        log_notice("Trying to parse as JSON RR: %s", text);
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *j = NULL;
+        ASSERT_OK(sd_json_parse(text, /* flags= */ 0, &j, /* reterr_line= */ NULL, /* reterr_column= */ NULL));
+        ASSERT_EQ(dns_resource_record_from_json(j, /* ret= */ NULL), expected);
+}
+
+TEST(from_bad_json) {
+        test_from_json("{}", -EBADMSG);
+        test_from_json("{\"key\":{}}", -ENXIO);
+        test_from_json("{\"key\":{\"name\":\"foobar\",\"type\":9}}", -EOPNOTSUPP);
+        test_from_json("{\"key\":{\"name\":\"foobar\"}}", -ENXIO);
+        test_from_json("{\"key\":{\"type\":9}}", -ENXIO);
+        test_from_json("{\"key\":{\"name\":\"foobar\",\"type\":1}}", -ENXIO);
+        test_from_json("{\"key\":{\"name\":\"foobar\",\"type\":1},\"address\":[1,2,3,4]}", /* expected= */ 0);
+        test_from_json("{\"key\":{\"name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"type\":1},\"address\":[1,2,3,4]}", /* expected= */ 0);
+        test_from_json("{\"key\":{\"name\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"type\":1},\"address\":[1,2,3,4]}", -EBADMSG);
+        test_from_json("{\"key\":{\"name\":\"a.a\",\"type\":1},\"address\":[1,2,3,4]}", /* expected= */ 0);
+        test_from_json("{\"key\":{\"name\":\"a..a\",\"type\":1},\"address\":[1,2,3,4]}", -EBADMSG);
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

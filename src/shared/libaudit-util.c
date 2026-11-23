@@ -4,8 +4,6 @@
 #include <linux/netlink.h>
 #include <sys/socket.h>
 
-#include "sd-dlopen.h"
-
 #include "errno-util.h"
 #include "fd-util.h"
 #include "iovec-util.h"
@@ -14,8 +12,6 @@
 #include "socket-util.h"
 
 #if HAVE_AUDIT
-static void *libaudit_dl = NULL;
-
 static DLSYM_PROTOTYPE(audit_close) = NULL;
 DLSYM_PROTOTYPE(audit_log_acct_message) = NULL;
 DLSYM_PROTOTYPE(audit_log_user_avc_message) = NULL;
@@ -23,25 +19,24 @@ DLSYM_PROTOTYPE(audit_log_user_comm_message) = NULL;
 static DLSYM_PROTOTYPE(audit_open) = NULL;
 #endif
 
-int dlopen_libaudit(void) {
+int dlopen_libaudit(int log_level) {
 #if HAVE_AUDIT
-        SD_ELF_NOTE_DLOPEN(
-                        "audit",
-                        "Support for Audit logging",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED,
-                        "libaudit.so.1");
+        static void *libaudit_dl = NULL;
+
+        LIBAUDIT_NOTE(suggested);
 
         return dlopen_many_sym_or_warn(
                         &libaudit_dl,
                         "libaudit.so.1",
-                        LOG_DEBUG,
+                        log_level,
                         DLSYM_ARG(audit_close),
                         DLSYM_ARG(audit_log_acct_message),
                         DLSYM_ARG(audit_log_user_avc_message),
                         DLSYM_ARG(audit_log_user_comm_message),
                         DLSYM_ARG(audit_open));
 #else
-        return -EOPNOTSUPP;
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libaudit support is not compiled in.");
 #endif
 }
 
@@ -72,7 +67,7 @@ static int try_audit_request(int fd) {
 
         iov.iov_len = sizeof(msg);
 
-        n = recvmsg_safe(fd, &mh, 0);
+        n = recvmsg_safe(fd, &mh, /* flags= */ 0);
         if (n < 0)
                 return n;
         if (n != NLMSG_LENGTH(sizeof(struct nlmsgerr)))
@@ -93,7 +88,7 @@ bool use_audit(void) {
         if (cached_use >= 0)
                 return cached_use;
 
-        if (dlopen_libaudit() < 0)
+        if (dlopen_libaudit(LOG_DEBUG) < 0)
                 return (cached_use = false);
 
         _cleanup_close_ int fd = socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK, NETLINK_AUDIT);
@@ -141,7 +136,7 @@ int open_audit_fd_or_warn(void) {
 #if HAVE_AUDIT
         int r;
 
-        r = dlopen_libaudit();
+        r = dlopen_libaudit(LOG_DEBUG);
         if (r < 0)
                 return r;
 

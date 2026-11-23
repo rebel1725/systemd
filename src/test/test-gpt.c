@@ -1,8 +1,12 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <unistd.h>
+
 #include "architecture.h"
+#include "fd-util.h"
 #include "gpt.h"
 #include "log.h"
+#include "memfd-util.h"
 #include "pretty-print.h"
 #include "strv.h"
 #include "tests.h"
@@ -49,19 +53,19 @@ TEST(verity_mappings) {
                 PartitionDesignator q;
 
                 q = partition_verity_hash_of(p);
-                assert_se(q < 0 || partition_verity_hash_to_data(q) == p);
+                ASSERT_TRUE(q < 0 || partition_verity_hash_to_data(q) == p);
 
                 q = partition_verity_sig_of(p);
-                assert_se(q < 0 || partition_verity_sig_to_data(q) == p);
+                ASSERT_TRUE(q < 0 || partition_verity_sig_to_data(q) == p);
 
                 q = partition_verity_hash_to_data(p);
-                assert_se(q < 0 || partition_verity_hash_of(q) == p);
+                ASSERT_TRUE(q < 0 || partition_verity_hash_of(q) == p);
 
                 q = partition_verity_sig_to_data(p);
-                assert_se(q < 0 || partition_verity_sig_of(q) == p);
+                ASSERT_TRUE(q < 0 || partition_verity_sig_of(q) == p);
 
                 q = partition_verity_to_data(p);
-                assert_se(q < 0 || partition_verity_hash_of(q) == p || partition_verity_sig_of(q) == p);
+                ASSERT_TRUE(q < 0 || partition_verity_hash_of(q) == p || partition_verity_sig_of(q) == p);
         }
 }
 
@@ -82,6 +86,61 @@ TEST(type_alias_same) {
         }
 }
 
+static void test_shorthand_one(const char *shorthand, const char *canonical) {
+        GptPartitionType x, y;
+
+        /* Some partition types, e.g. root-secondary, only exist on some architectures. */
+        if (gpt_partition_type_from_string(canonical, &x) < 0) {
+                ASSERT_ERROR(gpt_partition_type_from_string(shorthand, /* ret= */ NULL), EINVAL);
+                return;
+        }
+
+        ASSERT_OK(gpt_partition_type_from_string(shorthand, &y));
+        ASSERT_EQ_ID128(x.uuid, y.uuid);
+        ASSERT_EQ(x.arch, y.arch);
+        ASSERT_EQ(x.designator, y.designator);
+        ASSERT_STREQ(x.name, y.name);
+}
+
+TEST(shorthands) {
+        FOREACH_STRING(prefix, "root", "usr", "root-x86-64", "usr-arm64", "root-secondary", "usr-aarch64")
+                FOREACH_STRING(suffix, "-verity", "-verity-sig") {
+                        _cleanup_free_ char *canonical = NULL, *shorthand = NULL;
+
+                        ASSERT_NOT_NULL(canonical = strjoin(prefix, suffix));
+                        ASSERT_NOT_NULL(shorthand = strjoin(prefix, streq(suffix, "-verity") ? "-vty" : "-vsig"));
+
+                        test_shorthand_one(shorthand, canonical);
+                }
+
+        test_shorthand_one("root2", "root-secondary");
+        test_shorthand_one("usr2", "usr-secondary");
+        test_shorthand_one("root-vty2", "root-secondary-verity");
+        test_shorthand_one("usr-vsig2", "usr-secondary-verity-sig");
+        test_shorthand_one("usr-verity2", "usr-secondary-verity");
+        test_shorthand_one("root-verity-sig2", "root-secondary-verity-sig");
+
+        FOREACH_STRING(s, "", "2", "-vty", "-vsig", "esp-vty", "esp-vsig", "esp2", "root-sig", "root22",
+                       "root-secondary2", "root-x86-64-vty2", "root-verity-vty", "root-vty-vty",
+                       "root-verity-sig-vsig", "root-vsig-vsig")
+                ASSERT_ERROR(gpt_partition_type_from_string(s, /* ret= */ NULL), EINVAL);
+
+        /* "root-riscv32" ends in "2", but it is not "root-riscv3" for the secondary architecture. */
+        GptPartitionType t;
+        ASSERT_OK(gpt_partition_type_from_string("root-riscv32", &t));
+        ASSERT_EQ_ID128(t.uuid, SD_GPT_ROOT_RISCV32);
+        ASSERT_OK(gpt_partition_type_from_string("root-riscv32-vsig", &t));
+        ASSERT_EQ_ID128(t.uuid, SD_GPT_ROOT_RISCV32_VERITY_SIG);
+
+        ASSERT_EQ(partition_designator_from_string("root-vty"), PARTITION_ROOT_VERITY);
+        ASSERT_EQ(partition_designator_from_string("root-vsig"), PARTITION_ROOT_VERITY_SIG);
+        ASSERT_EQ(partition_designator_from_string("usr-vty"), PARTITION_USR_VERITY);
+        ASSERT_EQ(partition_designator_from_string("usr-vsig"), PARTITION_USR_VERITY_SIG);
+        ASSERT_EQ(partition_designator_from_string("usr-verity-sig"), PARTITION_USR_VERITY_SIG);
+        FOREACH_STRING(s, "root2", "usr-vty2", "esp-vty", "root-sig", "-vty")
+                ASSERT_ERROR(partition_designator_from_string(s), EINVAL);
+}
+
 TEST(override_architecture) {
         GptPartitionType x, y;
 
@@ -94,7 +153,7 @@ TEST(override_architecture) {
         x = gpt_partition_type_override_architecture(x, ARCHITECTURE_ARM64);
         ASSERT_EQ(x.arch, y.arch);
         ASSERT_EQ(x.designator, y.designator);
-        assert_se(sd_id128_equal(x.uuid, y.uuid));
+        ASSERT_EQ_ID128(x.uuid, y.uuid);
         ASSERT_STREQ(x.name, y.name);
 
         /* If the partition type does not have an architecture, nothing should change. */
@@ -105,8 +164,168 @@ TEST(override_architecture) {
         x = gpt_partition_type_override_architecture(x, ARCHITECTURE_ARM64);
         ASSERT_EQ(x.arch, y.arch);
         ASSERT_EQ(x.designator, y.designator);
-        assert_se(sd_id128_equal(x.uuid, y.uuid));
+        ASSERT_EQ_ID128(x.uuid, y.uuid);
         ASSERT_STREQ(x.name, y.name);
+}
+
+static void make_gpt(int fd, uint32_t sector_size, const GptPartitionEntry *part_entries, size_t n_entries) {
+        /* Zero-fill enough for header probing (gpt_probe reads 2*4096 = 8KB) */
+        static const uint8_t zeros[2 * 4096] = {};
+        ASSERT_OK_EQ_ERRNO(pwrite(fd, zeros, sizeof(zeros), 0), (ssize_t) sizeof(zeros));
+
+        GptHeader h = {
+                .signature = { 'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T' },
+                .revision = htole32(UINT32_C(0x00010000)),
+                .header_size = htole32(sizeof(GptHeader)),
+                .my_lba = htole64(1),
+                .partition_entry_lba = htole64(2),
+                .number_of_partition_entries = htole32(n_entries),
+                .size_of_partition_entry = htole32(sizeof(GptPartitionEntry)),
+        };
+        ASSERT_OK_EQ_ERRNO(pwrite(fd, &h, sizeof(h), sector_size), (ssize_t) sizeof(h));
+
+        if (n_entries > 0) {
+                size_t entries_size = n_entries * sizeof(GptPartitionEntry);
+                ASSERT_OK_EQ_ERRNO(pwrite(fd, part_entries, entries_size, 2 * sector_size), (ssize_t) entries_size);
+        }
+}
+
+TEST(gpt_label_is_valid) {
+        ASSERT_TRUE(gpt_label_is_valid(""));
+        ASSERT_TRUE(gpt_label_is_valid("root-x86-64"));
+        ASSERT_TRUE(gpt_label_is_valid("with \"quotes\" and \\ and *"));
+        ASSERT_TRUE(gpt_label_is_valid("123456789012345678901234567890123456"));
+        ASSERT_FALSE(gpt_label_is_valid("1234567890123456789012345678901234567"));
+        /* 36 two-byte UTF-8 characters fit, they are one UTF-16 code unit each */
+        ASSERT_TRUE(gpt_label_is_valid("ääääääääääääääääääääääääääääääääääää"));
+        ASSERT_FALSE(gpt_label_is_valid("äääääääääääääääääääääääääääääääääääää"));
+        /* Characters outside of the BMP take two UTF-16 code units */
+        ASSERT_TRUE(gpt_label_is_valid("😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀"));
+        ASSERT_FALSE(gpt_label_is_valid("😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀x"));
+        ASSERT_FALSE(gpt_label_is_valid(NULL));
+        ASSERT_FALSE(gpt_label_is_valid("\xff"));
+        ASSERT_FALSE(gpt_label_is_valid("foo\tbar"));
+        ASSERT_FALSE(gpt_label_is_valid("foo\nbar"));
+        ASSERT_FALSE(gpt_label_is_valid("foo\x7f"));
+        ASSERT_FALSE(gpt_label_is_valid("foo\xc2\x85")); /* U+0085, NEL, a C1 control character */
+}
+
+TEST(gpt_probe_empty) {
+        _cleanup_close_ int fd = -EBADF;
+
+        fd = ASSERT_OK(memfd_new("test-gpt-probe"));
+        ASSERT_OK_EQ(gpt_probe(fd, /* ret_header= */ NULL, /* ret_entries= */ NULL, /* ret_n_entries= */ NULL, /* ret_entry_size= */ NULL), (ssize_t) 0);
+}
+
+TEST(gpt_probe_too_short) {
+        _cleanup_close_ int fd = -EBADF;
+        static const uint8_t buf[4096] = {};
+
+        fd = ASSERT_OK(memfd_new("test-gpt-probe"));
+        ASSERT_OK_EQ_ERRNO(pwrite(fd, buf, sizeof(buf), 0), (ssize_t) sizeof(buf));
+        ASSERT_OK_EQ(gpt_probe(fd, /* ret_header= */ NULL, /* ret_entries= */ NULL, /* ret_n_entries= */ NULL, /* ret_entry_size= */ NULL), (ssize_t) 0);
+}
+
+TEST(gpt_probe_no_signature) {
+        _cleanup_close_ int fd = -EBADF;
+        static const uint8_t buf[2 * 4096] = {};
+
+        fd = ASSERT_OK(memfd_new("test-gpt-probe"));
+        ASSERT_OK_EQ_ERRNO(pwrite(fd, buf, sizeof(buf), 0), (ssize_t) sizeof(buf));
+        ASSERT_OK_EQ(gpt_probe(fd, /* ret_header= */ NULL, /* ret_entries= */ NULL, /* ret_n_entries= */ NULL, /* ret_entry_size= */ NULL), (ssize_t) 0);
+}
+
+TEST(gpt_probe_sector_512) {
+        _cleanup_close_ int fd = -EBADF;
+
+        const GptPartitionEntry entries[2] = {
+                {
+                        .unique_partition_guid = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                                                   0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 },
+                        .starting_lba = htole64(100),
+                        .ending_lba = htole64(200),
+                },
+                {
+                        .unique_partition_guid = { 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+                                                   0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20 },
+                        .starting_lba = htole64(300),
+                        .ending_lba = htole64(400),
+                },
+        };
+
+        fd = ASSERT_OK(memfd_new("test-gpt-probe"));
+        make_gpt(fd, 512, entries, 2);
+
+        /* Sector size detection only */
+        ASSERT_OK_EQ(gpt_probe(fd, /* ret_header= */ NULL, /* ret_entries= */ NULL, /* ret_n_entries= */ NULL, /* ret_entry_size= */ NULL), (ssize_t) 512);
+
+        /* Header return */
+        GptHeader h;
+        ASSERT_OK_EQ(gpt_probe(fd, &h, /* ret_entries= */ NULL, /* ret_n_entries= */ NULL, /* ret_entry_size= */ NULL), (ssize_t) 512);
+        ASSERT_EQ(le32toh(h.number_of_partition_entries), 2u);
+        ASSERT_EQ(le32toh(h.size_of_partition_entry), (uint32_t) sizeof(GptPartitionEntry));
+
+        /* Full probe with entries */
+        _cleanup_free_ void *ret_entries = NULL;
+        uint32_t n, sz;
+        ASSERT_OK_EQ(gpt_probe(fd, /* ret_header= */ NULL, &ret_entries, &n, &sz), (ssize_t) 512);
+        ASSERT_EQ(n, 2u);
+        ASSERT_EQ(sz, (uint32_t) sizeof(GptPartitionEntry));
+        ASSERT_NOT_NULL(ret_entries);
+
+        GptPartitionEntry *e = ret_entries;
+        ASSERT_MEMEQ_NN(e[0].unique_partition_guid, sizeof(e[0].unique_partition_guid), entries[0].unique_partition_guid, sizeof(entries[0].unique_partition_guid));
+        ASSERT_MEMEQ_NN(e[1].unique_partition_guid, sizeof(e[1].unique_partition_guid), entries[1].unique_partition_guid, sizeof(entries[1].unique_partition_guid));
+        ASSERT_EQ(le64toh(e[0].starting_lba), UINT64_C(100));
+        ASSERT_EQ(le64toh(e[1].starting_lba), UINT64_C(300));
+}
+
+TEST(gpt_probe_sector_4096) {
+        _cleanup_close_ int fd = -EBADF;
+
+        const GptPartitionEntry entry = {
+                .unique_partition_guid = { 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11,
+                                           0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99 },
+                .starting_lba = htole64(50),
+                .ending_lba = htole64(100),
+        };
+
+        fd = ASSERT_OK(memfd_new("test-gpt-probe"));
+        make_gpt(fd, 4096, &entry, 1);
+
+        ASSERT_OK_EQ(gpt_probe(fd, /* ret_header= */ NULL, /* ret_entries= */ NULL, /* ret_n_entries= */ NULL, /* ret_entry_size= */ NULL), (ssize_t) 4096);
+
+        _cleanup_free_ void *ret_entries = NULL;
+        uint32_t n, sz;
+        ASSERT_OK_EQ(gpt_probe(fd, /* ret_header= */ NULL, &ret_entries, &n, &sz), (ssize_t) 4096);
+        ASSERT_EQ(n, 1u);
+
+        GptPartitionEntry *e = ret_entries;
+        ASSERT_MEMEQ_NN(e[0].unique_partition_guid, sizeof(e[0].unique_partition_guid), entry.unique_partition_guid, sizeof(entry.unique_partition_guid));
+        ASSERT_EQ(le64toh(e[0].starting_lba), UINT64_C(50));
+}
+
+TEST(gpt_probe_ambiguous) {
+        _cleanup_close_ int fd = -EBADF;
+
+        const GptPartitionEntry entry = {};
+
+        fd = ASSERT_OK(memfd_new("test-gpt-probe"));
+        make_gpt(fd, 512, &entry, 1);
+
+        /* Place a second valid header at offset 4096 */
+        GptHeader h2 = {
+                .signature = { 'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T' },
+                .revision = htole32(UINT32_C(0x00010000)),
+                .header_size = htole32(sizeof(GptHeader)),
+                .my_lba = htole64(1),
+                .partition_entry_lba = htole64(2),
+                .number_of_partition_entries = htole32(1),
+                .size_of_partition_entry = htole32(sizeof(GptPartitionEntry)),
+        };
+        ASSERT_OK_EQ_ERRNO(pwrite(fd, &h2, sizeof(h2), 4096), (ssize_t) sizeof(h2));
+
+        ASSERT_ERROR(gpt_probe(fd, /* ret_header= */ NULL, /* ret_entries= */ NULL, /* ret_n_entries= */ NULL, /* ret_entry_size= */ NULL), ENOTUNIQ);
 }
 
 DEFINE_TEST_MAIN(LOG_INFO);

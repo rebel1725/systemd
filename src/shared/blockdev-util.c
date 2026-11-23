@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include <fcntl.h>
 #include <linux/blkpg.h>
 #include <linux/fs.h>
 #include <sys/file.h>
@@ -17,12 +18,18 @@
 #include "devnum-util.h"
 #include "dirent-util.h"
 #include "errno-util.h"
+#include "extension-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "macro.h"
+#include "os-util.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "string-util.h"
+
+/* Chunk size to use when writing zeroes manually, see blockdev_zero_out() */
+#define ZERO_OUT_BUFFER_SIZE (64U*U64_KB)
 
 static int fd_get_devnum(int fd, BlockDeviceLookupFlags flags, dev_t *ret) {
         struct stat st;
@@ -207,7 +214,7 @@ int block_device_new_from_fd(int fd, BlockDeviceLookupFlags flags, sd_device **r
 
                 r = block_device_get_originating(dev_whole_disk, &dev_origin, /* recursive= */ false);
                 if (r >= 0)
-                        device_unref_and_replace(dev, dev_origin);
+                        device_unref_and_replace_new_ref(dev, dev_origin);
                 else if (r != -ENOENT)
                         return r;
         }
@@ -233,9 +240,9 @@ int block_device_new_from_path(const char *path, BlockDeviceLookupFlags flags, s
         assert(path);
         assert(ret);
 
-        fd = open(path, O_CLOEXEC|O_PATH);
+        fd = xopenat(AT_FDCWD, path, O_PATH);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return block_device_new_from_fd(fd, flags, ret);
 }
@@ -316,9 +323,9 @@ int get_block_device(const char *path, dev_t *ret) {
         assert(path);
         assert(ret);
 
-        fd = open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+        fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NOFOLLOW);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return get_block_device_fd(fd, ret);
 }
@@ -366,9 +373,9 @@ int get_block_device_harder(const char *path, dev_t *ret) {
         assert(path);
         assert(ret);
 
-        fd = open(path, O_RDONLY|O_NOFOLLOW|O_CLOEXEC);
+        fd = xopenat(AT_FDCWD, path, O_RDONLY|O_NOFOLLOW);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return get_block_device_harder_fd(fd, ret);
 }
@@ -388,7 +395,7 @@ int lock_whole_block_device(dev_t devt, int open_flags, int operation) {
         if (r < 0)
                 return r;
 
-        lock_fd = device_open_from_devnum(S_IFBLK, whole_devt, open_flags|O_CLOEXEC|O_NONBLOCK|O_NOCTTY, NULL);
+        lock_fd = device_open_from_devnum(S_IFBLK, whole_devt, open_flags|O_NONBLOCK|O_NOCTTY, /* ret_devname= */ NULL);
         if (lock_fd < 0)
                 return lock_fd;
 
@@ -510,7 +517,7 @@ int blockdev_partscan_enabled_fd(int fd) {
 
         assert(fd >= 0);
 
-        r = block_device_new_from_fd(fd, 0, &dev);
+        r = block_device_new_from_fd(fd, /* flags= */ 0, &dev);
         if (r < 0)
                 return r;
 
@@ -635,22 +642,16 @@ int fd_get_whole_disk(int fd, bool backing, dev_t *ret) {
 int path_get_whole_disk(const char *path, bool backing, dev_t *ret) {
         _cleanup_close_ int fd = -EBADF;
 
-        fd = open(path, O_CLOEXEC|O_PATH);
+        fd = xopenat(AT_FDCWD, path, O_PATH);
         if (fd < 0)
-                return -errno;
+                return fd;
 
         return fd_get_whole_disk(fd, backing, ret);
 }
 
-int block_device_add_partition(
-                int fd,
-                const char *name,
-                int nr,
-                uint64_t start,
-                uint64_t size) {
+int block_device_add_partition(int fd, int nr, uint64_t start, uint64_t size) {
 
         assert(fd >= 0);
-        assert(name);
         assert(nr > 0);
 
         struct blkpg_partition bp = {
@@ -665,21 +666,12 @@ int block_device_add_partition(
                 .datalen = sizeof(bp),
         };
 
-        if (strlen(name) >= sizeof(bp.devname))
-                return -EINVAL;
-
-        strcpy(bp.devname, name);
-
         return RET_NERRNO(ioctl(fd, BLKPG, &ba));
 }
 
-int block_device_remove_partition(
-                int fd,
-                const char *name,
-                int nr) {
+int block_device_remove_partition(int fd, int nr) {
 
         assert(fd >= 0);
-        assert(name);
         assert(nr > 0);
 
         struct blkpg_partition bp = {
@@ -691,11 +683,6 @@ int block_device_remove_partition(
                 .data = &bp,
                 .datalen = sizeof(bp),
         };
-
-        if (strlen(name) >= sizeof(bp.devname))
-                return -EINVAL;
-
-        strcpy(bp.devname, name);
 
         return RET_NERRNO(ioctl(fd, BLKPG, &ba));
 }
@@ -783,7 +770,7 @@ int block_device_remove_all_partitions(sd_device *dev, int fd) {
         assert(dev || fd >= 0);
 
         if (!dev) {
-                r = block_device_new_from_fd(fd, 0, &dev_unref);
+                r = block_device_new_from_fd(fd, /* flags= */ 0, &dev_unref);
                 if (r < 0)
                         return r;
 
@@ -795,7 +782,7 @@ int block_device_remove_all_partitions(sd_device *dev, int fd) {
                 return r;
 
         if (fd < 0) {
-                fd_close = sd_device_open(dev, O_CLOEXEC|O_NONBLOCK|O_NOCTTY|O_RDONLY);
+                fd_close = device_open(dev, O_NONBLOCK|O_NOCTTY|O_RDONLY);
                 if (fd_close < 0)
                         return fd_close;
 
@@ -824,7 +811,7 @@ int block_device_remove_all_partitions(sd_device *dev, int fd) {
                 if (r < 0 && r != -ENOENT)
                         log_debug_errno(r, "Failed to forget btrfs device %s, ignoring: %m", devname);
 
-                r = block_device_remove_partition(fd, devname, nr);
+                r = block_device_remove_partition(fd, nr);
                 if (r == -ENODEV) {
                         log_debug("Kernel removed partition %s before us, ignoring", devname);
                         continue;
@@ -871,6 +858,139 @@ int blockdev_get_device_size(int fd, uint64_t *ret) {
         return 0;
 }
 
+static int write_zeroes(int fd, uint64_t offset, uint64_t size) {
+        _cleanup_free_ uint8_t *buffer = NULL;
+        size_t bufsz;
+
+        assert(fd >= 0);
+
+        if (size == 0)
+                return 0;
+
+        bufsz = MIN(size, ZERO_OUT_BUFFER_SIZE);
+        buffer = malloc0(bufsz);
+        if (!buffer)
+                return -ENOMEM;
+
+        while (size > 0) {
+                ssize_t n;
+
+                n = pwrite(fd, buffer, MIN(size, (uint64_t) bufsz), offset);
+                if (n < 0) {
+                        if (errno == EINTR)
+                                continue;
+
+                        return -errno;
+                }
+                if (n == 0)
+                        return -EIO;
+
+                assert((uint64_t) n <= size);
+                offset += n;
+                size -= n;
+        }
+
+        return 0;
+}
+
+int blockdev_zero_out(int fd, uint64_t offset, uint64_t size) {
+        struct stat st;
+        uint32_t ssz;
+        int r;
+
+        assert(fd >= 0);
+
+        /* Overwrites the specified range of a block device (or regular file) with zeroes. On block devices
+         * we try to make the kernel do the work via BLKZEROOUT, which it might be able to offload to the
+         * device. That ioctl operates on whole sectors only however, hence any incomplete sectors at the
+         * beginning and the end of the range are filled with explicit zeroes, and the aligned middle part is
+         * then handed to the ioctl. If that fails explicit zeroes are written for it too. On regular files
+         * (e.g. disk images) we punch a hole instead, which reads back as zeroes and keeps the file sparse;
+         * if the file system doesn't support that explicit zeroes are written as well.
+         *
+         * Note that the explicit writes to incomplete sectors rely on buffered I/O: the kernel then takes
+         * care of the read-modify-write of the affected sectors via the page cache. Hence this must not be
+         * used on fds opened with O_DIRECT. */
+
+        if (offset > UINT64_MAX - size)
+                return -EOVERFLOW;
+
+        if (fstat(fd, &st) < 0)
+                return -errno;
+
+        if (!IN_SET(st.st_mode & S_IFMT, S_IFREG, S_IFBLK))
+                return -ENOTBLK;
+
+        if (size == 0) /* check the size *after* validating the fd via fstat() */
+                return 0;
+
+        uint64_t end = offset + size;
+
+        if (S_ISREG(st.st_mode)) {
+                uint64_t file_size = st.st_size;
+
+                /* Punch a hole into the part of the range that is within the file. FALLOC_FL_KEEP_SIZE
+                 * means the file is not grown, hence the part beyond the end of the file is handled
+                 * separately below, by extending the file, which implicitly reads back as zeroes too. */
+                if (offset < file_size &&
+                    fallocate(fd, FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE, offset, MIN(size, file_size - offset)) < 0) {
+                        if (!ERRNO_IS_NOT_SUPPORTED(errno))
+                                return -errno;
+
+                        log_debug_errno(errno, "Failed to punch hole into regular file, writing zeroes manually: %m");
+                        return write_zeroes(fd, offset, size);
+                }
+
+                if (end > file_size && ftruncate(fd, end) < 0)
+                        return -errno;
+
+                return 0;
+        }
+
+        r = blockdev_get_sector_size(fd, &ssz);
+        if (r < 0)
+                return r;
+
+        uint64_t aligned_start = ROUND_UP(offset, ssz),
+                aligned_end = ALIGN_DOWN_U64(end, ssz);
+
+        if (aligned_start >= aligned_end) /* Range doesn't cover a single full sector? Then write it all manually */
+                return write_zeroes(fd, offset, size);
+
+        /* Fill up the incomplete sector at the beginning */
+        r = write_zeroes(fd, offset, aligned_start - offset);
+        if (r < 0)
+                return r;
+
+        /* Now let the kernel zero out the aligned part in the middle, if it can */
+        uint64_t range[] = { aligned_start, aligned_end - aligned_start };
+        r = RET_NERRNO(ioctl(fd, BLKZEROOUT, range));
+        if (r == -EBUSY) {
+                /* If another partition is in use, our payload and incomplete-sector writes may prevent
+                 * the kernel from invalidating dirty pages. Synchronize them and retry once to retain
+                 * offloading before falling back to buffered writes. */
+                log_debug_errno(r, "Failed to zero out block device via BLKZEROOUT, synchronizing and retrying: %m");
+
+                if (fdatasync(fd) < 0)
+                        return log_debug_errno(errno, "Failed to synchronize block device before zeroing out: %m");
+
+                r = RET_NERRNO(ioctl(fd, BLKZEROOUT, range));
+        }
+        if (r < 0) {
+                if (!ERRNO_IS_NOT_SUPPORTED(r) && r != -EBUSY)
+                        return log_debug_errno(r, "Failed to zero out block device via BLKZEROOUT: %m");
+
+                log_debug_errno(r, "Failed to zero out block device via BLKZEROOUT, writing zeroes manually: %m");
+
+                r = write_zeroes(fd, aligned_start, aligned_end - aligned_start);
+                if (r < 0)
+                        return r;
+        }
+
+        /* And finally fill the incomplete sector at the end */
+        return write_zeroes(fd, aligned_end, end - aligned_end);
+}
+
 int blockdev_get_root(int level, dev_t *ret) {
         _cleanup_free_ char *p = NULL;
         dev_t devno;
@@ -895,6 +1015,13 @@ int blockdev_get_root(int level, dev_t *ret) {
                                 return btrfs_log_dev_root(level, r, "/usr");
                         if (r < 0)
                                 return log_full_errno(level, r, "Failed to determine block device of /usr/ file system: %m");
+                        if (r == 0) { /* Not backed by a single block device, we might be looking at a sysext overlay */
+                                r = extension_overlay_block("/usr", IMAGE_SYSEXT, &devno);
+                                if (IN_SET(r, -ENOENT, -ENOTTY))
+                                        r = 0; /* no sysext overlay metadata */
+                                else if (r < 0)
+                                        return log_full_errno(level, r, "Failed to determine backing device of /usr/ extension overlay: %m");
+                        }
                         if (r == 0) { /* /usr/ not backed by single block device, either. */
                                 log_debug("Neither root nor /usr/ file system are on a (single) block device.");
 

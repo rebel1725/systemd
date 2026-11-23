@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #if HAVE_LIBCRYPT
+#  ifndef SYSTEMD_CFLAGS_MARKER_LIBCRYPT
+#    error "missing libcrypt_cflags in meson dependency."
+#  endif
 #  include <crypt.h>
 #endif
-
-#include "sd-dlopen.h"
 
 #include "alloc-util.h"
 #include "dlfcn-util.h"
@@ -14,62 +15,45 @@
 #include "string-util.h"
 #include "strv.h"
 
-#if HAVE_LIBCRYPT
-static void *libcrypt_dl = NULL;
+#define HASHED_PASSWORD_LENGTH_MIN 4U
 
+#if HAVE_LIBCRYPT
+#ifdef __GLIBC__
 static DLSYM_PROTOTYPE(crypt_gensalt_ra) = NULL;
 static DLSYM_PROTOTYPE(crypt_preferred_method) = NULL;
 static DLSYM_PROTOTYPE(crypt_ra) = NULL;
-
-int dlopen_libcrypt(void) {
-#ifdef __GLIBC__
-        static int cached = 0;
-        int r;
-
-        if (libcrypt_dl)
-                return 0; /* Already loaded */
-
-        if (cached < 0)
-                return cached; /* Already tried, and failed. */
-
-        /* Several distributions like Debian/Ubuntu and OpenSUSE provide libxcrypt as libcrypt.so.1
-         * (libcrypt.so.1.1 on some architectures), while others like Fedora/CentOS and Arch provide it as
-         * libcrypt.so.2. */
-        SD_ELF_NOTE_DLOPEN(
-                        "crypt",
-                        "Support for hashing passwords",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED,
-                        "libcrypt.so.2", "libcrypt.so.1", "libcrypt.so.1.1");
-
-        _cleanup_(dlclosep) void *dl = NULL;
-        const char *dle = NULL;
-        FOREACH_STRING(soname, "libcrypt.so.2", "libcrypt.so.1", "libcrypt.so.1.1") {
-                r = dlopen_safe(soname, &dl, &dle);
-                if (r >= 0) {
-                        log_debug("Loaded '%s' via dlopen().", soname);
-                        break;
-                }
-        }
-        if (r < 0) {
-                log_debug_errno(r, "Failed to load libcrypt: %s", dle ?: STRERROR(r));
-                return (cached = -EOPNOTSUPP); /* turn into recognizable error */
-        }
-
-        r = dlsym_many_or_warn(
-                        dl, LOG_DEBUG,
-                        DLSYM_ARG(crypt_gensalt_ra),
-                        DLSYM_ARG(crypt_preferred_method),
-                        DLSYM_ARG(crypt_ra));
-        if (r < 0)
-                return (cached = r);
-
-        libcrypt_dl = TAKE_PTR(dl);
 #else
-        libcrypt_dl = NULL;
-        sym_crypt_gensalt_ra = missing_crypt_gensalt_ra;
-        sym_crypt_preferred_method = missing_crypt_preferred_method;
-        sym_crypt_ra = missing_crypt_ra;
+static DLSYM_PROTOTYPE(crypt_gensalt_ra) = missing_crypt_gensalt_ra;
+static DLSYM_PROTOTYPE(crypt_preferred_method) = missing_crypt_preferred_method;
+static DLSYM_PROTOTYPE(crypt_ra) = missing_crypt_ra;
 #endif
+
+static int crypt_ra_safe(const char *phrase, const char *setting, void **data, int *size, const char **ret_phrase) {
+        const char *p;
+
+        assert(phrase);
+        assert(setting);
+        assert(data);
+        assert(size);
+        assert(ret_phrase);
+
+        /* A wrapper around crypt_ra() that adds extra protection: never accept a result that is too short to
+         * be a valid hashed password. This should protect us from vulnerabilities in the style of
+         * CVE-2026-123158, where a hashing failure results in a short constant string being returned, which
+         * might then match an equally short (corrupted or malicious) hashed password.
+         *
+         * Returns a negative errno on failure, and 0 on success, in which case the hashed string is returned
+         * in *ret_phrase. */
+
+        errno = 0;
+        p = sym_crypt_ra(phrase, setting, data, size);
+        if (!p)
+                return errno_or_else(EINVAL);
+
+        if (strlen(p) < HASHED_PASSWORD_LENGTH_MIN)
+                return -EINVAL;
+
+        *ret_phrase = p;
         return 0;
 }
 
@@ -80,7 +64,7 @@ int make_salt(char **ret) {
 
         assert(ret);
 
-        r = dlopen_libcrypt();
+        r = dlopen_libcrypt(LOG_DEBUG);
         if (r < 0)
                 return r;
 
@@ -111,10 +95,9 @@ int hash_password(const char *password, char **ret) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to generate salt: %m");
 
-        errno = 0;
-        p = sym_crypt_ra(password, salt, &cd_data, &cd_size);
-        if (!p)
-                return log_debug_errno(errno_or_else(SYNTHETIC_ERRNO(EINVAL)), "crypt_ra() failed: %m");
+        r = crypt_ra_safe(password, salt, &cd_data, &cd_size, &p);
+        if (r < 0)
+                return log_debug_errno(r, "crypt_ra() failed: %m");
 
         return strdup_to(ret, p);
 }
@@ -127,18 +110,15 @@ int test_password_one(const char *hashed_password, const char *password) {
         assert(hashed_password);
         assert(password);
 
-        r = dlopen_libcrypt();
+        r = dlopen_libcrypt(LOG_DEBUG);
         if (r < 0)
                 return r;
 
-        errno = 0;
-        k = sym_crypt_ra(password, hashed_password, &cd_data, &cd_size);
-        if (!k) {
-                if (errno == ENOMEM)
-                        return -ENOMEM;
-                /* Unknown or unavailable hashing method or string too short */
+        r = crypt_ra_safe(password, hashed_password, &cd_data, &cd_size, &k);
+        if (r == -ENOMEM)
+                return r;
+        if (r < 0) /* Unknown or unavailable hashing method or string too short */
                 return 0;
-        }
 
         return streq(k, hashed_password);
 }
@@ -174,4 +154,41 @@ bool looks_like_hashed_password(const char *s) {
         s += strspn(s, "!"); /* Skip (possibly duplicated) locking prefix */
 
         return !STR_IN_SET(s, "x", "*");
+}
+
+int dlopen_libcrypt(int log_level) {
+#if HAVE_LIBCRYPT
+#ifdef __GLIBC__
+        static void *libcrypt_dl = NULL;
+        static int cached = 0;
+        int r = -ENOENT;
+
+        if (libcrypt_dl)
+                return 1; /* Already loaded */
+
+        if (cached < 0)
+                return cached; /* Already tried, and failed. */
+
+        LIBCRYPT_NOTE(suggested);
+
+        /* Several distributions like Debian/Ubuntu and OpenSUSE provide libxcrypt as libcrypt.so.1
+         * (libcrypt.so.1.1 on some architectures), while others like Fedora/CentOS and Arch provide it as
+         * libcrypt.so.2. */
+        FOREACH_STRING(soname, "libcrypt.so.2", "libcrypt.so.1", "libcrypt.so.1.1") {
+                r = dlopen_many_sym_or_warn(
+                                &libcrypt_dl, soname, LOG_DEBUG,
+                                DLSYM_ARG(crypt_gensalt_ra),
+                                DLSYM_ARG(crypt_preferred_method),
+                                DLSYM_ARG(crypt_ra));
+                if (r >= 0)
+                        break;
+        }
+        if (r < 0)
+                return cached = log_full_errno(log_level, r, "Failed to load libcrypt: %m");
+#endif
+        return 1;
+#else
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libcrypt support is not compiled in.");
+#endif
 }

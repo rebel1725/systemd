@@ -5,7 +5,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 
-#include "basic-forward.h"
+#include "forward.h"
 
 /* maximum length of fdname */
 #define FDNAME_MAX 255
@@ -64,6 +64,12 @@
 assert_cc(XAT_FDROOT != AT_FDCWD);
 assert_cc(XAT_FDROOT < -ERRNO_MAX);
 
+/* Checks whether the specified fd is acceptable as a *at() directory fd that supports the two "wildcard"
+ * values: it's either a regular, valid fd (i.e. >= 0), or one of the special AT_FDCWD/XAT_FDROOT values. */
+static inline bool wildcard_fd_is_valid(int fd) {
+        return fd >= 0 || IN_SET(fd, AT_FDCWD, XAT_FDROOT);
+}
+
 int close_nointr(int fd);
 int safe_close(int fd);
 void safe_close_pair(int p[static 2]);
@@ -112,6 +118,8 @@ DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(DIR*, closedir, NULL);
 int fd_nonblock(int fd, bool nonblock);
 int stdio_disable_nonblock(void);
 
+void nonblock_resetp(int *fd);
+
 int fd_cloexec(int fd, bool cloexec);
 int fd_cloexec_many(const int fds[], size_t n_fds, bool cloexec);
 
@@ -127,6 +135,7 @@ int fd_validate(int fd);
 int same_fd(int a, int b);
 
 bool fdname_is_valid(const char *s);
+bool fdname_glob_is_valid(const char *s);
 
 int fd_get_path(int fd, char **ret);
 
@@ -153,7 +162,7 @@ static inline int make_null_stdio(void) {
         })
 
 int fd_reopen(int fd, int flags);
-int fd_reopen_propagate_append_and_position(int fd, int flags);
+int fd_dup_or_reopen_stdio_nonblock(int fd, int mode);
 int fd_reopen_condition(int fd, int flags, int mask, int *ret_new_fd);
 
 int fd_is_opath(int fd);
@@ -162,7 +171,7 @@ int fd_is_writable(int fd);
 
 int fd_verify_safe_flags_full(int fd, int extra_flags);
 static inline int fd_verify_safe_flags(int fd) {
-        return fd_verify_safe_flags_full(fd, 0);
+        return fd_verify_safe_flags_full(fd, /* extra_flags= */ 0);
 }
 
 unsigned read_nr_open(void);
@@ -173,10 +182,10 @@ static inline int path_is_root(const char *path) {
         return path_is_root_at(AT_FDCWD, path);
 }
 static inline int dir_fd_is_root(int dir_fd) {
-        return dir_fd == XAT_FDROOT ? true : path_is_root_at(dir_fd, NULL);
+        return dir_fd == XAT_FDROOT ? true : path_is_root_at(dir_fd, /* path= */ NULL);
 }
 static inline int dir_fd_is_root_or_cwd(int dir_fd) {
-        return IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT) ? true : path_is_root_at(dir_fd, NULL);
+        return IN_SET(dir_fd, AT_FDCWD, XAT_FDROOT) ? true : path_is_root_at(dir_fd, /* path= */ NULL);
 }
 
 int fds_inode_and_mount_same(int fd1, int fd2);

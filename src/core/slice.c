@@ -28,6 +28,7 @@ static void slice_init(Unit *u) {
         u->ignore_on_isolate = true;
         s->concurrency_hard_max = UINT_MAX;
         s->concurrency_soft_max = UINT_MAX;
+        s->activating_concurrency_max = UINT_MAX;
 }
 
 static void slice_set_state(Slice *s, SliceState state) {
@@ -36,7 +37,7 @@ static void slice_set_state(Slice *s, SliceState state) {
         assert(s);
 
         if (s->state != state)
-                bus_unit_send_pending_change_signal(UNIT(s), false);
+                bus_unit_send_pending_change_signal(UNIT(s), /* including_new= */ false);
 
         old_state = s->state;
         s->state = state;
@@ -60,7 +61,7 @@ static int slice_add_parent_slice(Slice *s) {
         if (r <= 0) /* 0 means root slice */
                 return r;
 
-        return unit_add_dependency_by_name(u, UNIT_IN_SLICE, a, true, UNIT_DEPENDENCY_IMPLICIT);
+        return unit_add_dependency_by_name(u, UNIT_IN_SLICE, a, /* add_reference= */ true, UNIT_DEPENDENCY_IMPLICIT);
 }
 
 static int slice_add_default_dependencies(Slice *s) {
@@ -75,7 +76,7 @@ static int slice_add_default_dependencies(Slice *s) {
         r = unit_add_two_dependencies_by_name(
                         UNIT(s),
                         UNIT_BEFORE, UNIT_CONFLICTS,
-                        SPECIAL_SHUTDOWN_TARGET, true, UNIT_DEPENDENCY_DEFAULT);
+                        SPECIAL_SHUTDOWN_TARGET, /* add_reference= */ true, UNIT_DEPENDENCY_DEFAULT);
         if (r < 0)
                 return r;
 
@@ -163,7 +164,7 @@ static int slice_load(Unit *u) {
         if (r < 0)
                 return r;
 
-        r = unit_load_fragment_and_dropin(u, false);
+        r = unit_load_fragment_and_dropin(u, /* fragment_required= */ false);
         if (r < 0)
                 return r;
 
@@ -338,7 +339,7 @@ static void slice_enumerate_perpetual(Manager *m) {
         }
 
         if (MANAGER_IS_SYSTEM(m))
-                (void) slice_make_perpetual(m, SPECIAL_SYSTEM_SLICE, NULL);
+                (void) slice_make_perpetual(m, SPECIAL_SYSTEM_SLICE, /* ret= */ NULL);
 }
 
 static bool slice_can_freeze(const Unit *u) {
@@ -410,6 +411,25 @@ unsigned slice_get_currently_active(Slice *slice, Unit *ignore, bool with_pendin
         return n;
 }
 
+static unsigned slice_get_currently_activating(Slice *slice, Unit *ignore) {
+        Unit *u = ASSERT_PTR(UNIT(slice));
+        unsigned n = 0;
+        Unit *member;
+
+        UNIT_FOREACH_DEPENDENCY(member, u, UNIT_ATOM_SLICE_OF) {
+                if (member == ignore)
+                        continue;
+
+                if (unit_active_state(member) == UNIT_ACTIVATING)
+                        n++;
+
+                if (member->type == UNIT_SLICE)
+                        n += slice_get_currently_activating(SLICE(member), ignore);
+        }
+
+        return n;
+}
+
 bool slice_concurrency_soft_max_reached(Slice *slice, Unit *ignore) {
         assert(slice);
 
@@ -434,6 +454,20 @@ bool slice_concurrency_hard_max_reached(Slice *slice, Unit *ignore) {
         Unit *parent = UNIT_GET_SLICE(UNIT(slice));
         if (parent)
                 return slice_concurrency_hard_max_reached(SLICE(parent), ignore);
+
+        return false;
+}
+
+bool slice_activating_concurrency_max_reached(Slice *slice, Unit *ignore) {
+        assert(slice);
+
+        if (slice->activating_concurrency_max != UINT_MAX &&
+            slice_get_currently_activating(slice, ignore) >= slice->activating_concurrency_max)
+                return true;
+
+        Unit *parent = UNIT_GET_SLICE(UNIT(slice));
+        if (parent)
+                return slice_activating_concurrency_max_reached(SLICE(parent), ignore);
 
         return false;
 }

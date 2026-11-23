@@ -1,18 +1,21 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <sys/epoll.h>
 #include <unistd.h>
 
+#include "sd-json.h"
+
+#include "build.h"
 #include "devnum-util.h"
 #include "fd-util.h"
 #include "libudev-list-internal.h"
 #include "log.h"
 #include "main-func.h"
 #include "libudev-util.h"
+#include "options.h"
 #include "string-util.h"
 #include "tests.h"
-#include "version.h"
+#include "verbs.h"
 
 static bool arg_monitor = false;
 
@@ -180,23 +183,21 @@ static void test_monitor(struct udev *udev) {
 
         log_info("/* %s */", __func__);
 
-        fd_ep = epoll_create1(EPOLL_CLOEXEC);
-        assert_se(fd_ep >= 0);
+        fd_ep = ASSERT_OK_ERRNO(epoll_create1(EPOLL_CLOEXEC));
 
-        udev_monitor = udev_monitor_new_from_netlink(udev, "udev");
-        assert_se(udev_monitor != NULL);
+        udev_monitor = ASSERT_NOT_NULL(udev_monitor_new_from_netlink(udev, "udev"));
 
         fd_udev = udev_monitor_get_fd(udev_monitor);
         ep_udev.data.fd = fd_udev;
 
-        assert_se(udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "block", NULL) >= 0);
-        assert_se(udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "tty", NULL) >= 0);
-        assert_se(udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "usb", "usb_device") >= 0);
+        ASSERT_OK(udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "block", /* devtype= */ NULL));
+        ASSERT_OK(udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "tty", /* devtype= */ NULL));
+        ASSERT_OK(udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "usb", "usb_device"));
 
-        assert_se(udev_monitor_enable_receiving(udev_monitor) >= 0);
+        ASSERT_OK(udev_monitor_enable_receiving(udev_monitor));
 
-        assert_se(epoll_ctl(fd_ep, EPOLL_CTL_ADD, fd_udev, &ep_udev) >= 0);
-        assert_se(epoll_ctl(fd_ep, EPOLL_CTL_ADD, STDIN_FILENO, &ep_stdin) >= 0);
+        ASSERT_OK_ERRNO(epoll_ctl(fd_ep, EPOLL_CTL_ADD, fd_udev, &ep_udev));
+        ASSERT_OK_ERRNO(epoll_ctl(fd_ep, EPOLL_CTL_ADD, STDIN_FILENO, &ep_stdin));
 
         for (;;) {
                 int fdcount;
@@ -231,7 +232,7 @@ static void test_queue(struct udev *udev) {
 
         log_info("/* %s */", __func__);
 
-        assert_se(udev_queue = udev_queue_new(udev));
+        ASSERT_NOT_NULL(udev_queue = udev_queue_new(udev));
 
         empty = udev_queue_get_queue_is_empty(udev_queue);
         log_info("queue is %s", empty ? "empty" : "not empty");
@@ -339,11 +340,11 @@ static void test_hwdb(struct udev *udev, const char *modalias) {
         SAVE_ASSERT_RETURN_IS_CRITICAL;
         log_set_assert_return_is_critical(hwdb);
 
-        udev_list_entry_foreach(entry, udev_hwdb_get_properties_list_entry(hwdb, modalias, 0))
+        udev_list_entry_foreach(entry, udev_hwdb_get_properties_list_entry(hwdb, modalias, /* flags= */ 0))
                 log_info("'%s'='%s'", udev_list_entry_get_name(entry), udev_list_entry_get_value(entry));
 
         hwdb = udev_hwdb_unref(hwdb);
-        assert_se(hwdb == NULL);
+        ASSERT_NULL(hwdb);
 }
 
 static void test_list(void) {
@@ -351,102 +352,93 @@ static void test_list(void) {
         struct udev_list_entry *e;
 
         /* empty list */
-        assert_se(list = udev_list_new(false));
-        assert_se(!udev_list_get_entry(list));
+        ASSERT_NOT_NULL(list = udev_list_new(/* unique= */ false));
+        ASSERT_NULL(udev_list_get_entry(list));
         list = udev_list_free(list);
 
         /* unique == false */
-        assert_se(list = udev_list_new(false));
-        assert_se(udev_list_entry_add(list, "aaa", "hoge"));
-        assert_se(udev_list_entry_add(list, "aaa", "hogehoge"));
-        assert_se(udev_list_entry_add(list, "bbb", "foo"));
-        e = udev_list_get_entry(list);
-        assert_se(e);
-        assert_se(streq_ptr(udev_list_entry_get_name(e), "aaa"));
-        assert_se(streq_ptr(udev_list_entry_get_value(e), "hoge"));
-        e = udev_list_entry_get_next(e);
-        assert_se(e);
-        assert_se(streq_ptr(udev_list_entry_get_name(e), "aaa"));
-        assert_se(streq_ptr(udev_list_entry_get_value(e), "hogehoge"));
-        e = udev_list_entry_get_next(e);
-        assert_se(e);
-        assert_se(streq_ptr(udev_list_entry_get_name(e), "bbb"));
-        assert_se(streq_ptr(udev_list_entry_get_value(e), "foo"));
-        assert_se(!udev_list_entry_get_next(e));
+        ASSERT_NOT_NULL(list = udev_list_new(/* unique= */ false));
+        ASSERT_NOT_NULL(udev_list_entry_add(list, "aaa", "hoge"));
+        ASSERT_NOT_NULL(udev_list_entry_add(list, "aaa", "hogehoge"));
+        ASSERT_NOT_NULL(udev_list_entry_add(list, "bbb", "foo"));
+        e = ASSERT_NOT_NULL(udev_list_get_entry(list));
+        ASSERT_STREQ(udev_list_entry_get_name(e), "aaa");
+        ASSERT_STREQ(udev_list_entry_get_value(e), "hoge");
+        e = ASSERT_NOT_NULL(udev_list_entry_get_next(e));
+        ASSERT_STREQ(udev_list_entry_get_name(e), "aaa");
+        ASSERT_STREQ(udev_list_entry_get_value(e), "hogehoge");
+        e = ASSERT_NOT_NULL(udev_list_entry_get_next(e));
+        ASSERT_STREQ(udev_list_entry_get_name(e), "bbb");
+        ASSERT_STREQ(udev_list_entry_get_value(e), "foo");
+        ASSERT_NULL(udev_list_entry_get_next(e));
 
-        assert_se(!udev_list_entry_get_by_name(e, "aaa"));
-        assert_se(!udev_list_entry_get_by_name(e, "bbb"));
-        assert_se(!udev_list_entry_get_by_name(e, "ccc"));
+        ASSERT_NULL(udev_list_entry_get_by_name(e, "aaa"));
+        ASSERT_NULL(udev_list_entry_get_by_name(e, "bbb"));
+        ASSERT_NULL(udev_list_entry_get_by_name(e, "ccc"));
         list = udev_list_free(list);
 
         /* unique == true */
-        assert_se(list = udev_list_new(true));
-        assert_se(udev_list_entry_add(list, "aaa", "hoge"));
-        assert_se(udev_list_entry_add(list, "aaa", "hogehoge"));
-        assert_se(udev_list_entry_add(list, "bbb", "foo"));
-        e = udev_list_get_entry(list);
-        assert_se(e);
-        assert_se(streq_ptr(udev_list_entry_get_name(e), "aaa"));
-        assert_se(streq_ptr(udev_list_entry_get_value(e), "hogehoge"));
+        ASSERT_NOT_NULL(list = udev_list_new(/* unique= */ true));
+        ASSERT_NOT_NULL(udev_list_entry_add(list, "aaa", "hoge"));
+        ASSERT_NOT_NULL(udev_list_entry_add(list, "aaa", "hogehoge"));
+        ASSERT_NOT_NULL(udev_list_entry_add(list, "bbb", "foo"));
+        e = ASSERT_NOT_NULL(udev_list_get_entry(list));
+        ASSERT_STREQ(udev_list_entry_get_name(e), "aaa");
+        ASSERT_STREQ(udev_list_entry_get_value(e), "hogehoge");
         e = udev_list_entry_get_next(e);
-        assert_se(streq_ptr(udev_list_entry_get_name(e), "bbb"));
-        assert_se(streq_ptr(udev_list_entry_get_value(e), "foo"));
-        assert_se(!udev_list_entry_get_next(e));
+        ASSERT_STREQ(udev_list_entry_get_name(e), "bbb");
+        ASSERT_STREQ(udev_list_entry_get_value(e), "foo");
+        ASSERT_NULL(udev_list_entry_get_next(e));
 
-        e = udev_list_entry_get_by_name(e, "bbb");
-        assert_se(e);
-        assert_se(streq_ptr(udev_list_entry_get_name(e), "bbb"));
-        assert_se(streq_ptr(udev_list_entry_get_value(e), "foo"));
-        e = udev_list_entry_get_by_name(e, "aaa");
-        assert_se(e);
-        assert_se(streq_ptr(udev_list_entry_get_name(e), "aaa"));
-        assert_se(streq_ptr(udev_list_entry_get_value(e), "hogehoge"));
-        assert_se(!udev_list_entry_get_by_name(e, "ccc"));
+        e = ASSERT_NOT_NULL(udev_list_entry_get_by_name(e, "bbb"));
+        ASSERT_STREQ(udev_list_entry_get_name(e), "bbb");
+        ASSERT_STREQ(udev_list_entry_get_value(e), "foo");
+        e = ASSERT_NOT_NULL(udev_list_entry_get_by_name(e, "aaa"));
+        ASSERT_STREQ(udev_list_entry_get_name(e), "aaa");
+        ASSERT_STREQ(udev_list_entry_get_value(e), "hogehoge");
+        ASSERT_NULL(udev_list_entry_get_by_name(e, "ccc"));
 }
 
+COMMAND(
+        "test-libudev\0",
+        "Test libudev functions.",
+);
+
 static int parse_args(int argc, char *argv[], const char **syspath, const char **subsystem) {
-        static const struct option options[] = {
-                { "syspath",   required_argument, NULL, 'p' },
-                { "subsystem", required_argument, NULL, 's' },
-                { "debug",     no_argument,       NULL, 'd' },
-                { "help",      no_argument,       NULL, 'h' },
-                { "version",   no_argument,       NULL, 'V' },
-                { "monitor",   no_argument,       NULL, 'm' },
-                {}
-        };
-        int c;
+        assert(argc >= 0);
+        assert(argv);
+        assert(syspath);
+        assert(subsystem);
 
-        while ((c = getopt_long(argc, argv, "p:s:dhVm", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
-                case 'p':
-                        *syspath = optarg;
+
+                OPTION_COMMON_HELP:
+                        return command_print_help();
+
+                OPTION_COMMON_VERSION_WITH_V:
+                        return version_only();
+
+                OPTION('p', "syspath", "PATH", "Syspath to test"):
+                        *syspath = opts.arg;
                         break;
 
-                case 's':
-                        *subsystem = optarg;
+                OPTION('s', "subsystem", "SUBSYSTEM", "Subsystem to enumerate"):
+                        *subsystem = opts.arg;
                         break;
 
-                case 'd':
+                OPTION('d', "debug", NULL, "Enable debug logging"):
                         log_set_max_level(LOG_DEBUG);
                         break;
 
-                case 'h':
-                        printf("--debug --syspath= --subsystem= --help\n");
-                        return 0;
-
-                case 'V':
-                        printf("%s\n", GIT_VERSION);
-                        return 0;
-
-                case 'm':
+                OPTION('m', "monitor", NULL, "Run monitor test"):
                         arg_monitor = true;
                         break;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
         return 1;
@@ -465,7 +457,7 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        assert_se(udev = udev_new());
+        ASSERT_NOT_NULL(udev = udev_new());
 
         /* add sys path if needed */
         if (!startswith(syspath, "/sys"))

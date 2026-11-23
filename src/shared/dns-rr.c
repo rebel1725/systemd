@@ -1,7 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <math.h>
-
 #include "alloc-util.h"
 #include "bitmap.h"
 #include "dns-answer.h"                 /* IWYU pragma: keep */
@@ -13,6 +11,7 @@
 #include "hash-funcs.h"
 #include "hexdecoct.h"
 #include "json-util.h"
+#include "math-util.h"
 #include "memory-util.h"
 #include "siphash24.h"
 #include "string-table.h"
@@ -85,7 +84,7 @@ int dns_resource_key_new_append_suffix(DnsResourceKey **ret, DnsResourceKey *key
                 return 0;
         }
 
-        r = dns_name_concat(dns_resource_key_name(key), name, 0, &joined);
+        r = dns_name_concat(dns_resource_key_name(key), name, /* flags= */ 0, &joined);
         if (r < 0)
                 return r;
 
@@ -249,7 +248,7 @@ int dns_resource_key_match_rr(const DnsResourceKey *key, DnsResourceRecord *rr, 
         if (search_domain) {
                 _cleanup_free_ char *joined = NULL;
 
-                r = dns_name_concat(dns_resource_key_name(key), search_domain, 0, &joined);
+                r = dns_name_concat(dns_resource_key_name(key), search_domain, /* flags= */ 0, &joined);
                 if (r < 0)
                         return r;
 
@@ -284,7 +283,7 @@ int dns_resource_key_match_cname_or_dname(const DnsResourceKey *key, const DnsRe
         if (search_domain) {
                 _cleanup_free_ char *joined = NULL;
 
-                r = dns_name_concat(dns_resource_key_name(key), search_domain, 0, &joined);
+                r = dns_name_concat(dns_resource_key_name(key), search_domain, /* flags= */ 0, &joined);
                 if (r < 0)
                         return r;
 
@@ -773,9 +772,9 @@ static char* format_location(uint32_t latitude, uint32_t longitude, uint32_t alt
         int lat = latitude >= 1U<<31 ? (int) (latitude - (1U<<31)) : (int) ((1U<<31) - latitude);
         int lon = longitude >= 1U<<31 ? (int) (longitude - (1U<<31)) : (int) ((1U<<31) - longitude);
         double alt = altitude >= 10000000u ? altitude - 10000000u : -(double)(10000000u - altitude);
-        double siz = (size >> 4) * exp10((double) (size & 0xF));
-        double hor = (horiz_pre >> 4) * exp10((double) (horiz_pre & 0xF));
-        double ver = (vert_pre >> 4) * exp10((double) (vert_pre & 0xF));
+        double siz = (size >> 4) * xexp10i(size & 0xF);
+        double hor = (horiz_pre >> 4) * xexp10i(horiz_pre & 0xF);
+        double ver = (vert_pre >> 4) * xexp10i(vert_pre & 0xF);
 
         if (asprintf(&s, "%d %d %.3f %c %d %d %.3f %c %.2fm %.2fm %.2fm %.2fm",
                      (lat / 60000 / 60),
@@ -1146,7 +1145,7 @@ const char* dns_resource_record_to_string(DnsResourceRecord *rr) {
                 _cleanup_free_ char *alg = NULL;
                 uint16_t key_tag;
 
-                key_tag = dnssec_keytag(rr, true);
+                key_tag = dnssec_keytag(rr, /* mask_revoke= */ true);
 
                 r = dnssec_algorithm_to_string_alloc(rr->dnskey.algorithm, &alg);
                 if (r < 0)
@@ -1247,7 +1246,7 @@ const char* dns_resource_record_to_string(DnsResourceRecord *rr) {
                                 return NULL;
                 }
 
-                hash = base32hexmem(rr->nsec3.next_hashed_name, rr->nsec3.next_hashed_name_size, false);
+                hash = base32hexmem(rr->nsec3.next_hashed_name, rr->nsec3.next_hashed_name_size, /* padding= */ false);
                 if (!hash)
                         return NULL;
 
@@ -1451,7 +1450,7 @@ int dns_resource_record_to_wire_format(DnsResourceRecord *rr, bool canonical) {
         if (rr->wire_format && rr->wire_format_canonical == canonical)
                 return 0;
 
-        r = dns_packet_append_rr(&packet, rr, 0, &start, &rds);
+        r = dns_packet_append_rr(&packet, rr, /* flags= */ 0, &start, &rds);
         if (r < 0)
                 return r;
 
@@ -1465,6 +1464,15 @@ int dns_resource_record_to_wire_format(DnsResourceRecord *rr, bool canonical) {
         rr->wire_format_canonical = canonical;
 
         return 0;
+}
+
+void dns_resource_record_clear_wire_format(DnsResourceRecord *rr) {
+        assert(rr);
+
+        rr->wire_format = mfree(rr->wire_format);
+        rr->wire_format_size = 0;
+        rr->wire_format_rdata_offset = 0;
+        rr->wire_format_canonical = false;
 }
 
 int dns_resource_record_signer(DnsResourceRecord *rr, const char **ret) {
@@ -1978,6 +1986,7 @@ int dns_resource_record_clamp_ttl(DnsResourceRecord **rr, uint32_t max_ttl) {
         if (old_rr->n_ref == 1) {
                 /* Patch in place */
                 old_rr->ttl = new_ttl;
+                dns_resource_record_clear_wire_format(old_rr);
                 return 1;
         }
 
@@ -2012,6 +2021,7 @@ int dns_resource_record_get_cname_target(DnsResourceKey *key, DnsResourceRecord 
 
         assert(key);
         assert(cname);
+        assert(ret);
 
         /* Checks if the RR `cname` is a CNAME/DNAME RR that matches the specified `key`. If so, returns the
          * target domain. If not, returns -EUNATCH */
@@ -2164,17 +2174,17 @@ int dns_resource_record_new_from_raw(DnsResourceRecord **ret, const void *data, 
         _cleanup_(dns_packet_unrefp) DnsPacket *p = NULL;
         int r;
 
-        r = dns_packet_new(&p, DNS_PROTOCOL_DNS, 0, DNS_PACKET_SIZE_MAX);
+        r = dns_packet_new(&p, DNS_PROTOCOL_DNS, /* min_alloc_dsize= */ 0, DNS_PACKET_SIZE_MAX);
         if (r < 0)
                 return r;
 
         p->refuse_compression = true;
 
-        r = dns_packet_append_blob(p, data, size, NULL);
+        r = dns_packet_append_blob(p, data, size, /* start= */ NULL);
         if (r < 0)
                 return r;
 
-        return dns_packet_read_rr(p, ret, NULL, NULL);
+        return dns_packet_read_rr(p, ret, /* ret_cache_flush= */ NULL, /* start= */ NULL);
 }
 
 int dns_resource_key_to_json(DnsResourceKey *key, sd_json_variant **ret) {
@@ -2211,9 +2221,15 @@ int dns_resource_key_from_json(sd_json_variant *v, DnsResourceKey **ret) {
         assert(v);
         assert(ret);
 
-        r = sd_json_dispatch(v, dispatch_table, 0, &p);
+        r = sd_json_dispatch(v, dispatch_table, /* flags= */ 0, &p);
         if (r < 0)
                 return r;
+
+        r = dns_name_is_valid(p.name);
+        if (r < 0)
+                return r;
+        if (r == 0)
+                return -EBADMSG;
 
         key = dns_resource_key_new(p.class, p.type, p.name);
         if (!key)
@@ -2243,7 +2259,7 @@ static int type_bitmap_to_json(Bitmap *b, sd_json_variant **ret) {
         }
 
         if (!l)
-                return sd_json_variant_new_array(ret, NULL, 0);
+                return sd_json_variant_new_array(ret, /* array= */ NULL, 0);
 
         *ret = TAKE_PTR(l);
         return 0;
@@ -2302,7 +2318,6 @@ int dns_resource_record_to_json(DnsResourceRecord *rr, sd_json_variant **ret) {
         int r;
 
         assert(rr);
-        assert(ret);
 
         r = dns_resource_key_to_json(rr->key, &k);
         if (r < 0)
@@ -2369,7 +2384,8 @@ int dns_resource_record_to_json(DnsResourceRecord *rr, sd_json_variant **ret) {
                                 SD_JSON_BUILD_PAIR_STRING("rname", rr->soa.rname),
                                 SD_JSON_BUILD_PAIR_UNSIGNED("serial", rr->soa.serial),
                                 SD_JSON_BUILD_PAIR_UNSIGNED("refresh", rr->soa.refresh),
-                                SD_JSON_BUILD_PAIR_UNSIGNED("expire", rr->soa.retry),
+                                SD_JSON_BUILD_PAIR_UNSIGNED("retry", rr->soa.retry),
+                                SD_JSON_BUILD_PAIR_UNSIGNED("expire", rr->soa.expire),
                                 SD_JSON_BUILD_PAIR_UNSIGNED("minimum", rr->soa.minimum));
 
         case DNS_TYPE_MX:
@@ -2471,6 +2487,12 @@ int dns_resource_record_to_json(DnsResourceRecord *rr, sd_json_variant **ret) {
                                 SD_JSON_BUILD_PAIR_UNSIGNED("matchingType", rr->tlsa.matching_type),
                                 SD_JSON_BUILD_PAIR_HEX("data", rr->tlsa.data, rr->tlsa.data_size));
 
+        case DNS_TYPE_OPENPGPKEY:
+                return sd_json_buildo(
+                                ret,
+                                SD_JSON_BUILD_PAIR_VARIANT("key", k),
+                                SD_JSON_BUILD_PAIR_BASE64("data", rr->generic.data, rr->generic.data_size));
+
         case DNS_TYPE_SVCB:
         case DNS_TYPE_HTTPS: {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *p = NULL;
@@ -2508,9 +2530,101 @@ int dns_resource_record_to_json(DnsResourceRecord *rr, sd_json_variant **ret) {
 
         default:
                 /* Can't provide broken-down format */
-                *ret = NULL;
+                if (ret)
+                        *ret = NULL;
                 return 0;
         }
+}
+
+int dns_resource_record_from_json(sd_json_variant *v, DnsResourceRecord **ret) {
+        int r;
+
+        assert(v);
+
+        sd_json_variant *k = sd_json_variant_by_key(v, "key");
+        if (!k)
+                return log_debug_errno(SYNTHETIC_ERRNO(EBADMSG), "Resource record entry lacks key field, refusing.");
+
+        _cleanup_(dns_resource_key_unrefp) DnsResourceKey *key = NULL;
+        r = dns_resource_key_from_json(k, &key);
+        if (r < 0)
+                return r;
+
+        _cleanup_(dns_resource_record_unrefp) DnsResourceRecord *rr = NULL;
+        rr = dns_resource_record_new(key);
+        if (!rr)
+                return log_oom_debug();
+
+        /* Note, for now we only support the most common subset of RRs for decoding here. Please send patches for more. */
+        switch (key->type) {
+
+        case DNS_TYPE_PTR:
+        case DNS_TYPE_NS:
+        case DNS_TYPE_CNAME:
+        case DNS_TYPE_DNAME: {
+                _cleanup_free_ char *name = NULL;
+
+                static const struct sd_json_dispatch_field table[] = {
+                        { "name", SD_JSON_VARIANT_STRING, sd_json_dispatch_string, 0, SD_JSON_MANDATORY },
+                        { "key",  SD_JSON_VARIANT_OBJECT, NULL,                    0, SD_JSON_MANDATORY },
+                        {}
+                };
+
+                r = sd_json_dispatch(v, table, /* flags= */ 0, &name);
+                if (r < 0)
+                        return r;
+
+                r = dns_name_is_valid(name);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return -EBADMSG;
+
+                rr->ptr.name = TAKE_PTR(name);
+                break;
+        }
+
+        case DNS_TYPE_A: {
+                struct in_addr addr = {};
+
+                static const struct sd_json_dispatch_field table[] = {
+                        { "address", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_in_addr, 0, SD_JSON_MANDATORY },
+                        { "key",     SD_JSON_VARIANT_OBJECT,        NULL,                  0, SD_JSON_MANDATORY },
+                        {}
+                };
+
+                r = sd_json_dispatch(v, table, /* flags= */ 0, &addr);
+                if (r < 0)
+                        return r;
+
+                rr->a.in_addr = addr;
+                break;
+        }
+
+        case DNS_TYPE_AAAA: {
+                struct in6_addr addr = {};
+
+                static const struct sd_json_dispatch_field table[] = {
+                        { "address", _SD_JSON_VARIANT_TYPE_INVALID, json_dispatch_in6_addr, 0, SD_JSON_MANDATORY },
+                        { "key",     SD_JSON_VARIANT_OBJECT,        NULL,                   0, SD_JSON_MANDATORY },
+                        {}
+                };
+
+                r = sd_json_dispatch(v, table, /* flags= */ 0, &addr);
+                if (r < 0)
+                        return r;
+
+                rr->aaaa.in6_addr = addr;
+                break;
+        }
+
+        default:
+                return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Decoding DNS type %s is currently not supported.", dns_type_to_string(key->type));
+        }
+
+        if (ret)
+                *ret = TAKE_PTR(rr);
+        return 0;
 }
 
 static const char* const dnssec_algorithm_table[_DNSSEC_ALGORITHM_MAX_DEFINED] = {
@@ -2529,6 +2643,7 @@ static const char* const dnssec_algorithm_table[_DNSSEC_ALGORITHM_MAX_DEFINED] =
         [DNSSEC_ALGORITHM_ECDSAP384SHA384]    = "ECDSAP384SHA384",
         [DNSSEC_ALGORITHM_ED25519]            = "ED25519",
         [DNSSEC_ALGORITHM_ED448]              = "ED448",
+        [DNSSEC_ALGORITHM_MLDSA44]            = "MLDSA44",
         [DNSSEC_ALGORITHM_INDIRECT]           = "INDIRECT",
         [DNSSEC_ALGORITHM_PRIVATEDNS]         = "PRIVATEDNS",
         [DNSSEC_ALGORITHM_PRIVATEOID]         = "PRIVATEOID",

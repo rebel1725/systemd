@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "basic-forward.h"
+#include "forward.h"
 
 /* What characters are special in the shell? */
 /* must be escaped outside and inside double-quotes */
@@ -44,7 +44,7 @@ int cunescape_one(const char *p, size_t length, char32_t *ret, bool *eight_bit, 
 
 ssize_t cunescape_length_with_prefix(const char *s, size_t length, const char *prefix, UnescapeFlags flags, char **ret);
 static inline ssize_t cunescape_length(const char *s, size_t length, UnescapeFlags flags, char **ret) {
-        return cunescape_length_with_prefix(s, length, NULL, flags, ret);
+        return cunescape_length_with_prefix(s, length, /* prefix= */ NULL, flags, ret);
 }
 static inline ssize_t cunescape(const char *s, UnescapeFlags flags, char **ret) {
         return cunescape_length(s, SIZE_MAX, flags, ret);
@@ -57,9 +57,12 @@ typedef enum XEscapeFlags {
 
 char* xescape_full(const char *s, const char *bad, size_t console_width, XEscapeFlags flags);
 static inline char* xescape(const char *s, const char *bad) {
-        return xescape_full(s, bad, SIZE_MAX, 0);
+        return xescape_full(s, bad, SIZE_MAX, /* flags= */ 0);
 }
-char* octescape(const char *s, size_t len);
+char* octescape_full(const char *s, size_t len, const char *bad);
+static inline char* octescape(const char *s, size_t len) {
+        return octescape_full(s, len, /* bad= */ NULL);
+}
 char* decescape(const char *s, size_t len, const char *bad) _nonnull_if_nonzero_(1, 2);
 char* escape_non_printable_full(const char *str, size_t console_width, XEscapeFlags flags);
 

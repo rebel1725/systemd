@@ -52,7 +52,7 @@ int sd_ndisc_is_running(sd_ndisc *nd) {
         if (!nd)
                 return false;
 
-        return sd_event_source_get_enabled(nd->recv_event_source, NULL) > 0;
+        return sd_event_source_get_enabled(nd->recv_event_source, /* ret= */ NULL) > 0;
 }
 
 int sd_ndisc_set_callback(
@@ -137,7 +137,7 @@ int sd_ndisc_attach_event(sd_ndisc *nd, sd_event *event, int64_t priority) {
         else {
                 r = sd_event_default(&nd->event);
                 if (r < 0)
-                        return 0;
+                        return r;
         }
 
         nd->event_priority = priority;
@@ -219,7 +219,10 @@ static int ndisc_handle_router(sd_ndisc *nd, ICMP6Packet *packet) {
         if (r < 0)
                 return r;
 
-        (void) event_source_disable(nd->timeout_event_source);
+        /* Stop sending RS once we have sent at least one RS and received an RA with a non-zero lifetime. */
+        if (nd->retransmit_time > 0 && sd_ndisc_router_get_lifetime(rt, /* ret= */ NULL) > 0)
+                (void) event_source_disable(nd->timeout_event_source);
+
         (void) event_source_disable(nd->timeout_no_ra);
 
         if (DEBUG_LOGGING) {
@@ -348,6 +351,12 @@ static int ndisc_recv(sd_event_source *s, int fd, uint32_t revents, void *userda
                 return 0;
         }
 
+        if (packet->ifindex != nd->ifindex) {
+                log_ndisc(nd, "Received an ICMPv6 packet on interface %i, expected %i, ignoring.",
+                          packet->ifindex, nd->ifindex);
+                return 0;
+        }
+
         /* The function icmp6_receive() accepts the null source address, but RFC 4861 Section 6.1.2 states
          * that hosts MUST discard messages with the null source address. */
         if (in6_addr_is_null(&packet->sender_address)) {
@@ -434,7 +443,7 @@ static int ndisc_timeout(sd_event_source *s, uint64_t usec, void *userdata) {
                              CLOCK_BOOTTIME,
                              time_now + nd->retransmit_time, 10 * USEC_PER_MSEC,
                              ndisc_timeout, nd,
-                             nd->event_priority, "ndisc-timeout-no-ra", true);
+                             nd->event_priority, "ndisc-timeout-no-ra", /* force_reset= */ true);
         if (r < 0)
                 goto fail;
 
@@ -460,8 +469,10 @@ static int ndisc_timeout_no_ra(sd_event_source *s, uint64_t usec, void *userdata
 
         log_ndisc(nd, "No RA received before link confirmation timeout");
 
+        /* Also stop sending RS here, by disabling timeout_event_source. */
+        (void) event_source_disable(nd->timeout_event_source);
         (void) event_source_disable(nd->timeout_no_ra);
-        ndisc_callback(nd, SD_NDISC_EVENT_TIMEOUT, NULL);
+        ndisc_callback(nd, SD_NDISC_EVENT_TIMEOUT, /* message= */ NULL);
 
         return 0;
 }
@@ -517,7 +528,7 @@ static int ndisc_setup_timer(sd_ndisc *nd) {
                                       CLOCK_BOOTTIME,
                                       USEC_PER_SEC / 2, 1 * USEC_PER_SEC, /* See RFC 8415 sec. 18.2.1 */
                                       ndisc_timeout, nd,
-                                      nd->event_priority, "ndisc-timeout", true);
+                                      nd->event_priority, "ndisc-timeout", /* force_reset= */ true);
         if (r < 0)
                 return r;
 
@@ -525,7 +536,7 @@ static int ndisc_setup_timer(sd_ndisc *nd) {
                                       CLOCK_BOOTTIME,
                                       NDISC_TIMEOUT_NO_RA_USEC, 10 * USEC_PER_MSEC,
                                       ndisc_timeout_no_ra, nd,
-                                      nd->event_priority, "ndisc-timeout-no-ra", true);
+                                      nd->event_priority, "ndisc-timeout-no-ra", /* force_reset= */ true);
         if (r < 0)
                 return r;
 

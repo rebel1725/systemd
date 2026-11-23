@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "basic-forward.h"
+#include "forward.h"
 #include "lock-util.h"
 
 /* The following macros add 1 when converting things, since 0 is a valid mode, while the pointer
@@ -30,7 +30,7 @@ static inline int chmod_and_chown(const char *path, mode_t mode, uid_t uid, gid_
 }
 int fchmod_and_chown_with_fallback(int fd, const char *path, mode_t mode, uid_t uid, gid_t gid);
 static inline int fchmod_and_chown(int fd, mode_t mode, uid_t uid, gid_t gid) {
-        return fchmod_and_chown_with_fallback(fd, NULL, mode, uid, gid); /* no fallback */
+        return fchmod_and_chown_with_fallback(fd, /* path= */ NULL, mode, uid, gid); /* no fallback */
 }
 
 int fchmod_umask(int fd, mode_t mode);
@@ -58,9 +58,12 @@ typedef enum SymlinkFlags {
         SYMLINK_LABEL         = 1 << 1,
 } SymlinkFlags;
 
-int symlinkat_atomic_full(const char *target, int atfd, const char *linkpath, SymlinkFlags flags);
+int symlinkat_atomic_full_label(const char *target, int atfd, const char *linkpath, SymlinkFlags flags, LabelContext *label_context);
+static inline int symlinkat_atomic_full(const char *target, int atfd, const char *linkpath, SymlinkFlags flags) {
+        return symlinkat_atomic_full_label(target, atfd, linkpath, flags, /* label_context= */ NULL);
+}
 static inline int symlink_atomic(const char *target, const char *linkpath) {
-        return symlinkat_atomic_full(target, AT_FDCWD, linkpath, 0);
+        return symlinkat_atomic_full(target, AT_FDCWD, linkpath, /* flags= */ 0);
 }
 
 int mknodat_atomic(int atfd, const char *path, mode_t mode, dev_t dev);
@@ -109,30 +112,44 @@ int posix_fallocate_loop(int fd, uint64_t offset, uint64_t size);
 int parse_cifs_service(const char *s, char **ret_host, char **ret_service, char **ret_path);
 
 typedef enum XOpenFlags {
-        XO_LABEL     = 1 << 0, /* When creating: relabel */
-        XO_SUBVOLUME = 1 << 1, /* When creating as directory: make it a subvolume */
-        XO_NOCOW     = 1 << 2, /* Enable NOCOW mode after opening */
-        XO_REGULAR   = 1 << 3, /* Fail if the inode is not a regular file */
+        XO_LABEL             = 1 << 0, /* When creating: relabel */
+        XO_SUBVOLUME         = 1 << 1, /* When creating as directory: make it a subvolume */
+        XO_NOCOW             = 1 << 2, /* Enable NOCOW mode after opening */
+        XO_COW               = 1 << 3, /* Enable COW mode after opening */
+        XO_REGULAR           = 1 << 4, /* Fail if the inode is not a regular file */
+        XO_SOCKET            = 1 << 5, /* Fail if the inode is not a socket */
+        XO_TRIGGER_AUTOMOUNT = 1 << 6, /* Trigger automounts via open_tree(). Requires O_PATH. */
+        XO_AUTO_RW_RO        = 1 << 7, /* Open in O_RDWR mode if possible, O_RDONLY if not */
+        XO_EMPTY_PATH        = 1 << 8, /* Reopen dir_fd if the path is NULL or empty, like AT_EMPTY_PATH */
 } XOpenFlags;
 
-int open_mkdir_at_full(int dirfd, const char *path, int flags, XOpenFlags xopen_flags, mode_t mode);
+int open_mkdir_at_full_label(int dirfd, const char *path, int flags, XOpenFlags xopen_flags, mode_t mode, LabelContext *label_context);
+static inline int open_mkdir_at_full(int dirfd, const char *path, int flags, XOpenFlags xopen_flags, mode_t mode) {
+        return open_mkdir_at_full_label(dirfd, path, flags, xopen_flags, mode, /* label_context= */ NULL);
+}
 static inline int open_mkdir_at(int dirfd, const char *path, int flags, mode_t mode) {
-        return open_mkdir_at_full(dirfd, path, flags, 0, mode);
+        return open_mkdir_at_full(dirfd, path, flags, /* xopen_flags= */ 0, mode);
 }
 static inline int open_mkdir(const char *path, int flags, mode_t mode) {
-        return open_mkdir_at_full(AT_FDCWD, path, flags, 0, mode);
+        return open_mkdir_at_full(AT_FDCWD, path, flags, /* xopen_flags= */ 0, mode);
 }
 
 int openat_report_new(int dirfd, const char *pathname, int flags, mode_t mode, bool *ret_newly_created);
 
-int xopenat_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_flags, mode_t mode);
+int xopenat_full_label(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_flags, mode_t mode, LabelContext *label_context);
+static inline int xopenat_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_flags, mode_t mode) {
+        return xopenat_full_label(dir_fd, path, open_flags, xopen_flags, mode, /* label_context= */ NULL);
+}
 static inline int xopenat(int dir_fd, const char *path, int open_flags) {
-        return xopenat_full(dir_fd, path, open_flags, 0, MODE_INVALID);
+        return xopenat_full(dir_fd, path, open_flags, /* xopen_flags= */ 0, MODE_INVALID);
 }
 
-int xopenat_lock_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_flags, mode_t mode, LockType locktype, int operation);
+int xopenat_lock_full_label(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_flags, mode_t mode, LockType locktype, int operation, LabelContext *label_context);
+static inline int xopenat_lock_full(int dir_fd, const char *path, int open_flags, XOpenFlags xopen_flags, mode_t mode, LockType locktype, int operation) {
+        return xopenat_lock_full_label(dir_fd, path, open_flags, xopen_flags, mode, locktype, operation, /* label_context= */ NULL);
+}
 static inline int xopenat_lock(int dir_fd, const char *path, int open_flags, LockType locktype, int operation) {
-        return xopenat_lock_full(dir_fd, path, open_flags, 0, 0, locktype, operation);
+        return xopenat_lock_full(dir_fd, path, open_flags, /* xopen_flags= */ 0, /* mode= */ 0, locktype, operation);
 }
 
 int link_fd(int fd, int newdirfd, const char *newpath);

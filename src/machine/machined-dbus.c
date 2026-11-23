@@ -12,7 +12,6 @@
 #include "bus-object.h"
 #include "bus-polkit.h"
 #include "bus-util.h"
-#include "cgroup-util.h"
 #include "discover-image.h"
 #include "errno-util.h"
 #include "fd-util.h"
@@ -133,7 +132,7 @@ static int method_get_image(sd_bus_message *message, void *userdata, sd_bus_erro
         if (r < 0)
                 return r;
 
-        r = image_find(m->runtime_scope, IMAGE_MACHINE, name, NULL, NULL);
+        r = image_find(m->runtime_scope, IMAGE_MACHINE, name, /* root= */ NULL, /* ret= */ NULL);
         if (r == -ENOENT)
                 return sd_bus_error_setf(error, BUS_ERROR_NO_SUCH_IMAGE, "No image '%s' known", name);
         if (r < 0)
@@ -256,6 +255,9 @@ static int machine_add_from_params(
         assert(manager);
         assert(message);
         assert(name);
+        assert(c == _MACHINE_CLASS_INVALID || MACHINE_CLASS_CAN_REGISTER(c));
+        assert(leader_pidref);
+        assert(supervisor_pidref);
         assert(ret);
 
         if (leader_pidref->pid == 1)
@@ -276,12 +278,33 @@ static int machine_add_from_params(
         /* Ensure an unprivileged user cannot claim any process they don't control as their own machine */
         switch (manager->runtime_scope) {
 
-        case RUNTIME_SCOPE_SYSTEM:
-                /* In system mode root may register anything */
-                if (uid == 0)
+        case RUNTIME_SCOPE_SYSTEM: {
+                const char *details[] = {
+                        "name",  name,
+                        "class", machine_class_to_string(c),
+                        NULL
+                };
+                bool sender_is_admin = false;
+
+                r = bus_verify_polkit_async_full(
+                                message,
+                                polkit_action,
+                                details,
+                                /* good_user= */ UID_INVALID,
+                                /* flags= */ 0,
+                                &manager->polkit_registry,
+                                &sender_is_admin,
+                                error);
+                if (r < 0)
+                        return r;
+                if (r == 0)
+                        return 0; /* Will call us back */
+
+                /* In system mode root/admin may register anything */
+                if (uid == 0 || sender_is_admin)
                         break;
 
-                /* And non-root may only register things if they own the userns */
+                /* And non-root/admin may only register things if they own the userns */
                 r = process_is_owned_by_uid(leader_pidref, uid);
                 if (r < 0)
                         return r;
@@ -289,7 +312,8 @@ static int machine_add_from_params(
                         break;
 
                 /* Nothing else may */
-                return sd_bus_error_set(error, SD_BUS_ERROR_ACCESS_DENIED, "Only root may register machines for other users");
+                return sd_bus_error_set(error, SD_BUS_ERROR_ACCESS_DENIED, "Only privileged users may register machines for other users");
+        }
 
         case RUNTIME_SCOPE_USER:
                 /* In user mode the user owning our instance may register anything. */
@@ -301,23 +325,6 @@ static int machine_add_from_params(
 
         default:
                 assert_not_reached();
-        }
-
-        if (manager->runtime_scope != RUNTIME_SCOPE_USER) {
-                const char *details[] = {
-                        "name",  name,
-                        "class", machine_class_to_string(c),
-                        NULL
-                };
-
-                r = bus_verify_polkit_async(
-                                message,
-                                polkit_action,
-                                details,
-                                &manager->polkit_registry,
-                                error);
-                if (r <= 0)
-                        return r; /* 0 means Polkit will call us back, see method_create_machine() */
         }
 
         r = manager_add_machine(manager, name, &m);
@@ -405,7 +412,7 @@ static int method_create_or_register_machine(
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0)
                 return r;
-        if (!hostname_is_valid(name, 0))
+        if (!hostname_is_valid(name, /* flags= */ 0))
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid machine name");
 
         r = bus_message_read_id128(message, &id);
@@ -433,7 +440,7 @@ static int method_create_or_register_machine(
                 c = _MACHINE_CLASS_INVALID;
         else {
                 c = machine_class_from_string(class);
-                if (c < 0 || !IN_SET(c, MACHINE_CONTAINER, MACHINE_VM))
+                if (c < 0 || !MACHINE_CLASS_CAN_REGISTER(c))
                         return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid machine class parameter");
         }
 
@@ -511,7 +518,7 @@ static int method_create_or_register_machine_ex(
         r = sd_bus_message_read(message, "s", &name);
         if (r < 0)
                 return r;
-        if (!hostname_is_valid(name, 0))
+        if (!hostname_is_valid(name, /* flags= */ 0))
                 return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid machine name");
 
         r = sd_bus_message_enter_container(message, 'a', "(sv)");
@@ -531,7 +538,7 @@ static int method_create_or_register_machine_ex(
                 if (r < 0)
                         return r;
 
-                r = sd_bus_message_enter_container(message, 'v', NULL);
+                r = sd_bus_message_enter_container(message, 'v', /* contents= */ NULL);
                 if (r < 0)
                         return r;
 
@@ -608,7 +615,7 @@ static int method_create_or_register_machine_ex(
                 c = _MACHINE_CLASS_INVALID;
         else {
                 c = machine_class_from_string(class);
-                if (c < 0 || !IN_SET(c, MACHINE_CONTAINER, MACHINE_VM))
+                if (c < 0 || !MACHINE_CLASS_CAN_REGISTER(c))
                         return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Invalid machine class parameter");
         }
 
@@ -680,8 +687,8 @@ static int method_create_machine(sd_bus_message *message, void *userdata, sd_bus
 
         assert(message);
 
-        if (sd_bus_message_is_method_call(message, NULL, "CreateMachineEx"))
-                r = method_create_or_register_machine_ex(manager, message, "org.freedesktop.machine1.create-machines", &m, error);
+        if (sd_bus_message_is_method_call(message, /* interface= */ NULL, "CreateMachineEx"))
+                r = method_create_or_register_machine_ex(manager, message, "org.freedesktop.machine1.create-machine", &m, error);
         else
                 r = method_create_or_register_machine(manager, message, "org.freedesktop.machine1.create-machine", &m, error);
         if (r < 0)
@@ -713,7 +720,7 @@ static int method_register_machine(sd_bus_message *message, void *userdata, sd_b
 
         assert(message);
 
-        if (sd_bus_message_is_method_call(message, NULL, "RegisterMachineEx"))
+        if (sd_bus_message_is_method_call(message, /* interface= */ NULL, "RegisterMachineEx"))
                 r = method_create_or_register_machine_ex(manager, message, "org.freedesktop.machine1.register-machine", &m, error);
         else
                 r = method_create_or_register_machine(manager, message, "org.freedesktop.machine1.register-machine", &m, error);
@@ -722,39 +729,15 @@ static int method_register_machine(sd_bus_message *message, void *userdata, sd_b
         if (r == 0)
                 return 1; /* Will call us back */
 
-        switch (manager->runtime_scope) {
-        case RUNTIME_SCOPE_USER:
-                r = cg_pidref_get_user_unit_full(&m->leader, &m->unit, &m->subgroup);
-                break;
-
-        case RUNTIME_SCOPE_SYSTEM:
-                r = cg_pidref_get_unit_full(&m->leader, &m->unit, &m->subgroup);
-                break;
-
-        default:
-                assert_not_reached();
-        }
+        r = machine_determine_unit(m);
         if (r < 0) {
                 r = sd_bus_error_set_errnof(error, r,
-                                            "Failed to determine unit of process "PID_FMT" : %m",
+                                            "Failed to determine unit or cgroup of process "PID_FMT": %m",
                                             m->leader.pid);
                 goto fail;
         }
 
-        if (!empty_or_root(m->subgroup)) {
-                /* If this is not a top-level cgroup, then we need the cgroup path to be able to watch when
-                 * it empties */
-
-                r = cg_pidref_get_path(&m->leader, &m->cgroup);
-                if (r < 0) {
-                        r = sd_bus_error_set_errnof(error, r,
-                                                    "Failed to determine cgroup of process "PID_FMT" : %m",
-                                                    m->leader.pid);
-                        goto fail;
-                }
-        }
-
-        r = machine_start(m, NULL, error);
+        r = machine_start(m, /* properties= */ NULL, error);
         if (r < 0)
                 goto fail;
 
@@ -823,7 +806,7 @@ static int method_list_images(sd_bus_message *message, void *userdata, sd_bus_er
         assert(message);
 
         _cleanup_hashmap_free_ Hashmap *images = NULL;
-        r = image_discover(m->runtime_scope, IMAGE_MACHINE, NULL, &images);
+        r = image_discover(m->runtime_scope, IMAGE_MACHINE, /* root= */ NULL, &images);
         if (r < 0)
                 return r;
 
@@ -1093,7 +1076,7 @@ static int method_set_pool_limit(sd_bus_message *message, void *userdata, sd_bus
         if (r < 0)
                 return sd_bus_error_set_errnof(error, r, "Failed to adjust quota limit: %m");
 
-        return sd_bus_reply_method_return(message, NULL);
+        return sd_bus_reply_method_return(message, /* types= */ NULL);
 }
 
 static int method_set_image_limit(sd_bus_message *message, void *userdata, sd_bus_error *error) {
@@ -1478,7 +1461,7 @@ int match_job_removed(sd_bus_message *message, void *userdata, sd_bus_error *err
 
                 if (machine->started) {
                         if (streq(result, "done"))
-                                machine_send_create_reply(machine, NULL);
+                                machine_send_create_reply(machine, /* error= */ NULL);
                         else {
                                 _cleanup_(sd_bus_error_free) sd_bus_error e = SD_BUS_ERROR_NULL;
 
@@ -1578,7 +1561,7 @@ int manager_unref_unit(
         assert(m);
         assert(unit);
 
-        return bus_call_method(m->api_bus, bus_systemd_mgr, "UnrefUnit", error, NULL, "s", unit);
+        return bus_call_method(m->api_bus, bus_systemd_mgr, "UnrefUnit", error, /* ret_reply= */ NULL, "s", unit);
 }
 
 int manager_stop_unit(Manager *manager, const char *unit, sd_bus_error *error, char **job) {
@@ -1626,9 +1609,9 @@ int manager_kill_unit(Manager *manager, const char *unit, const char *subgroup, 
         assert(unit);
 
         if (empty_or_root(subgroup))
-                return bus_call_method(manager->api_bus, bus_systemd_mgr, "KillUnit", reterr_error, NULL, "ssi", unit, "all", signo);
+                return bus_call_method(manager->api_bus, bus_systemd_mgr, "KillUnit", reterr_error, /* ret_reply= */ NULL, "ssi", unit, "all", signo);
 
-        return bus_call_method(manager->api_bus, bus_systemd_mgr, "KillUnitSubgroup", reterr_error, NULL, "sssi", unit, "cgroup", subgroup, signo);
+        return bus_call_method(manager->api_bus, bus_systemd_mgr, "KillUnitSubgroup", reterr_error, /* ret_reply= */ NULL, "sssi", unit, "cgroup", subgroup, signo);
 }
 
 int manager_unit_is_active(Manager *manager, const char *unit, sd_bus_error *reterr_error) {

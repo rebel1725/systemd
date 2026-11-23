@@ -2,67 +2,81 @@
 
 #include <fcntl.h>
 #include <grp.h>
+#include <linux/if_arp.h>
+#include <linux/if_ether.h>
+#include <linux/if_infiniband.h>
+#include <linux/pidfd.h>
+#include <linux/pkt_sched.h>
+#include <netinet/ip.h>
+#include <netinet/udp.h>
+#include <poll.h>
+#include <pthread.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "errno-util.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "fs-util.h"
 #include "in-addr-util.h"
+#include "io-util.h"
 #include "iovec-util.h"
 #include "log.h"
 #include "path-util.h"
+#include "pidfd-util.h"
 #include "pidref.h"
 #include "process-util.h"
 #include "random-util.h"
 #include "rm-rf.h"
 #include "socket-util.h"
 #include "tests.h"
+#include "time-util.h"
 #include "tmpfile-util.h"
 #include "user-util.h"
 
 assert_cc(SUN_PATH_LEN == 108);
 
 TEST(ifname_valid) {
-        assert_se( ifname_valid("foo"));
-        assert_se( ifname_valid("eth0"));
+        ASSERT_TRUE(ifname_valid("foo"));
+        ASSERT_TRUE(ifname_valid("eth0"));
 
-        assert_se(!ifname_valid("0"));
-        assert_se(!ifname_valid("99"));
-        assert_se( ifname_valid("a99"));
-        assert_se( ifname_valid("99a"));
+        ASSERT_FALSE(ifname_valid("0"));
+        ASSERT_FALSE(ifname_valid("99"));
+        ASSERT_TRUE(ifname_valid("a99"));
+        ASSERT_TRUE(ifname_valid("99a"));
 
-        assert_se(!ifname_valid(NULL));
-        assert_se(!ifname_valid(""));
-        assert_se(!ifname_valid(" "));
-        assert_se(!ifname_valid(" foo"));
-        assert_se(!ifname_valid("bar\n"));
-        assert_se(!ifname_valid("."));
-        assert_se(!ifname_valid(".."));
-        assert_se(ifname_valid("foo.bar"));
-        assert_se(!ifname_valid("x:y"));
+        ASSERT_FALSE(ifname_valid(NULL));
+        ASSERT_FALSE(ifname_valid(""));
+        ASSERT_FALSE(ifname_valid(" "));
+        ASSERT_FALSE(ifname_valid(" foo"));
+        ASSERT_FALSE(ifname_valid("bar\n"));
+        ASSERT_FALSE(ifname_valid("."));
+        ASSERT_FALSE(ifname_valid(".."));
+        ASSERT_TRUE(ifname_valid("foo.bar"));
+        ASSERT_FALSE(ifname_valid("x:y"));
 
-        assert_se( ifname_valid_full("xxxxxxxxxxxxxxx", 0));
-        assert_se(!ifname_valid_full("xxxxxxxxxxxxxxxx", 0));
-        assert_se( ifname_valid_full("xxxxxxxxxxxxxxxx", IFNAME_VALID_ALTERNATIVE));
-        assert_se( ifname_valid_full("xxxxxxxxxxxxxxxx", IFNAME_VALID_ALTERNATIVE));
-        assert_se(!ifname_valid_full("999", IFNAME_VALID_ALTERNATIVE));
-        assert_se( ifname_valid_full("999", IFNAME_VALID_ALTERNATIVE | IFNAME_VALID_NUMERIC));
-        assert_se(!ifname_valid_full("0", IFNAME_VALID_ALTERNATIVE | IFNAME_VALID_NUMERIC));
+        ASSERT_TRUE(ifname_valid_full("xxxxxxxxxxxxxxx", /* flags= */ 0));
+        ASSERT_FALSE(ifname_valid_full("xxxxxxxxxxxxxxxx", /* flags= */ 0));
+        ASSERT_TRUE(ifname_valid_full("xxxxxxxxxxxxxxxx", IFNAME_VALID_ALTERNATIVE));
+        ASSERT_TRUE(ifname_valid_full("xxxxxxxxxxxxxxxx", IFNAME_VALID_ALTERNATIVE));
+        ASSERT_FALSE(ifname_valid_full("999", IFNAME_VALID_ALTERNATIVE));
+        ASSERT_TRUE(ifname_valid_full("999", IFNAME_VALID_ALTERNATIVE | IFNAME_VALID_NUMERIC));
+        ASSERT_FALSE(ifname_valid_full("0", IFNAME_VALID_ALTERNATIVE | IFNAME_VALID_NUMERIC));
 }
 
 static void test_socket_print_unix_one(const char *in, size_t len_in, const char *expected) {
         _cleanup_free_ char *out = NULL, *c = NULL;
 
-        assert_se(len_in <= SUN_PATH_LEN);
+        ASSERT_LE(len_in, SUN_PATH_LEN);
         SocketAddress a = { .sockaddr = { .un = { .sun_family = AF_UNIX } },
                             .size = offsetof(struct sockaddr_un, sun_path) + len_in,
                             .type = SOCK_STREAM,
         };
         memcpy(a.sockaddr.un.sun_path, in, len_in);
 
-        assert_se(socket_address_print(&a, &out) >= 0);
-        assert_se(c = cescape(in));
+        ASSERT_OK(socket_address_print(&a, &out));
+        ASSERT_NOT_NULL(c = cescape(in));
         log_info("\"%s\" → \"%s\" (expect \"%s\")", in, out, expected);
         ASSERT_STREQ(out, expected);
 }
@@ -109,13 +123,26 @@ TEST(sockaddr_equal) {
                 .vm.svm_cid = VMADDR_CID_ANY,
         };
 
-        assert_se(sockaddr_equal(&a, &a));
-        assert_se(sockaddr_equal(&a, &b));
-        assert_se(sockaddr_equal(&d, &d));
-        assert_se(sockaddr_equal(&e, &e));
-        assert_se(!sockaddr_equal(&a, &c));
-        assert_se(!sockaddr_equal(&b, &c));
-        assert_se(!sockaddr_equal(&a, &e));
+        ASSERT_TRUE(sockaddr_equal(&a, &a));
+        ASSERT_TRUE(sockaddr_equal(&a, &b));
+        ASSERT_TRUE(sockaddr_equal(&d, &d));
+        ASSERT_TRUE(sockaddr_equal(&e, &e));
+        ASSERT_FALSE(sockaddr_equal(&a, &c));
+        ASSERT_FALSE(sockaddr_equal(&b, &c));
+        ASSERT_FALSE(sockaddr_equal(&a, &e));
+
+        /* Ports must match too */
+        union sockaddr_union f = a, g = d, h = e;
+        f.in.sin_port = htobe16(53);
+        g.in6.sin6_port = htobe16(53);
+        h.vm.svm_port = 53;
+
+        ASSERT_TRUE(sockaddr_equal(&f, &f));
+        ASSERT_TRUE(sockaddr_equal(&g, &g));
+        ASSERT_TRUE(sockaddr_equal(&h, &h));
+        ASSERT_FALSE(sockaddr_equal(&a, &f));
+        ASSERT_FALSE(sockaddr_equal(&d, &g));
+        ASSERT_FALSE(sockaddr_equal(&e, &h));
 }
 
 TEST(sockaddr_un_len) {
@@ -129,31 +156,60 @@ TEST(sockaddr_un_len) {
                 .sun_path = "\0foobar",
         };
 
-        assert_se(sockaddr_un_len(&fs) == offsetof(struct sockaddr_un, sun_path) + strlen(fs.sun_path) + 1);
-        assert_se(sockaddr_un_len(&abstract) == offsetof(struct sockaddr_un, sun_path) + 1 + strlen(abstract.sun_path + 1));
+        ASSERT_EQ(sockaddr_un_len(&fs), offsetof(struct sockaddr_un, sun_path) + strlen(fs.sun_path) + 1);
+        ASSERT_EQ(sockaddr_un_len(&abstract), offsetof(struct sockaddr_un, sun_path) + 1 + strlen(abstract.sun_path + 1));
+}
+
+TEST(sockaddr_ll_len) {
+        union sockaddr_union sa = {
+                .ll.sll_family = AF_PACKET,
+        };
+
+        /* Without any hardware type or address length, the plain structure size is used. */
+        ASSERT_EQ(sockaddr_ll_len(&sa.ll), sizeof(struct sockaddr_ll));
+
+        /* An Ethernet address fits into sll_addr. */
+        sa.ll.sll_hatype = htobe16(ARPHRD_ETHER);
+        sa.ll.sll_halen = ETH_ALEN;
+        ASSERT_EQ(sockaddr_ll_len(&sa.ll), sizeof(struct sockaddr_ll));
+
+        /* An InfiniBand address runs over sll_addr, and the length must cover it. */
+        sa.ll.sll_hatype = htobe16(ARPHRD_INFINIBAND);
+        sa.ll.sll_halen = INFINIBAND_ALEN;
+        ASSERT_EQ(sockaddr_ll_len(&sa.ll), offsetof(struct sockaddr_ll, sll_addr) + INFINIBAND_ALEN);
+
+        /* The kernel only looks at sll_halen when sending, hence the length must follow it even when
+         * the hardware type is not set. */
+        sa.ll.sll_hatype = 0;
+        ASSERT_EQ(sockaddr_ll_len(&sa.ll), offsetof(struct sockaddr_ll, sll_addr) + INFINIBAND_ALEN);
+
+        /* The largest address the helper accepts must still fit into the buffer reserved for it in
+         * sockaddr_union. */
+        sa.ll.sll_halen = HW_ADDR_MAX_SIZE;
+        ASSERT_LE(sockaddr_ll_len(&sa.ll), sizeof(sa.ll_buffer));
 }
 
 TEST(in_addr_is_multicast) {
         union in_addr_union a, b;
         int f;
 
-        assert_se(in_addr_from_string_auto("192.168.3.11", &f, &a) >= 0);
-        assert_se(in_addr_is_multicast(f, &a) == 0);
+        ASSERT_OK(in_addr_from_string_auto("192.168.3.11", &f, &a));
+        ASSERT_OK_EQ(in_addr_is_multicast(f, &a), 0);
 
-        assert_se(in_addr_from_string_auto("224.0.0.1", &f, &a) >= 0);
-        assert_se(in_addr_is_multicast(f, &a) == 1);
+        ASSERT_OK(in_addr_from_string_auto("224.0.0.1", &f, &a));
+        ASSERT_OK_EQ(in_addr_is_multicast(f, &a), 1);
 
-        assert_se(in_addr_from_string_auto("FF01:0:0:0:0:0:0:1", &f, &b) >= 0);
-        assert_se(in_addr_is_multicast(f, &b) == 1);
+        ASSERT_OK(in_addr_from_string_auto("FF01:0:0:0:0:0:0:1", &f, &b));
+        ASSERT_OK_EQ(in_addr_is_multicast(f, &b), 1);
 
-        assert_se(in_addr_from_string_auto("2001:db8::c:69b:aeff:fe53:743e", &f, &b) >= 0);
-        assert_se(in_addr_is_multicast(f, &b) == 0);
+        ASSERT_OK(in_addr_from_string_auto("2001:db8::c:69b:aeff:fe53:743e", &f, &b));
+        ASSERT_OK_EQ(in_addr_is_multicast(f, &b), 0);
 }
 
 TEST(getpeercred_getpeergroups) {
         int r;
 
-        r = ASSERT_OK(pidref_safe_fork("(getpeercred)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
+        r = ASSERT_OK(pidref_safe_fork("(getpeercred)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 static const gid_t gids[] = { 3, 4, 5, 6, 7 };
@@ -170,40 +226,34 @@ TEST(getpeercred_getpeergroups) {
                         test_gids = (gid_t*) gids;
                         n_test_gids = ELEMENTSOF(gids);
 
-                        assert_se(fully_set_uid_gid(test_uid, test_gid, test_gids, n_test_gids) >= 0);
+                        ASSERT_OK(fully_set_uid_gid(test_uid, test_gid, test_gids, n_test_gids));
                 } else {
-                        long ngroups_max;
-
                         test_uid = getuid();
                         test_gid = getgid();
 
-                        ngroups_max = sysconf(_SC_NGROUPS_MAX);
-                        assert_se(ngroups_max > 0);
+                        int ngroups_max = ASSERT_OK_POSITIVE(sysconf_ngroups_max());
 
                         test_gids = newa(gid_t, ngroups_max);
 
-                        r = getgroups(ngroups_max, test_gids);
-                        assert_se(r >= 0);
+                        r = ASSERT_OK_ERRNO(getgroups(ngroups_max, test_gids));
                         n_test_gids = (size_t) r;
                 }
 
-                assert_se(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) >= 0);
+                ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM, 0, pair));
 
-                assert_se(getpeercred(pair[0], &ucred) >= 0);
+                ASSERT_OK(getpeercred(pair[0], &ucred));
 
-                assert_se(ucred.uid == test_uid);
-                assert_se(ucred.gid == test_gid);
-                assert_se(ucred.pid == getpid_cached());
+                ASSERT_EQ(ucred.uid, test_uid);
+                ASSERT_EQ(ucred.gid, test_gid);
+                ASSERT_EQ(ucred.pid, getpid_cached());
 
                 {
                         _cleanup_free_ gid_t *peer_groups = NULL;
 
-                        r = getpeergroups(pair[0], &peer_groups);
-                        assert_se(r >= 0 || IN_SET(r, -EOPNOTSUPP, -ENOPROTOOPT));
+                        r = ASSERT_OK_OR(getpeergroups(pair[0], &peer_groups), -EOPNOTSUPP, -ENOPROTOOPT);
 
                         if (r >= 0) {
-                                assert_se((size_t) r == n_test_gids);
-                                assert_se(memcmp(peer_groups, test_gids, sizeof(gid_t) * n_test_gids) == 0);
+                                ASSERT_MEMEQ_NN(peer_groups, sizeof(gid_t) * (size_t) r, test_gids, sizeof(gid_t) * n_test_gids);
                         }
                 }
 
@@ -217,22 +267,21 @@ TEST(passfd_read) {
         _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         int r;
 
-        assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) >= 0);
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
 
-        r = ASSERT_OK(pidref_safe_fork("(passfd_read)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
+        r = ASSERT_OK(pidref_safe_fork("(passfd_read)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 /* Child */
                 pair[0] = safe_close(pair[0]);
 
                 char tmpfile[] = "/tmp/test-socket-util-passfd-read-XXXXXX";
-                assert_se(write_tmpfile(tmpfile, file_contents) == 0);
+                ASSERT_OK_ZERO(write_tmpfile(tmpfile, file_contents));
 
-                _cleanup_close_ int tmpfd = open(tmpfile, O_RDONLY);
-                assert_se(tmpfd >= 0);
-                assert_se(unlink(tmpfile) == 0);
+                _cleanup_close_ int tmpfd = ASSERT_OK(xopenat(AT_FDCWD, tmpfile, O_RDONLY));
+                ASSERT_OK_ERRNO(unlink(tmpfile));
 
-                assert_se(send_one_fd(pair[1], tmpfd, MSG_DONTWAIT) == 0);
+                ASSERT_OK_ZERO(send_one_fd(pair[1], tmpfd, MSG_DONTWAIT));
                 _exit(EXIT_SUCCESS);
         }
 
@@ -243,13 +292,182 @@ TEST(passfd_read) {
 
         pair[1] = safe_close(pair[1]);
 
-        assert_se(receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd) == 0);
+        ASSERT_OK_ZERO(receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd));
 
-        assert_se(fd >= 0);
-        ssize_t n = read(fd, buf, sizeof(buf)-1);
-        assert_se(n >= 0);
+        ASSERT_OK(fd);
+        ssize_t n = ASSERT_OK_ERRNO(read(fd, buf, sizeof(buf)-1));
         buf[n] = 0;
         ASSERT_STREQ(buf, file_contents);
+
+        /* recvmsg_safe() implies MSG_CMSG_CLOEXEC */
+        int fl = ASSERT_OK_ERRNO(fcntl(fd, F_GETFD));
+        ASSERT_TRUE(FLAGS_SET(fl, FD_CLOEXEC));
+}
+
+TEST(recvmsg_safe_packet) {
+        /* AF_PACKET refuses MSG_CMSG_CLOEXEC with EINVAL, recvmsg_safe() must only pass it for AF_UNIX */
+        _cleanup_close_ int fd = socket(AF_PACKET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
+        if (fd < 0) {
+                if (ERRNO_IS_PRIVILEGE(errno) || ERRNO_IS_NOT_SUPPORTED(errno))
+                        return (void) log_tests_skipped_errno(errno, "Failed to create AF_PACKET socket");
+                ASSERT_OK_ERRNO(fd);
+        }
+
+        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(int))) control = {};
+        char buf[1];
+        struct msghdr msg = {
+                .msg_iov = &IOVEC_MAKE(buf, sizeof(buf)),
+                .msg_iovlen = 1,
+                .msg_control = &control,
+                .msg_controllen = sizeof(control),
+        };
+
+        ASSERT_ERROR(recvmsg_safe(fd, &msg, MSG_DONTWAIT), EAGAIN);
+}
+
+static int make_loopback_udp_socket(union sockaddr_union *ret) {
+        assert(ret);
+
+        _cleanup_close_ int fd = ASSERT_OK_ERRNO(socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0));
+        union sockaddr_union sa = {
+                .in.sin_family = AF_INET,
+                .in.sin_addr.s_addr = htobe32(INADDR_LOOPBACK),
+        };
+        socklen_t salen = sizeof(sa.in);
+
+        /* The loopback interface is down when running in a network namespace without networking, e.g. in
+         * package build sandboxes. Depending on the kernel either bind() fails then, or bind() succeeds
+         * but routing to the address fails. Check both, the latter via a connect() on a scratch
+         * socket. */
+        int r = RET_NERRNO(bind(fd, &sa.sa, salen));
+        if (r >= 0) {
+                ASSERT_OK_ERRNO(getsockname(fd, &sa.sa, &salen));
+
+                _cleanup_close_ int probe_fd = ASSERT_OK_ERRNO(socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, 0));
+                r = RET_NERRNO(connect(probe_fd, &sa.sa, salen));
+        }
+        if (IN_SET(r, -EADDRNOTAVAIL, -ENETUNREACH)) {
+                log_tests_skipped_errno(r, "Loopback address not available");
+                return r;
+        }
+        ASSERT_OK(r);
+
+        *ret = sa;
+        return TAKE_FD(fd);
+}
+
+TEST(recvmsg_safe_short_name) {
+        union sockaddr_union sa;
+        _cleanup_close_ int fd = make_loopback_udp_socket(&sa);
+        if (fd < 0)
+                return;
+
+        _cleanup_close_ int sender_fd = ASSERT_OK_ERRNO(socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, 0));
+
+        /* The kernel reports the full address length in msg_namelen even if the buffer is shorter, and
+         * silently truncates the address. Such a truncated address must be refused. */
+        socklen_t size;
+        FOREACH_ARGUMENT(size, sizeof(sa_family_t) - 1, sizeof(struct sockaddr_in) - 1) {
+                union sockaddr_union peer = {};
+                char buf[4];
+                struct msghdr msg = {
+                        .msg_name = &peer,
+                        .msg_namelen = size,
+                        .msg_iov = &IOVEC_MAKE(buf, sizeof(buf)),
+                        .msg_iovlen = 1,
+                };
+
+                ASSERT_OK_EQ_ERRNO(sendto(sender_fd, "foo", 4, /* flags= */ 0, &sa.sa, sizeof(sa.in)), (ssize_t) 4);
+                ASSERT_OK_POSITIVE(fd_wait_for_event(fd, POLLIN, 5 * USEC_PER_SEC));
+                ASSERT_ERROR(recvmsg_safe(fd, &msg, MSG_DONTWAIT), ENOTNAM);
+                ASSERT_EQ(msg.msg_namelen, (socklen_t) sizeof(struct sockaddr_in));
+        }
+
+        /* The datagrams were consumed */
+        ASSERT_OK_ZERO(fd_wait_for_event(fd, POLLIN, /* timeout= */ 0));
+}
+
+static void send_udp_from_port_zero(int raw_fd, uint16_t dest_port) {
+        struct {
+                struct udphdr udp;
+                char payload[4];
+        } _packed_ packet = {
+                .udp.source = 0,
+                .udp.dest = htobe16(dest_port),
+                .udp.len = htobe16(sizeof(packet)),
+                .udp.check = 0, /* no checksum, valid for IPv4 */
+                .payload = "foo",
+        };
+        union sockaddr_union sa = {
+                .in.sin_family = AF_INET,
+                .in.sin_addr.s_addr = htobe32(INADDR_LOOPBACK),
+        };
+
+        ASSERT_OK_EQ_ERRNO(sendto(raw_fd, &packet, sizeof(packet), /* flags= */ 0, &sa.sa, sizeof(sa.in)), (ssize_t) sizeof(packet));
+}
+
+TEST(recvmsg_safe_port_zero) {
+        _cleanup_close_ int raw_fd = socket(AF_INET, SOCK_RAW|SOCK_CLOEXEC, IPPROTO_UDP);
+        if (raw_fd < 0) {
+                if (ERRNO_IS_PRIVILEGE(errno) || ERRNO_IS_NOT_SUPPORTED(errno))
+                        return (void) log_tests_skipped_errno(errno, "Failed to create raw UDP socket");
+                ASSERT_OK_ERRNO(raw_fd);
+        }
+
+        union sockaddr_union sa;
+        _cleanup_close_ int fd = make_loopback_udp_socket(&sa);
+        if (fd < 0)
+                return;
+        uint16_t port = be16toh(sa.in.sin_port);
+        ASSERT_GT(port, 0u);
+
+        union sockaddr_union peer;
+        char buf[16];
+        struct msghdr msg = {
+                .msg_name = &peer,
+                .msg_iov = &IOVEC_MAKE(buf, sizeof(buf)),
+                .msg_iovlen = 1,
+        };
+
+        /* A datagram from port 0 is suppressed, and with MSG_PEEK also dropped from the queue */
+        send_udp_from_port_zero(raw_fd, port);
+        ASSERT_OK_POSITIVE(fd_wait_for_event(fd, POLLIN, 5 * USEC_PER_SEC));
+        msg.msg_namelen = sizeof(peer);
+        ASSERT_ERROR(recvmsg_safe(fd, &msg, MSG_PEEK|MSG_DONTWAIT), EAGAIN);
+        ASSERT_OK_ZERO(fd_wait_for_event(fd, POLLIN, /* timeout= */ 0));
+
+        /* Same without MSG_PEEK */
+        send_udp_from_port_zero(raw_fd, port);
+        ASSERT_OK_POSITIVE(fd_wait_for_event(fd, POLLIN, 5 * USEC_PER_SEC));
+        msg.msg_namelen = sizeof(peer);
+        ASSERT_ERROR(recvmsg_safe(fd, &msg, MSG_DONTWAIT), EAGAIN);
+        ASSERT_OK_ZERO(fd_wait_for_event(fd, POLLIN, /* timeout= */ 0));
+
+        /* With RECVMSG_SAFE_ALLOW_PORT_ZERO it is let through */
+        send_udp_from_port_zero(raw_fd, port);
+        ASSERT_OK_POSITIVE(fd_wait_for_event(fd, POLLIN, 5 * USEC_PER_SEC));
+        msg.msg_namelen = sizeof(peer);
+        ASSERT_OK_EQ(recvmsg_safe_full(fd, &msg, MSG_DONTWAIT, RECVMSG_SAFE_ALLOW_PORT_ZERO), (ssize_t) 4);
+        ASSERT_EQ(peer.sa.sa_family, AF_INET);
+        ASSERT_EQ(peer.in.sin_port, 0);
+
+        /* Without a msg_name we cannot know the port, hence the datagram is let through */
+        send_udp_from_port_zero(raw_fd, port);
+        ASSERT_OK_POSITIVE(fd_wait_for_event(fd, POLLIN, 5 * USEC_PER_SEC));
+        msg.msg_name = NULL;
+        msg.msg_namelen = 0;
+        ASSERT_OK_EQ(recvmsg_safe(fd, &msg, MSG_DONTWAIT), (ssize_t) 4);
+        msg.msg_name = &peer;
+
+        /* A datagram from a regular port is let through */
+        _cleanup_close_ int sender_fd = ASSERT_OK_ERRNO(socket(AF_INET, SOCK_DGRAM|SOCK_CLOEXEC, 0));
+        ASSERT_OK_EQ_ERRNO(sendto(sender_fd, "bar", 4, /* flags= */ 0, &sa.sa, sizeof(sa.in)), (ssize_t) 4);
+        ASSERT_OK_POSITIVE(fd_wait_for_event(fd, POLLIN, 5 * USEC_PER_SEC));
+        msg.msg_namelen = sizeof(peer);
+        ASSERT_OK_EQ(recvmsg_safe(fd, &msg, MSG_DONTWAIT), (ssize_t) 4);
+        ASSERT_STREQ(buf, "bar");
+        ASSERT_EQ(peer.sa.sa_family, AF_INET);
+        ASSERT_NE(peer.in.sin_port, 0);
 }
 
 TEST(passfd_contents_read) {
@@ -258,9 +476,9 @@ TEST(passfd_contents_read) {
         static const char wire_contents[] = "test contents on the wire";
         int r;
 
-        assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) >= 0);
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
 
-        r = ASSERT_OK(pidref_safe_fork("(passfd_contents_read)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
+        r = ASSERT_OK(pidref_safe_fork("(passfd_contents_read)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 /* Child */
@@ -269,13 +487,12 @@ TEST(passfd_contents_read) {
 
                 pair[0] = safe_close(pair[0]);
 
-                assert_se(write_tmpfile(tmpfile, file_contents) == 0);
+                ASSERT_OK_ZERO(write_tmpfile(tmpfile, file_contents));
 
-                _cleanup_close_ int tmpfd = open(tmpfile, O_RDONLY);
-                assert_se(tmpfd >= 0);
-                assert_se(unlink(tmpfile) == 0);
+                _cleanup_close_ int tmpfd = ASSERT_OK(xopenat(AT_FDCWD, tmpfile, O_RDONLY));
+                ASSERT_OK_ERRNO(unlink(tmpfile));
 
-                assert_se(send_one_fd_iov(pair[1], tmpfd, &iov, 1, MSG_DONTWAIT) > 0);
+                ASSERT_OK_POSITIVE(send_one_fd_iov(pair[1], tmpfd, &iov, 1, MSG_DONTWAIT));
                 _exit(EXIT_SUCCESS);
         }
 
@@ -287,14 +504,12 @@ TEST(passfd_contents_read) {
 
         pair[1] = safe_close(pair[1]);
 
-        k = receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd);
-        assert_se(k > 0);
+        k = ASSERT_OK_POSITIVE(receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd));
         buf[k] = 0;
         ASSERT_STREQ(buf, wire_contents);
 
-        assert_se(fd >= 0);
-        r = read(fd, buf, sizeof(buf)-1);
-        assert_se(r >= 0);
+        ASSERT_OK(fd);
+        r = ASSERT_OK_ERRNO(read(fd, buf, sizeof(buf)-1));
         buf[r] = 0;
         ASSERT_STREQ(buf, file_contents);
 }
@@ -304,10 +519,9 @@ TEST(receive_nopassfd) {
         static const char wire_contents[] = "no fd passed here";
         int r;
 
-        assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) >= 0);
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
 
-        r = ASSERT_OK(pidref_safe_fork("(receive_nopassfd)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
-        assert_se(r >= 0);
+        r = ASSERT_OK(pidref_safe_fork("(receive_nopassfd)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 /* Child */
@@ -315,7 +529,7 @@ TEST(receive_nopassfd) {
 
                 pair[0] = safe_close(pair[0]);
 
-                assert_se(send_one_fd_iov(pair[1], -1, &iov, 1, MSG_DONTWAIT) > 0);
+                ASSERT_OK_POSITIVE(send_one_fd_iov(pair[1], -1, &iov, 1, MSG_DONTWAIT));
                 _exit(EXIT_SUCCESS);
         }
 
@@ -327,28 +541,27 @@ TEST(receive_nopassfd) {
 
         pair[1] = safe_close(pair[1]);
 
-        k = receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd);
-        assert_se(k > 0);
+        k = ASSERT_OK_POSITIVE(receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd));
         buf[k] = 0;
         ASSERT_STREQ(buf, wire_contents);
 
         /* no fd passed here, confirm it was reset */
-        assert_se(fd == -EBADF);
+        ASSERT_EQ(fd, -EBADF);
 }
 
 TEST(send_nodata_nofd) {
         _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         int r;
 
-        assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) >= 0);
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
 
-        r = ASSERT_OK(pidref_safe_fork("(send_nodata_nofd)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
+        r = ASSERT_OK(pidref_safe_fork("(send_nodata_nofd)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 /* Child */
                 pair[0] = safe_close(pair[0]);
 
-                assert_se(send_one_fd_iov(pair[1], -1, NULL, 0, MSG_DONTWAIT) == -EINVAL);
+                ASSERT_ERROR(send_one_fd_iov(pair[1], -1, NULL, 0, MSG_DONTWAIT), EINVAL);
                 _exit(EXIT_SUCCESS);
         }
 
@@ -356,32 +569,30 @@ TEST(send_nodata_nofd) {
         char buf[64];
         struct iovec iov = IOVEC_MAKE(buf, sizeof(buf)-1);
         int fd = -999;
-        ssize_t k;
 
         pair[1] = safe_close(pair[1]);
 
-        k = receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd);
         /* recvmsg() will return errno EAGAIN if nothing was sent */
-        assert_se(k == -EAGAIN);
+        ASSERT_ERROR(receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd), EAGAIN);
 
         /* receive_one_fd_iov returned error, so confirm &fd wasn't touched */
-        assert_se(fd == -999);
+        ASSERT_EQ(fd, -999);
 }
 
 TEST(send_emptydata) {
         _cleanup_close_pair_ int pair[2] = EBADF_PAIR;
         int r;
 
-        assert_se(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) >= 0);
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair));
 
-        r = ASSERT_OK(pidref_safe_fork("(send_emptydata)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, NULL));
+        r = ASSERT_OK(pidref_safe_fork("(send_emptydata)", FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT, /* ret= */ NULL));
 
         if (r == 0) {
                 /* Child */
                 pair[0] = safe_close(pair[0]);
 
                 /* This will succeed, since iov is set. */
-                assert_se(send_one_fd_iov(pair[1], -1, &iovec_empty, 1, MSG_DONTWAIT) == 0);
+                ASSERT_OK_ZERO(send_one_fd_iov(pair[1], -1, &iovec_empty, 1, MSG_DONTWAIT));
                 _exit(EXIT_SUCCESS);
         }
 
@@ -389,16 +600,14 @@ TEST(send_emptydata) {
         char buf[64];
         struct iovec iov = IOVEC_MAKE(buf, sizeof(buf)-1);
         int fd = -999;
-        ssize_t k;
 
         pair[1] = safe_close(pair[1]);
 
-        k = receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd);
         /* receive_one_fd_iov() returns -EIO if an fd is not found and no data was returned. */
-        assert_se(k == -EIO);
+        ASSERT_ERROR(receive_one_fd_iov(pair[0], &iov, 1, MSG_DONTWAIT, &fd), EIO);
 
         /* receive_one_fd_iov returned error, so confirm &fd wasn't touched */
-        assert_se(fd == -999);
+        ASSERT_EQ(fd, -999);
 }
 
 TEST(flush_accept) {
@@ -407,59 +616,49 @@ TEST(flush_accept) {
         union sockaddr_union lsa;
         socklen_t l;
 
-        listen_stream = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
-        assert_se(listen_stream >= 0);
+        ASSERT_OK_ERRNO(listen_stream = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0));
+        ASSERT_OK_ERRNO(listen_dgram = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0));
+        ASSERT_OK_ERRNO(listen_seqpacket = socket(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK, 0));
 
-        listen_dgram = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
-        assert_se(listen_dgram >= 0);
+        ASSERT_FAIL(flush_accept(listen_stream));
+        ASSERT_FAIL(flush_accept(listen_dgram));
+        ASSERT_FAIL(flush_accept(listen_seqpacket));
 
-        listen_seqpacket = socket(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
-        assert_se(listen_seqpacket >= 0);
+        ASSERT_OK_ERRNO(bind(listen_stream, &sa.sa, sizeof(sa_family_t)));
+        ASSERT_OK_ERRNO(bind(listen_dgram, &sa.sa, sizeof(sa_family_t)));
+        ASSERT_OK_ERRNO(bind(listen_seqpacket, &sa.sa, sizeof(sa_family_t)));
 
-        assert_se(flush_accept(listen_stream) < 0);
-        assert_se(flush_accept(listen_dgram) < 0);
-        assert_se(flush_accept(listen_seqpacket) < 0);
+        ASSERT_FAIL(flush_accept(listen_stream));
+        ASSERT_FAIL(flush_accept(listen_dgram));
+        ASSERT_FAIL(flush_accept(listen_seqpacket));
 
-        assert_se(bind(listen_stream, &sa.sa, sizeof(sa_family_t)) >= 0);
-        assert_se(bind(listen_dgram, &sa.sa, sizeof(sa_family_t)) >= 0);
-        assert_se(bind(listen_seqpacket, &sa.sa, sizeof(sa_family_t)) >= 0);
+        ASSERT_OK_ERRNO(listen(listen_stream, SOMAXCONN_DELUXE));
+        ASSERT_FAIL(listen(listen_dgram, SOMAXCONN_DELUXE));
+        ASSERT_OK_ERRNO(listen(listen_seqpacket, SOMAXCONN_DELUXE));
 
-        assert_se(flush_accept(listen_stream) < 0);
-        assert_se(flush_accept(listen_dgram) < 0);
-        assert_se(flush_accept(listen_seqpacket) < 0);
+        ASSERT_OK(flush_accept(listen_stream));
+        ASSERT_FAIL(flush_accept(listen_dgram));
+        ASSERT_OK(flush_accept(listen_seqpacket));
 
-        assert_se(listen(listen_stream, SOMAXCONN_DELUXE) >= 0);
-        assert_se(listen(listen_dgram, SOMAXCONN_DELUXE) < 0);
-        assert_se(listen(listen_seqpacket, SOMAXCONN_DELUXE) >= 0);
-
-        assert_se(flush_accept(listen_stream) >= 0);
-        assert_se(flush_accept(listen_dgram) < 0);
-        assert_se(flush_accept(listen_seqpacket) >= 0);
-
-        connect_stream = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
-        assert_se(connect_stream >= 0);
-
-        connect_dgram = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
-        assert_se(connect_dgram >= 0);
-
-        connect_seqpacket = socket(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK, 0);
-        assert_se(connect_seqpacket >= 0);
+        ASSERT_OK_ERRNO(connect_stream = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0));
+        ASSERT_OK_ERRNO(connect_dgram = socket(AF_UNIX, SOCK_DGRAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0));
+        ASSERT_OK_ERRNO(connect_seqpacket = socket(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC|SOCK_NONBLOCK, 0));
 
         l = sizeof(lsa);
-        assert_se(getsockname(listen_stream, &lsa.sa, &l) >= 0);
-        assert_se(connect(connect_stream, &lsa.sa, l) >= 0);
+        ASSERT_OK_ERRNO(getsockname(listen_stream, &lsa.sa, &l));
+        ASSERT_OK_ERRNO(connect(connect_stream, &lsa.sa, l));
 
         l = sizeof(lsa);
-        assert_se(getsockname(listen_dgram, &lsa.sa, &l) >= 0);
-        assert_se(connect(connect_dgram, &lsa.sa, l) >= 0);
+        ASSERT_OK_ERRNO(getsockname(listen_dgram, &lsa.sa, &l));
+        ASSERT_OK_ERRNO(connect(connect_dgram, &lsa.sa, l));
 
         l = sizeof(lsa);
-        assert_se(getsockname(listen_seqpacket, &lsa.sa, &l) >= 0);
-        assert_se(connect(connect_seqpacket, &lsa.sa, l) >= 0);
+        ASSERT_OK_ERRNO(getsockname(listen_seqpacket, &lsa.sa, &l));
+        ASSERT_OK_ERRNO(connect(connect_seqpacket, &lsa.sa, l));
 
-        assert_se(flush_accept(listen_stream) >= 0);
-        assert_se(flush_accept(listen_dgram) < 0);
-        assert_se(flush_accept(listen_seqpacket) >= 0);
+        ASSERT_OK(flush_accept(listen_stream));
+        ASSERT_FAIL(flush_accept(listen_dgram));
+        ASSERT_OK(flush_accept(listen_seqpacket));
 }
 
 TEST(ipv6_enabled) {
@@ -474,39 +673,35 @@ TEST(sockaddr_un_set_path) {
         union sockaddr_union sa;
         _cleanup_close_ int fd1, fd2, fd3;
 
-        assert_se(mkdtemp_malloc("/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaXXXXXX", &t) >= 0);
-        assert_se(strlen(t) > SUN_PATH_LEN);
+        ASSERT_OK(mkdtemp_malloc("/tmp/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaXXXXXX", &t));
+        ASSERT_GT(strlen(t), SUN_PATH_LEN);
 
-        assert_se(j = path_join(t, "sock"));
-        assert_se(sockaddr_un_set_path(&sa.un, j) == -ENAMETOOLONG); /* too long for AF_UNIX socket */
+        ASSERT_NOT_NULL(j = path_join(t, "sock"));
+        ASSERT_ERROR(sockaddr_un_set_path(&sa.un, j), ENAMETOOLONG); /* too long for AF_UNIX socket */
 
-        assert_se(asprintf(&sh, "/tmp/%" PRIx64, random_u64()) >= 0);
-        assert_se(symlink(t, sh) >= 0); /* create temporary symlink, to access it anyway */
+        ASSERT_OK_ERRNO(asprintf(&sh, "/tmp/%" PRIx64, random_u64()));
+        ASSERT_OK_ERRNO(symlink(t, sh)); /* create temporary symlink, to access it anyway */
 
         free(j);
-        assert_se(j = path_join(sh, "sock"));
-        assert_se(sockaddr_un_set_path(&sa.un, j) >= 0);
+        ASSERT_NOT_NULL(j = path_join(sh, "sock"));
+        ASSERT_OK(sockaddr_un_set_path(&sa.un, j));
 
-        fd1 = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
-        assert_se(fd1 >= 0);
-        assert_se(bind(fd1, &sa.sa, sockaddr_len(&sa)) >= 0);
-        assert_se(listen(fd1, 1) >= 0);
+        ASSERT_OK_ERRNO(fd1 = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0));
+        ASSERT_OK_ERRNO(bind(fd1, &sa.sa, sockaddr_len(&sa)));
+        ASSERT_OK_ERRNO(listen(fd1, 1));
 
         sh = unlink_and_free(sh); /* remove temporary symlink */
 
-        fd2 = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0);
-        assert_se(fd2 >= 0);
-        assert_se(connect(fd2, &sa.sa, sockaddr_len(&sa)) < 0);
-        assert_se(errno == ENOENT); /* we removed the symlink, must fail */
+        ASSERT_OK_ERRNO(fd2 = socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0));
+        ASSERT_ERROR_ERRNO(connect(fd2, &sa.sa, sockaddr_len(&sa)), ENOENT); /* we removed the symlink, must fail */
 
         free(j);
-        assert_se(j = path_join(t, "sock"));
+        ASSERT_NOT_NULL(j = path_join(t, "sock"));
 
-        fd3 = open(j, O_CLOEXEC|O_PATH|O_NOFOLLOW);
-        assert_se(fd3 > 0);
-        assert_se(sockaddr_un_set_path(&sa.un, FORMAT_PROC_FD_PATH(fd3)) >= 0); /* connect via O_PATH instead, circumventing 108ch limit */
+        ASSERT_OK(fd3 = xopenat(AT_FDCWD, j, O_PATH|O_NOFOLLOW));
+        ASSERT_OK(sockaddr_un_set_path(&sa.un, FORMAT_PROC_FD_PATH(fd3))); /* connect via O_PATH instead, circumventing 108ch limit */
 
-        assert_se(connect(fd2, &sa.sa, sockaddr_len(&sa)) >= 0);
+        ASSERT_OK_ERRNO(connect(fd2, &sa.sa, sockaddr_len(&sa)));
 }
 
 TEST(getpeerpidref) {
@@ -528,6 +723,105 @@ TEST(getpeerpidref) {
         ASSERT_TRUE(!pidref_equal(&pidref_self, &pidref_pid1));
         ASSERT_TRUE(!pidref_equal(&pidref1, &pidref_pid1));
         ASSERT_TRUE(!pidref_equal(&pidref0, &pidref_pid1));
+}
+
+typedef struct SocketpairThread {
+        int sync_fd;
+        int *fd;
+        pid_t tid;
+} SocketpairThread;
+
+static void* socketpair_thread(void *p) {
+        SocketpairThread *t = ASSERT_PTR(p);
+        char x;
+
+        t->tid = gettid();
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, t->fd));
+
+        /* let main thread know the socket pair exists */
+        ASSERT_OK_EQ_ERRNO(write(t->sync_fd, &(const char) { 'x' }, 1), 1);
+
+        /* stay alive until the main thread is done looking at us */
+        ASSERT_OK_EQ_ERRNO(read(t->sync_fd, &x, 1), 1);
+        return NULL;
+}
+
+TEST(getpeerpidfd_thread) {
+        _cleanup_close_pair_ int sync_fd[2] = EBADF_PAIR, fd[2] = EBADF_PAIR;
+        SocketpairThread t = { .fd = fd };
+        pthread_t thread;
+        char x;
+        int r;
+
+        /* Make some doorbells for chatting with the child thread */
+        ASSERT_OK_ERRNO(socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, sync_fd));
+        t.sync_fd = sync_fd[0];
+
+        _cleanup_close_ int pidfd = getpeerpidfd(sync_fd[0]);
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(pidfd))
+                return (void) log_tests_skipped_errno(pidfd, "SO_PEERPIDFD not supported");
+        ASSERT_OK(pidfd);
+
+        /* Have the child thread start to fill out its info and create its own socketpair */
+        ASSERT_EQ(pthread_create(&thread, NULL, &socketpair_thread, &t), 0);
+        ASSERT_OK_EQ_ERRNO(read(sync_fd[1], &x, 1), 1);
+        ASSERT_NE(t.tid, getpid_cached());
+
+        /* Make sure SO_PEERPIDFD returns the thread-group leader still on the child's socketpair */
+        _cleanup_(pidref_done) PidRef leader = PIDREF_NULL, self = PIDREF_NULL;
+        r = ASSERT_OK(getpeerpidfd(fd[0]));
+        ASSERT_OK(pidref_set_pidfd_consume(&leader, r));
+        ASSERT_OK(pidref_set_self(&self));
+        ASSERT_TRUE(pidref_equal(&leader, &self));
+
+        /* Make sure SO_PEERPIDFD_THREAD is returning the thread id on the child's socketpair */
+        _cleanup_(pidref_done) PidRef tidref = PIDREF_NULL;
+        r = getpeerpidfd_full(fd[0], PIDFD_THREAD);
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
+                log_tests_skipped_errno(r, "SO_PEERPIDFD_THREAD not supported");
+        else {
+                ASSERT_OK(r);
+                ASSERT_OK(pidref_set_pidfd_consume(&tidref, r));
+                ASSERT_EQ(tidref.pid, t.tid);
+
+                /* Confirm that the pidfd still shows us as the tgid field */
+                struct pidfd_info info = { .mask = PIDFD_INFO_PID };
+                ASSERT_OK(pidfd_get_info(tidref.fd, &info));
+                ASSERT_EQ((pid_t) info.tgid, getpid_cached());
+        }
+
+        ASSERT_OK_EQ_ERRNO(write(sync_fd[1], &(const char) { 'x' }, 1), 1);
+        ASSERT_EQ(pthread_join(thread, NULL), 0);
+}
+
+TEST(tos_to_priority) {
+        ASSERT_EQ(tos_to_priority(IPTOS_CLASS_CS7), TC_PRIO_CONTROL);
+        ASSERT_EQ(tos_to_priority(IPTOS_CLASS_CS6), TC_PRIO_CONTROL);
+        ASSERT_EQ(tos_to_priority(IPTOS_CLASS_CS5), TC_PRIO_INTERACTIVE);
+        ASSERT_EQ(tos_to_priority(IPTOS_CLASS_CS4), TC_PRIO_INTERACTIVE);
+        ASSERT_EQ(tos_to_priority(IPTOS_CLASS_CS3), TC_PRIO_INTERACTIVE_BULK);
+        ASSERT_EQ(tos_to_priority(IPTOS_CLASS_CS2), TC_PRIO_INTERACTIVE_BULK);
+        ASSERT_EQ(tos_to_priority(IPTOS_CLASS_CS1), TC_PRIO_BULK);
+        ASSERT_EQ(tos_to_priority(IPTOS_CLASS_CS0), TC_PRIO_BESTEFFORT);
+
+        /* check if lower bits are correctly filtered. */
+        ASSERT_EQ(tos_to_priority(IPTOS_CLASS_CS7 | IPTOS_LOWDELAY), TC_PRIO_CONTROL);
+        ASSERT_EQ(tos_to_priority(IPTOS_CLASS_CS1 | IPTOS_LOWCOST), TC_PRIO_BULK);
+
+        ASSERT_EQ(tos_to_priority(0x00), TC_PRIO_BESTEFFORT);
+        ASSERT_EQ(tos_to_priority(0xff), TC_PRIO_CONTROL);
+}
+
+TEST(socket_xattr_supported) {
+        int r;
+
+        r = socket_xattr_supported();
+        ASSERT_OK(r);
+
+        log_info("Extended attributes on socket inodes supported: %s", yes_no(r));
+
+        /* A second call must agree with the first. */
+        ASSERT_EQ(socket_xattr_supported(), r);
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

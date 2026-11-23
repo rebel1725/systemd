@@ -2,16 +2,12 @@
 
 #include <syslog.h>
 
-#include "sd-dlopen.h"
-
 #include "log.h"
 #include "module-util.h"
 #include "proc-cmdline.h"
 #include "strv.h"
 
 #if HAVE_KMOD
-
-static void *libkmod_dl = NULL;
 
 DLSYM_PROTOTYPE(kmod_list_next) = NULL;
 DLSYM_PROTOTYPE(kmod_load_resources) = NULL;
@@ -26,32 +22,6 @@ DLSYM_PROTOTYPE(kmod_new) = NULL;
 DLSYM_PROTOTYPE(kmod_set_log_fn) = NULL;
 DLSYM_PROTOTYPE(kmod_unref) = NULL;
 DLSYM_PROTOTYPE(kmod_validate_resources) = NULL;
-
-int dlopen_libkmod(void) {
-        SD_ELF_NOTE_DLOPEN(
-                        "kmod",
-                        "Support for loading kernel modules",
-                        SD_ELF_NOTE_DLOPEN_PRIORITY_RECOMMENDED,
-                        "libkmod.so.2");
-
-        return dlopen_many_sym_or_warn(
-                        &libkmod_dl,
-                        "libkmod.so.2",
-                        LOG_DEBUG,
-                        DLSYM_ARG(kmod_list_next),
-                        DLSYM_ARG(kmod_load_resources),
-                        DLSYM_ARG(kmod_module_get_initstate),
-                        DLSYM_ARG(kmod_module_get_module),
-                        DLSYM_ARG(kmod_module_get_name),
-                        DLSYM_ARG(kmod_module_new_from_lookup),
-                        DLSYM_ARG(kmod_module_probe_insert_module),
-                        DLSYM_ARG(kmod_module_unref),
-                        DLSYM_ARG(kmod_module_unref_list),
-                        DLSYM_ARG(kmod_new),
-                        DLSYM_ARG(kmod_set_log_fn),
-                        DLSYM_ARG(kmod_unref),
-                        DLSYM_ARG(kmod_validate_resources));
-}
 
 static int parse_proc_cmdline_item(const char *key, const char *value, void *data) {
         char ***denylist = ASSERT_PTR(data);
@@ -131,7 +101,7 @@ int module_load_and_warn(struct kmod_ctx *ctx, const char *module, bool verbose)
 
                                 if (err == -EPERM) {
                                         if (!denylist_parsed) {
-                                                r = proc_cmdline_parse(parse_proc_cmdline_item, &denylist, 0);
+                                                r = proc_cmdline_parse(parse_proc_cmdline_item, &denylist, /* flags= */ 0);
                                                 if (r < 0)
                                                         log_full_errno(!verbose ? LOG_DEBUG : LOG_WARNING,
                                                                        r,
@@ -171,7 +141,7 @@ _printf_(6,0) static void systemd_kmod_log(
                 const char *format,
                 va_list args) {
 
-        log_internalv(priority, 0, file, line, fn, format, args);
+        log_internalv(priority, /* error= */ 0, file, line, fn, format, args);
 }
 
 int module_setup_context(struct kmod_ctx **ret) {
@@ -180,19 +150,48 @@ int module_setup_context(struct kmod_ctx **ret) {
 
         assert(ret);
 
-        r = dlopen_libkmod();
+        r = dlopen_libkmod(LOG_DEBUG);
         if (r < 0)
                 return r;
 
-        ctx = sym_kmod_new(NULL, NULL);
+        ctx = sym_kmod_new(/* dirname= */ NULL, /* config_paths= */ NULL);
         if (!ctx)
                 return -ENOMEM;
 
         (void) sym_kmod_load_resources(ctx);
-        sym_kmod_set_log_fn(ctx, systemd_kmod_log, NULL);
+        sym_kmod_set_log_fn(ctx, systemd_kmod_log, /* data= */ NULL);
 
         *ret = TAKE_PTR(ctx);
         return 0;
 }
 
 #endif
+
+int dlopen_libkmod(int log_level) {
+#if HAVE_KMOD
+        static void *libkmod_dl = NULL;
+
+        LIBKMOD_NOTE(suggested);
+
+        return dlopen_many_sym_or_warn(
+                        &libkmod_dl,
+                        "libkmod.so.2",
+                        log_level,
+                        DLSYM_ARG(kmod_list_next),
+                        DLSYM_ARG(kmod_load_resources),
+                        DLSYM_ARG(kmod_module_get_initstate),
+                        DLSYM_ARG(kmod_module_get_module),
+                        DLSYM_ARG(kmod_module_get_name),
+                        DLSYM_ARG(kmod_module_new_from_lookup),
+                        DLSYM_ARG(kmod_module_probe_insert_module),
+                        DLSYM_ARG(kmod_module_unref),
+                        DLSYM_ARG(kmod_module_unref_list),
+                        DLSYM_ARG(kmod_new),
+                        DLSYM_ARG(kmod_set_log_fn),
+                        DLSYM_ARG(kmod_unref),
+                        DLSYM_ARG(kmod_validate_resources));
+#else
+        return log_full_errno(log_level, SYNTHETIC_ERRNO(EOPNOTSUPP),
+                              "libkmod support is not compiled in.");
+#endif
+}

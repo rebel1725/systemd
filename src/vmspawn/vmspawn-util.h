@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 
 #if defined(__x86_64__) || defined(__i386__) || defined(__arm__) || defined(__aarch64__)
 #  define ARCHITECTURE_SUPPORTS_SMBIOS 1
@@ -33,28 +33,103 @@
 #  define ARCHITECTURE_SUPPORTS_HPET 0
 #endif
 
+#if defined(__x86_64__) || defined(__aarch64__)
+#  define ARCHITECTURE_SUPPORTS_CXL 1
+#else
+#  define ARCHITECTURE_SUPPORTS_CXL 0
+#endif
+
+#if defined(__x86_64__) || defined(__i386__) || defined(__arm__) || defined(__aarch64__) || defined(__riscv) || defined(__loongarch64)
+#  define ARCHITECTURE_SUPPORTS_FW_CFG 1
+#else
+#  define ARCHITECTURE_SUPPORTS_FW_CFG 0
+#endif
+
+/* QEMU's fw_cfg file path buffer is FW_CFG_MAX_FILE_PATH (56) bytes including NUL */
+#define QEMU_FW_CFG_MAX_KEY_LEN 55
+
+/* These match the kernel's COMMAND_LINE_SIZE for each architecture */
+#if defined(__loongarch64)
+#  define KERNEL_CMDLINE_SIZE 4096
+#elif defined(__x86_64__) || defined(__i386__) || defined(__aarch64__)
+#  define KERNEL_CMDLINE_SIZE 2048
+#elif defined(__arm__) || defined(__riscv)
+#  define KERNEL_CMDLINE_SIZE 1024
+#else
+#  define KERNEL_CMDLINE_SIZE 512
+#endif
+
+/* ARCHITECTURE_NEEDS_PCIE_ROOT_PORTS is co-located with QEMU_MACHINE_TYPE so they stay in
+ * sync: q35 and virt machine types need pcie-root-port bridges for QMP device_add hotplug.
+ * Exception: m68k's "virt" uses virtio-mmio, not PCIe, so it doesn't need root ports. */
 #if defined(__x86_64__) || defined(__i386__)
 #  define QEMU_MACHINE_TYPE "q35"
-#elif defined(__arm__) || defined(__aarch64__) || defined(__riscv) || defined(__loongarch64) || defined(__m68k__)
+#  define ARCHITECTURE_NEEDS_PCIE_ROOT_PORTS 1
+#elif defined(__m68k__)
 #  define QEMU_MACHINE_TYPE "virt"
+#  define ARCHITECTURE_NEEDS_PCIE_ROOT_PORTS 0
+#elif defined(__arm__) || defined(__aarch64__) || defined(__riscv) || defined(__loongarch64)
+#  define QEMU_MACHINE_TYPE "virt"
+#  define ARCHITECTURE_NEEDS_PCIE_ROOT_PORTS 1
 #elif defined(__s390__) || defined(__s390x__)
 #  define QEMU_MACHINE_TYPE "s390-ccw-virtio"
+#  define ARCHITECTURE_NEEDS_PCIE_ROOT_PORTS 0
 #elif defined(__powerpc__) || defined(__powerpc64__)
 #  define QEMU_MACHINE_TYPE "pseries"
+#  define ARCHITECTURE_NEEDS_PCIE_ROOT_PORTS 0
 #elif defined(__mips__)
 #  define QEMU_MACHINE_TYPE "malta"
+#  define ARCHITECTURE_NEEDS_PCIE_ROOT_PORTS 0
 #elif defined(__sparc__)
 #  define QEMU_MACHINE_TYPE "sun4u"
+#  define ARCHITECTURE_NEEDS_PCIE_ROOT_PORTS 0
 #else
 #  define QEMU_MACHINE_TYPE "none"
+#  define ARCHITECTURE_NEEDS_PCIE_ROOT_PORTS 0
 #endif
+
+/* QEMU device that provides the UEFI variable store for firmware with the "host-uefi-vars" feature */
+#if defined(__x86_64__)
+#  define QEMU_UEFI_VARS_DEVICE "uefi-vars-x64"
+#elif defined(__aarch64__) || (defined(__riscv) && __riscv_xlen == 64) || defined(__loongarch64)
+#  define QEMU_UEFI_VARS_DEVICE "uefi-vars-sysbus"
+#else
+#  define QEMU_UEFI_VARS_DEVICE NULL
+#endif
+
+#if defined(__arm__) || defined(__aarch64__)
+#  define QEMU_SERIAL_CONSOLE_NAME "ttyAMA0"
+#else
+#  define QEMU_SERIAL_CONSOLE_NAME "ttyS0"
+#endif
+
+/* fdsets of fds passed on QEMU's command line with --add-fd. QEMU adds an fd to an existing fdset with the
+ * same ID, so the fdsets that are added later via QMP's add-fd are numbered after these. */
+typedef enum QemuFdset {
+        QEMU_FDSET_KVM,
+        QEMU_FDSET_EFI_VARS,
+        QEMU_FDSET_CONSOLE,
+        _QEMU_FDSET_MAX,
+        _QEMU_FDSET_INVALID = -EINVAL,
+} QemuFdset;
+
+#define QEMU_FDSET_PATH_MAX \
+        (STRLEN("/dev/fdset/") + DECIMAL_STR_MAX(int))
+
+char* format_qemu_fdset_path(char buf[static QEMU_FDSET_PATH_MAX], QemuFdset fdset);
+
+#define FORMAT_QEMU_FDSET_PATH(fdset) \
+        format_qemu_fdset_path((char[QEMU_FDSET_PATH_MAX]) {}, (fdset))
 
 typedef struct OvmfConfig {
         char *path;
         char *format;
         char *vars;
         char *vars_format;
-        bool supports_sb;
+        char *uefi_vars_template; /* JSON template for QEMU's uefi-vars device ("host-uefi-vars" feature) */
+        char *device;
+        char *mode;
+        char **features;
 } OvmfConfig;
 
 static inline const char* ovmf_config_format(const OvmfConfig *c) {
@@ -63,6 +138,13 @@ static inline const char* ovmf_config_format(const OvmfConfig *c) {
 
 static inline const char* ovmf_config_vars_format(const OvmfConfig *c) {
         return ASSERT_PTR(c)->vars_format ?: "raw";
+}
+
+bool ovmf_config_is_stateless(const OvmfConfig *config);
+bool ovmf_config_has_feature(const OvmfConfig *config, const char *feature);
+
+static inline bool ovmf_config_has_host_uefi_vars(const OvmfConfig *c) {
+        return ovmf_config_has_feature(c, "host-uefi-vars");
 }
 
 OvmfConfig* ovmf_config_free(OvmfConfig *ovmf_config);
@@ -87,8 +169,20 @@ DECLARE_STRING_TABLE_LOOKUP(network_stack, NetworkStack);
 int qemu_check_kvm_support(void);
 int qemu_check_vsock_support(void);
 int list_ovmf_config(char ***ret);
+int list_ovmf_firmware_features(char ***ret);
 int load_ovmf_config(const char *path, OvmfConfig **ret);
-int find_ovmf_config(int search_sb, OvmfConfig **ret);
+
+typedef enum FindOvmfConfigFlags {
+        FIND_OVMF_STATELESS   = 1 << 0, /* select stateless firmware (flash mode "stateless" or memory-mapped,
+                                         * bootable via -bios); default selects pflash firmware with an NVRAM
+                                         * template, or firmware with a template for a host-side UEFI
+                                         * variable store */
+        FIND_OVMF_REQUIRE_RAW = 1 << 1, /* skip non-raw firmware executables (-bios can't load qcow2) */
+} FindOvmfConfigFlags;
+
+int list_eligible_ovmf_config(Set *features_include, Set *features_exclude, FindOvmfConfigFlags flags, char ***ret_eligible, OvmfConfig **ret_first, sd_json_variant **ret_first_json);
+int find_ovmf_config(Set *features_include, Set *features_exclude, FindOvmfConfigFlags flags, OvmfConfig **ret, sd_json_variant **ret_firmware_json);
+int native_arch_as_qemu(const char **ret);
 int find_qemu_binary(char **ret_qemu_binary);
 int vsock_fix_child_cid(int vhost_device_fd, unsigned *machine_cid, const char *machine);
 

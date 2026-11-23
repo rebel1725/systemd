@@ -10,12 +10,14 @@
 
 #include "sd-bus.h"
 #include "sd-event.h"
+#include "sd-future.h"
 
 #include "af-list.h"
 #include "alloc-util.h"
 #include "bus-container.h"
 #include "bus-control.h"
 #include "bus-error.h"
+#include "bus-future.h"
 #include "bus-internal.h"
 #include "bus-kernel.h"
 #include "bus-label.h"
@@ -107,7 +109,7 @@ static sd_bus** bus_choose_default(int (**bus_open)(sd_bus **)) {
         /* Finally, if nothing is set use the cached connection for
          * the right scope */
 
-        if (cg_pid_get_owner_uid(0, NULL) >= 0) {
+        if (cg_pid_get_owner_uid(/* pid= */ 0, /* ret_uid= */ NULL) >= 0) {
                 if (bus_open)
                         *bus_open = sd_bus_open_user;
                 return &default_user_bus;
@@ -121,7 +123,7 @@ static sd_bus** bus_choose_default(int (**bus_open)(sd_bus **)) {
 sd_bus *bus_resolve(sd_bus *bus) {
         switch ((uintptr_t) bus) {
         case (uintptr_t) SD_BUS_DEFAULT:
-                return *(bus_choose_default(NULL));
+                return *(bus_choose_default(/* bus_open= */ NULL));
         case (uintptr_t) SD_BUS_DEFAULT_USER:
                 return default_user_bus;
         case (uintptr_t) SD_BUS_DEFAULT_SYSTEM:
@@ -193,7 +195,7 @@ static sd_bus* bus_free(sd_bus *b) {
                  * apps, but are dead. */
 
                 assert(s->floating);
-                bus_slot_disconnect(s, true);
+                bus_slot_disconnect(s, /* unref= */ true);
         }
 
         if (b->default_bus_ptr)
@@ -221,6 +223,12 @@ static sd_bus* bus_free(sd_bus *b) {
 
         ordered_hashmap_free(b->reply_callbacks);
         prioq_free(b->reply_callbacks_prioq);
+
+        /* Outstanding fiber handlers pin the bus via their BusFiberData ref, so by the time refcount
+         * reaches zero and bus_free() runs, every fiber has already resolved and removed itself from
+         * this set. */
+        assert(set_isempty(b->fiber_futures));
+        set_free(b->fiber_futures);
 
         assert(b->match_callbacks.type == BUS_MATCH_ROOT);
         bus_match_free(&b->match_callbacks);
@@ -360,8 +368,10 @@ _public_ int sd_bus_negotiate_fds(sd_bus *bus, int b) {
 _public_ int sd_bus_negotiate_timestamp(sd_bus *bus, int b) {
         assert_return(bus, -EINVAL);
         assert_return(bus = bus_resolve(bus), -ENOPKG);
-        assert_return(!IN_SET(bus->state, BUS_CLOSING, BUS_CLOSED), -EPERM);
         assert_return(!bus_origin_changed(bus), -ECHILD);
+
+        if (IN_SET(bus->state, BUS_CLOSING, BUS_CLOSED))
+                return -ENOTCONN;
 
         /* This is not actually supported by any of our transports these days, but we do honour it for synthetic
          * replies, and maybe one day classic D-Bus learns this too */
@@ -374,8 +384,10 @@ _public_ int sd_bus_negotiate_creds(sd_bus *bus, int b, uint64_t mask) {
         assert_return(bus, -EINVAL);
         assert_return(bus = bus_resolve(bus), -ENOPKG);
         assert_return(mask <= _SD_BUS_CREDS_ALL, -EINVAL);
-        assert_return(!IN_SET(bus->state, BUS_CLOSING, BUS_CLOSED), -EPERM);
         assert_return(!bus_origin_changed(bus), -ECHILD);
+
+        if (IN_SET(bus->state, BUS_CLOSING, BUS_CLOSED))
+                return -ENOTCONN;
 
         SET_FLAG(bus->creds_mask, mask, b);
 
@@ -613,7 +625,7 @@ static int bus_send_hello(sd_bus *bus) {
         if (r < 0)
                 return r;
 
-        return sd_bus_call_async(bus, NULL, m, hello_callback, NULL, 0);
+        return sd_bus_call_async(bus, /* ret_slot= */ NULL, m, hello_callback, /* userdata= */ NULL, /* usec= */ 0);
 }
 
 int bus_start_running(sd_bus *bus) {
@@ -819,6 +831,10 @@ static int parse_unix_address(sd_bus *b, const char **p, char **guid) {
 }
 
 static int parse_tcp_address(sd_bus *b, const char **p, char **guid) {
+#if BUILD_STATIC
+        return log_debug_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                               "tcp:// connections are not supported in static builds");
+#else
         _cleanup_free_ char *host = NULL, *port = NULL, *family = NULL;
         int r;
         struct addrinfo *result, hints = {
@@ -881,6 +897,7 @@ static int parse_tcp_address(sd_bus *b, const char **p, char **guid) {
         b->is_local = false;
 
         return 0;
+#endif
 }
 
 static int parse_exec_address(sd_bus *b, const char **p, char **guid) {
@@ -928,7 +945,7 @@ static int parse_exec_address(sd_bus *b, const char **p, char **guid) {
                                 n_argv = ul + 1;
                         }
 
-                        r = parse_address_key(p, NULL, argv + ul);
+                        r = parse_address_key(p, /* key= */ NULL, argv + ul);
                         if (r < 0)
                                 goto fail;
 
@@ -1194,20 +1211,20 @@ static int bus_start_fd(sd_bus *b) {
                           pi ?: "???", po ?: "???");
         }
 
-        r = fd_nonblock(b->input_fd, true);
+        r = fd_nonblock(b->input_fd, /* nonblock= */ true);
         if (r < 0)
                 return r;
 
-        r = fd_cloexec(b->input_fd, true);
+        r = fd_cloexec(b->input_fd, /* cloexec= */ true);
         if (r < 0)
                 return r;
 
         if (b->input_fd != b->output_fd) {
-                r = fd_nonblock(b->output_fd, true);
+                r = fd_nonblock(b->output_fd, /* nonblock= */ true);
                 if (r < 0)
                         return r;
 
-                r = fd_cloexec(b->output_fd, true);
+                r = fd_cloexec(b->output_fd, /* cloexec= */ true);
                 if (r < 0)
                         return r;
         }
@@ -1267,7 +1284,7 @@ _public_ int sd_bus_open_with_description(sd_bus **ret, const char *description)
 
         e = secure_getenv("DBUS_STARTER_ADDRESS");
         if (!e) {
-                if (cg_pid_get_owner_uid(0, NULL) >= 0)
+                if (cg_pid_get_owner_uid(/* pid= */ 0, /* ret_uid= */ NULL) >= 0)
                         return sd_bus_open_user_with_description(ret, description);
                 else
                         return sd_bus_open_system_with_description(ret, description);
@@ -1298,7 +1315,7 @@ _public_ int sd_bus_open_with_description(sd_bus **ret, const char *description)
 }
 
 _public_ int sd_bus_open(sd_bus **ret) {
-        return sd_bus_open_with_description(ret, NULL);
+        return sd_bus_open_with_description(ret, /* description= */ NULL);
 }
 
 int bus_set_address_system(sd_bus *b) {
@@ -1354,7 +1371,7 @@ _public_ int sd_bus_open_system_with_description(sd_bus **ret, const char *descr
 }
 
 _public_ int sd_bus_open_system(sd_bus **ret) {
-        return sd_bus_open_system_with_description(ret, NULL);
+        return sd_bus_open_system_with_description(ret, /* description= */ NULL);
 }
 
 int bus_set_address_user(sd_bus *b) {
@@ -1426,7 +1443,7 @@ _public_ int sd_bus_open_user_with_description(sd_bus **ret, const char *descrip
 }
 
 _public_ int sd_bus_open_user(sd_bus **ret) {
-        return sd_bus_open_user_with_description(ret, NULL);
+        return sd_bus_open_user_with_description(ret, /* description= */ NULL);
 }
 
 int bus_set_address_system_remote(sd_bus *b, const char *host) {
@@ -1481,7 +1498,7 @@ int bus_set_address_system_remote(sd_bus *b, const char *host) {
                 }
 
                 if (!in_charset(p, DIGITS) || *p == '\0') {
-                        if (!hostname_is_valid(p, 0) || got_forward_slash)
+                        if (!hostname_is_valid(p, /* flags= */ 0) || got_forward_slash)
                                 return -EINVAL;
 
                         m = TAKE_PTR(p);
@@ -1496,7 +1513,7 @@ int bus_set_address_system_remote(sd_bus *b, const char *host) {
 interpret_port_as_machine_old_syntax:
                 /* Let's make sure this is not a port of some kind,
                  * and is a valid machine name. */
-                if (!in_charset(m, DIGITS) && hostname_is_valid(m, 0))
+                if (!in_charset(m, DIGITS) && hostname_is_valid(m, /* flags= */ 0))
                         c = strjoina(",argv", p ? "7" : "5", "=--machine=", m);
         }
 
@@ -1809,6 +1826,9 @@ _public_ sd_bus* sd_bus_flush_close_unref(sd_bus *bus) {
 }
 
 void bus_enter_closing(sd_bus *bus, int exit_code) {
+        sd_future *f;
+        int r;
+
         assert(bus);
 
         if (!IN_SET(bus->state, BUS_WATCH_BIND, BUS_OPENING, BUS_AUTHENTICATING, BUS_HELLO, BUS_RUNNING))
@@ -1816,6 +1836,19 @@ void bus_enter_closing(sd_bus *bus, int exit_code) {
 
         bus_set_state(bus, BUS_CLOSING);
         bus->exit_code = exit_code;
+
+        /* Cancel all outstanding fiber-dispatched method handlers. Most cancellations are scheduled
+         * asynchronously (fibers resolve with -ECANCELED the next time they run), but a fiber still
+         * in FIBER_STATE_INITIAL resolves synchronously, which fires bus_fiber_resolved() and
+         * removes f from this set mid-iteration. That's safe because SET_FOREACH permits removal of
+         * exactly the current entry — see the assertion in hashmap_iterate_entry(). Either way this
+         * doesn't block here: process_closing() waits for the fiber_futures set to drain before it
+         * continues tearing down the rest of the bus. */
+        SET_FOREACH(f, bus->fiber_futures) {
+                r = sd_future_cancel(f);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to cancel outstanding fiber method handler, ignoring: %m");
+        }
 }
 
 /* Define manually so we can add the PID check */
@@ -2013,7 +2046,7 @@ int bus_seal_synthetic_message(sd_bus *b, sd_bus_message *m) {
          * synthetic messages might have a fake sender and we don't
          * want to interfere with the real sender's serial numbers we
          * pick a fixed, artificial one. */
-        return sd_bus_message_seal(m, UINT32_MAX, 0);
+        return sd_bus_message_seal(m, UINT32_MAX, /* timeout_usec= */ 0);
 }
 
 static int bus_write_message(sd_bus *bus, sd_bus_message *m, size_t *idx) {
@@ -2021,6 +2054,7 @@ static int bus_write_message(sd_bus *bus, sd_bus_message *m, size_t *idx) {
 
         assert(bus);
         assert(m);
+        assert(idx);
 
         r = bus_socket_write_message(bus, m, idx);
         if (r <= 0)
@@ -2165,7 +2199,7 @@ _public_ int sd_bus_send(sd_bus *bus, sd_bus_message *_m, uint64_t *ret_cookie) 
         if (!ret_cookie && !m->sealed)
                 m->header->flags |= BUS_MESSAGE_NO_REPLY_EXPECTED;
 
-        r = bus_seal_message(bus, m, 0);
+        r = bus_seal_message(bus, m, /* timeout= */ 0);
         if (r < 0)
                 return r;
 
@@ -2366,7 +2400,7 @@ int bus_ensure_running(sd_bus *bus) {
                 if (IN_SET(bus->state, BUS_UNSET, BUS_CLOSED, BUS_CLOSING))
                         return -ENOTCONN;
 
-                r = sd_bus_process(bus, NULL);
+                r = sd_bus_process(bus, /* ret= */ NULL);
                 if (r < 0)
                         return r;
                 if (bus->state == BUS_RUNNING)
@@ -2387,22 +2421,29 @@ _public_ int sd_bus_call(
                 sd_bus_error *reterr_error,
                 sd_bus_message **ret_reply) {
 
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = sd_bus_message_ref(_m);
         usec_t timeout;
         uint64_t cookie;
         size_t i;
         int r;
 
-        bus_assert_return(m, -EINVAL, reterr_error);
-        bus_assert_return(m->header->type == SD_BUS_MESSAGE_METHOD_CALL, -EINVAL, reterr_error);
-        bus_assert_return(!(m->header->flags & BUS_MESSAGE_NO_REPLY_EXPECTED), -EINVAL, reterr_error);
+        bus_assert_return(_m, -EINVAL, reterr_error);
+        bus_assert_return(_m->header->type == SD_BUS_MESSAGE_METHOD_CALL, -EINVAL, reterr_error);
+        bus_assert_return(!(_m->header->flags & BUS_MESSAGE_NO_REPLY_EXPECTED), -EINVAL, reterr_error);
         bus_assert_return(!bus_error_is_dirty(reterr_error), -EINVAL, reterr_error);
 
         if (bus)
                 assert_return(bus = bus_resolve(bus), -ENOPKG);
         else
-                assert_return(bus = m->bus, -ENOTCONN);
+                assert_return(bus = _m->bus, -ENOTCONN);
         bus_assert_return(!bus_origin_changed(bus), -ECHILD, reterr_error);
+
+        /* If the current fiber and the bus share their event loop, we can use sd_bus_call_suspend()
+         * instead which does an async method call. This allows multiple invocations of sd_bus_call() to
+         * happen across multiple fibers at once. */
+        if (sd_fiber_is_running() && bus->event == sd_fiber_get_event())
+                return bus_call_suspend(bus, _m, usec, reterr_error, ret_reply);
+
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *m = sd_bus_message_ref(_m);
 
         if (!BUS_IS_OPEN(bus->state)) {
                 r = -ENOTCONN;
@@ -2505,7 +2546,7 @@ _public_ int sd_bus_call(
                 } else
                         left = UINT64_MAX;
 
-                r = bus_poll(bus, true, left);
+                r = bus_poll(bus, /* need_more= */ true, left);
                 if (ERRNO_IS_NEG_TRANSIENT(r))
                         continue;
                 if (r < 0)
@@ -2708,7 +2749,7 @@ static int process_timeout(sd_bus *bus) {
         bus->current_message = NULL;
 
         if (slot->floating)
-                bus_slot_disconnect(slot, true);
+                bus_slot_disconnect(slot, /* unref= */ true);
 
         sd_bus_slot_unref(slot);
 
@@ -2791,7 +2832,7 @@ static int process_reply(sd_bus *bus, sd_bus_message *m) {
 
                 m = synthetic_reply;
         } else {
-                r = sd_bus_message_rewind(m, true);
+                r = sd_bus_message_rewind(m, /* complete= */ true);
                 if (r < 0)
                         return r;
         }
@@ -2812,7 +2853,7 @@ static int process_reply(sd_bus *bus, sd_bus_message *m) {
         bus->current_slot = NULL;
 
         if (slot->floating)
-                bus_slot_disconnect(slot, true);
+                bus_slot_disconnect(slot, /* unref= */ true);
 
         sd_bus_slot_unref(slot);
 
@@ -2846,7 +2887,7 @@ static int process_filter(sd_bus *bus, sd_bus_message *m) {
 
                         l->last_iteration = bus->iteration_counter;
 
-                        r = sd_bus_message_rewind(m, true);
+                        r = sd_bus_message_rewind(m, /* complete= */ true);
                         if (r < 0)
                                 return r;
 
@@ -2933,7 +2974,7 @@ static int process_builtin(sd_bus *bus, sd_bus_message *m) {
         if (r < 0)
                 return r;
 
-        r = sd_bus_send(bus, reply, NULL);
+        r = sd_bus_send(bus, reply, /* ret_cookie= */ NULL);
         if (r < 0)
                 return r;
 
@@ -3053,7 +3094,7 @@ static int process_running(sd_bus *bus, sd_bus_message **ret) {
                 goto null_message;
 
         if (ret) {
-                r = sd_bus_message_rewind(m, true);
+                r = sd_bus_message_rewind(m, /* complete= */ true);
                 if (r < 0)
                         return r;
 
@@ -3160,7 +3201,7 @@ static int process_closing_reply_callback(sd_bus *bus, BusReplyCallback *c) {
         bus->current_message = NULL;
 
         if (slot->floating)
-                bus_slot_disconnect(slot, true);
+                bus_slot_disconnect(slot, /* unref= */ true);
 
         sd_bus_slot_unref(slot);
 
@@ -3176,7 +3217,14 @@ static int process_closing(sd_bus *bus, sd_bus_message **ret) {
         assert(bus);
         assert(bus->state == BUS_CLOSING);
 
-        /* First, fail all outstanding method calls */
+        /* Wait for any still-running fiber method handlers to finish unwinding their cancellation
+         * before tearing down the rest of the bus. bus_enter_closing() scheduled the cancel; each
+         * fiber resolves asynchronously and bus_fiber_resolved() removes it from the set. Returning
+         * 1 here keeps the bus in CLOSING state so the event loop drives the fibers to completion. */
+        if (!set_isempty(bus->fiber_futures))
+                return 1;
+
+        /* Then, fail all outstanding method calls */
         c = ordered_hashmap_first(bus->reply_callbacks);
         if (c)
                 return process_closing_reply_callback(bus, c);
@@ -3391,7 +3439,7 @@ _public_ int sd_bus_wait(sd_bus *bus, uint64_t timeout_usec) {
         if (bus->rqueue_size > 0)
                 return 0;
 
-        r = bus_poll(bus, false, timeout_usec);
+        r = bus_poll(bus, /* need_more= */ false, timeout_usec);
         if (ERRNO_IS_NEG_TRANSIENT(r))
                 return 1; /* treat EINTR as success, but let's exit, so that the caller will call back into us soon. */
 
@@ -3433,7 +3481,7 @@ _public_ int sd_bus_flush(sd_bus *bus) {
                 if (bus->wqueue_size <= 0)
                         return 0;
 
-                r = bus_poll(bus, false, UINT64_MAX);
+                r = bus_poll(bus, /* need_more= */ false, UINT64_MAX);
                 if (ERRNO_IS_NEG_TRANSIENT(r))
                         continue;
                 if (r < 0)
@@ -3482,7 +3530,7 @@ static int add_match_callback(
 
         sd_bus_slot_ref(match_slot);
 
-        if (sd_bus_message_is_method_error(m, NULL)) {
+        if (sd_bus_message_is_method_error(m, /* name= */ NULL)) {
                 const sd_bus_error *e = ASSERT_PTR(sd_bus_message_get_error(m));
                 r = sd_bus_error_get_errno(e);
 
@@ -3528,7 +3576,7 @@ static int add_match_callback(
         match_slot->match_callback.install_slot = sd_bus_slot_unref(match_slot->match_callback.install_slot);
 
         if (failed && match_slot->floating)
-                bus_slot_disconnect(match_slot, true);
+                bus_slot_disconnect(match_slot, /* unref= */ true);
 
         sd_bus_slot_unref(match_slot);
 
@@ -3627,7 +3675,7 @@ _public_ int sd_bus_add_match(
                 sd_bus_message_handler_t callback,
                 void *userdata) {
 
-        return bus_add_match_full(bus, ret_slot, false, match, callback, NULL, userdata, 0);
+        return bus_add_match_full(bus, ret_slot, /* asynchronous= */ false, match, callback, /* install_callback= */ NULL, userdata, /* timeout_usec= */ 0);
 }
 
 _public_ int sd_bus_add_match_async(
@@ -3638,7 +3686,7 @@ _public_ int sd_bus_add_match_async(
                 sd_bus_message_handler_t install_callback,
                 void *userdata) {
 
-        return bus_add_match_full(bus, ret_slot, true, match, callback, install_callback, userdata, 0);
+        return bus_add_match_full(bus, ret_slot, /* asynchronous= */ true, match, callback, install_callback, userdata, /* timeout_usec= */ 0);
 }
 
 static int io_callback(sd_event_source *s, int fd, uint32_t revents, void *userdata) {
@@ -3647,7 +3695,7 @@ static int io_callback(sd_event_source *s, int fd, uint32_t revents, void *userd
 
         /* Note that this is called both on input_fd, output_fd, as well as inotify_fd events */
 
-        r = sd_bus_process(bus, NULL);
+        r = sd_bus_process(bus, /* ret= */ NULL);
         if (r < 0) {
                 log_debug_errno(r, "Processing of bus failed, closing down: %m");
                 bus_enter_closing(bus, r);
@@ -3660,7 +3708,7 @@ static int time_callback(sd_event_source *s, uint64_t usec, void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        r = sd_bus_process(bus, NULL);
+        r = sd_bus_process(bus, /* ret= */ NULL);
         if (r < 0) {
                 log_debug_errno(r, "Processing of bus failed, closing down: %m");
                 bus_enter_closing(bus, r);
@@ -3745,7 +3793,7 @@ int bus_attach_io_events(sd_bus *bus) {
                 return 0;
 
         if (!bus->input_io_event_source) {
-                r = sd_event_add_io(bus->event, &bus->input_io_event_source, bus->input_fd, 0, io_callback, bus);
+                r = sd_event_add_io(bus->event, &bus->input_io_event_source, bus->input_fd, /* events= */ 0, io_callback, bus);
                 if (r < 0)
                         return r;
 
@@ -3768,7 +3816,7 @@ int bus_attach_io_events(sd_bus *bus) {
                 assert(bus->output_fd >= 0);
 
                 if (!bus->output_io_event_source) {
-                        r = sd_event_add_io(bus->event, &bus->output_io_event_source, bus->output_fd, 0, io_callback, bus);
+                        r = sd_event_add_io(bus->event, &bus->output_io_event_source, bus->output_fd, /* events= */ 0, io_callback, bus);
                         if (r < 0)
                                 return r;
 
@@ -3844,7 +3892,7 @@ _public_ int sd_bus_attach_event(sd_bus *bus, sd_event *event, int priority) {
 
         bus->event_priority = priority;
 
-        r = sd_event_add_time(bus->event, &bus->time_event_source, CLOCK_MONOTONIC, 0, 0, time_callback, bus);
+        r = sd_event_add_time(bus->event, &bus->time_event_source, CLOCK_MONOTONIC, /* usec= */ 0, /* accuracy= */ 0, time_callback, bus);
         if (r < 0)
                 goto fail;
 

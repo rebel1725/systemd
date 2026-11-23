@@ -11,7 +11,7 @@ set -o pipefail
 
 . /etc/os-release
 if [[ "${ID_LIKE:-}" == alpine ]]; then
-    # Alpine/postmarketOS builds libdevmapper and so on without systemd support, and seems to not wait for
+    # Alpine/Nura builds libdevmapper and so on without systemd support, and seems to not wait for
     # uevents for dm-X devices being processed by systemd-udevd. That causes a significant issue in
     # dissect-image.c especially when multiple dm-X devices are activated/deactivated in parallel.
     exit 0
@@ -19,15 +19,16 @@ fi
 
 systemd-dissect --json=short "$MINIMAL_IMAGE.raw" | \
     grep -F '{"rw":"ro","designator":"root","partition_uuid":null,"partition_label":null,"fstype":"squashfs","architecture":null,"verity":"external"' >/dev/null
+systemd-dissect --json=short "$MINIMAL_IMAGE.raw" | grep -F '"size":' >/dev/null
 systemd-dissect "$MINIMAL_IMAGE.raw" | grep -F "MARKER=1" >/dev/null
 # shellcheck disable=SC2153
 systemd-dissect "$MINIMAL_IMAGE.raw" | grep -F -f <(sed 's/"//g' "$OS_RELEASE") >/dev/null
 
 systemd-dissect --list "$MINIMAL_IMAGE.raw" | grep '^etc/os-release$' >/dev/null
 systemd-dissect --mtree "$MINIMAL_IMAGE.raw" --mtree-hash yes | \
-    grep -E "^.(/usr|)/bin/cat type=file mode=0755 uid=0 gid=0 size=[0-9]* sha256sum=[a-z0-9]*$" >/dev/null
+    grep -E "^.(/usr|)/bin/bash type=file mode=0755 uid=0 gid=0 size=[0-9]* sha256sum=[a-z0-9]*$" >/dev/null
 systemd-dissect --mtree "$MINIMAL_IMAGE.raw" --mtree-hash no  | \
-    grep -E "^.(/usr|)/bin/cat type=file mode=0755 uid=0 gid=0 size=[0-9]*$" >/dev/null
+    grep -E "^.(/usr|)/bin/bash type=file mode=0755 uid=0 gid=0 size=[0-9]*$" >/dev/null
 
 read -r SHA256SUM1 _ < <(systemd-dissect --copy-from "$MINIMAL_IMAGE.raw" etc/os-release | sha256sum)
 test "$SHA256SUM1" != ""
@@ -65,6 +66,20 @@ mv "$MINIMAL_IMAGE.fooverity" "$MINIMAL_IMAGE.verity"
 mv "$MINIMAL_IMAGE.foohash" "$MINIMAL_IMAGE.roothash"
 
 mkdir -p "$IMAGE_DIR/mount" "$IMAGE_DIR/mount2"
+# systemd-dissect --umount of one mount of a shared verity device leaves the loop devices under the verity device
+# alone, since another mount still uses the verity device.
+SYSTEMD_VERITY_SHARING=1 SYSTEMD_DISSECT_VERITY_SIGNATURE=0 systemd-dissect --mount "$MINIMAL_IMAGE.raw" "$IMAGE_DIR/mount"
+SYSTEMD_VERITY_SHARING=1 SYSTEMD_DISSECT_VERITY_SIGNATURE=0 systemd-dissect --mount "$MINIMAL_IMAGE.raw" "$IMAGE_DIR/mount2"
+test "$(findmnt -n -o MAJ:MIN "$IMAGE_DIR/mount2")" = "$(findmnt -n -o MAJ:MIN "$IMAGE_DIR/mount")"
+systemd-dissect --umount "$IMAGE_DIR/mount2"
+for loop in $(dmsetup deps -o blkdevname "$MINIMAL_IMAGE_ROOTHASH-verity" | grep -o 'loop[0-9]*'); do
+    blockdev --getsize64 "/dev/$loop" >/dev/null
+done
+systemd-dissect --umount "$IMAGE_DIR/mount"
+# The kernel removes the verity device some time after the last mount is gone. The next test mounts the image with
+# a signature and checks that the kernel validated it. That check fails if the test reuses the device set up
+# here without a signature.
+timeout 60 bash -c 'while dmsetup info "$1" &>/dev/null; do sleep 0.1; done' bash "$MINIMAL_IMAGE_ROOTHASH-verity"
 SYSTEMD_VERITY_SHARING=1 systemd-dissect --mount "$MINIMAL_IMAGE.raw" "$IMAGE_DIR/mount"
 grep -q -F -f "$OS_RELEASE" "$IMAGE_DIR/mount/usr/lib/os-release"
 grep -q -F -f "$OS_RELEASE" "$IMAGE_DIR/mount/etc/os-release"
@@ -103,10 +118,180 @@ umount -R "$IMAGE_DIR/mount"
 timeout 60 bash -c "while test -e $d; do sleep 0.1; done"
 ( ! dmsetup ls | grep "$(basename "$d")") >/dev/null
 
+# A signature that can't be validated only prevents activation if the image policy allows "signed" but not
+# "verity". Userspace validation only parses the signature if a certificate is installed. Without one, it
+# reports a mismatch instead of failing on the garbage signature. The test image usually contains
+# /usr/lib/verity.d/mkosi.crt, but we install a certificate in /run/verity.d/ to be sure.
+mkdir -p /run/verity.d
+cp /usr/share/mkosi.crt /run/verity.d/test-50-mkosi.crt
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=test-50-unknown \
+            -keyout /tmp/test-50-unknown.key -out /tmp/test-50-unknown.crt
+openssl smime -sign -nocerts -noattr -binary \
+              -in "$MINIMAL_IMAGE.roothash" \
+              -inkey /tmp/test-50-unknown.key \
+              -signer /tmp/test-50-unknown.crt \
+              -outform der \
+              -out /tmp/test-50-unknown.p7s
+head -c 64 /dev/urandom >/tmp/test-50-garbage.p7s
+# The kernel validated the signature of a shared device, so a mount without a signature reuses the device, even if
+# the policy requires a signature.
+if [ "$VERITY_SIG_SUPPORTED" -eq 1 ]; then
+    mkdir -p /tmp/test-50-validated-mnt /tmp/test-50-reuse-mnt
+    SYSTEMD_VERITY_SHARING=1 systemd-dissect --mount --image-policy=root=signed \
+                                             "$MINIMAL_IMAGE.raw" /tmp/test-50-validated-mnt
+    SYSTEMD_VERITY_SHARING=1 SYSTEMD_DISSECT_VERITY_SIGNATURE=0 \
+        systemd-dissect --mount --image-policy=root=signed "$MINIMAL_IMAGE.raw" /tmp/test-50-reuse-mnt
+    test "$(findmnt -n -o MAJ:MIN /tmp/test-50-reuse-mnt)" = "$(findmnt -n -o MAJ:MIN /tmp/test-50-validated-mnt)"
+    systemd-dissect --umount /tmp/test-50-reuse-mnt
+    systemd-dissect --umount /tmp/test-50-validated-mnt
+    rmdir /tmp/test-50-validated-mnt /tmp/test-50-reuse-mnt
+fi
+for sig in /tmp/test-50-unknown.p7s /tmp/test-50-garbage.p7s; do
+    SYSTEMD_VERITY_SHARING=0 systemd-dissect --mtree "$MINIMAL_IMAGE.raw" \
+                                             --root-hash="$MINIMAL_IMAGE_ROOTHASH" \
+                                             --root-hash-sig="$sig" >/dev/null
+    SYSTEMD_VERITY_SHARING=0 systemd-dissect --mtree "$MINIMAL_IMAGE.raw" \
+                                             --root-hash="$MINIMAL_IMAGE_ROOTHASH" \
+                                             --root-hash-sig="$sig" \
+                                             --image-policy=root=verity+signed >/dev/null
+    # Every signature that no trusted key validates is reported the same way, whether the kernel has no key for
+    # it or rejects it for another reason, for example because it is garbage.
+    (! SYSTEMD_VERITY_SHARING=0 systemd-dissect --mtree "$MINIMAL_IMAGE.raw" \
+                                                --root-hash="$MINIMAL_IMAGE_ROOTHASH" \
+                                                --root-hash-sig="$sig" \
+                                                --image-policy=root=signed 2>&1 >/dev/null) |
+        grep -F "Image lacks recognized signature." >/dev/null
+done
+# A service whose policy requires a signature fails if no trusted key validates its signature, instead of
+# reusing a shared Verity device that was set up without a signature. Once a certificate for the signature is
+# installed, the service works.
+mkdir -p /tmp/test-50-unsigned-mnt
+timeout 60 bash -c 'while dmsetup info "$1" &>/dev/null; do sleep 0.1; done' bash "$MINIMAL_IMAGE_ROOTHASH-verity"
+SYSTEMD_VERITY_SHARING=1 SYSTEMD_DISSECT_VERITY_SIGNATURE=0 \
+    systemd-dissect --mount --image-policy=root=verity+signed "$MINIMAL_IMAGE.raw" /tmp/test-50-unsigned-mnt
+(! systemd-run --wait -P \
+               -p RootImage="$MINIMAL_IMAGE.raw" \
+               -p RootHashSignature=/tmp/test-50-unknown.p7s \
+               -p RootImagePolicy=root=signed+squashfs \
+               true)
+cp /tmp/test-50-unknown.crt /run/verity.d/test-50-unknown.crt
+systemd-run --wait -P \
+            -p RootImage="$MINIMAL_IMAGE.raw" \
+            -p RootHashSignature=/tmp/test-50-unknown.p7s \
+            -p RootImagePolicy=root=signed+squashfs \
+            true
+# If only userspace validates our signature, a device that we set up ourselves wouldn't have a validated
+# signature either, so we reuse the shared device, even if the policy requires a signature.
+mkdir -p /tmp/test-50-signed-mnt
+for policy in root=verity+signed root=signed; do
+    SYSTEMD_VERITY_SHARING=1 systemd-dissect --mount --image-policy="$policy" \
+                                             --root-hash="$MINIMAL_IMAGE_ROOTHASH" \
+                                             --root-hash-sig=/tmp/test-50-unknown.p7s \
+                                             "$MINIMAL_IMAGE.raw" /tmp/test-50-signed-mnt
+    test "$(findmnt -n -o MAJ:MIN /tmp/test-50-signed-mnt)" = "$(findmnt -n -o MAJ:MIN /tmp/test-50-unsigned-mnt)"
+    systemd-dissect --umount /tmp/test-50-signed-mnt
+done
+loop="$(losetup --find --show --read-only "$MINIMAL_IMAGE.raw")"
+name="${loop##*/}"
+if [ -e "/sys/class/block/$name/diskseq" ]; then
+    name+="-$(cat "/sys/class/block/$name/diskseq")"
+fi
+name+="-verity"
+veritysetup open "$loop" "$name" "$MINIMAL_IMAGE.verity" --root-hash-file "$MINIMAL_IMAGE.roothash"
+mkdir -p /var/tmp/test-50-noshare-mnt
+mount -o ro "/dev/mapper/$name" /var/tmp/test-50-noshare-mnt
+SYSTEMD_VERITY_SHARING=0 systemd-dissect --mtree "$loop" \
+                                      --root-hash="$MINIMAL_IMAGE_ROOTHASH" \
+                                      --verity-data="$MINIMAL_IMAGE.verity" \
+                                      --image-policy=root=verity >/dev/null
+for policy in root=verity+signed root=signed; do
+    (! SYSTEMD_VERITY_SHARING=0 systemd-dissect --mtree "$loop" \
+                                             --root-hash="$MINIMAL_IMAGE_ROOTHASH" \
+                                             --root-hash-sig=/tmp/test-50-unknown.p7s \
+                                             --verity-data="$MINIMAL_IMAGE.verity" \
+                                             --image-policy="$policy" >/dev/null)
+done
+dmsetup remove --deferred "$name"
+umount /var/tmp/test-50-noshare-mnt
+rmdir /var/tmp/test-50-noshare-mnt
+losetup --detach "$loop"
+# We only reuse a device without a validated signature if it uses our backing file. The owner of another copy of
+# the image can modify that copy.
+systemd-dissect --umount /tmp/test-50-unsigned-mnt
+timeout 60 bash -c 'while dmsetup info "$1" &>/dev/null; do sleep 0.1; done' bash "$MINIMAL_IMAGE_ROOTHASH-verity"
+cp "$MINIMAL_IMAGE.raw" /tmp/test-50-copy.raw
+SYSTEMD_VERITY_SHARING=1 SYSTEMD_DISSECT_VERITY_SIGNATURE=0 \
+    systemd-dissect --mount --image-policy=root=verity+signed \
+                    --root-hash="$MINIMAL_IMAGE_ROOTHASH" \
+                    --verity-data="$MINIMAL_IMAGE.verity" \
+                    /tmp/test-50-copy.raw /tmp/test-50-unsigned-mnt
+SYSTEMD_VERITY_SHARING=1 systemd-dissect --mount --image-policy=root=signed \
+                                         --root-hash="$MINIMAL_IMAGE_ROOTHASH" \
+                                         --root-hash-sig=/tmp/test-50-unknown.p7s \
+                                         "$MINIMAL_IMAGE.raw" /tmp/test-50-signed-mnt
+test "$(findmnt -n -o MAJ:MIN /tmp/test-50-signed-mnt)" != "$(findmnt -n -o MAJ:MIN /tmp/test-50-unsigned-mnt)"
+systemd-dissect --umount /tmp/test-50-signed-mnt
+systemd-dissect --umount /tmp/test-50-unsigned-mnt
+rm /tmp/test-50-copy.raw
+timeout 60 bash -c 'while dmsetup info "$1" &>/dev/null; do sleep 0.1; done' bash "$MINIMAL_IMAGE_ROOTHASH-verity"
+SYSTEMD_VERITY_SHARING=1 SYSTEMD_DISSECT_VERITY_SIGNATURE=0 \
+    systemd-dissect --mount --image-policy=root=verity+signed "$MINIMAL_IMAGE.raw" /tmp/test-50-unsigned-mnt
+rm /run/verity.d/test-50-unknown.crt
+# If the kernel validates our signature, we set up our own device instead.
+if [ "$VERITY_SIG_SUPPORTED" -eq 1 ]; then
+    SYSTEMD_VERITY_SHARING=1 systemd-dissect --mount --image-policy=root=verity+signed \
+                                             "$MINIMAL_IMAGE.raw" /tmp/test-50-signed-mnt
+    test "$(findmnt -n -o MAJ:MIN /tmp/test-50-signed-mnt)" != "$(findmnt -n -o MAJ:MIN /tmp/test-50-unsigned-mnt)"
+    systemd-dissect --umount /tmp/test-50-signed-mnt
+fi
+rmdir /tmp/test-50-signed-mnt
+systemd-dissect --umount /tmp/test-50-unsigned-mnt
+rmdir /tmp/test-50-unsigned-mnt
+# With root-hash-signature-required=yes, systemd-veritysetup only sets up the device if the kernel or
+# userspace validates the signature.
+for sig in /tmp/test-50-unknown.p7s /tmp/test-50-garbage.p7s; do
+    (! /usr/lib/systemd/systemd-veritysetup attach test-50-required "$MINIMAL_IMAGE.raw" "$MINIMAL_IMAGE.verity" \
+                                            "$MINIMAL_IMAGE_ROOTHASH" \
+                                            "root-hash-signature=$sig,root-hash-signature-required=yes")
+    /usr/lib/systemd/systemd-veritysetup attach test-50-optional "$MINIMAL_IMAGE.raw" "$MINIMAL_IMAGE.verity" \
+                                         "$MINIMAL_IMAGE_ROOTHASH" \
+                                         "root-hash-signature=$sig,root-hash-signature-required=no"
+    /usr/lib/systemd/systemd-veritysetup detach test-50-optional
+done
+cp /tmp/test-50-unknown.crt /run/verity.d/test-50-unknown.crt
+/usr/lib/systemd/systemd-veritysetup attach test-50-required "$MINIMAL_IMAGE.raw" "$MINIMAL_IMAGE.verity" \
+                                     "$MINIMAL_IMAGE_ROOTHASH" \
+                                     root-hash-signature=/tmp/test-50-unknown.p7s,root-hash-signature-required=yes
+/usr/lib/systemd/systemd-veritysetup detach test-50-required
+rm /run/verity.d/test-50-mkosi.crt /run/verity.d/test-50-unknown.crt /tmp/test-50-unknown.key /tmp/test-50-unknown.crt /tmp/test-50-unknown.p7s /tmp/test-50-garbage.p7s
+# A loop device of the plain file system image has no ID_DISSECT_PART_ROOTHASH_SIG property. With
+# root-hash-signature=auto, systemd-veritysetup activates it without a signature. If
+# root-hash-signature-required=yes is set as well, systemd-veritysetup refuses to activate it.
+loop="$(losetup --show -r -f "$MINIMAL_IMAGE.raw")"
+udevadm wait --timeout=60 --settle "$loop"
+(! /usr/lib/systemd/systemd-veritysetup attach test-50-auto "$loop" "$MINIMAL_IMAGE.verity" "$MINIMAL_IMAGE_ROOTHASH" \
+                                        root-hash-signature=auto,root-hash-signature-required=yes)
+/usr/lib/systemd/systemd-veritysetup attach test-50-auto "$loop" "$MINIMAL_IMAGE.verity" "$MINIMAL_IMAGE_ROOTHASH" \
+                                     root-hash-signature=auto
+# systemd-veritysetup checks whether the volume is already active before it reads the udev properties of the
+# data device. The data device has no signature, but the second attach with root-hash-signature-required=yes
+# succeeds because the volume is active.
+/usr/lib/systemd/systemd-veritysetup attach test-50-auto "$loop" "$MINIMAL_IMAGE.verity" "$MINIMAL_IMAGE_ROOTHASH" \
+                                     root-hash-signature=auto,root-hash-signature-required=yes
+/usr/lib/systemd/systemd-veritysetup detach test-50-auto
+losetup -d "$loop"
+
 # Test BindLogSockets=
 systemd-run --wait -p RootImage="$MINIMAL_IMAGE.raw" mountpoint /run/systemd/journal/socket
 (! systemd-run --wait -p RootImage="$MINIMAL_IMAGE.raw" -p BindLogSockets=no ls /run/systemd/journal/socket)
 (! systemd-run --wait -p RootImage="$MINIMAL_IMAGE.raw" -p MountAPIVFS=no ls /run/systemd/journal/socket)
+
+# Test that ProtectSystem=strict does not leak the host's /run/ into a service running off a RootImage=,
+# and keeps /run/ a private writable tmpfs.
+host_run_marker="$(mktemp /run/test-50-host-run.XXXXXX)"
+systemd-run --wait -p RootImage="$MINIMAL_IMAGE.raw" -p ProtectSystem=strict \
+    bash -xec "test ! -e $host_run_marker && test -w /run && [[ \"\$(stat -fc %T /run)\" == tmpfs ]]"
+rm -f "$host_run_marker"
 
 # Test that the notify socket is bind mounted to /run/host/notify in sandboxed environments and
 # $NOTIFY_SOCKET is set correctly.
@@ -210,12 +395,43 @@ systemd-dissect --validate "$MINIMAL_IMAGE.gpt" --image-policy=root=verity:swap=
 systemd-dissect --validate "$MINIMAL_IMAGE.gpt" --image-policy=root=signed
 (! systemd-dissect --validate "$MINIMAL_IMAGE.gpt" --image-policy=root=signed:root-verity-sig=unused+absent)
 (! systemd-dissect --validate "$MINIMAL_IMAGE.gpt" --image-policy=root=signed:root-verity=unused+absent)
+
+# Without a root hash, Verity can't be set up, so a policy that requires Verity must refuse the image instead
+# of mounting the data partition directly.
+SYSTEMD_DISSECT_VERITY_EMBEDDED=0 SYSTEMD_DISSECT_VERITY_GUESS=0 systemd-dissect --mtree "$MINIMAL_IMAGE.gpt" >/dev/null
+(! SYSTEMD_DISSECT_VERITY_EMBEDDED=0 SYSTEMD_DISSECT_VERITY_GUESS=0 systemd-dissect --mtree "$MINIMAL_IMAGE.gpt" --image-policy=root=verity >/dev/null)
+(! SYSTEMD_DISSECT_VERITY_EMBEDDED=0 SYSTEMD_DISSECT_VERITY_GUESS=0 systemd-dissect --mtree "$MINIMAL_IMAGE.gpt" --image-policy=root=signed >/dev/null)
+
 systemd-dissect --validate "$MINIMAL_IMAGE.usr.gpt" --image-policy=usr=verity
 systemd-dissect --validate "$MINIMAL_IMAGE.usr.gpt" --image-policy=usr=verity:usr-verity-sig=unused+absent
 (! systemd-dissect --validate "$MINIMAL_IMAGE.usr.gpt" --image-policy=usr=verity:usr-verity=unused+absent)
 systemd-dissect --validate "$MINIMAL_IMAGE.usr.gpt" --image-policy=usr=signed
 (! systemd-dissect --validate "$MINIMAL_IMAGE.usr.gpt" --image-policy=usr=signed:usr-verity-sig=unused+absent)
 (! systemd-dissect --validate "$MINIMAL_IMAGE.usr.gpt" --image-policy=usr=signed:usr-verity=unused+absent)
+
+# A signature partition that can't be parsed is ignored, unless the image policy requires a signature.
+cp "$MINIMAL_IMAGE.gpt" /tmp/test-50-badsig.gpt
+loop="$(losetup --show -P -f /tmp/test-50-badsig.gpt)"
+udevadm wait --timeout=60 --settle --initialized=no "${loop}p3"
+printf 'garbage' | udevadm lock --timeout=60 --device="${loop}p3" dd of="${loop}p3" conv=notrunc
+losetup -d "$loop"
+udevadm settle --timeout=60
+systemd-dissect --mtree /tmp/test-50-badsig.gpt >/dev/null
+systemd-dissect --mtree /tmp/test-50-badsig.gpt --root-hash="$MINIMAL_IMAGE_ROOTHASH" >/dev/null
+(! systemd-dissect --mtree /tmp/test-50-badsig.gpt --image-policy=root=signed >/dev/null)
+(! systemd-dissect --mtree /tmp/test-50-badsig.gpt --root-hash="$MINIMAL_IMAGE_ROOTHASH" --image-policy=root=signed >/dev/null)
+(! SYSTEMD_DISSECT_VERITY_GUESS=0 systemd-dissect --mtree /tmp/test-50-badsig.gpt --image-policy=root=signed >/dev/null)
+# With a root hash, the signature partition is ignored and counts as absent. "verity+signed" allows that.
+systemd-dissect --mtree /tmp/test-50-badsig.gpt --root-hash="$MINIMAL_IMAGE_ROOTHASH" --image-policy=root=verity+signed >/dev/null
+# Set up a shared Verity device for the same root hash without a signature. A policy that requires a
+# signature must not reuse it.
+mkdir -p /tmp/test-50-badsig-mnt
+SYSTEMD_VERITY_SHARING=1 SYSTEMD_DISSECT_VERITY_SIGNATURE=0 \
+    systemd-dissect --mount --image-policy=root=verity+signed "$MINIMAL_IMAGE.raw" /tmp/test-50-badsig-mnt
+(! SYSTEMD_VERITY_SHARING=1 systemd-dissect --mtree /tmp/test-50-badsig.gpt --image-policy=root=signed >/dev/null)
+systemd-dissect --umount /tmp/test-50-badsig-mnt
+rmdir /tmp/test-50-badsig-mnt
+rm /tmp/test-50-badsig.gpt
 
 # Test RootImagePolicy= unit file setting
 systemd-run --wait -P \
@@ -411,7 +627,7 @@ ExecStart=bash -c ' \\
         sleep 0.1; \\
     done; \\
     mount; \\
-    mount | grep -F "on /tmp/img type squashfs" | grep -q -F "nosuid"; \\
+    mount | grep -F "on /tmp/img type squashfs" | grep -F "nosuid" >/dev/null; \\
 '
 EOF
 systemctl start testservice-50d.service
@@ -469,7 +685,7 @@ systemd-run -P \
 # Check that two identical verity images at different paths do not fail with -ELOOP from OverlayFS
 mkdir -p /tmp/loop
 cp /tmp/app0.raw /tmp/loop/app0.raw
-veritysetup format /tmp/loop/app0.raw /tmp/loop/app0.verity --root-hash-file /tmp/loop/app0.roothash
+veritysetup format /tmp/loop/app0.raw /tmp/loop/app0.verity --hash=sha256 --root-hash-file /tmp/loop/app0.roothash
 cp /tmp/loop/app0.raw /tmp/loop/app0_copy.raw
 cp /tmp/loop/app0.verity /tmp/loop/app0_copy.verity
 cp /tmp/loop/app0.roothash /tmp/loop/app0_copy.roothash
@@ -932,6 +1148,94 @@ umount /tmp/img
 umount /tmp/ext
 veritysetup close "$(cat "$MINIMAL_IMAGE.roothash")-verity" ||:
 veritysetup close "$(cat /tmp/app0.roothash)-verity" ||:
+# A unit whose image policy requires a signature only takes the shortcut if the kernel validated a signature for
+# the existing device, while a unit whose image policy allows "verity" always does. veritysetup sets up the
+# devices without a signature here. The process of the unit logs the messages before it
+# executes the command, and the unit exits right after. journald attributes the messages to the wrong unit if
+# the process is gone when journald looks up its cgroup. So we don't filter the journal by unit. Each message
+# starts with the name of the unit, and each line of the trace of this script starts with a "+". We match the
+# messages from the start of the line, so the trace can't match.
+for image in "$MINIMAL_IMAGE" /tmp/app0; do
+    name="$(cat "$image.roothash")-verity"
+    timeout 60 bash -c 'while dmsetup info "$1" &>/dev/null; do sleep 0.1; done' bash "$name"
+    veritysetup open "$image.raw" "$name" "$image.verity" --root-hash-file "$image.roothash"
+done
+mount -o ro "/dev/mapper/$(cat "$MINIMAL_IMAGE.roothash")-verity" /tmp/img
+mount -o ro "/dev/mapper/$(cat /tmp/app0.roothash)-verity" /tmp/ext
+if [ "$VERITY_SIG_SUPPORTED" -eq 1 ]; then
+    journalctl --sync
+    cursor="$(journalctl -n 1 --show-cursor | sed -n 's/^-- cursor: //p')"
+    test -n "$cursor"
+    systemd-run --wait -P --unit=test-50-shortcut-signed.service \
+                -p RootImage="$MINIMAL_IMAGE.raw" \
+                -p RootImagePolicy=root=signed+squashfs \
+                -p ExtensionImages=/tmp/app0.raw \
+                -p ExtensionImagePolicy=root=signed+squashfs \
+                -p TemporaryFileSystem=/var/lib \
+                -p MountImages=/tmp/app0.raw:/var/lib/app \
+                -p MountImagePolicy=root=signed+squashfs \
+                cat /opt/script0.sh
+    journalctl --sync
+    journalctl --after-cursor="$cursor" -o cat >/tmp/test-50-shortcut.log
+    test "$(grep -cE '^test-50-shortcut-signed.service: Verity device /dev/mapper/[0-9a-f]+-verity has no validated signature, skipping verity shortcut\.$' /tmp/test-50-shortcut.log)" -ge 3
+    (! grep -E '^test-50-shortcut-signed.service: Reusing pre-existing verity-protected' /tmp/test-50-shortcut.log)
+fi
+journalctl --sync
+cursor="$(journalctl -n 1 --show-cursor | sed -n 's/^-- cursor: //p')"
+test -n "$cursor"
+systemd-run --wait -P --unit=test-50-shortcut-verity.service \
+            -p RootImage="$MINIMAL_IMAGE.raw" \
+            -p RootImagePolicy=root=verity+squashfs \
+            -p ExtensionImages=/tmp/app0.raw \
+            -p ExtensionImagePolicy=root=verity+squashfs \
+            -p TemporaryFileSystem=/var/lib \
+            -p MountImages=/tmp/app0.raw:/var/lib/app \
+            -p MountImagePolicy=root=verity+squashfs \
+            cat /opt/script0.sh
+journalctl --sync
+journalctl --after-cursor="$cursor" -o cat >/tmp/test-50-shortcut.log
+grep -E '^test-50-shortcut-verity.service: Reusing pre-existing verity-protected root image ' /tmp/test-50-shortcut.log >/dev/null
+test "$(grep -cE '^test-50-shortcut-verity.service: Reusing pre-existing verity-protected image ' /tmp/test-50-shortcut.log)" -ge 2
+rm /tmp/test-50-shortcut.log
+umount /tmp/img
+umount /tmp/ext
+# A unit that checks a device but can't reuse it requests deferred removal of the device, so the devices can be
+# gone already.
+veritysetup close "$(cat "$MINIMAL_IMAGE.roothash")-verity" ||:
+veritysetup close "$(cat /tmp/app0.roothash)-verity" ||:
+# With devices for which the kernel validated a signature, a unit whose image policy requires a signature takes
+# the shortcut too.
+if [ "$VERITY_SIG_SUPPORTED" -eq 1 ]; then
+    for image in "$MINIMAL_IMAGE" /tmp/app0; do
+        name="$(cat "$image.roothash")-verity"
+        timeout 60 bash -c 'while dmsetup info "$1" &>/dev/null; do sleep 0.1; done' bash "$name"
+        veritysetup open "$image.raw" "$name" "$image.verity" --root-hash-file "$image.roothash" \
+                    --root-hash-signature "$image.roothash.p7s"
+    done
+    mount -o ro "/dev/mapper/$(cat "$MINIMAL_IMAGE.roothash")-verity" /tmp/img
+    mount -o ro "/dev/mapper/$(cat /tmp/app0.roothash)-verity" /tmp/ext
+    journalctl --sync
+    cursor="$(journalctl -n 1 --show-cursor | sed -n 's/^-- cursor: //p')"
+    test -n "$cursor"
+    systemd-run --wait -P --unit=test-50-shortcut-signed2.service \
+                -p RootImage="$MINIMAL_IMAGE.raw" \
+                -p RootImagePolicy=root=signed+squashfs \
+                -p ExtensionImages=/tmp/app0.raw \
+                -p ExtensionImagePolicy=root=signed+squashfs \
+                -p TemporaryFileSystem=/var/lib \
+                -p MountImages=/tmp/app0.raw:/var/lib/app \
+                -p MountImagePolicy=root=signed+squashfs \
+                cat /opt/script0.sh
+    journalctl --sync
+    journalctl --after-cursor="$cursor" -o cat >/tmp/test-50-shortcut.log
+    grep -E '^test-50-shortcut-signed2.service: Reusing pre-existing verity-protected root image ' /tmp/test-50-shortcut.log >/dev/null
+    test "$(grep -cE '^test-50-shortcut-signed2.service: Reusing pre-existing verity-protected image ' /tmp/test-50-shortcut.log)" -ge 2
+    rm /tmp/test-50-shortcut.log
+    umount /tmp/img
+    umount /tmp/ext
+    veritysetup close "$(cat "$MINIMAL_IMAGE.roothash")-verity" ||:
+    veritysetup close "$(cat /tmp/app0.roothash)-verity" ||:
+fi
 
 # Test that an extension consisting of an empty directory under /etc/extensions/ takes precedence
 mkdir -p /var/lib/extensions/
@@ -1065,6 +1369,18 @@ test ! -e "/dev/disk/by-loop-ref/$name"
 systemd-dissect --detach "$MINIMAL_IMAGE.raw"
 (! systemd-dissect --detach "$MINIMAL_IMAGE.raw")
 
+# --attach --relax also works on images that do not qualify as DDI, e.g. an entirely blank one
+BLANK_IMAGE="$(mktemp /var/tmp/blankXXX.raw)"
+truncate -s 16M "$BLANK_IMAGE"
+(! systemd-dissect --attach "$BLANK_IMAGE")
+LOOP="$(systemd-dissect --attach --relax "$BLANK_IMAGE")"
+test -b "$LOOP"
+systemd-dissect --detach "$LOOP"
+rm -f "$BLANK_IMAGE"
+
+# --relax makes no sense for the other verbs
+(! systemd-dissect --relax "$MINIMAL_IMAGE.raw")
+
 # check for confext functionality
 mkdir -p /run/confexts/test/etc/extension-release.d
 echo "ID=_any" >/run/confexts/test/etc/extension-release.d/extension-release.test
@@ -1079,8 +1395,129 @@ systemd-confext merge
 grep -q -F "MARKER_CONFEXT_123" /etc/testfile
 (! /etc/testscript)
 systemd-confext status
+systemd-confext status --json=pretty | jq -e 'any(.[]; .hierarchy == "/etc" and .extensions == ["test"] and .since != null)' >/dev/null
 systemd-confext unmerge
+systemd-confext status --json=pretty | jq -e 'any(.[]; .hierarchy == "/etc" and .extensions == [] and .since == null)' >/dev/null
 rm -rf /run/confexts/
+
+cleanup_sysupdate_notify_confext_mutable() {
+    local mutable_marker="$1"
+    local notify_socket_was_active="$2"
+
+    if [[ "$notify_socket_was_active" == "yes" ]]; then
+        systemctl restart systemd-sysupdate-notify-sysext.socket || :
+    else
+        systemctl stop systemd-sysupdate-notify-sysext.socket || :
+    fi
+
+    rm -f "$mutable_marker"
+    rm -f "/var/lib/extensions.mutable/etc/${mutable_marker#/etc/}"
+    systemd-confext unmerge || :
+    rm -f /run/systemd/confext.conf.d/50-test-mutable.conf
+    rm -rf /run/confexts/
+    rmdir /var/lib/extensions.mutable/etc /var/lib/extensions.mutable 2>/dev/null || :
+}
+
+test_sysupdate_notify_confext_mutable() {
+    local mutable_marker="/etc/test-confext-mutable-$RANDOM"
+    local notify_socket_was_active=no
+
+    if systemctl is-active --quiet systemd-sysupdate-notify-sysext.socket; then
+        notify_socket_was_active=yes
+    fi
+
+    trap 'cleanup_sysupdate_notify_confext_mutable "$mutable_marker" "$notify_socket_was_active"' RETURN ERR
+
+    # Check that the sysupdate notification refresh honors confext-specific configuration.
+    mkdir -p /run/systemd/confext.conf.d
+    cat >/run/systemd/confext.conf.d/50-test-mutable.conf <<EOF
+[ConfExt]
+Mutable=yes
+EOF
+    mkdir -p /run/confexts/test/etc/extension-release.d
+    echo "ID=_any" >/run/confexts/test/etc/extension-release.d/extension-release.test
+    echo "ARCHITECTURE=_any" >>/run/confexts/test/etc/extension-release.d/extension-release.test
+    echo "MARKER_CONFEXT_123" >/run/confexts/test/etc/testfile
+    systemd-confext merge
+    echo "MARKER_CONFEXT_MUTABLE" >"$mutable_marker"
+    systemctl start systemd-sysupdate-notify-sysext.socket
+    varlinkctl call /run/systemd/sysupdate/notify/io.systemd.sysext io.systemd.SysUpdate.Notify.OnCompletedUpdate '{}'
+    grep -F "MARKER_CONFEXT_MUTABLE" "$mutable_marker" >/dev/null
+    trap - RETURN ERR
+    cleanup_sysupdate_notify_confext_mutable "$mutable_marker" "$notify_socket_was_active"
+}
+
+test_sysupdate_notify_confext_mutable
+
+cleanup_sysupdate_notify_confext_before_sysext() {
+    local notify_socket_was_active="$1"
+
+    if [[ "$notify_socket_was_active" == "yes" ]]; then
+        systemctl restart systemd-sysupdate-notify-sysext.socket || :
+    else
+        systemctl stop systemd-sysupdate-notify-sysext.socket || :
+    fi
+
+    systemctl stop test-order-foo.service || :
+    systemd-sysext unmerge || :
+    systemd-confext unmerge || :
+    rm -rf /run/extensions/test-order /run/confexts/test-order
+    rm -f /run/test-order-marker
+}
+
+test_sysupdate_notify_confext_before_sysext() {
+    local notify_socket_was_active=no
+
+    if systemctl is-active --quiet systemd-sysupdate-notify-sysext.socket; then
+        notify_socket_was_active=yes
+    fi
+
+    trap 'cleanup_sysupdate_notify_confext_before_sysext "$notify_socket_was_active"' RETURN ERR
+
+    # Check that the sysupdate notification refresh merges confexts before sysexts, same order as for unit
+    # startup at boot. The confext ships a drop-in for a whole prefix of units, meaning it can't know what
+    # units to restart through EXTENSION_RESTART_UNITS= if it would be merged after the sysext that defines
+    # the unit affected by the drop-in. Only if the confext is merged first the unit picks up the drop-in.
+    # This is just one example the general scenario when a confext has to create state before a sysext's
+    # service is started and the confext does not know what sysext's services would be affected.
+    mkdir -p /run/confexts/test-order/etc/extension-release.d /run/confexts/test-order/etc/systemd/system/test-order-.service.d
+    cat >/run/confexts/test-order/etc/extension-release.d/extension-release.test-order <<EOF
+ID=_any
+ARCHITECTURE=_any
+EXTENSION_RELOAD_MANAGER=1
+EOF
+    cat >/run/confexts/test-order/etc/systemd/system/test-order-.service.d/10-marker.conf <<EOF
+[Service]
+Environment=MARKER=from-confext
+EOF
+
+    mkdir -p /run/extensions/test-order/usr/lib/extension-release.d /run/extensions/test-order/usr/lib/systemd/system
+    cat >/run/extensions/test-order/usr/lib/extension-release.d/extension-release.test-order <<EOF
+ID=_any
+ARCHITECTURE=_any
+EXTENSION_RELOAD_MANAGER=1
+EXTENSION_RESTART_UNITS=test-order-foo.service
+EOF
+    cat >/run/extensions/test-order/usr/lib/systemd/system/test-order-foo.service <<'EOF'
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=sh -c 'echo "${MARKER:-unset}" >/run/test-order-marker'
+EOF
+
+    systemctl start systemd-sysupdate-notify-sysext.socket
+    varlinkctl call /run/systemd/sysupdate/notify/io.systemd.sysext io.systemd.SysUpdate.Notify.OnCompletedUpdate '{}'
+
+    test -f /etc/systemd/system/test-order-.service.d/10-marker.conf
+    test -f /usr/lib/systemd/system/test-order-foo.service
+    systemctl --quiet is-active test-order-foo.service
+    grep -F "from-confext" /run/test-order-marker >/dev/null
+
+    trap - RETURN ERR
+    cleanup_sysupdate_notify_confext_before_sysext "$notify_socket_was_active"
+}
+
+test_sysupdate_notify_confext_before_sysext
 
 unsquashfs -force -no-xattrs -d /tmp/img "$MINIMAL_IMAGE.raw"
 systemd-run --unit=test-root-ephemeral \
@@ -1099,8 +1536,163 @@ systemd-run --wait --pipe --root-directory=/tmp/img -- grep -q 'MARKER=1' /usr/l
 # Make sure the same root file descriptor can be reused multiple times.
 systemd-run --wait --pipe --same-root-dir -p ExecStartPre=true true
 
+# Test the precedence of the root settings:
+# RootDirectoryFileDescriptor= > RootImage= > RootDirectory=.
+# The unused RootDirectory= is nonexistent, and the unused RootImage= is not an image, so the
+# service would fail if the respective setting were used.
+systemd-run --wait --pipe --root-directory=/tmp/img -p RootDirectory=/nonexistent \
+    -- grep -q 'MARKER=1' /usr/lib/os-release
+systemd-run --wait --pipe --root-directory=/tmp/img -p RootImage=/dev/null \
+    -- grep -q 'MARKER=1' /usr/lib/os-release
+# RootImage= wins over RootDirectory=: the nonexistent RootDirectory= is ignored.
+systemd-run --wait --pipe -p RootDirectory=/nonexistent -p RootImage="$MINIMAL_IMAGE.raw" \
+    -- grep -q 'MARKER=1' /usr/lib/os-release
+
+# Test RootEphemeral= with RootDirectoryFileDescriptor= and with RootDirectory=: all spawns
+# of the activation run in the same ephemeral copy (ExecStartPre= creates the file,
+# ExecStart= sees it), and the copy is discarded when the service stops.
+systemd-run --wait --pipe --root-directory=/tmp/img -p RootEphemeral=yes \
+    -p "ExecStartPre=bash -c 'touch /pre'" \
+    bash -xec '[[ -e /pre ]]'
+systemd-run --wait --pipe -p RootDirectory=/tmp/img -p RootEphemeral=yes \
+    -p "ExecStartPre=bash -c 'touch /pre'" \
+    bash -xec '[[ -e /pre ]]'
+test ! -e /tmp/img/pre
+timeout 10 bash -c 'until test -z "$(ls -A /var/lib/systemd/ephemeral-trees)"; do sleep .5; done'
+
+# Plain paths in ReadWritePaths= and friends are relative to the host's root directory,
+# '+'-prefixed paths are relative to the root directory. Both select the same path inside
+# the root, a plain path outside the root directory is ignored.
+mkdir -p /tmp/img/hoge
+systemd-run --wait --pipe -p RootDirectory=/tmp/img \
+    -p ReadOnlyPaths=/tmp/img/hoge -- bash -xec '! test -w /hoge'
+systemd-run --wait --pipe -p RootDirectory=/tmp/img \
+    -p ReadOnlyPaths=+/hoge -- bash -xec '! test -w /hoge'
+systemd-run --wait --pipe -p RootDirectory=/tmp/img \
+    -p ReadOnlyPaths=/hoge -- bash -xec 'test -w /hoge'
+rm -rf /tmp/img/hoge
+
 systemd-dissect --mtree /tmp/img >/dev/null
 systemd-dissect --list /tmp/img >/dev/null
+
+# Test --uapi16: exercise every inode type as well as hardlinks
+MANIFEST_ROOT=$(mktemp -d /tmp/manifest-test.XXXXXX)
+
+# Regular file (with content), empty regular file, directory + nested file
+echo -n "hello world" >"$MANIFEST_ROOT/regular.txt"
+: >"$MANIFEST_ROOT/empty.txt"
+mkdir "$MANIFEST_ROOT/subdir"
+echo -n "nested" >"$MANIFEST_ROOT/subdir/nested.txt"
+# Symlink with a non-trivial relative target
+ln -s regular.txt "$MANIFEST_ROOT/symlink"
+# FIFO, char device (/dev/null = 1,3), block device (loop0 = 7,0)
+mkfifo "$MANIFEST_ROOT/fifo"
+mknod "$MANIFEST_ROOT/chardev" c 1 3
+mknod "$MANIFEST_ROOT/blockdev" b 7 0
+# Hardlinked pair of regular files (same inode, nlink=2)
+echo -n "hardlinked content" >"$MANIFEST_ROOT/hardlink_a"
+ln "$MANIFEST_ROOT/hardlink_a" "$MANIFEST_ROOT/hardlink_b"
+# Unix socket — bind() it with python3 if available (process exits, file persists)
+HAVE_SOCKET=0
+if command -v python3 >/dev/null 2>&1; then
+    python3 -c "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])" "$MANIFEST_ROOT/socket"
+    HAVE_SOCKET=1
+fi
+# Predictable permissions for mode assertions
+chmod 0644 "$MANIFEST_ROOT/regular.txt" "$MANIFEST_ROOT/empty.txt" \
+           "$MANIFEST_ROOT/subdir/nested.txt" "$MANIFEST_ROOT/hardlink_a"
+chmod 0755 "$MANIFEST_ROOT/subdir"
+chmod 0600 "$MANIFEST_ROOT/fifo"
+chmod 0666 "$MANIFEST_ROOT/chardev" "$MANIFEST_ROOT/blockdev"
+
+# Capture the JSON-seq stream and convert to JSON-Lines for jq filtering. Each
+# record is already on its own line in compact form, so stripping the RS (0x1E)
+# byte gives us a valid JSON-Lines stream.
+systemd-dissect --uapi16 "$MANIFEST_ROOT" >"$MANIFEST_ROOT.seq"
+tr -d '\036' <"$MANIFEST_ROOT.seq" >"$MANIFEST_ROOT.jsonl"
+test -s "$MANIFEST_ROOT.jsonl"
+
+# Helper: emit the entry whose "name" matches $1 (root entry has no name)
+get_entry() { jq -c --arg n "$1" 'select(.name == $n)' <"$MANIFEST_ROOT.jsonl"; }
+
+# Root entry is the first record, has mediaType and no name
+head -n1 "$MANIFEST_ROOT.jsonl" | \
+    jq -e '.mediaType == "application/vnd.uapi.16.manifest" and (has("name") | not)' >/dev/null
+
+# Regular file: no "type" field, has size, sha256 matches sha256sum(1), mode is 0644
+ENTRY=$(get_entry regular.txt)
+test "$(jq 'has("type")' <<<"$ENTRY")" = "false"
+test "$(jq -r '.size' <<<"$ENTRY")" = "11"
+EXPECTED_SHA=$(sha256sum "$MANIFEST_ROOT/regular.txt" | awk '{print $1}')
+test "$(jq -r '.sha256' <<<"$ENTRY")" = "$EXPECTED_SHA"
+test "$(printf '%o' "$(jq -r '.mode' <<<"$ENTRY")")" = "644"
+# A non-hardlinked entry must not have an inodeToken
+test "$(jq 'has("inodeToken")' <<<"$ENTRY")" = "false"
+
+# Empty file: size 0, and no sha256, as it is implied by the size
+ENTRY=$(get_entry empty.txt)
+test "$(jq -r '.size' <<<"$ENTRY")" = "0"
+test "$(jq 'has("sha256")' <<<"$ENTRY")" = "false"
+
+# Directory
+ENTRY=$(get_entry subdir)
+test "$(jq -r '.type' <<<"$ENTRY")" = "dir"
+test "$(printf '%o' "$(jq -r '.mode' <<<"$ENTRY")")" = "755"
+
+# Nested file uses '/' as path separator
+ENTRY=$(get_entry subdir/nested.txt)
+test "$(jq -r '.size' <<<"$ENTRY")" = "6"
+test "$(jq 'has("sha256")' <<<"$ENTRY")" = "true"
+
+# Symlink: type=lnk, size = strlen(target), contents carries base64 of target,
+# and there is no "mode" field for symlinks
+ENTRY=$(get_entry symlink)
+test "$(jq -r '.type' <<<"$ENTRY")" = "lnk"
+test "$(jq -r '.size' <<<"$ENTRY")" = "11"
+test "$(jq -r '.contents[0].literal' <<<"$ENTRY")" = "$(printf 'regular.txt' | base64 -w0)"
+test "$(jq 'has("mode")' <<<"$ENTRY")" = "false"
+
+# FIFO
+ENTRY=$(get_entry fifo)
+test "$(jq -r '.type' <<<"$ENTRY")" = "fifo"
+test "$(printf '%o' "$(jq -r '.mode' <<<"$ENTRY")")" = "600"
+
+# Char device with major/minor
+ENTRY=$(get_entry chardev)
+test "$(jq -r '.type' <<<"$ENTRY")" = "chr"
+test "$(jq -r '.major' <<<"$ENTRY")" = "1"
+test "$(jq -r '.minor' <<<"$ENTRY")" = "3"
+
+# Block device with major/minor
+ENTRY=$(get_entry blockdev)
+test "$(jq -r '.type' <<<"$ENTRY")" = "blk"
+test "$(jq -r '.major' <<<"$ENTRY")" = "7"
+test "$(jq -r '.minor' <<<"$ENTRY")" = "0"
+
+# Unix socket (only if we managed to create one)
+if [[ "$HAVE_SOCKET" -eq 1 ]]; then
+    ENTRY=$(get_entry socket)
+    test "$(jq -r '.type' <<<"$ENTRY")" = "sock"
+fi
+
+# Hardlinks: both members carry an inodeToken > 0, with matching token and sha256
+TOKEN_A=$(get_entry hardlink_a | jq -r '.inodeToken')
+TOKEN_B=$(get_entry hardlink_b | jq -r '.inodeToken')
+test "$TOKEN_A" != "null"
+test "$TOKEN_A" != "0"
+test "$TOKEN_A" = "$TOKEN_B"
+EXPECTED_SHA=$(sha256sum "$MANIFEST_ROOT/hardlink_a" | awk '{print $1}')
+test "$(get_entry hardlink_a | jq -r '.sha256')" = "$EXPECTED_SHA"
+test "$(get_entry hardlink_b | jq -r '.sha256')" = "$EXPECTED_SHA"
+
+# --uapi16 output must be stable for the same directory tree
+systemd-dissect --uapi16 "$MANIFEST_ROOT" >"$MANIFEST_ROOT.seq2"
+cmp "$MANIFEST_ROOT.seq" "$MANIFEST_ROOT.seq2"
+
+# --uapi16 also works against a dissected image (uses the same code path)
+systemd-dissect --uapi16 "$MINIMAL_IMAGE.raw" >/dev/null
+
+rm -rf "$MANIFEST_ROOT" "$MANIFEST_ROOT.seq" "$MANIFEST_ROOT.seq2" "$MANIFEST_ROOT.jsonl"
 
 read -r SHA256SUM1 _ < <(systemd-dissect --copy-from /tmp/img etc/os-release | sha256sum)
 test "$SHA256SUM1" != ""
@@ -1203,9 +1795,113 @@ systemd-sysext unmerge
 systemctl status foo.service 2>&1 | grep -v -F "Warning" >/dev/null
 rm /var/lib/extensions/app-reload.raw
 
+# Test that GPT images with an ISO9660 El Torito boot catalog are dissected correctly. The blkid
+# superblock filter must prevent the iso9660 superblock from being detected, so dissection proceeds via
+# the GPT partition table rather than treating the whole image as a single iso9660 filesystem.
+defs="$(mktemp --directory "$IMAGE_DIR/test-50-dissect-eltorito.defs.XXXXXXXXXX")"
+imgs="$(mktemp --directory "$IMAGE_DIR/test-50-dissect-eltorito.imgs.XXXXXXXXXX")"
+
+tee "$defs/00-esp.conf" <<EOF
+[Partition]
+Type=esp
+Format=vfat
+SizeMinBytes=100M
+SizeMaxBytes=100M
+EOF
+
+tee "$defs/10-root.conf" <<EOF
+[Partition]
+Type=root
+Format=ext4
+SizeMinBytes=100M
+SizeMaxBytes=100M
+EOF
+
+systemd-repart --pretty=yes \
+               --definitions="$defs" \
+               --empty=create \
+               --size=auto \
+               --dry-run=no \
+               --offline=yes \
+               --el-torito=yes \
+               "$imgs/eltorito.img"
+
+# Verify the image has both iso9660 superblock and GPT partition table
+blkid -o value -s PTTYPE "$imgs/eltorito.img" | grep -x gpt
+blkid -o value -s TYPE "$imgs/eltorito.img" | grep -x iso9660
+
+# systemd-dissect must process the GPT partitions, not the whole-device iso9660 superblock
+systemd-dissect --json=short "$imgs/eltorito.img" | grep -F '"designator":"root"' | grep -F '"fstype":"ext4"'
+systemd-dissect --json=short "$imgs/eltorito.img" | grep -F '"designator":"esp"' | grep -F '"fstype":"vfat"'
+
+rm -rf "$defs" "$imgs"
+
 # Sneak in a couple of expected-to-fail invocations to cover
 # https://github.com/systemd/systemd/issues/29610
 (! systemd-run -P -p MountImages="/this/should/definitely/not/exist.img:/run/img2\:3:nosuid" false)
 (! systemd-run -P -p ExtensionImages="/this/should/definitely/not/exist.img" false)
 (! systemd-run -P -p RootImage="/this/should/definitely/not/exist.img" false)
 (! systemd-run -P -p ExtensionDirectories="/foo/bar /foo/baz" false)
+
+# Ensure a multi-device btrfs doesn't fail to mount due to loopdev
+# https://github.com/systemd/systemd/issues/42520:
+if [[ -f "${BTRFS_MEMBER1:-}" ]]; then
+    img="" mnt="" loop=""
+
+    # This block runs under 'set -e'; register cleanup up front so a failure in between can't leak the
+    # attached loop device or the image and perturb later device enumeration / udevadm settle.
+    # shellcheck disable=SC2317
+    cleanup_btrfs_mountimages() {
+        if [[ -n "$mnt" ]]; then
+            umount -R "$mnt" || true
+        fi
+        if [[ -n "$loop" ]]; then
+            # Drop the members from the kernel's global, boot-wide btrfs device cache before detaching;
+            # otherwise the cached entries dangle at recycled loop minors and trip multi-device detection in
+            # later tests reusing the same /dev/loopN.
+            btrfs device scan --forget "${loop}p1" "${loop}p2" || true
+            losetup -d "$loop" || true
+            # Pair the detach with a settle, like every other losetup -d in this test, so teardown isn't
+            # still in flight when control returns to the broader TEST-50 run.
+            udevadm settle --timeout=60 || true
+        fi
+        rm -f "$img"
+        # Only remove the mountpoint once it is confirmed unmounted, so a failed unmount above doesn't make
+        # rm -rf recurse through the mountpoint into the still-mounted filesystem.
+        if [[ -n "$mnt" ]] && ! mountpoint -q "$mnt"; then
+            rm -rf "$mnt"
+        fi
+    }
+    trap cleanup_btrfs_mountimages EXIT
+
+    img="$(mktemp /var/tmp/test-50-mountimages-btrfs.img.XXXXXXXXXX)"
+    mnt="$(mktemp -d "$IMAGE_DIR/test-50-mountimages-btrfs.mnt.XXXXXXXXXX")"
+    truncate -s 600M "$img"
+    echo -e 'label: gpt\nsize=280MiB, type=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name=data1\ntype=0FC63DAF-8483-4772-8E79-3D69D8477DE4, name=data2' | sfdisk "$img"
+    loop="$(losetup --show -P -f "$img")"
+    udevadm wait --timeout=60 --settle --initialized=no "${loop}p1" "${loop}p2"
+    udevadm lock --timeout=60 --device="$loop" dd if="$BTRFS_MEMBER1" of="${loop}p1" bs=4M
+    udevadm lock --timeout=60 --device="$loop" dd if="$BTRFS_MEMBER2" of="${loop}p2" bs=4M
+    udevadm settle --timeout=60
+    btrfs device scan "${loop}p1" "${loop}p2"
+
+    mount -t btrfs "${loop}p1" "$mnt"
+    btrfs subvolume create "$mnt/@demo"
+    echo "MARKER=1" >"$mnt/@demo/os-release"
+    btrfs subvolume create "$mnt/@"
+    btrfs subvolume set-default "$mnt/@"
+    umount "$mnt"
+    mount -t btrfs "${loop}p1" "$mnt"
+
+    systemd-run -P \
+                -p MountImages="${loop}p1:/run/img-btrfs:subvol=@demo" \
+                cat /run/img-btrfs/os-release | grep -F "MARKER=1" >/dev/null
+    # Double check that there's no loopdev
+    src="$(systemd-run -P \
+                    -p MountImages="${loop}p1:/run/img-btrfs:subvol=@demo" \
+                    findmnt -n -o SOURCE /run/img-btrfs)"
+    assert_eq "${src%%\[*}" "${loop}p1"
+
+    trap - EXIT
+    cleanup_btrfs_mountimages
+fi

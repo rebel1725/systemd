@@ -5,7 +5,7 @@
   Copyright © 2014 Axis Communications AB. All rights reserved.
 ***/
 
-#include "sd-forward.h"
+#include "forward.h"
 
 int arp_update_filter(int fd, const struct in_addr *a, const struct ether_addr *mac);
 int arp_network_bind_raw_socket(int ifindex, const struct in_addr *a, const struct ether_addr *mac);
@@ -21,12 +21,12 @@ static inline int arp_send_probe(
                 int ifindex,
                 const struct in_addr *pa,
                 const struct ether_addr *ha) {
-        return arp_send_packet(fd, ifindex, pa, ha, false);
+        return arp_send_packet(fd, ifindex, pa, ha, /* announce= */ false);
 }
 static inline int arp_send_announcement(
                 int fd,
                 int ifindex,
                 const struct in_addr *pa,
                 const struct ether_addr *ha) {
-        return arp_send_packet(fd, ifindex, pa, ha, true);
+        return arp_send_packet(fd, ifindex, pa, ha, /* announce= */ true);
 }

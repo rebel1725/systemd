@@ -38,6 +38,7 @@ struct udev_device {
 
         struct udev_device *parent;
         bool parent_set;
+        int parent_errno;
 
         struct udev_list *properties;
         uint64_t properties_generation;
@@ -190,19 +191,19 @@ struct udev_device* udev_device_new(struct udev *udev, sd_device *device) {
 
         assert(device);
 
-        properties = udev_list_new(true);
+        properties = udev_list_new(/* unique= */ true);
         if (!properties)
                 return_with_errno(NULL, ENOMEM);
-        all_tags = udev_list_new(true);
+        all_tags = udev_list_new(/* unique= */ true);
         if (!all_tags)
                 return_with_errno(NULL, ENOMEM);
-        current_tags = udev_list_new(true);
+        current_tags = udev_list_new(/* unique= */ true);
         if (!current_tags)
                 return_with_errno(NULL, ENOMEM);
-        sysattrs = udev_list_new(true);
+        sysattrs = udev_list_new(/* unique= */ true);
         if (!sysattrs)
                 return_with_errno(NULL, ENOMEM);
-        devlinks = udev_list_new(true);
+        devlinks = udev_list_new(/* unique= */ true);
         if (!devlinks)
                 return_with_errno(NULL, ENOMEM);
 
@@ -393,9 +394,12 @@ _public_ struct udev_device* udev_device_get_parent(struct udev_device *udev_dev
         if (!udev_device->parent_set) {
                 udev_device->parent_set = true;
                 udev_device->parent = device_new_from_parent(udev_device);
+                udev_device->parent_errno = udev_device->parent ? 0 : errno;
         }
 
-        /* TODO: errno will differ here in case parent == NULL */
+        if (!udev_device->parent)
+                errno = udev_device->parent_errno;
+
         return udev_device->parent;
 }
 
@@ -627,7 +631,7 @@ _public_ struct udev_list_entry* udev_device_get_devlinks_list_entry(struct udev
                 udev_list_cleanup(udev_device->devlinks);
 
                 FOREACH_DEVICE_DEVLINK(udev_device->device, devlink)
-                        if (!udev_list_entry_add(udev_device->devlinks, devlink, NULL))
+                        if (!udev_list_entry_add(udev_device->devlinks, devlink, /* value= */ NULL))
                                 return_with_errno(NULL, ENOMEM);
 
                 udev_device->devlinks_read = true;
@@ -775,7 +779,7 @@ _public_ struct udev_list_entry* udev_device_get_sysattr_list_entry(struct udev_
                 udev_list_cleanup(udev_device->sysattrs);
 
                 FOREACH_DEVICE_SYSATTR(udev_device->device, sysattr)
-                        if (!udev_list_entry_add(udev_device->sysattrs, sysattr, NULL))
+                        if (!udev_list_entry_add(udev_device->sysattrs, sysattr, /* value= */ NULL))
                                 return_with_errno(NULL, ENOMEM);
 
                 udev_device->sysattrs_read = true;
@@ -828,7 +832,7 @@ _public_ struct udev_list_entry* udev_device_get_tags_list_entry(struct udev_dev
                 udev_list_cleanup(udev_device->all_tags);
 
                 FOREACH_DEVICE_TAG(udev_device->device, tag)
-                        if (!udev_list_entry_add(udev_device->all_tags, tag, NULL))
+                        if (!udev_list_entry_add(udev_device->all_tags, tag, /* value= */ NULL))
                                 return_with_errno(NULL, ENOMEM);
 
                 udev_device->all_tags_read = true;
@@ -846,7 +850,7 @@ _public_ struct udev_list_entry* udev_device_get_current_tags_list_entry(struct 
                 udev_list_cleanup(udev_device->current_tags);
 
                 FOREACH_DEVICE_CURRENT_TAG(udev_device->device, tag)
-                        if (!udev_list_entry_add(udev_device->current_tags, tag, NULL))
+                        if (!udev_list_entry_add(udev_device->current_tags, tag, /* value= */ NULL))
                                 return_with_errno(NULL, ENOMEM);
 
                 udev_device->current_tags_read = true;

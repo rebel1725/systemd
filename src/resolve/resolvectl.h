@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 #pragma once
 
-#include "shared-forward.h"
+#include "forward.h"
 
 typedef enum ExecutionMode {
         MODE_RESOLVE_HOST,
@@ -27,8 +27,8 @@ extern bool arg_ifindex_permissive;
 
 int ifname_mangle_full(const char *s, bool drop_protocol_specifier);
 static inline int ifname_mangle(const char *s) {
-        return ifname_mangle_full(s, false);
+        return ifname_mangle_full(s, /* drop_protocol_specifier= */ false);
 }
 static inline int ifname_resolvconf_mangle(const char *s) {
-        return ifname_mangle_full(s, true);
+        return ifname_mangle_full(s, /* drop_protocol_specifier= */ true);
 }

@@ -115,7 +115,7 @@ int dns_zone_remove_rrs_by_key(DnsZone *z, DnsResourceKey *key) {
         bool tentative;
         int r;
 
-        r = dns_zone_lookup(z, key, 0, &answer, &soa, &tentative);
+        r = dns_zone_lookup(z, key, /* ifindex= */ 0, &answer, &soa, &tentative);
         if (r < 0)
                 return r;
 
@@ -161,8 +161,15 @@ static int dns_zone_link_item(DnsZone *z, DnsZoneItem *i) {
                 assert_se(hashmap_replace(z->by_name, dns_resource_key_name(first->rr->key), first) >= 0);
         } else {
                 r = hashmap_put(z->by_name, dns_resource_key_name(i->rr->key), i);
-                if (r < 0)
+                if (r < 0) {
+                        first = hashmap_get(z->by_key, i->rr->key);
+                        LIST_REMOVE(by_key, first, i);
+                        if (first)
+                                assert_se(hashmap_replace(z->by_key, first->rr->key, first) >= 0);
+                        else
+                                hashmap_remove(z->by_key, i->rr->key);
                         return r;
+                }
         }
 
         return 0;
@@ -188,16 +195,16 @@ static int dns_zone_item_probe_start(DnsZoneItem *i)  {
                 if (!key)
                         return -ENOMEM;
 
-                r = dns_transaction_new(&t, i->scope, key, NULL, SD_RESOLVED_NO_CACHE|SD_RESOLVED_NO_ZONE);
+                r = dns_transaction_new(&t, i->scope, key, /* bypass= */ NULL, SD_RESOLVED_NO_CACHE|SD_RESOLVED_NO_ZONE);
                 if (r < 0)
                         return r;
         }
 
-        r = set_ensure_allocated(&t->notify_zone_items_done, NULL);
+        r = set_ensure_allocated(&t->notify_zone_items_done, /* hash_ops= */ NULL);
         if (r < 0)
                 return r;
 
-        r = set_ensure_put(&t->notify_zone_items, NULL, i);
+        r = set_ensure_put(&t->notify_zone_items, /* hash_ops= */ NULL, i);
         if (r < 0)
                 return r;
 
@@ -300,7 +307,7 @@ static int dns_zone_add_authenticated_answer(DnsAnswer *a, DnsZoneItem *i, int i
         else
                 flags = DNS_ANSWER_AUTHENTICATED;
 
-        return dns_answer_add(a, i->rr, ifindex, flags, NULL);
+        return dns_answer_add(a, i->rr, ifindex, flags, /* rrsig= */ NULL);
 }
 
 int dns_zone_lookup(DnsZone *z, DnsResourceKey *key, int ifindex, DnsAnswer **ret_answer, DnsAnswer **ret_soa, bool *ret_tentative) {
@@ -334,7 +341,7 @@ int dns_zone_lookup(DnsZone *z, DnsResourceKey *key, int ifindex, DnsAnswer **re
 
                         found = true;
 
-                        k = dns_resource_key_match_rr(key, j->rr, NULL);
+                        k = dns_resource_key_match_rr(key, j->rr, /* search_domain= */ NULL);
                         if (k < 0)
                                 return k;
                         if (k > 0) {
@@ -404,7 +411,7 @@ int dns_zone_lookup(DnsZone *z, DnsResourceKey *key, int ifindex, DnsAnswer **re
                         if (j->state != DNS_ZONE_ITEM_PROBING)
                                 tentative = false;
 
-                        k = dns_resource_key_match_rr(key, j->rr, NULL);
+                        k = dns_resource_key_match_rr(key, j->rr, /* search_domain= */ NULL);
                         if (k < 0)
                                 return k;
                         if (k > 0) {

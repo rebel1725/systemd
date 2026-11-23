@@ -28,6 +28,7 @@
 #include "format-util.h"
 #include "fs-util.h"
 #include "hashmap.h"
+#include "json-util.h"
 #include "login-util.h"
 #include "logind.h"
 #include "logind-dbus.h"
@@ -39,7 +40,7 @@
 #include "logind-user.h"
 #include "logind-user-dbus.h"
 #include "logind-varlink.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "process-util.h"
@@ -280,8 +281,10 @@ static void session_save_devices(Session *s, FILE *f) {
         }
 }
 
-static int trigger_xaccess(char * const *extra_devices) {
+static int trigger_xaccess(Manager *m, char * const *extra_devices) {
         int r;
+
+        assert(m);
 
         if (strv_isempty(extra_devices))
                 return 0;
@@ -314,14 +317,14 @@ static int trigger_xaccess(char * const *extra_devices) {
                         continue;
 
                 /* In case people mistag devices without nodes, we need to ignore this. */
-                r = sd_device_get_devname(d, NULL);
+                r = sd_device_get_devname(d, /* ret= */ NULL);
                 if (r == -ENOENT)
                         continue;
                 if (r < 0)
                         return r;
 
                 sd_id128_t uuid;
-                r = sd_device_trigger_with_uuid(d, SD_DEVICE_CHANGE, &uuid);
+                r = device_trigger_with_timestamp(d, SD_DEVICE_CHANGE, m->device_trigger_args, &uuid);
                 if (r < 0) {
                         log_device_debug_errno(d, r, "Failed to trigger 'change' event, ignoring: %m");
                         continue;
@@ -344,13 +347,13 @@ int session_save(Session *s) {
         if (!s->started)
                 return 0;
 
-        r = mkdir_safe_label("/run/systemd/sessions", 0755, 0, 0, MKDIR_WARN_MODE);
+        r = mkdir_safe_label("/run/systemd/sessions", 0755, /* uid= */ 0, /* gid= */ 0, MKDIR_WARN_MODE);
         if (r < 0)
                 return log_error_errno(r, "Failed to create /run/systemd/sessions/: %m");
 
         _cleanup_(unlink_and_freep) char *temp_path = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        r = fopen_tmpfile_linkable(s->state_file, O_WRONLY|O_CLOEXEC, &temp_path, &f);
+        r = fopen_tmpfile_linkable(s->state_file, O_WRONLY, &temp_path, &f);
         if (r < 0)
                 return log_error_errno(r, "Failed to create state file '%s': %m", s->state_file);
 
@@ -452,7 +455,7 @@ static int session_load_devices(Session *s, const char *devices) {
                 dev_t dev;
                 int k;
 
-                k = extract_first_word(&p, &word, NULL, 0);
+                k = extract_first_word(&p, &word, /* separators= */ NULL, /* flags= */ 0);
                 if (k <= 0) {
                         RET_GATHER(r, k);
                         break;
@@ -702,8 +705,8 @@ int session_load(Session *s) {
         }
 
         if (controller) {
-                if (bus_name_has_owner(s->manager->bus, controller, NULL) > 0) {
-                        session_set_controller(s, controller, false, false);
+                if (bus_name_has_owner(s->manager->bus, controller, /* reterr_error= */ NULL) > 0) {
+                        session_set_controller(s, controller, /* force= */ false, /* prepare= */ false);
                         session_load_devices(s, devices);
                 } else
                         session_restore_vt(s);
@@ -872,7 +875,7 @@ static int session_setup_stop_on_idle_timer(Session *s) {
                         &s->stop_on_idle_event_source,
                         CLOCK_MONOTONIC,
                         s->manager->stop_idle_session_usec,
-                        0,
+                        /* accuracy= */ 0,
                         session_dispatch_stop_on_idle, s);
         if (r < 0)
                 return log_error_errno(r, "Failed to add stop on idle session event source: %m");
@@ -884,6 +887,7 @@ int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error) {
         int r;
 
         assert(s);
+        assert(s->manager);
 
         if (!s->user)
                 return -ESTALE;
@@ -922,10 +926,13 @@ int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error) {
         if (!dual_timestamp_is_set(&s->timestamp))
                 dual_timestamp_now(&s->timestamp);
 
+        /* Must be set before seat_read_active_vt(); the activation it
+         * triggers reaches seat_triggered_uevents_done() synchronously
+         * and gates session_device_resume_all() on s->started. */
+        s->started = true;
+
         if (s->seat)
                 seat_read_active_vt(s->seat);
-
-        s->started = true;
 
         user_elect_display(s->user);
 
@@ -935,10 +942,10 @@ int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error) {
         if (s->seat)
                 (void) seat_save(s->seat);
 
-        (void) trigger_xaccess(s->extra_device_access);
+        (void) trigger_xaccess(s->manager, s->extra_device_access);
 
         /* Send signals */
-        (void) session_send_signal(s, true);
+        (void) session_send_signal(s, /* new_session= */ true);
         (void) user_send_changed(s->user, "Display");
 
         if (s->seat && s->seat->active == s)
@@ -999,6 +1006,7 @@ int session_stop(Session *s, bool force) {
         int r;
 
         assert(s);
+        assert(s->manager);
 
         /* This is called whenever we begin with tearing down a session record. It's called in four cases: explicit API
          * request via the bus (either directly for the session object or for the seat or user object this session
@@ -1027,7 +1035,7 @@ int session_stop(Session *s, bool force) {
         (void) session_save(s);
         (void) user_save(s->user);
 
-        (void) trigger_xaccess(s->extra_device_access);
+        (void) trigger_xaccess(s->manager, s->extra_device_access);
 
         return r;
 }
@@ -1062,13 +1070,13 @@ int session_finalize(Session *s) {
         user_add_to_gc_queue(s->user);
 
         if (s->started) {
-                session_send_signal(s, false);
+                session_send_signal(s, /* new_session= */ false);
                 s->started = false;
         }
 
         if (s->seat) {
                 if (s->seat->active == s)
-                        seat_set_active(s->seat, NULL);
+                        seat_set_active(s->seat, /* session= */ NULL);
 
                 seat_save(s->seat);
         }
@@ -1103,7 +1111,7 @@ int session_release(Session *s) {
                         s->manager->event,
                         &s->timer_event_source,
                         CLOCK_MONOTONIC,
-                        RELEASE_USEC, 0,
+                        RELEASE_USEC, /* accuracy= */ 0,
                         release_timeout_callback, s);
 }
 
@@ -1146,26 +1154,30 @@ static int get_process_ctty_atime(pid_t pid, usec_t *atime) {
         assert(pid > 0);
         assert(atime);
 
-        r = get_ctty(pid, NULL, &p);
+        r = get_ctty(pid, /* ret_devnr= */ NULL, &p);
         if (r < 0)
                 return r;
 
         return get_tty_atime(p, atime);
 }
 
-int session_get_idle_hint(Session *s, dual_timestamp *t) {
+bool session_get_idle_hint(Session *s, dual_timestamp *ret_timestamp) {
         usec_t atime = 0, dtime = 0;
         int r;
 
         assert(s);
 
-        if (!SESSION_CLASS_CAN_IDLE(s->class))
+        if (!SESSION_CLASS_CAN_IDLE(s->class)) {
+                if (ret_timestamp)
+                        *ret_timestamp = DUAL_TIMESTAMP_NULL;
+
                 return false;
+        }
 
         /* Graphical sessions have an explicit idle hint */
         if (SESSION_TYPE_IS_GRAPHICAL(s->type)) {
-                if (t)
-                        *t = s->idle_hint_timestamp;
+                if (ret_timestamp)
+                        *ret_timestamp = s->idle_hint_timestamp;
 
                 return s->idle_hint;
         }
@@ -1187,14 +1199,14 @@ int session_get_idle_hint(Session *s, dual_timestamp *t) {
                 }
         }
 
-        if (t)
-                *t = DUAL_TIMESTAMP_NULL;
+        if (ret_timestamp)
+                *ret_timestamp = DUAL_TIMESTAMP_NULL;
 
         return false;
 
 found_atime:
-        if (t)
-                dual_timestamp_from_realtime(t, atime);
+        if (ret_timestamp)
+                dual_timestamp_from_realtime(ret_timestamp, atime);
 
         if (s->manager->idle_action_usec > 0 && s->manager->stop_idle_session_usec != USEC_INFINITY)
                 dtime = MIN(s->manager->idle_action_usec, s->manager->stop_idle_session_usec);
@@ -1419,7 +1431,7 @@ static int session_open_vt(Session *s, bool reopen) {
 
         sprintf(path, "/dev/tty%u", s->vtnr);
 
-        fd = open_terminal(path, O_RDWR | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
+        fd = open_terminal(path, O_RDWR | O_NONBLOCK | O_NOCTTY);
         if (fd < 0)
                 return log_error_errno(fd, "Cannot open VT %s of session %s: %m", path, s->id);
 
@@ -1623,7 +1635,7 @@ int session_set_controller(Session *s, const char *sender, bool force, bool prep
                 }
         }
 
-        session_release_controller(s, true);
+        session_release_controller(s, /* notify= */ true);
         s->controller = TAKE_PTR(name);
         (void) session_save(s);
 
@@ -1638,7 +1650,7 @@ void session_drop_controller(Session *s) {
 
         s->track = sd_bus_track_unref(s->track);
         session_set_type(s, s->original_type);
-        session_release_controller(s, false);
+        session_release_controller(s, /* notify= */ false);
         (void) session_save(s);
         session_restore_vt(s);
 }
@@ -1678,6 +1690,65 @@ bool session_is_self(const char *name) {
 
 bool session_is_auto(const char *name) {
         return streq_ptr(name, "auto");
+}
+
+static int session_context_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Session *s = ASSERT_PTR(userdata);
+
+        assert(ret);
+        assert(s->user);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_UNSIGNED("UID", s->user->user_record->uid),
+                        JSON_BUILD_PAIR_PIDREF_NON_NULL("PID", &s->leader),
+                        JSON_BUILD_PAIR_ENUM("Type", session_type_to_string(s->type)),
+                        JSON_BUILD_PAIR_ENUM("Class", session_class_to_string(s->class)),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Service", s->service),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Desktop", s->desktop),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Seat", s->seat ? s->seat->id : NULL),
+                        JSON_BUILD_PAIR_UNSIGNED_NON_ZERO("VTNr", s->vtnr),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("TTY", s->tty),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Display", s->display),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("Remote", s->remote),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("RemoteHost", s->remote_host),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("RemoteUser", s->remote_user),
+                        JSON_BUILD_PAIR_STRV_NON_EMPTY("ExtraDeviceAccess", s->extra_device_access));
+}
+
+static int session_runtime_build_json(sd_json_variant **ret, const char *name, void *userdata) {
+        Session *s = ASSERT_PTR(userdata);
+
+        assert(ret);
+
+        dual_timestamp idle_ts;
+        bool idle = session_get_idle_hint(s, &idle_ts);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_STRING("Id", s->id),
+                        JSON_BUILD_PAIR_STRING_NON_EMPTY("Scope", s->scope),
+                        SD_JSON_BUILD_PAIR_CONDITION(audit_session_is_valid(s->audit_id),
+                                                     "Audit", SD_JSON_BUILD_UNSIGNED(s->audit_id)),
+                        JSON_BUILD_PAIR_DUAL_TIMESTAMP_NON_NULL("Timestamp", &s->timestamp),
+                        JSON_BUILD_PAIR_ENUM("State", session_state_to_string(session_get_state(s))),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("Active", session_is_active(s)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("IdleHint", idle),
+                        SD_JSON_BUILD_PAIR_CONDITION(idle, "IdleSinceHint", JSON_BUILD_DUAL_TIMESTAMP(&idle_ts)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("LockedHint", s->locked_hint),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("CanIdle", SESSION_CLASS_CAN_IDLE(s->class)),
+                        SD_JSON_BUILD_PAIR_BOOLEAN("CanLock", SESSION_CLASS_CAN_LOCK(s->class)));
+}
+
+int session_build_json(Session *s, sd_json_variant **ret) {
+        assert(s);
+        assert(s->user);
+        assert(ret);
+
+        return sd_json_buildo(
+                        ret,
+                        SD_JSON_BUILD_PAIR_CALLBACK("context", session_context_build_json, s),
+                        SD_JSON_BUILD_PAIR_CALLBACK("runtime", session_runtime_build_json, s));
 }
 
 static const char* const session_state_table[_SESSION_STATE_MAX] = {

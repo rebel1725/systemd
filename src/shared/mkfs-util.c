@@ -4,13 +4,16 @@
 #include <sys/mount.h>
 #include <unistd.h>
 
+#include "escape.h"
+#include "install-file.h"
 #include "log.h"
+#include "memory-util.h"
 #include "mkfs-util.h"
+#include "vfat-util.h"
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "path-util.h"
 #include "process-util.h"
-#include "recurse-dir.h"
 #include "stat-util.h"
 #include "stdio-util.h"
 #include "string-util.h"
@@ -30,13 +33,63 @@ int mkfs_exists(const char *fstype) {
         if (!filename_is_valid(mkfs)) /* refuse file system types with slashes and similar */
                 return -EINVAL;
 
-        r = find_executable(mkfs, NULL);
+        r = find_executable(mkfs, /* ret_filename= */ NULL);
         if (r == -ENOENT)
                 return false;
         if (r < 0)
                 return r;
 
         return true;
+}
+
+int mkfs_find_or_warn(const char *fstype, int have_root, char **ret) {
+        int r;
+
+        assert(fstype);
+
+        if (fstype_is_ro(fstype) && have_root == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "Cannot generate read-only filesystem %s without a source tree.", fstype);
+
+        const char *bin = NULL;
+        if (streq(fstype, "swap")) {
+                if (have_root > 0)
+                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                               "A swap filesystem can't be populated, refusing");
+                bin = "mkswap";
+        } else if (streq(fstype, "squashfs"))
+                bin = "mksquashfs";
+        else if (streq(fstype, "erofs"))
+                bin = "mkfs.erofs";
+        else if (fstype_is_ro(fstype))
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                       "Don't know how to create read-only file system '%s', refusing.", fstype);
+        if (bin) {
+                r = find_executable(bin, ret);
+                if (r == -ENOENT)
+                        return log_error_errno(SYNTHETIC_ERRNO(EPROTONOSUPPORT), "%s binary not available.", bin);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to determine whether %s binary exists: %m", bin);
+                return 0;
+        }
+
+        if (have_root > 0 && !mkfs_supports_root_option(fstype))
+                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
+                                       "Populating with source tree is not supported for %s", fstype);
+        r = mkfs_exists(fstype);
+        if (r < 0)
+                return log_error_errno(r, "Failed to determine whether mkfs binary for %s exists: %m", fstype);
+        if (r == 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EPROTONOSUPPORT), "mkfs binary for %s not available.", fstype);
+
+        if (ret) {
+                char *mkfs = strjoin("mkfs.", fstype);
+                if (!mkfs)
+                        return log_oom();
+                *ret = mkfs;
+        }
+
+        return 0;
 }
 
 int mkfs_supports_root_option(const char *fstype) {
@@ -74,10 +127,11 @@ static int mangle_linux_fs_label(const char *s, size_t max_len, char **ret) {
 }
 
 static int mangle_fat_label(const char *s, char **ret) {
-        assert(s);
-
         _cleanup_free_ char *q = NULL;
         int r;
+
+        assert(s);
+        assert(ret);
 
         r = utf8_to_ascii(s, '_', &q);
         if (r < 0)
@@ -94,74 +148,6 @@ static int mangle_fat_label(const char *s, char **ret) {
                         *p = '_';
 
         *ret = TAKE_PTR(q);
-        return 0;
-}
-
-static int do_mcopy(const char *node, const char *root) {
-        _cleanup_free_ char *mcopy = NULL;
-        _cleanup_strv_free_ char **argv = NULL;
-        _cleanup_free_ DirectoryEntries *de = NULL;
-        int r;
-
-        assert(node);
-        assert(root);
-
-        /* Return early if there's nothing to copy. */
-        if (dir_is_empty(root, /* ignore_hidden_or_backup= */ false))
-                return 0;
-
-        r = find_executable("mcopy", &mcopy);
-        if (r == -ENOENT)
-                return log_error_errno(SYNTHETIC_ERRNO(EPROTONOSUPPORT), "Could not find mcopy binary.");
-        if (r < 0)
-                return log_error_errno(r, "Failed to determine whether mcopy binary exists: %m");
-
-        argv = strv_new(mcopy, "-s", "-p", "-Q", "-m", "-i", node);
-        if (!argv)
-                return log_oom();
-
-        /* mcopy copies the top level directory instead of everything in it so we have to pass all
-         * the subdirectories to mcopy instead to end up with the correct directory structure. */
-
-        r = readdir_all_at(AT_FDCWD, root, RECURSE_DIR_SORT|RECURSE_DIR_ENSURE_TYPE, &de);
-        if (r < 0)
-                return log_error_errno(r, "Failed to read '%s' contents: %m", root);
-
-        for (size_t i = 0; i < de->n_entries; i++) {
-                _cleanup_free_ char *p = NULL;
-
-                p = path_join(root, de->entries[i]->d_name);
-                if (!p)
-                        return log_oom();
-
-                if (!IN_SET(de->entries[i]->d_type, DT_REG, DT_DIR)) {
-                        log_debug("%s is not a file/directory which are the only file types supported by vfat, ignoring", p);
-                        continue;
-                }
-
-                if (strv_consume(&argv, TAKE_PTR(p)) < 0)
-                        return log_oom();
-        }
-
-        if (strv_extend(&argv, "::") < 0)
-                return log_oom();
-
-        r = pidref_safe_fork(
-                        "(mcopy)",
-                        FORK_RESET_SIGNALS|FORK_RLIMIT_NOFILE_SAFE|FORK_DEATHSIG_SIGTERM|FORK_LOG|FORK_WAIT|FORK_STDOUT_TO_STDERR|FORK_CLOSE_ALL_FDS,
-                        /* ret= */ NULL);
-        if (r < 0)
-                return r;
-        if (r == 0) {
-                /* Avoid failures caused by mismatch in expectations between mkfs.vfat and mcopy by disabling
-                 * the stricter mcopy checks using MTOOLS_SKIP_CHECK. */
-                execve(mcopy, argv, STRV_MAKE("MTOOLS_SKIP_CHECK=1", "TZ=UTC", strv_find_prefix(environ, "SOURCE_DATE_EPOCH=")));
-
-                log_error_errno(errno, "Failed to execute mcopy: %m");
-
-                _exit(EXIT_FAILURE);
-        }
-
         return 0;
 }
 
@@ -189,52 +175,9 @@ int make_filesystem(
         assert(fstype);
         assert(label);
 
-        if (fstype_is_ro(fstype) && !root)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "Cannot generate read-only filesystem %s without a source tree.",
-                                       fstype);
-
-        if (streq(fstype, "swap")) {
-                if (root)
-                        return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                               "A swap filesystem can't be populated, refusing");
-                r = find_executable("mkswap", &mkfs);
-                if (r == -ENOENT)
-                        return log_error_errno(SYNTHETIC_ERRNO(EPROTONOSUPPORT), "mkswap binary not available.");
-                if (r < 0)
-                        return log_error_errno(r, "Failed to determine whether mkswap binary exists: %m");
-        } else if (streq(fstype, "squashfs")) {
-                r = find_executable("mksquashfs", &mkfs);
-                if (r == -ENOENT)
-                        return log_error_errno(SYNTHETIC_ERRNO(EPROTONOSUPPORT), "mksquashfs binary not available.");
-                if (r < 0)
-                        return log_error_errno(r, "Failed to determine whether mksquashfs binary exists: %m");
-
-        } else if (streq(fstype, "erofs")) {
-                r = find_executable("mkfs.erofs", &mkfs);
-                if (r == -ENOENT)
-                        return log_error_errno(SYNTHETIC_ERRNO(EPROTONOSUPPORT), "mkfs.erofs binary not available.");
-                if (r < 0)
-                        return log_error_errno(r, "Failed to determine whether mkfs.erofs binary exists: %m");
-
-        } else if (fstype_is_ro(fstype)) {
-                return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                                       "Don't know how to create read-only file system '%s', refusing.",
-                                                       fstype);
-        } else {
-                if (root && !mkfs_supports_root_option(fstype))
-                        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                               "Populating with source tree is not supported for %s", fstype);
-                r = mkfs_exists(fstype);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to determine whether mkfs binary for %s exists: %m", fstype);
-                if (r == 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EPROTONOSUPPORT), "mkfs binary for %s is not available.", fstype);
-
-                mkfs = strjoin("mkfs.", fstype);
-                if (!mkfs)
-                        return log_oom();
-        }
+        r = mkfs_find_or_warn(fstype, /* have_root= */ !!root, &mkfs);
+        if (r < 0)
+                return r;
 
         if (STR_IN_SET(fstype, "ext2", "ext3", "ext4", "xfs", "swap")) {
                 size_t max_len =
@@ -310,8 +253,11 @@ int make_filesystem(
                  * 0 value handling, where $E2FSPROGS_FAKE_TIME=0 is ignored and the current time is used,
                  * but $SOURCE_DATE_EPOCH=0 sets 1970-01-01 as the timestamp. */
                 if (!secure_getenv("E2FSPROGS_FAKE_TIME")) { /* honor $E2FSPROGS_FAKE_TIME if already set */
-                        const char *e = secure_getenv("SOURCE_DATE_EPOCH");
-                        if (e && strv_extend_strv(&env, STRV_MAKE("E2FSPROGS_FAKE_TIME", e), /* filter_duplicates= */ false) < 0)
+                        _cleanup_free_ char *seconds = NULL;
+
+                        if (source_date_epoch_seconds(&seconds) < 0)
+                                return log_oom();
+                        if (seconds && strv_extend_strv(&env, STRV_MAKE("E2FSPROGS_FAKE_TIME", seconds), /* filter_duplicates= */ false) < 0)
                                 return log_oom();
                 }
 
@@ -501,6 +447,12 @@ int make_filesystem(
                                 return log_oom();
                 }
 
+                /* mkfs.erofs defaults to the page size and rejects block sizes larger than
+                 * that, so only pass an explicit block size when it is actually smaller. */
+                if (sector_size > 0 && sector_size < (uint64_t) page_size() &&
+                    strv_extendf(&argv, "-b%"PRIu64, sector_size) < 0)
+                        return log_oom();
+
                 if (strv_extend_many(&argv, node, root) < 0)
                         return log_oom();
 
@@ -511,25 +463,27 @@ int make_filesystem(
                         return log_oom();
         }
 
-        if (extra_mkfs_args && strv_extend_strv(&argv, extra_mkfs_args, false) < 0)
+        if (extra_mkfs_args && strv_extend_strv(&argv, extra_mkfs_args, /* filter_duplicates= */ false) < 0)
                 return log_oom();
 
         if (streq(fstype, "btrfs")) {
                 struct stat st;
 
                 if (stat(node, &st) < 0)
-                        return log_error_errno(r, "Failed to stat '%s': %m", node);
+                        return log_error_errno(errno, "Failed to stat '%s': %m", node);
 
                 if (S_ISBLK(st.st_mode))
                         fork_flags |= FORK_NEW_MOUNTNS;
         }
 
+        _cleanup_free_ char *source_date_epoch = NULL;
+        if (source_date_epoch_seconds(&source_date_epoch) < 0)
+                return log_oom();
+
         log_info("Formatting %s as %s", node, fstype);
 
         if (DEBUG_LOGGING) {
-                _cleanup_free_ char *j = NULL;
-
-                j = strv_join(argv, " ");
+                _cleanup_free_ char *j = quote_command_line(argv, SHELL_ESCAPE_EMPTY);
                 log_debug("Executing mkfs command: %s", strna(j));
         }
 
@@ -547,26 +501,33 @@ int make_filesystem(
 
                 STRV_FOREACH_PAIR(k, v, env)
                         if (setenv(*k, *v, /* replace= */ true) < 0) {
-                                log_error_errno(r, "Failed to set %s=%s environment variable: %m", *k, *v);
+                                log_error_errno(errno, "Failed to set %s=%s environment variable: %m", *k, *v);
                                 _exit(EXIT_FAILURE);
                         }
+
+                /* Same as in mtools_exec(): the mkfs tool gets our reading of the variable, or none. */
+                if (source_date_epoch ? setenv("SOURCE_DATE_EPOCH", source_date_epoch, /* replace= */ true) < 0
+                                      : unsetenv("SOURCE_DATE_EPOCH") < 0) {
+                        log_error_errno(errno, "Failed to adjust $SOURCE_DATE_EPOCH: %m");
+                        _exit(EXIT_FAILURE);
+                }
 
                 /* mkfs.btrfs refuses to operate on block devices with mounted partitions, even if operating
                  * on unformatted free space, so let's trick it and other mkfs tools into thinking no
                  * partitions are mounted. See https://github.com/kdave/btrfs-progs/issues/640 for more
-                 ° information. */
+                 * information. */
                  if (fork_flags & FORK_NEW_MOUNTNS)
-                        (void) mount_nofollow_verbose(LOG_DEBUG, "/dev/null", "/proc/self/mounts", NULL, MS_BIND, NULL);
+                        (void) mount_nofollow_verbose(LOG_DEBUG, "/dev/null", "/proc/self/mounts", /* fstype= */ NULL, MS_BIND, /* options= */ NULL);
 
-                execvp(mkfs, argv);
+                r = execvp_safe(mkfs, argv);
 
-                log_error_errno(errno, "Failed to execute %s: %m", mkfs);
+                log_error_errno(r, "Failed to execute %s: %m", mkfs);
 
                 _exit(EXIT_FAILURE);
         }
 
         if (root && streq(fstype, "vfat")) {
-                r = do_mcopy(node, root);
+                r = vfat_copy_tree(node, /* offset= */ 0, root);
                 if (r < 0)
                         return r;
         }
@@ -596,7 +557,7 @@ int mkfs_options_from_env(const char *component, const char *fstype, char ***ret
         n = strjoina("SYSTEMD_", component, "_MKFS_OPTIONS_", fstype);
         e = getenv(ascii_strupper(n));
         if (e) {
-                l = strv_split(e, NULL);
+                l = strv_split(e, /* separators= */ NULL);
                 if (!l)
                         return -ENOMEM;
         }

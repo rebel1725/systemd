@@ -1,14 +1,18 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+if conf.get('ENABLE_SLEEP') != 1
+        subdir_done()
+endif
+
 executables += [
         libexec_template + {
                 'name' : 'systemd-sleep',
                 'sources' : files('sleep.c'),
-                'extract' : files('battery-capacity.c'),
+                'export' : files('battery-capacity.c'),
         },
         test_template + {
                 'sources' : files('test-battery-capacity.c'),
-                'objects' : ['systemd-sleep'],
+                'import' : ['systemd-sleep'],
         },
 ]
 

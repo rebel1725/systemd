@@ -227,13 +227,13 @@ static int get_path(uint64_t type, char **buffer, const char **ret) {
                 return 0;
 
         case SD_PATH_USER_BINARIES:
-                return from_home_dir(NULL, ".local/bin", buffer, ret);
+                return from_home_dir(/* envname= */ NULL, ".local/bin", buffer, ret);
 
         case SD_PATH_USER_LIBRARY_PRIVATE:
-                return from_home_dir(NULL, ".local/lib", buffer, ret);
+                return from_home_dir(/* envname= */ NULL, ".local/lib", buffer, ret);
 
         case SD_PATH_USER_LIBRARY_ARCH:
-                return from_home_dir(NULL, ".local/lib/" LIB_ARCH_TUPLE, buffer, ret);
+                return from_home_dir(/* envname= */ NULL, ".local/lib/" LIB_ARCH_TUPLE, buffer, ret);
 
         case SD_PATH_USER_SHARED:
                 return from_home_dir("XDG_DATA_HOME", ".local/share", buffer, ret);
@@ -242,7 +242,7 @@ static int get_path(uint64_t type, char **buffer, const char **ret) {
                 return from_home_dir("XDG_CONFIG_HOME", ".config", buffer, ret);
 
         case SD_PATH_USER_RUNTIME:
-                return from_environment("XDG_RUNTIME_DIR", NULL, ret);
+                return from_environment("XDG_RUNTIME_DIR", /* fallback= */ NULL, ret);
 
         case SD_PATH_USER_STATE_CACHE:
                 return from_home_dir("XDG_CACHE_HOME", ".cache", buffer, ret);
@@ -281,6 +281,9 @@ static int get_path(uint64_t type, char **buffer, const char **ret) {
 
         case SD_PATH_USER_DESKTOP:
                 return from_xdg_user_dir("XDG_DESKTOP_DIR", buffer, ret);
+
+        case SD_PATH_USER_PROJECTS:
+                return from_xdg_user_dir("XDG_PROJECTS_DIR", buffer, ret);
 
         case SD_PATH_SYSTEMD_UTIL:
                 *ret = PREFIX_NOSLASH "/lib/systemd";
@@ -529,30 +532,30 @@ static int get_search(uint64_t type, char ***ret) {
 
         case SD_PATH_SEARCH_BINARIES:
                 return search_from_environment(ret,
-                                               NULL,
+                                               /* env_home= */ NULL,
                                                ".local/bin",
                                                "PATH",
-                                               true,
+                                               /* env_search_sufficient= */ true,
                                                ARRAY_SBIN_BIN("/usr/local/"),
                                                ARRAY_SBIN_BIN("/usr/"),
                                                NULL);
 
         case SD_PATH_SEARCH_LIBRARY_PRIVATE:
                 return search_from_environment(ret,
-                                               NULL,
+                                               /* env_home= */ NULL,
                                                ".local/lib",
-                                               NULL,
-                                               false,
+                                               /* env_search= */ NULL,
+                                               /* env_search_sufficient= */ false,
                                                "/usr/local/lib",
                                                "/usr/lib",
                                                NULL);
 
         case SD_PATH_SEARCH_LIBRARY_ARCH:
                 return search_from_environment(ret,
-                                               NULL,
+                                               /* env_home= */ NULL,
                                                ".local/lib/" LIB_ARCH_TUPLE,
                                                "LD_LIBRARY_PATH",
-                                               true,
+                                               /* env_search_sufficient= */ true,
                                                LIBDIR,
                                                NULL);
 
@@ -561,27 +564,27 @@ static int get_search(uint64_t type, char ***ret) {
                                                "XDG_DATA_HOME",
                                                ".local/share",
                                                "XDG_DATA_DIRS",
-                                               false,
+                                               /* env_search_sufficient= */ false,
                                                "/usr/local/share",
                                                "/usr/share",
                                                NULL);
 
         case SD_PATH_SEARCH_CONFIGURATION_FACTORY:
                 return search_from_environment(ret,
-                                               NULL,
-                                               NULL,
-                                               NULL,
-                                               false,
+                                               /* env_home= */ NULL,
+                                               /* home_suffix= */ NULL,
+                                               /* env_search= */ NULL,
+                                               /* env_search_sufficient= */ false,
                                                "/usr/local/share/factory/etc",
                                                "/usr/share/factory/etc",
                                                NULL);
 
         case SD_PATH_SEARCH_STATE_FACTORY:
                 return search_from_environment(ret,
-                                               NULL,
-                                               NULL,
-                                               NULL,
-                                               false,
+                                               /* env_home= */ NULL,
+                                               /* home_suffix= */ NULL,
+                                               /* env_search= */ NULL,
+                                               /* env_search_sufficient= */ false,
                                                "/usr/local/share/factory/var",
                                                "/usr/share/factory/var",
                                                NULL);
@@ -591,7 +594,7 @@ static int get_search(uint64_t type, char ***ret) {
                                                "XDG_CONFIG_HOME",
                                                ".config",
                                                "XDG_CONFIG_DIRS",
-                                               false,
+                                               /* env_search_sufficient= */ false,
                                                "/etc",
                                                NULL);
 
@@ -610,7 +613,7 @@ static int get_search(uint64_t type, char ***ret) {
                 RuntimeScope scope = type == SD_PATH_SYSTEMD_SEARCH_SYSTEM_UNIT ?
                         RUNTIME_SCOPE_SYSTEM : RUNTIME_SCOPE_USER;
 
-                r = lookup_paths_init(&lp, scope, 0, NULL);
+                r = lookup_paths_init(&lp, scope, /* flags= */ 0, /* root_dir= */ NULL);
                 if (r < 0)
                         return r;
 
@@ -628,11 +631,12 @@ static int get_search(uint64_t type, char ***ret) {
                 bool env_generator = IN_SET(type, SD_PATH_SYSTEMD_SEARCH_SYSTEM_ENVIRONMENT_GENERATOR,
                                                   SD_PATH_SYSTEMD_SEARCH_USER_ENVIRONMENT_GENERATOR);
 
-                char **t = generator_binary_paths_internal(scope, env_generator);
-                if (!t)
-                        return -ENOMEM;
+                _cleanup_strv_free_ char **t = NULL;
+                r = generator_binary_paths_internal(scope, env_generator, &t);
+                if (r < 0)
+                        return r;
 
-                *ret = t;
+                *ret = TAKE_PTR(t);
                 return 0;
         }
 

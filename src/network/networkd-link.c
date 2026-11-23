@@ -10,6 +10,7 @@
 
 #include "sd-bus.h"
 #include "sd-dhcp-client.h"
+#include "sd-dhcp-relay.h"
 #include "sd-dhcp-server.h"
 #include "sd-dhcp6-client.h"
 #include "sd-dhcp6-lease.h"
@@ -23,12 +24,12 @@
 #include "alloc-util.h"
 #include "arphrd-util.h"
 #include "bitfield.h"
+#include "device-private.h"
 #include "device-util.h"
 #include "dns-domain.h"
 #include "errno-util.h"
 #include "ethtool-util.h"
 #include "event-util.h"
-#include "format-ifname.h"
 #include "fs-util.h"
 #include "glyph-util.h"
 #include "logarithm.h"
@@ -40,18 +41,19 @@
 #include "networkd-bridge-mdb.h"
 #include "networkd-bridge-vlan.h"
 #include "networkd-dhcp-prefix-delegation.h"
+#include "networkd-dhcp-relay.h"
 #include "networkd-dhcp-server.h"
 #include "networkd-dhcp4.h"
 #include "networkd-dhcp6.h"
 #include "networkd-ipv4acd.h"
 #include "networkd-ipv4ll.h"
-#include "networkd-ipv6-proxy-ndp.h"
 #include "networkd-link.h"
 #include "networkd-link-bus.h"
 #include "networkd-lldp-tx.h"
 #include "networkd-manager.h"
 #include "networkd-ndisc.h"
 #include "networkd-neighbor.h"
+#include "networkd-neighbor-proxy.h"
 #include "networkd-nexthop.h"
 #include "networkd-queue.h"
 #include "networkd-radv.h"
@@ -66,7 +68,6 @@
 #include "networkd-wifi.h"
 #include "networkd-wwan-bus.h"
 #include "ordered-set.h"
-#include "parse-util.h"
 #include "set.h"
 #include "socket-util.h"
 #include "string-table.h"
@@ -151,7 +152,7 @@ bool link_has_ipv6_connectivity(Link *link) {
 
         assert(link);
 
-        link_get_address_states(link, NULL, &ipv6_address_state, NULL);
+        link_get_address_states(link, /* ret_ipv4= */ NULL, &ipv6_address_state, /* ret_all= */ NULL);
 
         switch (ipv6_address_state) {
         case LINK_ADDRESS_STATE_ROUTABLE:
@@ -218,11 +219,7 @@ void link_ntp_settings_clear(Link *link) {
 }
 
 void link_dns_settings_clear(Link *link) {
-        if (link->n_dns != UINT_MAX)
-                for (unsigned i = 0; i < link->n_dns; i++)
-                        in_addr_full_free(link->dns[i]);
-        link->dns = mfree(link->dns);
-        link->n_dns = UINT_MAX;
+        link_set_dns(link, /* dns= */ NULL, /* n_dns= */ UINT_MAX);
 
         link->search_domains = ordered_set_free(link->search_domains);
         link->route_domains = ordered_set_free(link->route_domains);
@@ -240,6 +237,8 @@ static void link_free_engines(Link *link) {
         if (!link)
                 return;
 
+        link->dhcp_relay_interface = sd_dhcp_relay_interface_unref(link->dhcp_relay_interface);
+        link->dhcp_relay_interface_compat = sd_dhcp_relay_interface_unref(link->dhcp_relay_interface_compat);
         link->dhcp_server = sd_dhcp_server_unref(link->dhcp_server);
 
         link->dhcp_client = sd_dhcp_client_unref(link->dhcp_client);
@@ -258,6 +257,7 @@ static void link_free_engines(Link *link) {
 
         link->ndisc = sd_ndisc_unref(link->ndisc);
         link->ndisc_expire = sd_event_source_disable_unref(link->ndisc_expire);
+        link->ndisc_dhcp6_renew = sd_event_source_disable_unref(link->ndisc_dhcp6_renew);
         ndisc_flush(link);
 
         link->radv = sd_radv_unref(link->radv);
@@ -288,7 +288,6 @@ static Link* link_free(Link *link) {
         free(link->previous_ssid);
         free(link->driver);
 
-        unlink_and_free(link->lease_file);
         unlink_and_free(link->state_file);
 
         sd_device_unref(link->dev);
@@ -425,6 +424,14 @@ int link_stop_engines(Link *link, bool may_keep_dynamic) {
                 ndisc_flush(link);
         }
 
+        r = sd_dhcp_relay_interface_stop(link->dhcp_relay_interface);
+        if (r < 0)
+                RET_GATHER(ret, log_link_warning_errno(link, r, "Could not stop DHCP relay agent: %m"));
+
+        r = sd_dhcp_relay_interface_stop(link->dhcp_relay_interface_compat);
+        if (r < 0)
+                RET_GATHER(ret, log_link_warning_errno(link, r, "Could not stop DHCP relay agent (compat): %m"));
+
         r = sd_dhcp_server_stop(link->dhcp_server);
         if (r < 0)
                 RET_GATHER(ret, log_link_warning_errno(link, r, "Could not stop DHCPv4 server: %m"));
@@ -471,96 +478,99 @@ stop:
         (void) link_stop_engines(link, /* may_keep_dynamic= */ false);
 }
 
-void link_check_ready(Link *link) {
+/* Returns why the link is still configuring, or _LINK_CONFIGURING_REASON_INVALID when the link is ready. When
+ * a static address is not ready yet, the address is also returned in ret_address. If log_func is set, the
+ * finished dynamic addressing protocols are logged on its behalf. */
+static LinkConfiguringReason link_get_configuring_reason_full(
+                Link *link,
+                const char *log_func,
+                Address **ret_address) {
         Address *a;
 
         assert(link);
+        assert(link->network);
 
-        if (link->state == LINK_STATE_CONFIGURED)
-                return;
-
-        if (link->state != LINK_STATE_CONFIGURING)
-                return (void) log_link_debug(link, "%s(): link is in %s state.", __func__, link_state_to_string(link->state));
-
-        if (!link->network)
-                return (void) log_link_debug(link, "%s(): link is unmanaged.", __func__);
+        if (ret_address)
+                *ret_address = NULL;
 
         if (!link->tc_configured)
-                return (void) log_link_debug(link, "%s(): traffic controls are not configured.", __func__);
+                return LINK_CONFIGURING_REASON_TRAFFIC_CONTROL;
 
         if (link->set_link_messages > 0)
-                return (void) log_link_debug(link, "%s(): link layer is configuring.", __func__);
+                return LINK_CONFIGURING_REASON_LINK_LAYER;
 
         if (!link->activated)
-                return (void) log_link_debug(link, "%s(): link is not activated.", __func__);
+                return LINK_CONFIGURING_REASON_ACTIVATION;
 
         if (link->iftype == ARPHRD_CAN)
                 /* let's shortcut things for CAN which doesn't need most of checks below. */
-                goto ready;
+                return _LINK_CONFIGURING_REASON_INVALID;
 
         if (!link->stacked_netdevs_created)
-                return (void) log_link_debug(link, "%s(): stacked netdevs are not created.", __func__);
+                return LINK_CONFIGURING_REASON_STACKED_NETDEVS;
 
         if (!link->static_addresses_configured)
-                return (void) log_link_debug(link, "%s(): static addresses are not configured.", __func__);
+                return LINK_CONFIGURING_REASON_STATIC_ADDRESSES;
 
         if (!link->static_address_labels_configured)
-                return (void) log_link_debug(link, "%s(): static address labels are not configured.", __func__);
+                return LINK_CONFIGURING_REASON_STATIC_ADDRESS_LABELS;
 
         if (!link->static_bridge_fdb_configured)
-                return (void) log_link_debug(link, "%s(): static bridge MDB entries are not configured.", __func__);
+                return LINK_CONFIGURING_REASON_STATIC_BRIDGE_FDB;
 
         if (!link->static_bridge_mdb_configured)
-                return (void) log_link_debug(link, "%s(): static bridge MDB entries are not configured.", __func__);
-
-        if (!link->static_ipv6_proxy_ndp_configured)
-                return (void) log_link_debug(link, "%s(): static IPv6 proxy NDP addresses are not configured.", __func__);
+                return LINK_CONFIGURING_REASON_STATIC_BRIDGE_MDB;
 
         if (!link->static_neighbors_configured)
-                return (void) log_link_debug(link, "%s(): static neighbors are not configured.", __func__);
+                return LINK_CONFIGURING_REASON_STATIC_NEIGHBORS;
+
+        if (!link->static_neighbor_proxy_configured)
+                return LINK_CONFIGURING_REASON_STATIC_NEIGHBOR_PROXY;
 
         if (!link->static_nexthops_configured)
-                return (void) log_link_debug(link, "%s(): static nexthops are not configured.", __func__);
+                return LINK_CONFIGURING_REASON_STATIC_NEXTHOPS;
 
         if (!link->static_routes_configured)
-                return (void) log_link_debug(link, "%s(): static routes are not configured.", __func__);
+                return LINK_CONFIGURING_REASON_STATIC_ROUTES;
 
         if (!link->static_routing_policy_rules_configured)
-                return (void) log_link_debug(link, "%s(): static routing policy rules are not configured.", __func__);
+                return LINK_CONFIGURING_REASON_STATIC_ROUTING_POLICY_RULES;
 
         if (!link->sr_iov_configured)
-                return (void) log_link_debug(link, "%s(): SR-IOV is not configured.", __func__);
+                return LINK_CONFIGURING_REASON_SR_IOV;
 
         if (!link->bearer_configured)
-                return (void) log_link_debug(link, "%s(): Bearer has not been applied.", __func__);
+                return LINK_CONFIGURING_REASON_BEARER;
 
         /* IPv6LL is assigned after the link gains its carrier. */
         if (!link->network->configure_without_carrier &&
             link_ipv6ll_enabled(link) &&
             !in6_addr_is_set(&link->ipv6ll_address))
-                return (void) log_link_debug(link, "%s(): IPv6LL is not configured yet.", __func__);
+                return LINK_CONFIGURING_REASON_IPV6LL;
 
         /* All static addresses must be ready. */
         bool has_static_address = false;
         SET_FOREACH(a, link->addresses) {
                 if (!IN_SET(a->source, NETWORK_CONFIG_SOURCE_STATIC, NETWORK_CONFIG_SOURCE_MODEM_MANAGER))
                         continue;
-                if (!address_is_ready(a))
-                        return (void) log_link_debug(link, "%s(): static address %s is not ready.", __func__,
-                                                     IN_ADDR_PREFIX_TO_STRING(a->family, &a->in_addr, a->prefixlen));
+                if (!address_is_ready(a)) {
+                        if (ret_address)
+                                *ret_address = a;
+                        return LINK_CONFIGURING_REASON_STATIC_ADDRESS_NOT_READY;
+                }
                 has_static_address = true;
         }
 
         /* If at least one static address is requested, do not request that dynamic addressing protocols are finished. */
         if (has_static_address)
-                goto ready;
+                return _LINK_CONFIGURING_REASON_INVALID;
 
         /* If no dynamic addressing protocol enabled, assume the interface is ready.
          * Note, ignore NDisc when ConfigureWithoutCarrier= is enabled, as IPv6AcceptRA= is enabled by default. */
         if (!link_ipv4ll_enabled(link) && !link_dhcp4_enabled(link) &&
             !link_dhcp6_enabled(link) && !link_dhcp_pd_is_enabled(link) &&
             (link->network->configure_without_carrier || !link_ndisc_enabled(link)))
-                goto ready;
+                return _LINK_CONFIGURING_REASON_INVALID;
 
         bool ipv4ll_ready =
                 link_ipv4ll_enabled(link) && link->ipv4ll_address_configured &&
@@ -586,33 +596,68 @@ void link_check_ready(Link *link) {
                 if (link_dhcp4_enabled(link) && link->network->dhcp_use_6rd &&
                     sd_dhcp_lease_has_6rd(link->dhcp_lease)) {
                         if (!link->dhcp4_configured)
-                                return (void) log_link_debug(link, "%s(): DHCPv4 6rd prefix is assigned, but DHCPv4 protocol is not finished yet.", __func__);
+                                return LINK_CONFIGURING_REASON_DHCP4_6RD;
                         if (!dhcp_pd_ready)
-                                return (void) log_link_debug(link, "%s(): DHCPv4 is finished, but prefix acquired by DHCPv4-6rd is not assigned yet.", __func__);
+                                return LINK_CONFIGURING_REASON_DHCP4_6RD_PREFIX;
                 }
 
                 if (link_dhcp6_enabled(link) && link->network->dhcp6_use_pd_prefix &&
                     sd_dhcp6_lease_has_pd_prefix(link->dhcp6_lease)) {
                         if (!link->dhcp6_configured)
-                                return (void) log_link_debug(link, "%s(): DHCPv6 IA_PD prefix is assigned, but DHCPv6 protocol is not finished yet.", __func__);
+                                return LINK_CONFIGURING_REASON_DHCP6_PD;
                         if (!dhcp_pd_ready)
-                                return (void) log_link_debug(link, "%s(): DHCPv6 is finished, but prefix acquired by DHCPv6 IA_PD is not assigned yet.", __func__);
+                                return LINK_CONFIGURING_REASON_DHCP6_PD_PREFIX;
                 }
         }
 
         /* At least one dynamic addressing protocol is finished. */
         if (!ipv4ll_ready && !dhcp4_ready && !dhcp6_ready && !dhcp_pd_ready && !ndisc_ready)
-                return (void) log_link_debug(link, "%s(): dynamic addressing protocols are enabled but none of them finished yet.", __func__);
+                return LINK_CONFIGURING_REASON_DYNAMIC_ADDRESSING;
 
-        log_link_debug(link, "%s(): IPv4LL:%s DHCPv4:%s DHCPv6:%s DHCP-PD:%s NDisc:%s",
-                       __func__,
-                       yes_no(ipv4ll_ready),
-                       yes_no(dhcp4_ready),
-                       yes_no(dhcp6_ready),
-                       yes_no(dhcp_pd_ready),
-                       yes_no(ndisc_ready));
+        if (log_func)
+                log_link_debug(link, "%s(): IPv4LL:%s DHCPv4:%s DHCPv6:%s DHCP-PD:%s NDisc:%s",
+                               log_func,
+                               yes_no(ipv4ll_ready),
+                               yes_no(dhcp4_ready),
+                               yes_no(dhcp6_ready),
+                               yes_no(dhcp_pd_ready),
+                               yes_no(ndisc_ready));
+        return _LINK_CONFIGURING_REASON_INVALID;
+}
 
-ready:
+LinkConfiguringReason link_get_configuring_reason(Link *link) {
+        assert(link);
+
+        if (link->state != LINK_STATE_CONFIGURING || !link->network)
+                return _LINK_CONFIGURING_REASON_INVALID;
+
+        return link_get_configuring_reason_full(link, /* log_func= */ NULL, /* ret_address= */ NULL);
+}
+
+void link_check_ready(Link *link) {
+        LinkConfiguringReason reason;
+        Address *address;
+
+        assert(link);
+
+        if (link->state == LINK_STATE_CONFIGURED)
+                return;
+
+        if (link->state != LINK_STATE_CONFIGURING)
+                return (void) log_link_debug(link, "%s(): link is in %s state.", __func__, link_state_to_string(link->state));
+
+        if (!link->network)
+                return (void) log_link_debug(link, "%s(): link is unmanaged.", __func__);
+
+        reason = link_get_configuring_reason_full(link, __func__, &address);
+        if (reason >= 0) {
+                if (address)
+                        return (void) log_link_debug(link, "%s(): static address %s is not ready.", __func__,
+                                                     IN_ADDR_PREFIX_TO_STRING(address->family, &address->in_addr, address->prefixlen));
+
+                return (void) log_link_debug(link, "%s(): %s.", __func__, link_configuring_reason_message_to_string(reason));
+        }
+
         link_set_state(link, LINK_STATE_CONFIGURED);
 }
 
@@ -639,19 +684,19 @@ static int link_request_static_configs(Link *link) {
         if (r < 0)
                 return r;
 
-        r = link_request_static_ipv6_proxy_ndp_addresses(link);
-        if (r < 0)
-                return r;
-
         r = link_request_static_neighbors(link);
         if (r < 0)
                 return r;
 
-        r = link_request_static_nexthops(link, false);
+        r = link_request_static_neighbor_proxy_addresses(link);
         if (r < 0)
                 return r;
 
-        r = link_request_static_routes(link, false);
+        r = link_request_static_nexthops(link, /* only_ipv4= */ false);
+        if (r < 0)
+                return r;
+
+        r = link_request_static_routes(link, /* only_ipv4= */ false);
         if (r < 0)
                 return r;
 
@@ -740,6 +785,10 @@ static int link_acquire_dynamic_ipv4_conf(Link *link) {
                         log_link_debug(link, "Acquiring IPv4 link-local address.");
         }
 
+        r = link_start_dhcp_relay(link);
+        if (r < 0)
+                return log_link_warning_errno(link, r, "Could not start DHCP relay agent: %m");
+
         r = link_start_dhcp4_server(link);
         if (r < 0)
                 return log_link_warning_errno(link, r, "Could not start DHCP server: %m");
@@ -814,6 +863,46 @@ int link_ipv6ll_gained(Link *link) {
         return 0;
 }
 
+int link_ipv6ll_lost(Link *link, const struct in6_addr *dropped_ipv6ll, bool has_replacement) {
+        int ret = 0, r;
+
+        assert(link);
+        assert(dropped_ipv6ll);
+
+        if (!IN_SET(link->state, LINK_STATE_CONFIGURING, LINK_STATE_CONFIGURED))
+                return 0;
+
+        log_link_info(link, "Lost IPv6LL address %s%s.",
+                      IN6_ADDR_TO_STRING(dropped_ipv6ll),
+                      has_replacement ? ", switching to alternate IPv6LL source" : "");
+
+        r = sd_dhcp6_client_stop(link->dhcp6_client);
+        if (r < 0)
+                RET_GATHER(ret, log_link_warning_errno(link, r, "Could not stop DHCPv6 client: %m"));
+
+        /* DHCPv6 must be restarted to switch the client's source address, while NDisc and
+         * RADV can switch to the replacement IPv6LL in link_ipv6ll_gained() without flushing
+         * learned state. Keep link->ndisc_configured as-is in this path. */
+        if (has_replacement)
+                return ret;
+
+        r = ndisc_stop(link);
+        if (r < 0)
+                RET_GATHER(ret, log_link_warning_errno(link, r, "Could not stop IPv6 Router Discovery: %m"));
+        link->ndisc_configured = false;
+        ndisc_flush(link);
+
+        r = sd_radv_stop(link->radv);
+        if (r < 0)
+                RET_GATHER(ret, log_link_warning_errno(link, r, "Could not stop IPv6 Router Advertisement: %m"));
+
+        r = link_request_stacked_netdevs(link, NETDEV_LOCAL_ADDRESS_IPV6LL);
+        if (r < 0)
+                RET_GATHER(ret, log_link_warning_errno(link, r, "Could not reconfigure stacked netdevs after IPv6LL loss: %m"));
+
+        return ret;
+}
+
 int link_handle_bound_to_list(Link *link) {
         bool required_up = false;
         Link *l;
@@ -862,6 +951,7 @@ static int link_put_carrier(Link *link, Link *carrier, Hashmap **h) {
 
         assert(link);
         assert(carrier);
+        assert(h);
 
         if (link == carrier)
                 return 0;
@@ -869,7 +959,7 @@ static int link_put_carrier(Link *link, Link *carrier, Hashmap **h) {
         if (hashmap_contains(*h, INT_TO_PTR(carrier->ifindex)))
                 return 0;
 
-        r = hashmap_ensure_put(h, NULL, INT_TO_PTR(carrier->ifindex), carrier);
+        r = hashmap_ensure_put(h, /* hash_ops= */ NULL, INT_TO_PTR(carrier->ifindex), carrier);
         if (r < 0)
                 return r;
 
@@ -980,7 +1070,7 @@ static void link_free_bound_by_list(Link *link) {
                 link_dirty(link);
 }
 
-static int link_append_to_master(Link *link) {
+int link_append_to_master(Link *link) {
         Link *master;
         int r;
 
@@ -1013,12 +1103,16 @@ static void link_drop_from_master(Link *link) {
         link_unref(set_remove(master->slaves, link));
 }
 
-static int link_drop_requests(Link *link) {
+int link_drop_requests(Link *link, NetworkConfigSource source) {
         Request *req;
         int ret = 0;
 
         assert(link);
         assert(link->manager);
+
+        /* If the interface is already removed, then per-source request removal is not necessary. */
+        if (source >= 0 && link->state == LINK_STATE_LINGER)
+                return 0;
 
         ORDERED_SET_FOREACH(req, link->manager->request_queue) {
                 if (req->link != link)
@@ -1027,39 +1121,58 @@ static int link_drop_requests(Link *link) {
                 /* If the request is already called, but its reply is not received, then we need to
                  * drop the configuration (e.g. address) here. Note, if the configuration is known,
                  * it will be handled later by link_drop_unmanaged_addresses() or so. */
-                if (req->waiting_reply && link->state != LINK_STATE_LINGER)
-                        switch (req->type) {
-                        case REQUEST_TYPE_ADDRESS: {
-                                Address *address = ASSERT_PTR(req->userdata);
+                bool remove = req->waiting_reply && link->state != LINK_STATE_LINGER;
 
-                                if (address_get(link, address, NULL) < 0)
+                switch (req->type) {
+                case REQUEST_TYPE_ADDRESS: {
+                        Address *address = ASSERT_PTR(req->userdata);
+
+                        if (source >= 0 && address->source != source)
+                                continue;
+
+                        if (address_get(link, address, /* ret= */ NULL) < 0) {
+                                if (remove)
                                         RET_GATHER(ret, address_remove(address, link));
-                                break;
+                                else
+                                        ipv4acd_detach(link, address);
                         }
-                        case REQUEST_TYPE_NEIGHBOR: {
-                                Neighbor *neighbor = ASSERT_PTR(req->userdata);
+                        break;
+                }
+                case REQUEST_TYPE_NEIGHBOR: {
+                        Neighbor *neighbor = ASSERT_PTR(req->userdata);
 
-                                if (neighbor_get(link, neighbor, NULL) < 0)
-                                        RET_GATHER(ret, neighbor_remove(neighbor, link));
-                                break;
-                        }
-                        case REQUEST_TYPE_NEXTHOP: {
-                                NextHop *nexthop = ASSERT_PTR(req->userdata);
+                        if (source >= 0 && neighbor->source != source)
+                                continue;
 
-                                if (nexthop_get_by_id(link->manager, nexthop->id, NULL) < 0)
-                                        RET_GATHER(ret, nexthop_remove(nexthop, link->manager));
-                                break;
-                        }
-                        case REQUEST_TYPE_ROUTE: {
-                                Route *route = ASSERT_PTR(req->userdata);
+                        if (remove && neighbor_get(link, neighbor, /* ret= */ NULL) < 0)
+                                RET_GATHER(ret, neighbor_remove(neighbor, link));
+                        break;
+                }
+                case REQUEST_TYPE_NEXTHOP: {
+                        NextHop *nexthop = ASSERT_PTR(req->userdata);
 
-                                if (route_get(link->manager, route, NULL) < 0)
-                                        RET_GATHER(ret, route_remove(route, link->manager));
-                                break;
-                        }
-                        default:
-                                ;
-                        }
+                        if (source >= 0 && nexthop->source != source)
+                                continue;
+
+                        if (remove && nexthop_get_by_id(link->manager, nexthop->id, /* ret= */ NULL) < 0)
+                                RET_GATHER(ret, nexthop_remove(nexthop, link->manager));
+                        break;
+                }
+                case REQUEST_TYPE_ROUTE: {
+                        Route *route = ASSERT_PTR(req->userdata);
+
+                        if (source >= 0 && route->source != source)
+                                continue;
+
+                        if (remove && route_get(link->manager, route, /* ret= */ NULL) < 0)
+                                RET_GATHER(ret, route_remove(route, link->manager));
+                        break;
+                }
+                default:
+                        /* If a source is specified, then ignore all other kinds of requests. */
+                        if (source >= 0)
+                                continue;
+                }
 
                 request_detach(req);
         }
@@ -1080,7 +1193,7 @@ static Link *link_drop(Link *link) {
         /* Drop all references from other links and manager. Note that async netlink calls may have
          * references to the link, and they will be dropped when we receive replies. */
 
-        (void) link_drop_requests(link);
+        (void) link_drop_requests(link, _NETWORK_CONFIG_SOURCE_INVALID);
 
         link_free_bound_to_list(link);
         link_free_bound_by_list(link);
@@ -1095,14 +1208,14 @@ static Link *link_drop(Link *link) {
         link_clean(link);
 
         STRV_FOREACH(n, link->alternative_names)
-                hashmap_remove(link->manager->links_by_name, *n);
-        hashmap_remove(link->manager->links_by_name, link->ifname);
+                hashmap_remove_value(link->manager->links_by_name, *n, link);
+        hashmap_remove_value(link->manager->links_by_name, link->ifname, link);
 
         /* bonding master and its slaves have the same hardware address. */
         hashmap_remove_value(link->manager->links_by_hw_addr, &link->hw_addr, link);
 
         /* The following must be called at last. */
-        assert_se(hashmap_remove(link->manager->links_by_index, INT_TO_PTR(link->ifindex)) == link);
+        hashmap_remove_value(link->manager->links_by_index, INT_TO_PTR(link->ifindex), link);
 
         if (notify)
                 manager_notify_hook_filters(link->manager);
@@ -1156,6 +1269,8 @@ static int link_drop_dynamic_config(Link *link, Network *network) {
         RET_GATHER(r, link_drop_dhcp4_config(link, network));
         RET_GATHER(r, link_drop_dhcp6_config(link, network));
         RET_GATHER(r, link_drop_dhcp_pd_config(link, network));
+        link->dhcp_relay_interface = sd_dhcp_relay_interface_unref(link->dhcp_relay_interface);
+        link->dhcp_relay_interface_compat = sd_dhcp_relay_interface_unref(link->dhcp_relay_interface_compat);
         link->dhcp_server = sd_dhcp_server_unref(link->dhcp_server);
         link->lldp_rx = sd_lldp_rx_unref(link->lldp_rx); /* TODO: keep the received neighbors. */
         link->lldp_tx = sd_lldp_tx_unref(link->lldp_tx);
@@ -1274,6 +1389,10 @@ static int link_configure(Link *link) {
         if (r < 0)
                 return r;
 
+        r = link_request_dhcp_relay(link);
+        if (r < 0)
+                return r;
+
         r = link_request_dhcp_server(link);
         if (r < 0)
                 return r;
@@ -1334,13 +1453,9 @@ static int link_get_network(Link *link, Network **ret) {
                         continue;
 
                 if (network->match.ifname && link->dev) {
-                        uint8_t name_assign_type = NET_NAME_UNKNOWN;
-                        const char *attr;
-
-                        if (sd_device_get_sysattr_value(link->dev, "name_assign_type", &attr) >= 0)
-                                (void) safe_atou8(attr, &name_assign_type);
-
-                        warn = name_assign_type == NET_NAME_ENUM;
+                        uint8_t name_assign_type;
+                        if (device_get_sysattr_u8(link->dev, "name_assign_type", &name_assign_type) >= 0)
+                                warn = name_assign_type == NET_NAME_ENUM;
                 }
 
                 log_link_full(link, warn ? LOG_WARNING : LOG_DEBUG,
@@ -1370,7 +1485,7 @@ static void link_enter_unmanaged(Link *link) {
                       "Unmanaging interface.");
 
         (void) link_stop_engines(link, /* may_keep_dynamic= */ false);
-        (void) link_drop_requests(link);
+        (void) link_drop_requests(link, _NETWORK_CONFIG_SOURCE_INVALID);
         (void) link_drop_static_config(link);
 
         /* The bound_to map depends on .network file, hence it needs to be freed. But, do not free the
@@ -1458,7 +1573,7 @@ int link_reconfigure_impl(Link *link, LinkReconfigurationFlag flags) {
                               isempty(joined) ? "" : ")");
 
         /* Dropping configurations based on the old .network file. */
-        r = link_drop_requests(link);
+        r = link_drop_requests(link, _NETWORK_CONFIG_SOURCE_INVALID);
         if (r < 0)
                 return r;
 
@@ -1492,7 +1607,7 @@ int link_reconfigure_impl(Link *link, LinkReconfigurationFlag flags) {
                 link_free_engines(link);
         }
 
-        link_update_operstate(link, true);
+        link_update_operstate(link, /* also_update_master= */ true);
         link_dirty(link);
 
         link_set_state(link, LINK_STATE_INITIALIZED);
@@ -1545,13 +1660,13 @@ static void link_reconfiguration_data_destroy_callback(LinkReconfigurationData *
                 (void) manager_clean_all(data->manager);
 
                 if (data->message) {
-                        r = sd_bus_reply_method_return(data->message, NULL);
+                        r = sd_bus_reply_method_return(data->message, /* types= */ NULL);
                         if (r < 0)
                                 log_warning_errno(r, "Failed to reply for DBus method, ignoring: %m");
                 }
 
                 if (data->varlink) {
-                        r = sd_varlink_reply(data->varlink, NULL);
+                        r = sd_varlink_reply(data->varlink, /* parameters= */ NULL);
                         if (r < 0)
                                 log_warning_errno(r, "Failed to reply to Varlink request, ignoring: %m");
                 }
@@ -1677,7 +1792,7 @@ static int link_initialized(Link *link, sd_device *device) {
 
         /* Always replace with the new sd_device object. As the sysname (and possibly other properties
          * or sysattrs) may be outdated. */
-        device_unref_and_replace(link->dev, device);
+        device_unref_and_replace_new_ref(link->dev, device);
 
         r = link_managed_by_us(link);
         if (r <= 0)
@@ -1942,12 +2057,12 @@ static int link_carrier_lost(Link *link) {
                                          &link->carrier_lost_timer,
                                          CLOCK_BOOTTIME,
                                          usec,
-                                         0,
+                                         /* accuracy= */ 0,
                                          link_carrier_lost_handler,
                                          link,
-                                         0,
+                                         /* priority= */ 0,
                                          "link-carrier-loss",
-                                         true);
+                                         /* force_reset= */ true);
 }
 
 static int link_admin_state_up(Link *link) {
@@ -1970,7 +2085,10 @@ static int link_admin_state_up(Link *link) {
          * ipv6 mtu on NETDEV_UP, so we need to reset it. */
         (void) link_set_ipv6_mtu(link, LOG_INFO);
 
-        return 0;
+        /* Some drivers, e.g. WireGuard, reset the IPv6LL address generation mode when the interface is
+         * brought up, so we need to reset it. As the interface is up, the mode is set by sysctl, which
+         * also generates the address. */
+        return link_request_to_set_addrgen_mode(link);
 }
 
 static int link_admin_state_down(Link *link) {
@@ -2028,7 +2146,7 @@ void link_update_operstate(Link *link, bool also_update_master) {
                 Link *slave;
 
                 SET_FOREACH(slave, link->slaves) {
-                        link_update_operstate(slave, false);
+                        link_update_operstate(slave, /* also_update_master= */ false);
 
                         if (slave->carrier_state < LINK_CARRIER_STATE_CARRIER)
                                 carrier_state = LINK_CARRIER_STATE_DEGRADED_CARRIER;
@@ -2145,7 +2263,7 @@ void link_update_operstate(Link *link, bool also_update_master) {
                 Link *master;
 
                 if (link_get_master(link, &master) >= 0)
-                        link_update_operstate(master, true);
+                        link_update_operstate(master, /* also_update_master= */ true);
         }
 }
 
@@ -2170,10 +2288,37 @@ bool link_multicast_enabled(Link *link) {
         return FLAGS_SET(link->flags, IFF_MULTICAST);
 }
 
-#define FLAG_STRING(string, flag, old, new)                      \
-        (((old ^ new) & flag)                                    \
-         ? ((old & flag) ? (" -" string) : (" +" string))        \
-         : "")
+#define _FLAG_STRING(old_flags, new_flags, string, flag)                        \
+        ({                                                                      \
+                unsigned _old_flags = (old_flags), _new_flags = (new_flags);    \
+                                                                                \
+                (((_old_flags ^ _new_flags) & flag)                             \
+                 ? ((_old_flags & flag) ? (" -" string) : (" +" string))        \
+                 : "");                                                         \
+        })
+#define FLAG_STRING(old_flags, new_flags, name)                                 \
+        _FLAG_STRING(old_flags, new_flags, STRINGIFY(name), IFF_##name)
+
+#define KNOWN_IFF_FLAGS                         \
+        (IFF_UP |                               \
+         IFF_BROADCAST |                        \
+         IFF_DEBUG |                            \
+         IFF_LOOPBACK |                         \
+         IFF_POINTOPOINT |                      \
+         IFF_NOTRAILERS |                       \
+         IFF_RUNNING |                          \
+         IFF_NOARP |                            \
+         IFF_PROMISC |                          \
+         IFF_ALLMULTI |                         \
+         IFF_MASTER |                           \
+         IFF_SLAVE |                            \
+         IFF_MULTICAST |                        \
+         IFF_PORTSEL |                          \
+         IFF_AUTOMEDIA |                        \
+         IFF_DYNAMIC |                          \
+         IFF_LOWER_UP |                         \
+         IFF_DORMANT |                          \
+         IFF_ECHO)
 
 static int link_update_flags(Link *link, sd_netlink_message *message) {
         bool link_was_admin_up, had_carrier;
@@ -2199,42 +2344,34 @@ static int link_update_flags(Link *link, sd_netlink_message *message) {
                 return 0;
 
         if (link->flags != flags) {
-                unsigned unknown_flags, unknown_flags_added, unknown_flags_removed;
-
                 log_link_debug(link, "Flags change:%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
-                               FLAG_STRING("LOOPBACK", IFF_LOOPBACK, link->flags, flags),
-                               FLAG_STRING("MASTER", IFF_MASTER, link->flags, flags),
-                               FLAG_STRING("SLAVE", IFF_SLAVE, link->flags, flags),
-                               FLAG_STRING("UP", IFF_UP, link->flags, flags),
-                               FLAG_STRING("DORMANT", IFF_DORMANT, link->flags, flags),
-                               FLAG_STRING("LOWER_UP", IFF_LOWER_UP, link->flags, flags),
-                               FLAG_STRING("RUNNING", IFF_RUNNING, link->flags, flags),
-                               FLAG_STRING("MULTICAST", IFF_MULTICAST, link->flags, flags),
-                               FLAG_STRING("BROADCAST", IFF_BROADCAST, link->flags, flags),
-                               FLAG_STRING("POINTOPOINT", IFF_POINTOPOINT, link->flags, flags),
-                               FLAG_STRING("PROMISC", IFF_PROMISC, link->flags, flags),
-                               FLAG_STRING("ALLMULTI", IFF_ALLMULTI, link->flags, flags),
-                               FLAG_STRING("PORTSEL", IFF_PORTSEL, link->flags, flags),
-                               FLAG_STRING("AUTOMEDIA", IFF_AUTOMEDIA, link->flags, flags),
-                               FLAG_STRING("DYNAMIC", IFF_DYNAMIC, link->flags, flags),
-                               FLAG_STRING("NOARP", IFF_NOARP, link->flags, flags),
-                               FLAG_STRING("NOTRAILERS", IFF_NOTRAILERS, link->flags, flags),
-                               FLAG_STRING("DEBUG", IFF_DEBUG, link->flags, flags),
-                               FLAG_STRING("ECHO", IFF_ECHO, link->flags, flags));
+                               FLAG_STRING(link->flags, flags, UP),
+                               FLAG_STRING(link->flags, flags, BROADCAST),
+                               FLAG_STRING(link->flags, flags, DEBUG),
+                               FLAG_STRING(link->flags, flags, LOOPBACK),
+                               FLAG_STRING(link->flags, flags, POINTOPOINT),
+                               FLAG_STRING(link->flags, flags, NOTRAILERS),
+                               FLAG_STRING(link->flags, flags, RUNNING),
+                               FLAG_STRING(link->flags, flags, NOARP),
+                               FLAG_STRING(link->flags, flags, PROMISC),
+                               FLAG_STRING(link->flags, flags, ALLMULTI),
+                               FLAG_STRING(link->flags, flags, MASTER),
+                               FLAG_STRING(link->flags, flags, SLAVE),
+                               FLAG_STRING(link->flags, flags, MULTICAST),
+                               FLAG_STRING(link->flags, flags, PORTSEL),
+                               FLAG_STRING(link->flags, flags, AUTOMEDIA),
+                               FLAG_STRING(link->flags, flags, DYNAMIC),
+                               FLAG_STRING(link->flags, flags, LOWER_UP),
+                               FLAG_STRING(link->flags, flags, DORMANT),
+                               FLAG_STRING(link->flags, flags, ECHO));
 
-                unknown_flags = ~(IFF_LOOPBACK | IFF_MASTER | IFF_SLAVE | IFF_UP |
-                                  IFF_DORMANT | IFF_LOWER_UP | IFF_RUNNING |
-                                  IFF_MULTICAST | IFF_BROADCAST | IFF_POINTOPOINT |
-                                  IFF_PROMISC | IFF_ALLMULTI | IFF_PORTSEL |
-                                  IFF_AUTOMEDIA | IFF_DYNAMIC | IFF_NOARP |
-                                  IFF_NOTRAILERS | IFF_DEBUG | IFF_ECHO);
-                unknown_flags_added = ((link->flags ^ flags) & flags & unknown_flags);
-                unknown_flags_removed = ((link->flags ^ flags) & link->flags & unknown_flags);
+                unsigned unknown_flags_added = ((link->flags ^ flags) & flags & ~KNOWN_IFF_FLAGS);
+                unsigned unknown_flags_removed = ((link->flags ^ flags) & link->flags & ~KNOWN_IFF_FLAGS);
 
-                if (unknown_flags_added)
+                if (unknown_flags_added != 0)
                         log_link_debug(link, "Unknown link flags gained, ignoring: %#.5x", unknown_flags_added);
 
-                if (unknown_flags_removed)
+                if (unknown_flags_removed != 0)
                         log_link_debug(link, "Unknown link flags lost, ignoring: %#.5x", unknown_flags_removed);
         }
 
@@ -2244,7 +2381,7 @@ static int link_update_flags(Link *link, sd_netlink_message *message) {
         link->flags = flags;
         link->kernel_operstate = operstate;
 
-        link_update_operstate(link, true);
+        link_update_operstate(link, /* also_update_master= */ true);
 
         r = 0;
 
@@ -2433,12 +2570,6 @@ static int link_update_hardware_address(Link *link, sd_netlink_message *message)
         if (r < 0)
                 return log_link_debug_errno(link, r, "Could not update MAC address for Router Advertisement: %m");
 
-        if (link->ndisc && link->hw_addr.length == ETH_ALEN) {
-                r = sd_ndisc_set_mac(link->ndisc, &link->hw_addr.ether);
-                if (r < 0)
-                        return log_link_debug_errno(link, r, "Could not update MAC for NDisc: %m");
-        }
-
         if (link->lldp_rx) {
                 r = sd_lldp_rx_set_filter_address(link->lldp_rx, &link->hw_addr.ether);
                 if (r < 0)
@@ -2450,6 +2581,12 @@ static int link_update_hardware_address(Link *link, sd_netlink_message *message)
                 if (r < 0)
                         return log_link_debug_errno(link, r, "Could not update MAC address for LLDP Tx: %m");
         }
+
+        /* Do this at the end so that we can fail the link in case we don't manage to restart NDisc. */
+        r = ndisc_update_mac(link);
+        if (r < 0)
+                return log_link_warning_errno(
+                                link, r, "Could not restart IPv6 Router Discovery after MAC change: %m");
 
         return 1; /* needs reconfigure */
 }
@@ -2536,8 +2673,21 @@ static int link_update_alternative_names(Link *link, sd_netlink_message *message
         if (strv_equal(altnames, link->alternative_names))
                 return 0;
 
+        /* See the comment in link_update_name(). If one of the new alternative names is already in use by
+         * another interface, the alternative-name information in this message is likely stale. Ignore the
+         * entire IFLA_ALT_IFNAME attribute in that case. */
+        STRV_FOREACH(n, altnames) {
+                Link *existing;
+                if (link_get_by_name(link->manager, *n, &existing) >= 0 && existing != link) {
+                        log_link_debug(link,
+                                       "Alternative interface name update detected, but the new name '%s' is already in use by another interface (ifindex=%i), ignoring the update as it may be stale.",
+                                       *n, existing->ifindex);
+                        return 0;
+                }
+        }
+
         STRV_FOREACH(n, link->alternative_names)
-                hashmap_remove(link->manager->links_by_name, *n);
+                hashmap_remove_value(link->manager->links_by_name, *n, link);
 
         strv_free_and_replace(link->alternative_names, altnames);
 
@@ -2551,7 +2701,6 @@ static int link_update_alternative_names(Link *link, sd_netlink_message *message
 }
 
 static int link_update_name(Link *link, sd_netlink_message *message) {
-        char ifname_from_index[IF_NAMESIZE];
         const char *ifname;
         int r;
 
@@ -2568,20 +2717,57 @@ static int link_update_name(Link *link, sd_netlink_message *message) {
         if (streq(ifname, link->ifname))
                 return 0;
 
-        r = format_ifname(link->ifindex, ifname_from_index);
-        if (r < 0)
-                return log_link_debug_errno(link, r, "Could not get interface name for index %i.", link->ifindex);
-
-        if (!streq(ifname, ifname_from_index)) {
-                log_link_debug(link, "New interface name '%s' received from the kernel does not correspond "
-                               "with the name currently configured on the actual interface '%s'. Ignoring.",
-                               ifname, ifname_from_index);
+        /* Check if the new interface name is already used by another interface. If so, the rename is likely
+         * stale. Consider the following race:
+         *
+         * 1. networkd enables rtnl matches in manager_connect_rtnl().
+         * 2. The kernel sends an RTM_NEWLINK notification for an interface (say, ifindex=2, ifname="eth0"),
+         *    and the notification message (A) is queued in networkd's sd-netlink object.
+         * 3. The interface is renamed (say, "eth0" -> "enp0"), e.g. by udevd. The kernel sends another
+         *    RTM_NEWLINK notification for the rename, and the notification message (B) is also queued in
+         *    networkd's sd-netlink object.
+         * 4. The kernel detects another new interface (say, ifindex=3). Since the name "eth0" is now unused,
+         *    the interface is named "eth0".
+         * 5. networkd enumerates links and creates Link objects for:
+         *    - ifindex=2, ifname="enp0"
+         *    - ifindex=3, ifname="eth0"
+         * 6. After enumeration, when processing message (A), networkd becomes confused and thinks that the
+         *    interface with ifindex=2 was renamed from "enp0" to "eth0". However, it fails to update the
+         *    Manager.links_by_name hashmap because "eth0" is already used by the interface with ifindex=3.
+         * 7. When processing message (B), networkd thinks that the interface with ifindex=2 has been renamed
+         *    again from "eth0" to "enp0", and renames the Link object back to "enp0".
+         *
+         * When this happens, we get something like the following:
+         *
+         * systemd-networkd[5164]: enp0: Interface name change detected, renamed to eth0.
+         * systemd-networkd[5164]: eth0: Failed to manage link by its new name: File exists
+         * systemd-networkd[5164]: Could not process link message: File exists
+         * systemd-networkd[5164]: eth0: Failed
+         * systemd-networkd[5164]: eth0: State changed: initialized -> failed
+         * systemd-networkd[5164]: eth0: Interface name change detected, renamed to enp0.
+         *
+         * See also #20203.
+         *
+         * To avoid the race, ignore the rename. A subsequent RTM_NEWLINK message should eventually provide
+         * the current interface name, e.g. message (B) above. */
+        Link *existing;
+        if (link_get_by_name(link->manager, ifname, &existing) >= 0 && existing != link) {
+                log_link_debug(link,
+                               "Interface name change detected, but the new interface name '%s' is already in use by another interface (ifindex=%i), ignoring the rename as it may be stale.",
+                               ifname, existing->ifindex);
                 return 0;
         }
 
         log_link_info(link, "Interface name change detected, renamed to %s.", ifname);
 
-        hashmap_remove(link->manager->links_by_name, link->ifname);
+        /* The legacy ethtool API uses interface names instead of ifindexes, which is racy.
+         * Invalidate the driver cache so it can be re-read later.
+         * TODO: Switch to the new Netlink-based API that accepts ifindex directly. */
+        link->ethtool_driver_read = false;
+        link->driver = mfree(link->driver);
+        link->dsa_master_ifindex = 0;
+
+        hashmap_remove_value(link->manager->links_by_name, link->ifname, link);
 
         r = free_and_strdup(&link->ifname, ifname);
         if (r < 0)
@@ -2607,6 +2793,12 @@ static int link_update_name(Link *link, sd_netlink_message *message) {
                 r = sd_ndisc_set_ifname(link->ndisc, link->ifname);
                 if (r < 0)
                         return log_link_debug_errno(link, r, "Failed to update interface name in NDisc: %m");
+        }
+
+        if (link->dhcp_relay_interface) {
+                r = sd_dhcp_relay_interface_set_ifname(link->dhcp_relay_interface, link->ifname);
+                if (r < 0)
+                        return log_link_debug_errno(link, r, "Failed to update interface name in DHCP relay interface: %m");
         }
 
         if (link->dhcp_server) {
@@ -2712,7 +2904,7 @@ static Link *link_drop_or_unref(Link *link) {
 DEFINE_TRIVIAL_CLEANUP_FUNC(Link*, link_drop_or_unref);
 
 static int link_new(Manager *manager, sd_netlink_message *message, Link **ret) {
-        _cleanup_free_ char *ifname = NULL, *kind = NULL, *state_file = NULL, *lease_file = NULL;
+        _cleanup_free_ char *ifname = NULL, *kind = NULL, *state_file = NULL;
         _cleanup_(link_drop_or_unrefp) Link *link = NULL;
         unsigned short iftype;
         int r, ifindex;
@@ -2750,9 +2942,6 @@ static int link_new(Manager *manager, sd_netlink_message *message, Link **ret) {
                 /* Do not update state files when running in test mode. */
                 if (asprintf(&state_file, "/run/systemd/netif/links/%d", ifindex) < 0)
                         return log_oom_debug();
-
-                if (asprintf(&lease_file, "/run/systemd/netif/leases/%d", ifindex) < 0)
-                        return log_oom_debug();
         }
 
         link = new(Link, 1);
@@ -2774,7 +2963,6 @@ static int link_new(Manager *manager, sd_netlink_message *message, Link **ret) {
                 .ipv6ll_address_gen_mode = _IPV6_LINK_LOCAL_ADDRESS_GEN_MODE_INVALID,
 
                 .state_file = TAKE_PTR(state_file),
-                .lease_file = TAKE_PTR(lease_file),
 
                 .n_dns = UINT_MAX,
                 .dns_default_route = -1,
@@ -3011,6 +3199,60 @@ static const char* const link_state_table[_LINK_STATE_MAX] = {
 
 DEFINE_STRING_TABLE_LOOKUP(link_state, LinkState);
 
+static const char *const link_configuring_reason_table[_LINK_CONFIGURING_REASON_MAX] = {
+        [LINK_CONFIGURING_REASON_TRAFFIC_CONTROL]             = "traffic-control",
+        [LINK_CONFIGURING_REASON_LINK_LAYER]                  = "link-layer",
+        [LINK_CONFIGURING_REASON_ACTIVATION]                  = "activation",
+        [LINK_CONFIGURING_REASON_STACKED_NETDEVS]             = "stacked-netdevs",
+        [LINK_CONFIGURING_REASON_STATIC_ADDRESSES]            = "static-addresses",
+        [LINK_CONFIGURING_REASON_STATIC_ADDRESS_LABELS]       = "static-address-labels",
+        [LINK_CONFIGURING_REASON_STATIC_BRIDGE_FDB]           = "static-bridge-fdb",
+        [LINK_CONFIGURING_REASON_STATIC_BRIDGE_MDB]           = "static-bridge-mdb",
+        [LINK_CONFIGURING_REASON_STATIC_NEIGHBORS]            = "static-neighbors",
+        [LINK_CONFIGURING_REASON_STATIC_NEIGHBOR_PROXY]       = "static-neighbor-proxy",
+        [LINK_CONFIGURING_REASON_STATIC_NEXTHOPS]             = "static-nexthops",
+        [LINK_CONFIGURING_REASON_STATIC_ROUTES]               = "static-routes",
+        [LINK_CONFIGURING_REASON_STATIC_ROUTING_POLICY_RULES] = "static-routing-policy-rules",
+        [LINK_CONFIGURING_REASON_SR_IOV]                      = "sr-iov",
+        [LINK_CONFIGURING_REASON_BEARER]                      = "bearer",
+        [LINK_CONFIGURING_REASON_IPV6LL]                      = "ipv6ll",
+        [LINK_CONFIGURING_REASON_STATIC_ADDRESS_NOT_READY]    = "static-address-not-ready",
+        [LINK_CONFIGURING_REASON_DHCP4_6RD]                   = "dhcp4-6rd",
+        [LINK_CONFIGURING_REASON_DHCP4_6RD_PREFIX]            = "dhcp4-6rd-prefix",
+        [LINK_CONFIGURING_REASON_DHCP6_PD]                    = "dhcp6-pd",
+        [LINK_CONFIGURING_REASON_DHCP6_PD_PREFIX]             = "dhcp6-pd-prefix",
+        [LINK_CONFIGURING_REASON_DYNAMIC_ADDRESSING]          = "dynamic-addressing",
+};
+
+DEFINE_STRING_TABLE_LOOKUP(link_configuring_reason, LinkConfiguringReason);
+
+static const char *const link_configuring_reason_message_table[_LINK_CONFIGURING_REASON_MAX] = {
+        [LINK_CONFIGURING_REASON_TRAFFIC_CONTROL]             = "traffic controls are not configured",
+        [LINK_CONFIGURING_REASON_LINK_LAYER]                  = "link layer is configuring",
+        [LINK_CONFIGURING_REASON_ACTIVATION]                  = "link is not activated",
+        [LINK_CONFIGURING_REASON_STACKED_NETDEVS]             = "stacked netdevs are not created",
+        [LINK_CONFIGURING_REASON_STATIC_ADDRESSES]            = "static addresses are not configured",
+        [LINK_CONFIGURING_REASON_STATIC_ADDRESS_LABELS]       = "static address labels are not configured",
+        [LINK_CONFIGURING_REASON_STATIC_BRIDGE_FDB]           = "static bridge FDB entries are not configured",
+        [LINK_CONFIGURING_REASON_STATIC_BRIDGE_MDB]           = "static bridge MDB entries are not configured",
+        [LINK_CONFIGURING_REASON_STATIC_NEIGHBORS]            = "static neighbors are not configured",
+        [LINK_CONFIGURING_REASON_STATIC_NEIGHBOR_PROXY]       = "static neighbor proxy addresses are not configured",
+        [LINK_CONFIGURING_REASON_STATIC_NEXTHOPS]             = "static nexthops are not configured",
+        [LINK_CONFIGURING_REASON_STATIC_ROUTES]               = "static routes are not configured",
+        [LINK_CONFIGURING_REASON_STATIC_ROUTING_POLICY_RULES] = "static routing policy rules are not configured",
+        [LINK_CONFIGURING_REASON_SR_IOV]                      = "SR-IOV is not configured",
+        [LINK_CONFIGURING_REASON_BEARER]                      = "bearer has not been applied",
+        [LINK_CONFIGURING_REASON_IPV6LL]                      = "IPv6LL is not configured yet",
+        [LINK_CONFIGURING_REASON_STATIC_ADDRESS_NOT_READY]    = "static address is not ready",
+        [LINK_CONFIGURING_REASON_DHCP4_6RD]                   = "DHCPv4 6rd prefix is assigned, but DHCPv4 protocol is not finished yet",
+        [LINK_CONFIGURING_REASON_DHCP4_6RD_PREFIX]            = "DHCPv4 is finished, but prefix acquired by DHCPv4-6rd is not assigned yet",
+        [LINK_CONFIGURING_REASON_DHCP6_PD]                    = "DHCPv6 IA_PD prefix is assigned, but DHCPv6 protocol is not finished yet",
+        [LINK_CONFIGURING_REASON_DHCP6_PD_PREFIX]             = "DHCPv6 is finished, but prefix acquired by DHCPv6 IA_PD is not assigned yet",
+        [LINK_CONFIGURING_REASON_DYNAMIC_ADDRESSING]          = "dynamic addressing protocols are enabled but none of them finished yet",
+};
+
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(link_configuring_reason_message, LinkConfiguringReason);
+
 int link_flags_to_string_alloc(uint32_t flags, char **ret) {
         _cleanup_free_ char *str = NULL;
         static const char* map[] = {
@@ -3065,4 +3307,15 @@ bool link_has_local_lease_domain(Link *link) {
                 link->network &&
                 link->network->dhcp_server_local_lease_domain &&
                 !dns_name_is_root(link->network->dhcp_server_local_lease_domain);
+}
+
+void link_set_dns(Link *link, struct in_addr_full **dns, unsigned n_dns) {
+        assert(link);
+
+        if (link->n_dns != UINT_MAX)
+                FOREACH_ARRAY(d, link->dns, link->n_dns)
+                        in_addr_full_free(*d);
+
+        free_and_replace(link->dns, dns);
+        link->n_dns = n_dns;
 }

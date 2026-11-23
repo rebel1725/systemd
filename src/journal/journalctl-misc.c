@@ -4,10 +4,13 @@
 
 #include "alloc-util.h"
 #include "dirent-util.h"
+#include "errno-util.h"
 #include "fd-util.h"
 #include "format-table.h"
 #include "format-util.h"
 #include "hashmap.h"
+#include "id128-util.h"
+#include "journal-authenticate.h"
 #include "journal-internal.h"
 #include "journal-verify.h"
 #include "journalctl.h"
@@ -35,9 +38,11 @@ int action_print_header(void) {
 
 int action_verify(void) {
         _cleanup_(sd_journal_closep) sd_journal *j = NULL;
-        int r;
+        int r, ret = 0;
 
         assert(arg_action == ACTION_VERIFY);
+
+        journal_auth_init();
 
         r = acquire_journal(&j);
         if (r < 0)
@@ -47,43 +52,44 @@ int action_verify(void) {
 
         JournalFile *f;
         ORDERED_HASHMAP_FOREACH(f, j->files) {
-                int k;
                 usec_t first = 0, validated = 0, last = 0;
 
-#if HAVE_GCRYPT
-                if (!arg_verify_key && JOURNAL_HEADER_SEALED(f->header))
-                        log_notice("Journal file %s has sealing enabled but verification key has not been passed using --verify-key=.", f->path);
-#endif
-
-                k = journal_file_verify(f, arg_verify_key, &first, &validated, &last, /* show_progress= */ !arg_quiet);
-                if (k == -EINVAL)
+                r = journal_file_verify(f, arg_verify_key, &first, &validated, &last, /* show_progress= */ !arg_quiet);
+                if (r == -EIDRM) {
+                        log_debug_errno(r, "Journal file '%s' has been removed while we are verifying it, ignoring the file.", f->path);
+                        continue;
+                }
+                if (r == -EKEYREJECTED)
                         /* If the key was invalid give up right-away. */
-                        return k;
-                if (k < 0)
-                        r = log_warning_errno(k, "FAIL: %s (%m)", f->path);
-                else {
-                        char a[FORMAT_TIMESTAMP_MAX], b[FORMAT_TIMESTAMP_MAX];
-                        log_full(arg_quiet ? LOG_DEBUG : LOG_INFO, "PASS: %s", f->path);
+                        return r;
+                if (r == -ENOKEY)
+                        log_notice_errno(r, "Journal file '%s' has sealing enabled but verification key has not been passed using --verify-key=.", f->path);
+                if (r < 0) {
+                        RET_GATHER(ret, log_warning_errno(r, "FAIL: %s: %m", f->path));
+                        continue;
+                }
 
-                        if (arg_verify_key && JOURNAL_HEADER_SEALED(f->header)) {
-                                if (validated > 0) {
-                                        log_full(arg_quiet ? LOG_DEBUG : LOG_INFO,
-                                                 "=> Validated from %s to %s, final %s entries not sealed.",
-                                                 format_timestamp_maybe_utc(a, sizeof(a), first),
-                                                 format_timestamp_maybe_utc(b, sizeof(b), validated),
-                                                 FORMAT_TIMESPAN(last > validated ? last - validated : 0, 0));
-                                } else if (last > 0)
-                                        log_full(arg_quiet ? LOG_DEBUG : LOG_INFO,
-                                                 "=> No sealing yet, %s of entries not sealed.",
-                                                 FORMAT_TIMESPAN(last - first, 0));
-                                else
-                                        log_full(arg_quiet ? LOG_DEBUG : LOG_INFO,
-                                                 "=> No sealing yet, no entries in file.");
-                        }
+                log_full(arg_quiet ? LOG_DEBUG : LOG_INFO, "PASS: %s", f->path);
+
+                if (arg_verify_key && JOURNAL_HEADER_SEALED(f->header)) {
+                        if (validated > 0) {
+                                char a[FORMAT_TIMESTAMP_MAX], b[FORMAT_TIMESTAMP_MAX];
+                                log_full(arg_quiet ? LOG_DEBUG : LOG_INFO,
+                                         "=> Validated from %s to %s, final %s entries not sealed.",
+                                         format_timestamp_maybe_utc(a, sizeof(a), first),
+                                         format_timestamp_maybe_utc(b, sizeof(b), validated),
+                                         FORMAT_TIMESPAN(usec_sub_unsigned(last, validated), 0));
+                        } else if (last > 0)
+                                log_full(arg_quiet ? LOG_DEBUG : LOG_INFO,
+                                         "=> No sealing yet, %s of entries not sealed.",
+                                         FORMAT_TIMESPAN(usec_sub_unsigned(last, first), 0));
+                        else
+                                log_full(arg_quiet ? LOG_DEBUG : LOG_INFO,
+                                         "=> No sealing yet, no entries in file.");
                 }
         }
 
-        return r;
+        return ret;
 }
 
 int action_disk_usage(void) {
@@ -119,14 +125,14 @@ static int show_log_ids(const LogId *ids, size_t n_ids, const char *name) {
                 return log_oom();
 
         if (arg_full)
-                table_set_width(table, 0);
+                table_set_width(table, /* width= */ 0);
 
-        r = table_set_json_field_name(table, 0, "index");
+        r = table_set_json_field_name(table, /* idx= */ 0, "index");
         if (r < 0)
                 return log_error_errno(r, "Failed to set JSON field name of column 0: %m");
 
         (void) table_set_sort(table, (size_t) 0);
-        (void) table_set_reverse(table, 0, arg_reverse);
+        (void) table_set_reverse(table, /* column= */ 0, arg_reverse);
 
         for (size_t i = 0; i < n_ids; i++) {
                 int64_t index;
@@ -197,10 +203,6 @@ int action_list_fields(void) {
 
         if (!journal_boot_has_effect(j))
                 return 0;
-
-        r = sd_journal_set_data_threshold(j, 0);
-        if (r < 0)
-                return log_error_errno(r, "Failed to unset data size threshold: %m");
 
         r = sd_journal_query_unique(j, arg_field);
         if (r < 0)
@@ -287,7 +289,7 @@ int action_list_namespaces(void) {
 
         assert(arg_action == ACTION_LIST_NAMESPACES);
 
-        r = sd_id128_get_machine(&machine);
+        r = id128_get_machine(arg_root, &machine);
         if (r < 0)
                 return log_error_errno(r, "Failed to get machine ID: %m");
 
@@ -334,7 +336,7 @@ int action_list_namespaces(void) {
                         if (!log_namespace_name_valid(e))
                                 continue;
 
-                        r = table_add_cell(table, NULL, TABLE_STRING, e);
+                        r = table_add_cell(table, /* ret_cell= */ NULL, TABLE_STRING, e);
                         if (r < 0)
                                 return table_log_add_error(r);
                 }

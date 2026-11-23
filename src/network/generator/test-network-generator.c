@@ -28,10 +28,37 @@ static void test_network_two(const char *ifname,
 
         ASSERT_OK(parse_cmdline_item(key1, value1, &context));
         ASSERT_OK(parse_cmdline_item(key2, value2, &context));
+        context_finalize_bootif(&context);
         ASSERT_OK(context_merge_networks(&context));
         ASSERT_NOT_NULL((network = network_get(&context, ifname)));
         ASSERT_OK(network_format(network, &output));
         ASSERT_STREQ(output, expected);
+}
+
+static void test_network_three(const char *ifname,
+                               const char *key1, const char *value1,
+                               const char *key2, const char *value2,
+                               const char *key3, const char *value3,
+                               const char *expected) {
+        _cleanup_(context_clear) Context context = {};
+        _cleanup_free_ char *output = NULL;
+        Network *network;
+
+        log_debug("/* %s(%s=%s, %s=%s, %s=%s) */", __func__, key1, value1, key2, value2, key3, value3);
+
+        ASSERT_OK(parse_cmdline_item(key1, value1, &context));
+        ASSERT_OK(parse_cmdline_item(key2, value2, &context));
+        ASSERT_OK(parse_cmdline_item(key3, value3, &context));
+        context_finalize_bootif(&context);
+        ASSERT_OK(context_merge_networks(&context));
+
+        network = network_get(&context, ifname);
+        if (expected) {
+                ASSERT_NOT_NULL(network);
+                ASSERT_OK(network_format(network, &output));
+                ASSERT_STREQ(output, expected);
+        } else
+                ASSERT_NULL(network);
 }
 
 static void test_netdev_one(const char *ifname, const char *key, const char *value, const char *expected) {
@@ -60,9 +87,7 @@ static void test_link_one(const char *filename, const char *key, const char *val
         ASSERT_STREQ(output, expected);
 }
 
-int main(int argc, char *argv[]) {
-        test_setup_logging(LOG_DEBUG);
-
+TEST(network_generator) {
         test_network_one("", "ip", "dhcp6",
                          "[Match]\n"
                          "Kind=!*\n"
@@ -101,6 +126,60 @@ int main(int argc, char *argv[]) {
                          "\n[Network]\n"
                          "DHCP=ipv4\n"
                          "\n[DHCP]\n"
+                         );
+
+        test_network_one("00:11:22:33:44:55", "ip", "00-11-22-33-44-55:dhcp",
+                         "[Match]\n"
+                         "MACAddress=00:11:22:33:44:55\n"
+                         "Kind=!*\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=ipv4\n"
+                         "\n[DHCP]\n"
+                         );
+
+        test_network_one("00:11:22:33:44:55", "ip", "00-11-22-33-44-55:dhcp6:1530:00:aa:bb:cc:dd:ee",
+                         "[Match]\n"
+                         "MACAddress=00:11:22:33:44:55\n"
+                         "Kind=!*\n"
+                         "\n[Link]\n"
+                         "MTUBytes=1530\n"
+                         "\n[Network]\n"
+                         "DHCP=ipv6\n"
+                         "\n[DHCP]\n"
+                         );
+
+        test_network_one("00:11:22:33:44:55", "ip", "192.168.0.10::192.168.0.1:255.255.255.0:hogehoge:00-11-22-33-44-55:off",
+                         "[Match]\n"
+                         "MACAddress=00:11:22:33:44:55\n"
+                         "Kind=!*\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=no\n"
+                         "LinkLocalAddressing=no\n"
+                         "IPv6AcceptRA=no\n"
+                         "\n[DHCP]\n"
+                         "Hostname=hogehoge\n"
+                         "\n[Address]\n"
+                         "Address=192.168.0.10/24\n"
+                         "\n[Route]\n"
+                         "Gateway=192.168.0.1\n"
+                         );
+
+        /* Different spellings of the same address refer to the same network. */
+        test_network_two("00:11:22:33:aa:bb",
+                         "ip", "00-11-22-33-AA-BB:dhcp",
+                         "rd.route", "10.1.2.3/16:10.0.2.3:00-11-22-33-aa-bb",
+                         "[Match]\n"
+                         "MACAddress=00:11:22:33:aa:bb\n"
+                         "Kind=!*\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=ipv4\n"
+                         "\n[DHCP]\n"
+                         "\n[Route]\n"
+                         "Destination=10.1.2.3/16\n"
+                         "Gateway=10.0.2.3\n"
                          );
 
         test_network_one("eth0", "ip", "10.99.37.44::10.99.10.1:255.255.0.0::eth0:off",
@@ -573,5 +652,65 @@ int main(int argc, char *argv[]) {
                          "Gateway=192.168.0.1\n"
                          );
 
-        return 0;
+        test_network_two("BOOTIF",
+                         "ip", "::::hogehoge:BOOTIF:dhcp",
+                         "BOOTIF", "01-00:11:22:33:44:55",
+                         "[Match]\n"
+                         "MACAddress=00:11:22:33:44:55\n"
+                         "Kind=!*\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=ipv4\n"
+                         "\n[DHCP]\n"
+                         "Hostname=hogehoge\n"
+                         );
+
+        test_network_two("BOOTIF",
+                         "ip", "::::hogehoge:BOOTIF:dhcp",
+                         "BOOTIF", "00:11:22:33:44:55",
+                         "[Match]\n"
+                         "MACAddress=00:11:22:33:44:55\n"
+                         "Kind=!*\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=ipv4\n"
+                         "\n[DHCP]\n"
+                         "Hostname=hogehoge\n"
+                         );
+
+        test_network_two("BOOTIF",
+                         "ip", "::::hogehoge:BOOTIF:dhcp",
+                         "BOOTIF", "01-00-11-22-33-44-55",
+                         "[Match]\n"
+                         "MACAddress=00:11:22:33:44:55\n"
+                         "Kind=!*\n"
+                         "\n[Link]\n"
+                         "\n[Network]\n"
+                         "DHCP=ipv4\n"
+                         "\n[DHCP]\n"
+                         "Hostname=hogehoge\n"
+                         );
+
+        test_network_three("BOOTIF",
+                           "ip", "::::hogehoge:BOOTIF:dhcp",
+                           "BOOTIF", "01-00:11:22:33:44:55",
+                           "rd.bootif", "1",
+                           "[Match]\n"
+                           "MACAddress=00:11:22:33:44:55\n"
+                           "Kind=!*\n"
+                           "\n[Link]\n"
+                           "\n[Network]\n"
+                           "DHCP=ipv4\n"
+                           "\n[DHCP]\n"
+                           "Hostname=hogehoge\n"
+                           );
+
+        test_network_three("BOOTIF",
+                           "ip", "::::hogehoge:BOOTIF:dhcp",
+                           "BOOTIF", "01-00:11:22:33:44:55",
+                           "rd.bootif", "0",
+                           /* expected= */ NULL
+                           );
 }
+
+DEFINE_TEST_MAIN(LOG_DEBUG);

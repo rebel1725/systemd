@@ -2,12 +2,12 @@
 
 #include <linux/netfilter/nf_tables.h>
 #include <locale.h>
-#include <math.h>
 #include <sys/socket.h>
 
 #include "capability-util.h"
 #include "locale-util.h"
 #include "parse-util.h"
+#include "stdio-util.h"
 #include "tests.h"
 
 TEST(parse_boolean) {
@@ -660,7 +660,7 @@ TEST(safe_atod) {
         ASSERT_ERROR(safe_atod("junk", &d), EINVAL);
 
         ASSERT_OK_ZERO(safe_atod("0.2244", &d));
-        assert_se(fabs(d - 0.2244) < 0.000001);
+        ASSERT_TRUE(ABS(d - 0.2244) < 0.000001);
 
         ASSERT_ERROR(safe_atod("0,5", &d), EINVAL);
         ASSERT_ERROR(safe_atod("", &d), EINVAL);
@@ -672,7 +672,7 @@ TEST(safe_atod) {
                 return (void) log_tests_skipped_errno(errno, "locale de_DE.utf8 not found");
 
         ASSERT_OK_ZERO(safe_atod("0.2244", &d));
-        assert_se(fabs(d - 0.2244) < 0.000001);
+        ASSERT_TRUE(ABS(d - 0.2244) < 0.000001);
 
         ASSERT_ERROR(safe_atod("0,5", &d), EINVAL);
         ASSERT_ERROR(safe_atod("", &d), EINVAL);
@@ -865,6 +865,26 @@ TEST(parse_loadavg_fixed_point) {
         ASSERT_ERROR(parse_loadavg_fixed_point("4096.4096", &fp), ERANGE);
         ASSERT_ERROR(parse_loadavg_fixed_point("-4000.5", &fp), ERANGE);
         ASSERT_ERROR(parse_loadavg_fixed_point("18446744073709551615.5", &fp), ERANGE);
+
+        /* Neither part may be large enough to overflow the shift by LOADAVG_PRECISION_BITS. Derive the
+         * boundary from the width of unsigned long, so that this holds on 32 bit too: the largest integer
+         * part that still fits is ~0UL >> LOADAVG_PRECISION_BITS (2^53-1 on 64 bit), and one more than
+         * that used to shift clean out of the word and be reported as a load of zero. */
+        unsigned long max_side = ~0UL >> LOADAVG_PRECISION_BITS;
+        char buf[DECIMAL_STR_MAX(unsigned long) + STRLEN(".99")];
+
+        xsprintf(buf, "%lu.99", max_side);
+        ASSERT_OK_ZERO(parse_loadavg_fixed_point(buf, &fp));
+        ASSERT_EQ(LOADAVG_INT_SIDE(fp), max_side);
+        ASSERT_EQ(LOADAVG_DECIMAL_SIDE(fp), 99U);
+
+        xsprintf(buf, "%lu.00", max_side + 1);
+        ASSERT_ERROR(parse_loadavg_fixed_point(buf, &fp), ERANGE);
+
+        /* Same for the fractional part, which used to be shifted before it was range checked. */
+        xsprintf(buf, "1.%lu", max_side + 1);
+        ASSERT_ERROR(parse_loadavg_fixed_point(buf, &fp), ERANGE);
+
         ASSERT_ERROR(parse_loadavg_fixed_point("foobar", &fp), EINVAL);
         ASSERT_ERROR(parse_loadavg_fixed_point("3333", &fp), EINVAL);
         ASSERT_ERROR(parse_loadavg_fixed_point("1.2.3", &fp), EINVAL);
@@ -878,7 +898,7 @@ TEST(nft_identifier_valid) {
         ASSERT_TRUE(nft_identifier_valid("abc"));
         ASSERT_TRUE(nft_identifier_valid("a012/_\\."));
 
-        ASSERT_FALSE(nft_identifier_valid(NULL));
+        ASSERT_FALSE(nft_identifier_valid(/* id= */ NULL));
         ASSERT_FALSE(nft_identifier_valid(""));
         ASSERT_FALSE(nft_identifier_valid("1234"));
         ASSERT_FALSE(nft_identifier_valid("1xyz"));
@@ -957,7 +977,7 @@ TEST(parse_capability_set) {
         /* Numeric capability */
         current = CAP_MASK_UNSET;
         ASSERT_OK(parse_capability_set("0", CAP_MASK_UNSET, &current));
-        ASSERT_EQ(current, make_cap(0));
+        ASSERT_EQ(current, make_cap(/* cap= */ 0));
 
         current = CAP_MASK_UNSET;
         ASSERT_OK(parse_capability_set("5", CAP_MASK_UNSET, &current));
@@ -966,7 +986,7 @@ TEST(parse_capability_set) {
         /* Mixed numeric and named capabilities */
         current = CAP_MASK_UNSET;
         ASSERT_OK(parse_capability_set("0 cap_chown 5", CAP_MASK_UNSET, &current));
-        ASSERT_EQ(current, make_cap(0) | make_cap(CAP_CHOWN) | make_cap(5));
+        ASSERT_EQ(current, make_cap(/* cap= */ 0) | make_cap(CAP_CHOWN) | make_cap(5));
 
         /* Invalid capabilities are ignored but function returns 0 */
         current = CAP_MASK_UNSET;

@@ -5,17 +5,21 @@
 
 #include "sd-json.h"
 
+#include "fileio.h"
 #include "log.h"
-#include "sd-forward.h"
+#include "forward.h"
 #include "string-util.h"        /* IWYU pragma: keep */
 
-#define JSON_VARIANT_REPLACE(v, q)        \
-        do {                              \
-                typeof(v)* _v = &(v);     \
-                typeof(q) _q = (q);       \
+#define JSON_VARIANT_REPLACE(v, q)           \
+        do {                                 \
+                typeof(v)* _v = &(v);        \
+                typeof(q) _q = (q);          \
                 sd_json_variant_unref(*_v);  \
-                *_v = _q;                 \
+                *_v = _q;                    \
         } while(false)
+
+#define json_variant_unref_and_replace(a, b) \
+        free_and_replace_full(a, b, sd_json_variant_unref)
 
 static inline int json_variant_set_field_non_null(sd_json_variant **v, const char *field, sd_json_variant *value) {
         return value && !sd_json_variant_is_null(value) ? sd_json_variant_set_field(v, field, value) : 0;
@@ -62,14 +66,14 @@ struct json_variant_foreach_state {
                         return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "JSON field '%s' is not a string.", strna(n)); \
                                                                         \
                 type cc = func(sd_json_variant_string(variant));        \
-                if (cc < 0) {                                           \
+                if ((int) cc < 0) {                                     \
                         /* Maybe this enum is recognizable if we replace "_" (i.e. Varlink syntax) with "-" (how we usually prefer it). */ \
                         _cleanup_free_ char *z = strdup(sd_json_variant_string(variant)); \
                         if (!z)                                         \
                                 return json_log_oom(variant, flags);    \
                                                                         \
                         cc = func(json_dashify(z));                     \
-                        if (cc < 0)                                     \
+                        if ((int) cc < 0)                               \
                                 return json_log(variant, flags, SYNTHETIC_ERRNO(EINVAL), "Value of JSON field '%s' not recognized: %s", strna(n), sd_json_variant_string(variant)); \
                 }                                                       \
                                                                         \
@@ -108,6 +112,7 @@ int json_log_internal(sd_json_variant *variant, int level, int error, const char
 #define json_log_oom(variant, flags) \
         json_log(variant, flags, SYNTHETIC_ERRNO(ENOMEM), "Out of memory.")
 
+int json_dispatch_unhex_iovec32(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_unhex_iovec(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_unbase64_iovec(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_byte_array_iovec(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
@@ -115,19 +120,37 @@ int json_dispatch_user_group_name(const char *name, sd_json_variant *variant, sd
 int json_dispatch_const_user_group_name(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_const_unit_name(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_in_addr(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
+int json_dispatch_in6_addr(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
+int json_dispatch_in_addr_data(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
+int json_dispatch_dual_timestamp(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_path(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_const_path(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_strv_path(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_filename(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
+int json_dispatch_http_url(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
+int json_dispatch_http_urls(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_const_filename(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_version(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_const_version(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
+int json_dispatch_versions(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_pidref(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_devnum(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_ifindex(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_log_level(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_strv_environment(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
 int json_dispatch_access_mode(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
+int json_dispatch_job_id(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
+int json_dispatch_address_family(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
+int json_dispatch_yes_no_string(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
+int json_dispatch_string_non_empty(const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, void *userdata);
+
+#if __SIZEOF_SIZE_T__ == 8
+#define json_dispatch_size sd_json_dispatch_uint64
+#elif __SIZEOF_SIZE_T__ == 4
+#define json_dispatch_size sd_json_dispatch_uint32
+#else
+#error "Unexpected size_t width"
+#endif
 
 static inline int json_variant_unbase64_iovec(sd_json_variant *v, struct iovec *ret) {
         return sd_json_variant_unbase64(v, ret ? &ret->iov_base : NULL, ret ? &ret->iov_len : NULL);
@@ -168,7 +191,9 @@ enum {
         _JSON_BUILD_PAIR_UNSIGNED_NON_ZERO,
         _JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL,
         _JSON_BUILD_PAIR_FINITE_USEC,
+        _JSON_BUILD_PAIR_FINITE_USEC_NON_ZERO,
         _JSON_BUILD_PAIR_STRING_NON_EMPTY,
+        _JSON_BUILD_PAIR_STRING_NON_EMPTY_UNDERSCORIFY,
         _JSON_BUILD_PAIR_STRV_NON_EMPTY,
         _JSON_BUILD_PAIR_STRV_ENV_PAIR_NON_EMPTY,
         _JSON_BUILD_PAIR_VARIANT_NON_NULL,
@@ -217,7 +242,9 @@ enum {
 #define JSON_BUILD_PAIR_UNSIGNED_NON_ZERO(name, u) _JSON_BUILD_PAIR_UNSIGNED_NON_ZERO, (const char*) { name }, (uint64_t) { u }
 #define JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL(name, u, eq) _JSON_BUILD_PAIR_UNSIGNED_NOT_EQUAL, (const char*) { name }, (uint64_t) { u }, (uint64_t) { eq }
 #define JSON_BUILD_PAIR_FINITE_USEC(name, u) _JSON_BUILD_PAIR_FINITE_USEC, (const char*) { name }, (usec_t) { u }
+#define JSON_BUILD_PAIR_FINITE_USEC_NON_ZERO(name, u) _JSON_BUILD_PAIR_FINITE_USEC_NON_ZERO, (const char*) { name }, (usec_t) { u }
 #define JSON_BUILD_PAIR_STRING_NON_EMPTY(name, s) _JSON_BUILD_PAIR_STRING_NON_EMPTY, (const char*) { name }, (const char*) { s }
+#define JSON_BUILD_PAIR_STRING_NON_EMPTY_UNDERSCORIFY(name, s) _JSON_BUILD_PAIR_STRING_NON_EMPTY_UNDERSCORIFY, (const char*) { name }, (const char*) { s }
 #define JSON_BUILD_PAIR_STRV_NON_EMPTY(name, l) _JSON_BUILD_PAIR_STRV_NON_EMPTY, (const char*) { name }, (char**) { l }
 #define JSON_BUILD_PAIR_STRV_ENV_PAIR_NON_EMPTY(name, l) _JSON_BUILD_PAIR_STRV_ENV_PAIR_NON_EMPTY, (const char*) { name }, (char**) { l }
 #define JSON_BUILD_PAIR_VARIANT_NON_NULL(name, v) _JSON_BUILD_PAIR_VARIANT_NON_NULL, (const char*) { name }, (sd_json_variant*) { v }
@@ -258,12 +285,16 @@ enum {
 #define JSON_BUILD_PAIR_TRISTATE(name, i) SD_JSON_BUILD_PAIR(name, JSON_BUILD_TRISTATE(i))
 #define JSON_BUILD_PAIR_PIDREF(name, p) SD_JSON_BUILD_PAIR(name, JSON_BUILD_PIDREF(p))
 #define JSON_BUILD_PAIR_DEVNUM(name, d) SD_JSON_BUILD_PAIR(name, JSON_BUILD_DEVNUM(d))
+#define JSON_BUILD_PAIR_ENUM(name, s) SD_JSON_BUILD_PAIR(name, JSON_BUILD_STRING_UNDERSCORIFY(s))
+#define JSON_BUILD_PAIR_ENUM_NON_EMPTY(name, s) JSON_BUILD_PAIR_STRING_NON_EMPTY_UNDERSCORIFY(name, s)
 #define JSON_BUILD_PAIR_YES_NO(name, b) SD_JSON_BUILD_PAIR(name, SD_JSON_BUILD_STRING(yes_no(b)))
 
 #define JSON_BUILD_PAIR_CONDITION_UNSIGNED(condition, name, value) \
         SD_JSON_BUILD_PAIR_CONDITION(condition, name, SD_JSON_BUILD_UNSIGNED(value))
 #define JSON_BUILD_PAIR_CONDITION_BOOLEAN(condition, name, value) \
         SD_JSON_BUILD_PAIR_CONDITION(condition, name, SD_JSON_BUILD_BOOLEAN(value))
+#define JSON_BUILD_PAIR_CONDITION_STRING(condition, name, value) \
+        SD_JSON_BUILD_PAIR_CONDITION(condition, name, SD_JSON_BUILD_STRING(value))
 #define JSON_BUILD_PAIR_CONDITION_STRV(condition, name, value) \
         SD_JSON_BUILD_PAIR_CONDITION(condition, name, SD_JSON_BUILD_STRV(value))
 
@@ -275,3 +306,7 @@ char *json_underscorify(char *p);
 char *json_dashify(char *p);
 
 int json_variant_compare(sd_json_variant *a, sd_json_variant *b);
+
+int json_seq_extract(const char **p, size_t *left, sd_json_parse_flags_t flags, bool eol, sd_json_variant **ret);
+
+int json_variant_write_file_at(int dir_fd, const char *path, sd_json_variant *v, sd_json_format_flags_t format_flags, WriteStringFileFlags write_flags);

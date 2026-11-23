@@ -14,16 +14,18 @@
 #include "generator.h"
 #include "initrd-util.h"
 #include "log.h"
-#include "mkdir-label.h"
+#include "mkdir.h"
 #include "mountpoint-util.h"
 #include "parse-util.h"
 #include "path-util.h"
 #include "special.h"
 #include "specifier.h"
 #include "string-util.h"
+#include "strv.h"
 #include "time-util.h"
 #include "tmpfile-util.h"
 #include "unit-name.h"
+#include "verbs.h"
 
 static int symlink_unless_exists(const char *target, const char *linkpath) {
         (void) mkdir_parents(linkpath, 0755);
@@ -352,7 +354,7 @@ int generator_write_fsck_deps(
                         dep = "Requires";
 
                 } else if (in_initrd() && path_equal(where, "/sysusr/usr")) {
-                        r = write_fsck_sysroot_service(SPECIAL_FSCK_USR_SERVICE, dir, what, NULL);
+                        r = write_fsck_sysroot_service(SPECIAL_FSCK_USR_SERVICE, dir, what, /* extra_after= */ NULL);
                         if (r < 0)
                                 return r;
 
@@ -401,7 +403,7 @@ int generator_write_device_timeout(
 
         r = fstab_filter_options(opts, "comment=systemd.device-timeout\0"
                                        "x-systemd.device-timeout\0",
-                                 NULL, &timeout, NULL, filtered);
+                                 /* ret_namefound= */ NULL, &timeout, /* ret_values= */ NULL, filtered);
         if (r < 0) {
                 log_warning_errno(r, "Failed to parse fstab options, ignoring: %m");
                 return 0;
@@ -457,7 +459,7 @@ int generator_write_unit_timeout(
         assert(filter);
         assert(unit_setting);
 
-        r = fstab_filter_options(opts, filter, NULL, &timeout, NULL, NULL);
+        r = fstab_filter_options(opts, filter, /* ret_namefound= */ NULL, &timeout, /* ret_values= */ NULL, /* ret_filtered= */ NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse options for '%s': %m", where);
         if (r == 0)
@@ -490,9 +492,8 @@ int generator_write_network_device_deps(
 
         assert(dir);
         assert(what);
-        assert(where);
 
-        if (fstab_is_extrinsic(where, opts))
+        if (where && fstab_is_extrinsic(where, opts))
                 return 0;
 
         if (!fstab_test_option(opts, "_netdev\0"))
@@ -818,12 +819,18 @@ int generator_hook_up_quotacheck(
 
         if (isempty(fstype) || streq(fstype, "auto"))
                 return log_warning_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Couldn't determine filesystem type for %s, quota cannot be activated", what);
+        if (fstype_has_internal_quota(fstype)) {
+                log_debug("%s handles quotas internally, skipping quotacheck/quotaon setup for %s", fstype, what);
+                return 0;
+        }
         if (!fstype_needs_quota(fstype))
                 return log_warning_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Quota was requested for %s, but not supported, ignoring: %s", what, fstype);
 
         /* quotacheck unit for system root */
-        if (path_equal(where, "/"))
-                return generator_add_symlink(dir, SPECIAL_LOCAL_FS_TARGET, "wants", SYSTEM_DATA_UNIT_DIR "/" SPECIAL_QUOTACHECK_ROOT_SERVICE);
+        if (path_equal(where, "/")) {
+                r = generator_add_symlink(dir, SPECIAL_LOCAL_FS_TARGET, "wants", SYSTEM_DATA_UNIT_DIR "/" SPECIAL_QUOTACHECK_ROOT_SERVICE);
+                return r < 0 ? r : 1;
+        }
 
         r = unit_name_path_escape(where, &instance);
         if (r < 0)
@@ -839,7 +846,8 @@ int generator_hook_up_quotacheck(
         if (r < 0)
                 return log_error_errno(r, "Failed to make unit name from path '%s': %m", where);
 
-        return generator_add_symlink_full(dir, where_unit, "wants", SYSTEM_DATA_UNIT_DIR "/" SPECIAL_QUOTACHECK_SERVICE, instance);
+        r = generator_add_symlink_full(dir, where_unit, "wants", SYSTEM_DATA_UNIT_DIR "/" SPECIAL_QUOTACHECK_SERVICE, instance);
+        return r < 0 ? r : 1;
 }
 
 int generator_hook_up_quotaon(
@@ -915,7 +923,12 @@ int generator_write_cryptsetup_unit_section(FILE *f, const char *source) {
         fprintf(f,
                 "\n"
                 "DefaultDependencies=no\n"
-                "After=cryptsetup-pre.target systemd-udevd-kernel.socket systemd-tpm2-setup-early.service\n"
+                /* The ordering against systemd-udevd.service is mostly about shutdown, not startup: on stop
+                 * the device is detached via a device-mapper ioctl that carries a udev cookie, and we block in
+                 * dm_udev_wait() until udev releases it (see 95-dm-notify.rules). Ordering After= it means we
+                 * are stopped first, while udevd is still around to service that cookie; otherwise during
+                 * soft-reboot/shutdown udevd may exit first and the detach hangs until the job timeout. */
+                "After=cryptsetup-pre.target systemd-udevd-kernel.socket systemd-udevd.service systemd-tpm2-setup-early.service\n"
                 "Before=blockdev@dev-mapper-%%i.target\n"
                 "Wants=blockdev@dev-mapper-%%i.target\n"
                 "IgnoreOnIsolate=true\n");
@@ -987,7 +1000,11 @@ int generator_write_veritysetup_unit_section(FILE *f, const char *source) {
         fprintf(f,
                 "DefaultDependencies=no\n"
                 "IgnoreOnIsolate=true\n"
-                "After=veritysetup-pre.target systemd-udevd-kernel.socket\n"
+                /* The systemd-udevd.service ordering is mostly about shutdown, not startup: on stop the dm
+                 * device is detached via an ioctl carrying a udev cookie that blocks in dm_udev_wait() until
+                 * udev releases it (95-dm-notify.rules). Stopping before udevd keeps it around to service the
+                 * cookie; otherwise during soft-reboot/shutdown udevd may exit first and the detach hangs. */
+                "After=veritysetup-pre.target systemd-udevd-kernel.socket systemd-udevd.service\n"
                 "Before=blockdev@dev-mapper-%%i.target\n"
                 "Wants=blockdev@dev-mapper-%%i.target\n");
 
@@ -1029,7 +1046,14 @@ int generator_write_veritysetup_service_section(
         }
 
         if (options) {
-                options_escaped = specifier_escape(options);
+                /* ExecStart= processes C escapes in its arguments. systemd-veritysetup expects a backslash
+                 * before a comma in an option value. We escape the options, so that systemd-veritysetup gets
+                 * the backslashes unchanged. */
+                _cleanup_free_ char *c = cescape(options);
+                if (!c)
+                        return log_oom();
+
+                options_escaped = specifier_escape(c);
                 if (!options_escaped)
                         return log_oom();
         }
@@ -1082,6 +1106,36 @@ bool generator_soft_rebooted(void) {
         }
 
         return (cached = (u > 0));
+}
+
+int _generator_main(
+                const Verb verbs[],
+                const Verb verbs_end[],
+                const Option options[],
+                const Option options_end[],
+                int argc, char *argv[],
+                generator_main_func_t impl) {
+        int r;
+
+        assert(argc >= 0);
+        assert(argv);
+        assert(impl);
+
+        char **args = NULL;
+        r = _common_parse_argv(verbs, verbs_end, options, options_end, argc, argv,
+                               OPTION_PARSER_NORMAL,
+                               /* min_args= */ 0, /* max_args= */ SIZE_MAX, &args);
+        if (r <= 0)
+                return r;
+
+        /* The count is checked here rather than through min_args/max_args so that every wrong count
+         * is reported with the same message. */
+        size_t n = strv_length(args);
+        if (!IN_SET(n, 1, 3))
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "This program takes one or three arguments.");
+
+        return impl(args[0], args[n == 3 ? 1 : 0], args[n == 3 ? 2 : 0]);
 }
 
 GptAutoRoot parse_gpt_auto_root(const char *switch_name, const char *value) {

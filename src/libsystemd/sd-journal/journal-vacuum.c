@@ -21,7 +21,7 @@
 #include "time-util.h"
 #include "xattr-util.h"
 
-typedef struct vacuum_info {
+typedef struct VacuumInfo {
         uint64_t usage;
         char *filename;
 
@@ -30,9 +30,9 @@ typedef struct vacuum_info {
         sd_id128_t seqnum_id;
         uint64_t seqnum;
         bool have_seqnum;
-} vacuum_info;
+} VacuumInfo;
 
-static int vacuum_info_compare(const vacuum_info *a, const vacuum_info *b) {
+static int vacuum_info_compare(const VacuumInfo *a, const VacuumInfo *b) {
         int r;
 
         if (a->have_seqnum && b->have_seqnum &&
@@ -49,15 +49,12 @@ static int vacuum_info_compare(const vacuum_info *a, const vacuum_info *b) {
         return strcmp(a->filename, b->filename);
 }
 
-static void vacuum_info_array_free(vacuum_info *list, size_t n) {
-        if (!list)
-                return;
-
-        FOREACH_ARRAY(i, list, n)
-                free(i->filename);
-
-        free(list);
+static void vacuum_info_done(VacuumInfo *info) {
+        assert(info);
+        info->filename = mfree(info->filename);
 }
+
+static DEFINE_ARRAY_FREE_FUNC(vacuum_info_array_free, VacuumInfo, vacuum_info_done);
 
 static void patch_realtime(
                 int fd,
@@ -101,12 +98,12 @@ static int journal_file_empty(int dir_fd, const char *name) {
         le64_t n_entries;
         ssize_t n;
 
-        fd = openat(dir_fd, name, O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK|O_NOATIME);
+        fd = xopenat(dir_fd, name, O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_NOATIME);
         if (fd < 0) {
                 /* Maybe failed due to O_NOATIME and lack of privileges? */
-                fd = openat(dir_fd, name, O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+                fd = xopenat(dir_fd, name, O_RDONLY|O_NOFOLLOW|O_NONBLOCK);
                 if (fd < 0)
-                        return -errno;
+                        return fd;
         }
 
         if (fstat(fd, &st) < 0)
@@ -137,13 +134,14 @@ int journal_directory_vacuum(
         uint64_t sum = 0, freed = 0, n_active_files = 0;
         size_t n_list = 0, i;
         _cleanup_closedir_ DIR *d = NULL;
-        vacuum_info *list = NULL;
+        VacuumInfo *list = NULL;
         usec_t retention_limit = 0;
         int r;
 
         CLEANUP_ARRAY(list, n_list, vacuum_info_array_free);
 
         assert(directory);
+        POINTER_MAY_BE_NULL(oldest_usec);
 
         if (max_use <= 0 && max_retention_usec <= 0 && n_max_files <= 0)
                 return 0;
@@ -260,7 +258,7 @@ int journal_directory_vacuum(
                 if (r > 0) {
                         /* Always vacuum empty non-online files. */
 
-                        r = unlinkat_deallocate(dirfd(d), p, 0);
+                        r = unlinkat_deallocate(dirfd(d), p, /* flags= */ 0);
                         if (r >= 0) {
 
                                 log_full(verbose ? LOG_INFO : LOG_DEBUG,
@@ -280,7 +278,7 @@ int journal_directory_vacuum(
                 if (!GREEDY_REALLOC(list, n_list + 1))
                         return -ENOMEM;
 
-                list[n_list++] = (vacuum_info) {
+                list[n_list++] = (VacuumInfo) {
                         .filename = TAKE_PTR(p),
                         .usage = size,
                         .seqnum = seqnum,
@@ -304,7 +302,7 @@ int journal_directory_vacuum(
                     (n_max_files <= 0 || left <= n_max_files))
                         break;
 
-                r = unlinkat_deallocate(dirfd(d), list[i].filename, 0);
+                r = unlinkat_deallocate(dirfd(d), list[i].filename, /* flags= */ 0);
                 if (r >= 0) {
                         log_full(verbose ? LOG_INFO : LOG_DEBUG, "Deleted archived journal %s/%s (%s).",
                                  directory, list[i].filename, FORMAT_BYTES(list[i].usage));

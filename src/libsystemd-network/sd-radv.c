@@ -58,7 +58,7 @@ int sd_radv_attach_event(sd_radv *ra, sd_event *event, int64_t priority) {
         else {
                 r = sd_event_default(&ra->event);
                 if (r < 0)
-                        return 0;
+                        return r;
         }
 
         ra->event_priority = priority;
@@ -148,6 +148,19 @@ static int radv_send_router_on_stop(sd_radv *ra) {
         return ndisc_send(ra->fd, &IN6_ADDR_ALL_NODES_MULTICAST, &adv.nd_ra_hdr, options, time_now);
 }
 
+static void radv_drop_expired_prefixes(sd_radv *ra, usec_t time_now) {
+        assert(ra);
+
+        /* Hosts that heard the prefix from us have already dropped it, so stop advertising it. */
+        sd_ndisc_option *opt;
+        SET_FOREACH(opt, ra->options)
+                if (opt->type == SD_NDISC_OPTION_PREFIX_INFORMATION && opt->prefix.valid_until <= time_now) {
+                        log_radv(ra, "Valid lifetime of prefix %s expired, no longer advertising it.",
+                                 IN6_ADDR_PREFIX_TO_STRING(&opt->prefix.address, opt->prefix.prefixlen));
+                        ndisc_option_remove(ra->options, opt);
+                }
+}
+
 static int radv_send_router(sd_radv *ra, const struct in6_addr *dst) {
         assert(ra);
 
@@ -163,6 +176,8 @@ static int radv_send_router(sd_radv *ra, const struct in6_addr *dst) {
         r = sd_event_now(ra->event, CLOCK_BOOTTIME, &time_now);
         if (r < 0)
                 return r;
+
+        radv_drop_expired_prefixes(ra, time_now);
 
         /* The nd_ra_curhoplimit and nd_ra_flags_reserved fields cannot specified with nd_ra_router_lifetime
          * simultaneously in the structured initializer in the above. */
@@ -226,6 +241,12 @@ static int radv_recv(sd_event_source *s, int fd, uint32_t revents, void *userdat
                 return 0;
         }
 
+        if (packet->ifindex != ra->ifindex) {
+                log_radv(ra, "Received an ICMPv6 packet on interface %i, expected %i, ignoring.",
+                         packet->ifindex, ra->ifindex);
+                return 0;
+        }
+
         (void) radv_process_packet(ra, packet);
         return 0;
 }
@@ -252,11 +273,15 @@ int sd_radv_send(sd_radv *ra) {
         if (r < 0)
                 return r;
 
-        r = radv_send_router(ra, NULL);
+        r = radv_send_router(ra, /* dst= */ NULL);
         if (r < 0)
-                return log_radv_errno(ra, r, "Unable to send Router Advertisement: %m");
-
-        ra->ra_sent++;
+                /* Do not treat transient send failures (e.g. ENOBUFS while a bond is still selecting an
+                 * aggregator after a carrier flap, or ENETDOWN/EADDRNOTAVAIL during a short link bounce) as
+                 * fatal: log and reschedule so we try again instead of stopping the RA engine for good.
+                 * Solicited RAs already behave this way, see radv_process_packet(). */
+                log_radv_errno(ra, r, "Unable to send Router Advertisement, will retry later: %m");
+        else
+                ra->ra_sent++;
 
         /* RFC 4861, Section 6.2.4, sending initial Router Advertisements */
         if (ra->ra_sent <= RADV_MAX_INITIAL_RTR_ADVERTISEMENTS)
@@ -283,15 +308,19 @@ int sd_radv_send(sd_radv *ra) {
         assert(min_timeout <= max_timeout * 3 / 4);
 
         timeout = min_timeout + random_u64_range(max_timeout - min_timeout);
-        log_radv(ra, "Sent unsolicited Router Advertisement. Next advertisement will be in %s.",
-                 FORMAT_TIMESPAN(timeout, USEC_PER_SEC));
+        if (r >= 0)
+                log_radv(ra, "Sent unsolicited Router Advertisement. Next advertisement will be in %s.",
+                         FORMAT_TIMESPAN(timeout, USEC_PER_SEC));
+        else
+                log_radv(ra, "Next Router Advertisement attempt in %s.",
+                         FORMAT_TIMESPAN(timeout, USEC_PER_SEC));
 
         return event_reset_time(
                         ra->event, &ra->timeout_event_source,
                         CLOCK_BOOTTIME,
                         usec_add(time_now, timeout), MSEC_PER_SEC,
                         radv_timeout, ra,
-                        ra->event_priority, "radv-timeout", true);
+                        ra->event_priority, "radv-timeout", /* force_reset= */ true);
 }
 
 int sd_radv_stop(sd_radv *ra) {
@@ -360,9 +389,9 @@ int sd_radv_start(sd_radv *ra) {
 
         r = event_reset_time(ra->event, &ra->timeout_event_source,
                              CLOCK_BOOTTIME,
-                             0, 0,
+                             /* usec= */ 0, /* accuracy= */ 0,
                              radv_timeout, ra,
-                             ra->event_priority, "radv-timeout", true);
+                             ra->event_priority, "radv-timeout", /* force_reset= */ true);
         if (r < 0)
                 goto fail;
 

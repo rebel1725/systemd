@@ -13,7 +13,7 @@
 #include "errno-util.h"
 #include "fd-util.h"
 #include "fileio.h"
-#include "label.h"
+#include "fs-util.h"
 #include "label-util.h"
 #include "log.h"
 #include "path-util.h"
@@ -149,16 +149,8 @@ static int smack_fix_fd(
                                                                     to ignore failures caused by that,
                                                                     suppress error */
                 return 0;
-        if (r < 0) {
-                /* If the old label is identical to the new one, suppress any kind of error */
-                _cleanup_free_ char *old_label = NULL;
-
-                if (fgetxattr_malloc(fd, "security.SMACK64", &old_label, /* ret_size= */ NULL) >= 0 &&
-                    streq(old_label, label))
-                        return 0;
-
+        if (r < 0)
                 return log_debug_errno(r, "Unable to fix SMACK label of '%s': %m", label_path);
-        }
 
         return 0;
 }
@@ -182,12 +174,12 @@ int mac_smack_fix_full(
                 return 0;
 
         if (inode_path) {
-                opened_fd = openat(atfd, inode_path, O_NOFOLLOW|O_CLOEXEC|O_PATH);
+                opened_fd = xopenat(atfd, inode_path, O_NOFOLLOW|O_PATH);
                 if (opened_fd < 0) {
-                        if (errno == ENOENT && FLAGS_SET(flags, LABEL_IGNORE_ENOENT))
+                        if (opened_fd == -ENOENT && FLAGS_SET(flags, LABEL_IGNORE_ENOENT))
                                 return 0;
 
-                        return -errno;
+                        return opened_fd;
                 }
                 inode_fd = opened_fd;
         } else
@@ -230,15 +222,15 @@ int renameat_and_apply_smack_floor_label(int fdf, const char *from, int fdt, con
 #endif
 }
 
-static int mac_smack_label_pre(int dir_fd, const char *path, mode_t mode) {
+static int mac_smack_label_pre(int dir_fd, const char *path, mode_t mode, LabelContext *label_context) {
         return 0;
 }
 
-static int mac_smack_label_post(int dir_fd, const char *path, bool created) {
+static int mac_smack_label_post(int dir_fd, const char *path, bool created, LabelContext *label_context) {
         if (!created)
                 return 0;
 
-        return mac_smack_fix_full(dir_fd, path, NULL, 0);
+        return mac_smack_fix_full(dir_fd, path, /* label_path= */ NULL, /* flags= */ 0);
 }
 
 int mac_smack_init(void) {

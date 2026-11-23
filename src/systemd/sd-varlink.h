@@ -55,8 +55,9 @@ __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_varlink_reply_flags_t) {
 } sd_varlink_reply_flags_t;
 
 __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_varlink_method_flags_t) {
-        SD_VARLINK_METHOD_ONEWAY = 1 << 0,
-        SD_VARLINK_METHOD_MORE   = 1 << 1,
+        SD_VARLINK_METHOD_ONEWAY  = 1 << 0,
+        SD_VARLINK_METHOD_MORE    = 1 << 1,
+        SD_VARLINK_METHOD_UPGRADE = 1 << 2,
         _SD_ENUM_FORCE_S64(SD_VARLINK_METHOD)
 } sd_varlink_method_flags_t;
 
@@ -71,8 +72,14 @@ __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_varlink_server_flags_t) {
         SD_VARLINK_SERVER_FD_PASSING_INPUT_STRICT = 1 << 7, /* Reject input messages with fds if fd passing is disabled (needs kernel v6.16+) */
         SD_VARLINK_SERVER_HANDLE_SIGINT           = 1 << 8, /* Exit cleanly on SIGINT */
         SD_VARLINK_SERVER_HANDLE_SIGTERM          = 1 << 9, /* Exit cleanly on SIGTERM */
+        SD_VARLINK_SERVER_UPGRADABLE              = 1 << 10, /* Server has upgrade methods; avoid consuming post-upgrade data during reads */
         _SD_ENUM_FORCE_S64(SD_VARLINK_SERVER)
 } sd_varlink_server_flags_t;
+
+__extension__ typedef enum _SD_ENUM_TYPE_S64(sd_varlink_server_claim_flags_t) {
+        SD_VARLINK_SERVER_CLAIM_AGAIN = 1 << 0,
+        _SD_ENUM_FORCE_S64(SD_VARLINK_SERVER_CLAIM)
+} sd_varlink_server_claim_flags_t;
 
 __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_varlink_invocation_flags_t) {
         SD_VARLINK_ALLOW_LISTEN = 1 << 0,
@@ -82,6 +89,7 @@ __extension__ typedef enum _SD_ENUM_TYPE_S64(sd_varlink_invocation_flags_t) {
 
 typedef int (*sd_varlink_method_t)(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_flags_t flags, void *userdata);
 typedef int (*sd_varlink_reply_t)(sd_varlink *link, sd_json_variant *parameters, const char *error_id, sd_varlink_reply_flags_t flags, void *userdata);
+typedef int (*sd_varlink_upgrade_t)(sd_varlink *link, int input_fd, int output_fd, void *userdata);
 typedef int (*sd_varlink_connect_t)(sd_varlink_server *server, sd_varlink *link, void *userdata);
 typedef void (*sd_varlink_disconnect_t)(sd_varlink_server *server, sd_varlink *link, void *userdata);
 
@@ -110,6 +118,7 @@ int sd_varlink_wait(sd_varlink *v, uint64_t timeout);
 
 int sd_varlink_is_idle(sd_varlink *v);
 int sd_varlink_is_connected(sd_varlink *v);
+int sd_varlink_wants_reply(sd_varlink *v);
 
 int sd_varlink_flush(sd_varlink *v);
 int sd_varlink_close(sd_varlink *v);
@@ -135,6 +144,17 @@ int sd_varlink_callb(sd_varlink *v, const char *method, sd_json_variant **ret_pa
 #define sd_varlink_callbo(v, method, ret_parameters, ret_error_id, ...)    \
         sd_varlink_callb((v), (method), (ret_parameters), (ret_error_id), SD_JSON_BUILD_OBJECT(__VA_ARGS__))
 
+/* Send method call with upgrade, wait for reply, then steal the connection fds for raw I/O.
+ * For bidirectional sockets ret_input_fd and ret_output_fd will be separate (dupped) fds
+ * referring to the same underlying socket. ret_parameters and ret_error_id are borrowed
+ * references valid only until v is closed or unreffed.
+ * Returns > 0 if the connection was upgraded, 0 if a Varlink error occurred (and ret_error_id was set),
+ * or < 0 on local failure. */
+int sd_varlink_call_and_upgrade(sd_varlink *v, const char *method, sd_json_variant *parameters, sd_json_variant **ret_parameters, const char **ret_error_id, int *ret_input_fd, int *ret_output_fd);
+int sd_varlink_call_and_upgradeb(sd_varlink *v, const char *method, sd_json_variant **ret_parameters, const char **ret_error_id, int *ret_input_fd, int *ret_output_fd, ...);
+#define sd_varlink_call_and_upgradebo(v, method, ret_parameters, ret_error_id, ret_input_fd, ret_output_fd, ...) \
+        sd_varlink_call_and_upgradeb((v), (method), (ret_parameters), (ret_error_id), (ret_input_fd), (ret_output_fd), SD_JSON_BUILD_OBJECT(__VA_ARGS__))
+
 /* Send method call and begin collecting all 'more' replies into an array, finishing when a final reply is sent */
 int sd_varlink_collect_full(sd_varlink *v, const char *method, sd_json_variant *parameters, sd_json_variant **ret_parameters, const char **ret_error_id, sd_varlink_reply_flags_t *ret_flags);
 int sd_varlink_collect(sd_varlink *v, const char *method, sd_json_variant *parameters, sd_json_variant **ret_parameters, const char **ret_error_id);
@@ -148,6 +168,15 @@ int sd_varlink_invokeb(sd_varlink *v, const char *method, ...);
 #define sd_varlink_invokebo(v, method, ...)                                \
         sd_varlink_invokeb((v), (method), SD_JSON_BUILD_OBJECT(__VA_ARGS__))
 
+/* Enqueue method call with upgrade request. The reply is delivered to the reply callback. If the server
+ * accepted the upgrade, the connection is disconnected from the Varlink protocol afterwards and its fds are
+ * handed to the upgrade callback, see sd_varlink_bind_upgrade(). The asynchronous counterpart of
+ * sd_varlink_call_and_upgrade(). */
+int sd_varlink_invoke_and_upgrade(sd_varlink *v, const char *method, sd_json_variant *parameters);
+int sd_varlink_invoke_and_upgradeb(sd_varlink *v, const char *method, ...);
+#define sd_varlink_invoke_and_upgradebo(v, method, ...)                    \
+        sd_varlink_invoke_and_upgradeb((v), (method), SD_JSON_BUILD_OBJECT(__VA_ARGS__))
+
 /* Enqueue method call, expect a reply now, and possibly more later, which are all delivered to the reply callback */
 int sd_varlink_observe(sd_varlink *v, const char *method, sd_json_variant *parameters);
 int sd_varlink_observeb(sd_varlink *v, const char *method, ...);
@@ -159,6 +188,24 @@ int sd_varlink_reply(sd_varlink *v, sd_json_variant *parameters);
 int sd_varlink_replyb(sd_varlink *v, ...);
 #define sd_varlink_replybo(v, ...)                         \
         sd_varlink_replyb((v), SD_JSON_BUILD_OBJECT(__VA_ARGS__))
+
+/* Send a final reply to an upgrade request, then steal the connection fds for raw I/O.
+ * The fds are returned in blocking mode. The varlink connection is disconnected afterwards.
+ * For bidirectional sockets ret_input_fd and ret_output_fd will be separate (dupped) fds
+ * referring to the same underlying socket. For pipe pairs (e.g. ssh-exec transport) they
+ * will differ. Either ret pointer may be NULL.
+ *
+ * Note: this call synchronously blocks until the reply is flushed to the socket. This is
+ * usually fine as flush is fast but a misbehaving/adversary client that stops reading
+ * could stall the caller. So do not use in servers that multiplex many varlink
+ * connections. */
+int sd_varlink_reply_and_upgrade(sd_varlink *v, sd_json_variant *parameters, int *ret_input_fd, int *ret_output_fd);
+
+/* Like sd_varlink_reply_and_upgrade() but asynchronous */
+int sd_varlink_respond_and_upgrade(sd_varlink *v, sd_json_variant *parameters);
+int sd_varlink_respond_and_upgradeb(sd_varlink *v, ...);
+#define sd_varlink_respond_and_upgradebo(v, ...)                           \
+        sd_varlink_respond_and_upgradeb((v), SD_JSON_BUILD_OBJECT(__VA_ARGS__))
 
 /* Enqueue a (final) error */
 int sd_varlink_error(sd_varlink *v, const char *error_id, sd_json_variant *parameters);
@@ -202,8 +249,16 @@ int sd_varlink_set_allow_fd_passing_output(sd_varlink *v, int b);
 /* Bind a disconnect, reply or timeout callback */
 int sd_varlink_bind_reply(sd_varlink *v, sd_varlink_reply_t reply);
 
+/* Bind an upgrade callback (server side) */
+int sd_varlink_bind_upgrade(sd_varlink *v, sd_varlink_upgrade_t upgrade);
+
 void* sd_varlink_set_userdata(sd_varlink *v, void *userdata);
 void* sd_varlink_get_userdata(sd_varlink *v);
+
+/* Queue a reply to be sent if no other reply was sent by a method callback.
+ * Useful when implementing services which send a (possibly empty) series
+ * of objects and terminate. */
+int sd_varlink_set_sentinel(sd_varlink *v, const char *error_id);
 
 int sd_varlink_get_peer_uid(sd_varlink *v, uid_t *ret);
 int sd_varlink_get_peer_gid(sd_varlink *v, gid_t *ret);
@@ -219,6 +274,22 @@ const char* sd_varlink_get_description(sd_varlink *v);
 
 /* Automatically mark the parameters part of incoming messages as security sensitive */
 int sd_varlink_set_input_sensitive(sd_varlink *v);
+
+/* Serialize/deserialize a connection's state (buffered input and output, passed fds, the pending method
+ * call, …), for passing it on across execve(). The returned data is opaque, the fds are duplicates owned by
+ * the caller. On success sd_varlink_deserialize() takes possession of all passed fds (and sets the array
+ * entries to -EBADF). Userdata, callbacks, event loop attachment and similar settings are not serialized,
+ * and need to be restored by the caller. */
+int sd_varlink_serialize(sd_varlink *v, void **ret_data, size_t *ret_size, int **ret_fds, size_t *ret_n_fds);
+int sd_varlink_deserialize(sd_varlink **ret, const void *data, size_t size, int *fds, size_t n_fds);
+
+/* Returns an identifier for the connection that remains stable across execve(). The returned string is
+ * owned by the connection object, and remains valid until the connection is closed. */
+int sd_varlink_get_connection_id(sd_varlink *v, const char **ret);
+
+/* Keep the method call currently pending on this server side connection across serialization. If not
+ * set, connections with pending method calls are disconnected on serialization. */
+int sd_varlink_set_serialize_pending(sd_varlink *v, int b);
 
 /* Create a varlink server */
 int sd_varlink_server_new(sd_varlink_server **ret, sd_varlink_server_flags_t flags);
@@ -279,6 +350,14 @@ unsigned sd_varlink_server_current_connections(sd_varlink_server *s);
 
 int sd_varlink_server_set_description(sd_varlink_server *s, const char *description);
 
+/* Serialize/deserialize all connections of a server (but not its listening sockets). After deserialization,
+ * connections with a pending method call need to be claimed by the program, the ones remaining unclaimed
+ * can be disconnected with sd_varlink_server_disconnect_unclaimed_connections(). */
+int sd_varlink_server_serialize(sd_varlink_server *s, void **ret_data, size_t *ret_size, int **ret_fds, size_t *ret_n_fds);
+int sd_varlink_server_deserialize(sd_varlink_server *s, const void *data, size_t size, int *fds, size_t n_fds);
+int sd_varlink_server_claim_connection(sd_varlink_server *s, const char *id, sd_varlink_server_claim_flags_t flags, sd_varlink **ret);
+int sd_varlink_server_disconnect_unclaimed_connections(sd_varlink_server *s);
+
 int sd_varlink_invocation(sd_varlink_invocation_flags_t flags);
 
 int sd_varlink_error_to_errno(const char *error, sd_json_variant *parameters);
@@ -299,6 +378,9 @@ _SD_DEFINE_POINTER_CLEANUP_FUNC(sd_varlink_server, sd_varlink_server_unref);
 /* This one we invented, and use for generically propagating system errors (errno) to clients */
 #define SD_VARLINK_ERROR_SYSTEM "io.systemd.System"
 
+/* The method is implemented, but the requested operation is not supported. */
+#define SD_VARLINK_ERROR_OPERATION_NOT_SUPPORTED "io.systemd.OperationNotSupported"
+
 /* This one we invented and is a weaker version of "org.varlink.service.PermissionDenied", and indicates that if user would allow interactive auth, we might allow access */
 #define SD_VARLINK_ERROR_INTERACTIVE_AUTHENTICATION_REQUIRED "io.systemd.InteractiveAuthenticationRequired"
 
@@ -309,6 +391,7 @@ _SD_DEFINE_POINTER_CLEANUP_FUNC(sd_varlink_server, sd_varlink_server_unref);
 #define SD_VARLINK_ERROR_INVALID_PARAMETER "org.varlink.service.InvalidParameter"
 #define SD_VARLINK_ERROR_PERMISSION_DENIED "org.varlink.service.PermissionDenied"
 #define SD_VARLINK_ERROR_EXPECTED_MORE "org.varlink.service.ExpectedMore"
+#define SD_VARLINK_ERROR_EXPECTED_UPGRADE "org.varlink.service.ExpectedUpgrade"
 
 _SD_END_DECLARATIONS;
 

@@ -92,11 +92,11 @@
     </refsect2>
   </refsect1>
 
-  <xi:include href="libsystemd-pkgconfig.xml" />
+  <xi:include href="libsystemd-notes.xml"/>
 
   <refsect1>
     <title>History</title>
-    <para><function>sd_bus_message_skip()</function> was added in version 240.</para>
+    <para><function>sd_bus_message_skip()</function> was added in version 221.</para>
   </refsect1>
 
   <refsect1>

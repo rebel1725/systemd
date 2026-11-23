@@ -7,7 +7,7 @@ endif
 systemd_machined_sources = files(
         'machined.c'
 )
-systemd_machined_extract_sources = files(
+systemd_machined_export_sources = files(
         'image.c',
         'image-dbus.c',
         'image-varlink.c',
@@ -17,6 +17,7 @@ systemd_machined_extract_sources = files(
         'machined-core.c',
         'machined-dbus.c',
         'machined-resolve-hook.c',
+        'machined-ssh-agent.c',
         'machined-varlink.c',
         'operation.c',
 )
@@ -26,23 +27,24 @@ executables += [
                 'name' : 'systemd-machined',
                 'dbus' : true,
                 'sources' : systemd_machined_sources,
-                'extract' : systemd_machined_extract_sources,
+                'export' : systemd_machined_export_sources,
         },
         executable_template + {
                 'name' : 'machinectl',
-                'public' : true,
                 'sources' : files('machinectl.c'),
                 'dependencies' : [
                         liblz4_cflags,
                         libxz_cflags,
                         libzstd_cflags,
-                        threads,
                 ],
         },
         test_template + {
+                'sources' : files('test-machine.c'),
+                'import' : ['systemd-machined'],
+        },
+        test_template + {
                 'sources' : files('test-machine-tables.c'),
-                'objects' : ['systemd-machined'],
-                'dependencies': threads,
+                'import' : ['systemd-machined'],
         },
 ]
 

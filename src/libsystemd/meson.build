@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 sd_journal_sources = files(
-        'sd-journal/audit-type.c',
         'sd-journal/catalog.c',
-        'sd-journal/fsprg.c',
-        'sd-journal/journal-authenticate.c',
+        'sd-journal/journal-authenticate-internal.c',
         'sd-journal/journal-file.c',
         'sd-journal/journal-send.c',
         'sd-journal/journal-vacuum.c',
@@ -13,11 +11,6 @@ sd_journal_sources = files(
         'sd-journal/mmap-cache.c',
         'sd-journal/sd-journal.c',
 )
-
-subdir('sd-journal')
-
-generated_sources += audit_type_to_name
-sd_journal_sources += audit_type_to_name
 
 ############################################################
 
@@ -33,6 +26,7 @@ sd_daemon_sources = files('sd-daemon/sd-daemon.c')
 ############################################################
 
 sd_event_sources = files(
+        'sd-event/event-future.c',
         'sd-event/event-util.c',
         'sd-event/sd-event.c',
 )
@@ -48,6 +42,7 @@ sd_bus_sources = files(
         'sd-bus/bus-dump.c',
         'sd-bus/bus-dump-json.c',
         'sd-bus/bus-error.c',
+        'sd-bus/bus-future.c',
         'sd-bus/bus-internal.c',
         'sd-bus/bus-introspect.c',
         'sd-bus/bus-kernel.c',
@@ -75,11 +70,22 @@ sd_device_sources = files(
 
 ############################################################
 
+sd_future_sources = files(
+        'sd-future/channel.c',
+        'sd-future/fiber-io.c',
+        'sd-future/fiber.c',
+        'sd-future/future-group.c',
+        'sd-future/sd-future.c',
+)
+
+############################################################
+
 sd_login_sources = files('sd-login/sd-login.c')
 
 ############################################################
 
 sd_json_sources = files(
+        'sd-json/json-stream.c',
         'sd-json/json-util.c',
         'sd-json/sd-json.c',
 )
@@ -89,6 +95,8 @@ sd_json_sources = files(
 sd_varlink_sources = files(
         'sd-varlink/sd-varlink.c',
         'sd-varlink/sd-varlink-idl.c',
+        'sd-varlink/varlink-idl-json.c',
+        'sd-varlink/varlink-future.c',
         'sd-varlink/varlink-io.systemd.c',
         'sd-varlink/varlink-org.varlink.service.c',
         'sd-varlink/varlink-util.c',
@@ -105,6 +113,7 @@ sd_path_sources = files(
 
 sd_netlink_sources = files(
         'sd-netlink/netlink-genl.c',
+        'sd-netlink/netlink-message-genl-ethtool.c',
         'sd-netlink/netlink-message-nfnl.c',
         'sd-netlink/netlink-message-rtnl.c',
         'sd-netlink/netlink-message.c',
@@ -134,8 +143,9 @@ libsystemd_sources = files(
         'sd-resolve/sd-resolve.c',
 ) + sd_journal_sources + sd_id128_sources + sd_daemon_sources \
   + sd_event_sources + sd_bus_sources + sd_device_sources \
-  + sd_login_sources + sd_json_sources + sd_varlink_sources \
-  + sd_path_sources + sd_netlink_sources + sd_network_sources
+  + sd_future_sources + sd_login_sources + sd_json_sources \
+  + sd_varlink_sources + sd_path_sources + sd_netlink_sources \
+  + sd_network_sources
 
 sources += libsystemd_sources
 
@@ -149,16 +159,13 @@ libsystemd_static = static_library(
         c_args : libsystemd_c_args,
         link_with : [libc_wrapper_static,
                      libbasic_static],
-        dependencies : [threads,
-                        libm,
-                        librt,
+        dependencies : [libm,
+                        libucontext,
                         userspace],
         build_by_default : false)
 
-libsystemd_dir_path = meson.current_source_dir()
-
 libsystemd_sym = files('libsystemd.sym')
-libsystemd_sym_path = libsystemd_dir_path / 'libsystemd.sym'
+libsystemd_sym_path = relative_source_path / 'src/libsystemd/libsystemd.sym'
 
 static_libsystemd = get_option('static-libsystemd')
 static_libsystemd_pic = static_libsystemd == 'true' or static_libsystemd == 'pic'
@@ -174,96 +181,72 @@ libsystemd_pc = custom_target(
 ############################################################
 
 simple_tests += files(
-        'sd-journal/test-audit-type.c',
-        'sd-journal/test-catalog.c',
-        'sd-journal/test-journal-file.c',
-        'sd-journal/test-journal-init.c',
-        'sd-journal/test-journal-match.c',
-        'sd-journal/test-journal-send.c',
-        'sd-journal/test-mmap-cache.c',
-)
-
-libsystemd_tests += [
-        {
-                'sources' : files('sd-journal/test-journal-enum.c'),
-                'timeout' : 360,
-        },
-        {
-                'sources' : files('sd-event/test-event.c'),
-                'timeout' : 120,
-        }
-]
-
-############################################################
-
-simple_tests += files(
         'sd-bus/test-bus-creds.c',
+        'sd-bus/test-bus-fiber.c',
         'sd-bus/test-bus-introspect.c',
         'sd-bus/test-bus-match.c',
         'sd-bus/test-bus-vtable.c',
         'sd-device/test-device-util.c',
         'sd-device/test-sd-device-monitor.c',
+        'sd-event/test-event-future.c',
+        'sd-future/test-channel.c',
+        'sd-future/test-fiber.c',
+        'sd-future/test-future-group.c',
+        'sd-hwdb/test-sd-hwdb.c',
+        'sd-id128/test-id128.c',
+        'sd-journal/test-catalog.c',
         'sd-journal/test-journal-flush.c',
+        'sd-journal/test-journal-init.c',
         'sd-journal/test-journal-interleaving.c',
+        'sd-journal/test-journal-match.c',
+        'sd-journal/test-journal-send.c',
         'sd-journal/test-journal-stream.c',
         'sd-journal/test-journal.c',
+        'sd-journal/test-mmap-cache.c',
         'sd-login/test-login.c',
         'sd-login/test-sd-login.c',
         'sd-netlink/test-netlink.c',
+        'sd-path/test-sd-path.c',
 )
 
 libsystemd_tests += [
         {
-                'sources' : files('sd-device/test-sd-device.c'),
-                'dependencies' : [ threads, libmount_cflags ],
-        },
-        {
                 'sources' : files('sd-bus/test-bus-address.c'),
-                'dependencies' : threads
         },
         {
                 'sources' : files('sd-bus/test-bus-benchmark.c'),
-                'dependencies' : threads,
                 'type' : 'manual',
         },
         {
                 'sources' : files('sd-bus/test-bus-chat.c'),
-                'dependencies' : threads,
+                'io_uring' : true,
         },
         {
                 'sources' : files('sd-bus/test-bus-cleanup.c'),
-                'dependencies' : [threads, libseccomp_cflags],
+                'dependencies' : libseccomp_cflags,
         },
         {
                 'sources' : files('sd-bus/test-bus-marshal.c'),
                 'dependencies' : [
-                        libdbus,
-                        libgio,
-                        libglib,
-                        libgobject,
-                        libm,
-                        threads,
+                        libdbus_cflags,
+                        libglib_cflags,
                 ],
         },
         {
                 'sources' : files('sd-bus/test-bus-objects.c'),
-                'dependencies' : threads,
         },
         {
                 'sources' : files('sd-bus/test-bus-peersockaddr.c'),
-                'dependencies' : threads,
+                'io_uring' : true,
         },
         {
                 'sources' : files('sd-bus/test-bus-queue-ref-cycle.c'),
-                'dependencies' : threads,
         },
         {
                 'sources' : files('sd-bus/test-bus-server.c'),
-                'dependencies' : threads,
         },
         {
                 'sources' : files('sd-bus/test-bus-signature.c'),
-                'dependencies' : threads,
         },
         {
                 'sources' : files('sd-bus/test-bus-track.c'),
@@ -271,11 +254,39 @@ libsystemd_tests += [
         },
         {
                 'sources' : files('sd-bus/test-bus-watch-bind.c'),
-                'dependencies' : threads,
+                'timeout' : 120,
+                'io_uring' : true,
+        },
+        {
+                'sources' : files('sd-device/test-sd-device.c'),
+                'dependencies' : libmount_cflags,
+        },
+        {
+                'sources' : files('sd-event/test-event.c'),
                 'timeout' : 120,
         },
         {
+                'sources' : files('sd-future/test-fiber-io.c'),
+                'io_uring' : true,
+        },
+        {
+                'sources' : files('sd-future/test-fiber-ops.c'),
+                'io_uring' : true,
+        },
+        {
+                'sources' : files('sd-journal/test-journal-enum.c'),
+                'timeout' : 360,
+        },
+        {
+                'sources' : files('sd-journal/test-journal-file.c'),
+                'export' : files('sd-journal/journal-test-util.c'),
+        },
+        {
                 'sources' : files('sd-journal/test-journal-append.c'),
+                'type' : 'manual',
+        },
+        {
+                'sources' : files('sd-journal/test-journal-benchmark.c'),
                 'type' : 'manual',
         },
         {
@@ -287,9 +298,18 @@ libsystemd_tests += [
                 'timeout' : 90,
         },
         {
+                'sources' : files('sd-json/test-json.c'),
+                'dependencies' : libm,
+        },
+        {
                 'sources' : files('sd-resolve/test-resolve.c'),
-                'dependencies' : threads,
                 'timeout' : 120,
+        },
+        {
+                'sources' : files('sd-varlink/test-varlink.c'),
+        },
+        {
+                'sources' : files('sd-varlink/test-varlink-idl.c'),
         },
 ]
 
@@ -302,4 +322,6 @@ endif
 simple_fuzzers += files(
         'sd-bus/fuzz-bus-match.c',
         'sd-bus/fuzz-bus-message.c',
+        'sd-hwdb/fuzz-hwdb.c',
+        'sd-journal/fuzz-journal-file.c',
 )

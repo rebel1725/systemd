@@ -6,15 +6,16 @@
 #include "bpf-bind-iface.h"
 #include "cgroup.h"
 #include "fd-util.h"
+#include "fs-util.h"
 #include "netlink-util.h"
 #include "string-util.h"
 #include "unit.h"
 
 #if BPF_FRAMEWORK
 /* libbpf, clang, llvm and bpftool compile time dependencies are satisfied */
-#include "bpf-dlopen.h"
+#include "bpf-util.h"
 #include "bpf-link.h"
-#include "bpf/bind-iface/bind-iface-skel.h"
+#include "bind-iface-skel.h"
 
 static struct bind_iface_bpf *bind_iface_bpf_free(struct bind_iface_bpf *obj) {
         bind_iface_bpf__destroy(obj);
@@ -31,7 +32,7 @@ int bpf_bind_network_interface_supported(void) {
         if (supported >= 0)
                 return supported;
 
-        if (dlopen_bpf_full(LOG_WARNING) < 0)
+        if (dlopen_bpf(LOG_WARNING) < 0)
                 return (supported = false);
 
         obj = bind_iface_bpf__open();
@@ -92,9 +93,9 @@ static int bind_network_interface_install_impl(Unit *u, CGroupRuntime *crt) {
                 return log_unit_error_errno(u, r, "bind-interface: Failed to load BPF object: %m");
 
         /* Open the cgroup directory */
-        cgroup_fd = open(cgroup_path, O_PATH | O_CLOEXEC | O_DIRECTORY, 0);
+        cgroup_fd = xopenat(AT_FDCWD, cgroup_path, O_PATH | O_DIRECTORY);
         if (cgroup_fd < 0)
-                return log_unit_error_errno(u, errno, "bind-interface: Failed to open cgroup directory '%s': %m", cgroup_path);
+                return log_unit_error_errno(u, cgroup_fd, "bind-interface: Failed to open cgroup directory '%s': %m", cgroup_path);
 
         /* Attach the BPF program to the cgroup */
         link = sym_bpf_program__attach_cgroup(obj->progs.sd_bind_interface, cgroup_fd);
@@ -103,7 +104,7 @@ static int bind_network_interface_install_impl(Unit *u, CGroupRuntime *crt) {
                 return log_unit_error_errno(u, r, "bind-interface: Failed to create cgroup link: %m");
 
         /* Store the link in CGroupRuntime */
-        crt->bpf_bind_network_interface_link = TAKE_PTR(link);
+        free_and_replace_full(crt->bpf_bind_network_interface_link, link, bpf_link_free);
 
         log_unit_debug(u, "bind-interface: Successfully installed VRF binding for interface '%s' (ifindex=%d)",
                        cc->bind_network_interface, ifindex);

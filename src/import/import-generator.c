@@ -5,6 +5,7 @@
 #include "alloc-util.h"
 #include "creds-util.h"
 #include "discover-image.h"
+#include "dlopen-note.h"
 #include "efivars.h"
 #include "errno-util.h"
 #include "extract-word.h"
@@ -21,7 +22,16 @@
 #include "specifier.h"
 #include "string-util.h"
 #include "unit-name.h"
+#include "verbs.h"
 #include "web-util.h"
+
+COMMAND(
+        "systemd-import-generator\0",
+        "Download disk images at boot.",
+        .argspec = GENERATOR_ARGSPEC,
+        .man_page = "systemd-import-generator(8)",
+        .option_namespace = "common",
+);
 
 typedef struct Transfer {
         ImageClass class;
@@ -211,10 +221,10 @@ static int parse_pull_expression(const char *v) {
                         &j,
                         SD_JSON_BUILD_PAIR_STRING("remote", remote),
                         SD_JSON_BUILD_PAIR_STRING("local", local),
-                        SD_JSON_BUILD_PAIR("class", JSON_BUILD_STRING_UNDERSCORIFY(image_class_to_string(class))),
-                        SD_JSON_BUILD_PAIR("type", JSON_BUILD_STRING_UNDERSCORIFY(import_type_to_string(type))),
+                        JSON_BUILD_PAIR_ENUM("class", image_class_to_string(class)),
+                        JSON_BUILD_PAIR_ENUM("type", import_type_to_string(type)),
                         SD_JSON_BUILD_PAIR_BOOLEAN("readOnly", ro),
-                        SD_JSON_BUILD_PAIR("verify", JSON_BUILD_STRING_UNDERSCORIFY(import_verify_to_string(verify))),
+                        JSON_BUILD_PAIR_ENUM("verify", import_verify_to_string(verify)),
                         SD_JSON_BUILD_PAIR_STRING("imageRoot", image_root));
         if (r < 0)
                 return log_error_errno(r, "Failed to build import JSON object: %m");
@@ -426,9 +436,12 @@ static int generate(void) {
 static int run(const char *dest, const char *dest_early, const char *dest_late) {
         int r;
 
+        LIBCRYPTO_NOTE(suggested);
+        TPM2_NOTE(suggested);
+
         assert_se(arg_dest = dest);
 
-        r = proc_cmdline_parse(parse_proc_cmdline_item, NULL, PROC_CMDLINE_RD_STRICT|PROC_CMDLINE_STRIP_RD_PREFIX);
+        r = proc_cmdline_parse(parse_proc_cmdline_item, /* userdata= */ NULL, PROC_CMDLINE_RD_STRICT|PROC_CMDLINE_STRIP_RD_PREFIX);
         if (r < 0)
                 log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
 

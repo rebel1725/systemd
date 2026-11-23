@@ -3,7 +3,7 @@
 
 #include "sd-varlink.h"
 
-#include "sd-forward.h"
+#include "forward.h"
 
 int varlink_get_peer_pidref(sd_varlink *v, PidRef *ret);
 
@@ -19,6 +19,10 @@ int varlink_many_notifyb(Set *s, ...);
 int varlink_many_reply(Set *s, sd_json_variant *parameters);
 int varlink_many_error(Set *s, const char *error_id, sd_json_variant *parameters);
 
+int varlink_server_bind_fiber(sd_varlink_server *s, const char *method, sd_varlink_method_t callback);
+int varlink_server_bind_fiber_many_internal(sd_varlink_server *s, ...);
+#define varlink_server_bind_fiber_many(s, ...) varlink_server_bind_fiber_many_internal(s, __VA_ARGS__, NULL)
+
 int varlink_set_info_systemd(sd_varlink_server *server);
 
 int varlink_server_new(
@@ -28,6 +32,11 @@ int varlink_server_new(
 
 int varlink_check_privileged_peer(sd_varlink *vl);
 
-int varlink_set_sentinel(sd_varlink *v, const char *error_id);
+int varlink_dispatch_fd(sd_varlink *link, const char *name, sd_json_variant *variant, sd_json_dispatch_flags_t flags, int *fd);
 
 extern const struct hash_ops varlink_hash_ops;
+
+ssize_t varlink_execute_directory_full(const char *path, const char *method, sd_json_variant *parameters, bool more, usec_t timeout_usec, sd_varlink_reply_t reply, void *userdata, char ***ret_offline_sockets);
+static inline ssize_t varlink_execute_directory(const char *path, const char *method, sd_json_variant *parameters, bool more, usec_t timeout_usec, sd_varlink_reply_t reply, void *userdata) {
+        return varlink_execute_directory_full(path, method, parameters, more, timeout_usec, reply, userdata, /* ret_offline_sockets= */ NULL);
+}

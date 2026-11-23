@@ -1,11 +1,11 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <getopt.h>
 #include <stdlib.h>
 #include <sys/file.h>
 #include <unistd.h>
 
 #include "sd-event.h"
+#include "sd-json.h"
 #include "sd-netlink.h"
 
 #include "af-list.h"
@@ -14,19 +14,21 @@
 #include "blockdev-util.h"
 #include "build.h"
 #include "daemon-util.h"
+#include "device-private.h"
 #include "device-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "fs-util.h"
+#include "glyph-util.h"
 #include "hashmap.h"
 #include "id128-util.h"
 #include "local-addresses.h"
+#include "lock-util.h"
 #include "main-func.h"
 #include "mountpoint-util.h"
 #include "os-util.h"
 #include "path-util.h"
 #include "plymouth-util.h"
-#include "pretty-print.h"
 #include "random-util.h"
 #include "recurse-dir.h"
 #include "siphash24.h"
@@ -37,6 +39,7 @@
 #include "terminal-util.h"
 #include "time-util.h"
 #include "udev-util.h"
+#include "verbs.h"
 
 static char **arg_devices = NULL;
 static char *arg_nqn = NULL;
@@ -45,101 +48,74 @@ static int arg_all = 0;
 STATIC_DESTRUCTOR_REGISTER(arg_devices, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_nqn, freep);
 
-static int help(void) {
-        _cleanup_free_ char *link = NULL;
-        int r;
-
-        r = terminal_urlify_man("systemd-storagetm", "8", &link);
-        if (r < 0)
-                return log_oom();
-
-        printf("%s [OPTIONS...] [DEVICE...]\n"
-               "\n%sExpose a block device or regular file as NVMe-TCP volume.%s\n\n"
-               "  -h --help            Show this help\n"
-               "     --version         Show package version\n"
-               "     --nqn=STRING      Select NQN (NVMe Qualified Name)\n"
-               "  -a --all             Expose all devices\n"
-               "     --list-devices    List candidate block devices to operate on\n"
-               "\nSee the %s for details.\n",
-               program_invocation_short_name,
-               ansi_highlight(),
-               ansi_normal(),
-               link);
-
-        return 0;
-}
+COMMAND(
+        "systemd-storagetm\0",
+        "Expose a block device or regular file as NVMe-TCP volume.",
+        .argspec =
+                "DEVICE…\0"
+                "--all\0"
+                "--list-devices\0",
+        .man_page = "systemd-storagetm(8)",
+);
 
 static int parse_argv(int argc, char *argv[]) {
-
-        enum {
-                ARG_NQN = 0x100,
-                ARG_VERSION,
-                ARG_LIST_DEVICES,
-        };
-
-        static const struct option options[] = {
-                { "help",         no_argument,       NULL, 'h'              },
-                { "version",      no_argument,       NULL, ARG_VERSION      },
-                { "nqn",          required_argument, NULL, ARG_NQN          },
-                { "all",          no_argument,       NULL, 'a'              },
-                { "list-devices", no_argument,       NULL, ARG_LIST_DEVICES },
-                {}
-        };
-
-        int r, c;
-
         assert(argc >= 0);
         assert(argv);
 
-        while ((c = getopt_long(argc, argv, "ha", options, NULL)) >= 0)
+        OptionParser opts = { argc, argv };
+        int r;
 
+        FOREACH_OPTION_OR_RETURN(c, &opts)
                 switch (c) {
 
-                case 'h':
-                        return help();
+                OPTION_COMMON_HELP:
+                        return command_print_help();
 
-                case ARG_VERSION:
+                OPTION_COMMON_VERSION:
                         return version();
 
-                case ARG_NQN:
-                        if (!filename_is_valid(optarg))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "NQN invalid: %s", optarg);
+                OPTION_LONG("nqn", "STRING",
+                            "Select NQN (NVMe Qualified Name)"):
+                        if (!filename_is_valid(opts.arg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "NQN invalid: %s", opts.arg);
 
-                        if (free_and_strdup(&arg_nqn, optarg) < 0)
+                        if (free_and_strdup(&arg_nqn, opts.arg) < 0)
                                 return log_oom();
 
                         break;
 
-                case 'a':
+                OPTION('a', "all", NULL, "Expose all devices"):
                         arg_all++;
                         break;
 
-                case ARG_LIST_DEVICES:
-                        r = blockdev_list(BLOCKDEV_LIST_SHOW_SYMLINKS|BLOCKDEV_LIST_IGNORE_ZRAM, /* ret_devices= */ NULL, /* ret_n_devices= */ NULL);
+                OPTION_LONG("list-devices", NULL,
+                            "List candidate block devices to operate on"):
+                        r = blockdev_list(BLOCKDEV_LIST_SHOW_SYMLINKS|BLOCKDEV_LIST_IGNORE_RAMDISK,
+                                          /* ret_devices= */ NULL, /* ret_n_devices= */ NULL);
                         if (r < 0)
                                 return r;
 
                         return 0;
 
-                case '?':
-                        return -EINVAL;
-
-                default:
-                        assert_not_reached();
+                OPTION_COMMON_INTROSPECT_CLI:
+                        return introspect_cli(SD_JSON_FORMAT_OFF);
                 }
 
+        char **args = option_parser_get_args(&opts);
         if (arg_all > 0) {
-                if (argc > optind)
+                if (!strv_isempty(args))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Expects no further arguments if --all/-a is specified.");
         } else {
-                if (optind >= argc)
+                if (strv_isempty(args))
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Expecting device name or --all/-a.");
 
-                for (int i = optind; i < argc; i++)
-                        if (!path_is_valid(argv[i]))
-                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid path: %s", argv[i]);
+                STRV_FOREACH(a, args)
+                        if (!path_is_valid(*a))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid path: %s", *a);
 
-                arg_devices = strv_copy(argv + optind);
+                arg_devices = strv_copy(args);
+                if (!arg_devices)
+                        return log_oom();
         }
 
         if (!arg_nqn) {
@@ -187,9 +163,9 @@ static int nvme_subsystem_unlink(NvmeSubsystem *s) {
         if (s->nvme_our_subsystem_fd >= 0) {
                 _cleanup_close_ int namespaces_fd = -EBADF;
 
-                namespaces_fd = openat(s->nvme_our_subsystem_fd, "namespaces", O_CLOEXEC|O_DIRECTORY|O_RDONLY);
+                namespaces_fd = xopenat(s->nvme_our_subsystem_fd, "namespaces", O_DIRECTORY|O_RDONLY);
                 if (namespaces_fd < 0)
-                        log_warning_errno(errno, "Failed to open 'namespaces' directory of subsystem '%s': %m", s->name);
+                        log_warning_errno(namespaces_fd, "Failed to open 'namespaces' directory of subsystem '%s': %m", s->name);
                 else {
                         _cleanup_free_ DirectoryEntries *de = NULL;
 
@@ -271,6 +247,8 @@ static int nvme_subsystem_write_metadata(int subsystem_fd, sd_device *device) {
         }
         if (w) {
                 _cleanup_free_ char *truncated = strndup(w, 40); /* kernel refuses more than 40 chars (as per nvme spec) */
+                if (!truncated)
+                        return log_oom();
 
                 /* The default string stored in 'attr_model' is "Linux" btw. */
                 r = write_string_file_at(subsystem_fd, "attr_model", truncated, WRITE_STRING_FILE_DISABLE_BUFFER);
@@ -390,7 +368,7 @@ static int nvme_subsystem_add(const char *node, int consumed_fd, sd_device *devi
                 return log_oom();
 
         if (fd < 0) {
-                fd = RET_NERRNO(open(node, O_RDWR|O_CLOEXEC|O_NONBLOCK));
+                fd = xopenat(AT_FDCWD, node, O_RDWR|O_NONBLOCK);
                 if (fd < 0)
                         return log_error_errno(fd, "Failed to open '%s': %m", node);
         }
@@ -418,12 +396,12 @@ static int nvme_subsystem_add(const char *node, int consumed_fd, sd_device *devi
                 return log_error_errno(r, "Failed to lock block device: %m");
 
         _cleanup_close_ int subsystems_fd = -EBADF;
-        subsystems_fd = RET_NERRNO(open("/sys/kernel/config/nvmet/subsystems", O_DIRECTORY|O_CLOEXEC|O_RDONLY));
+        subsystems_fd = xopenat(AT_FDCWD, "/sys/kernel/config/nvmet/subsystems", O_DIRECTORY|O_RDONLY);
         if (subsystems_fd < 0)
                 return log_error_errno(subsystems_fd, "Failed to open %s: %m", "/sys/kernel/config/nvmet/subsystems");
 
         _cleanup_close_ int subsystem_fd = -EBADF;
-        subsystem_fd = open_mkdir_at(subsystems_fd, j, O_EXCL|O_RDONLY|O_CLOEXEC, 0777);
+        subsystem_fd = open_mkdir_at(subsystems_fd, j, O_EXCL|O_RDONLY, 0777);
         if (subsystem_fd < 0)
                 return log_error_errno(subsystem_fd, "Failed to create NVME subsystem '%s': %m", j);
 
@@ -434,7 +412,7 @@ static int nvme_subsystem_add(const char *node, int consumed_fd, sd_device *devi
         (void) nvme_subsystem_write_metadata(subsystem_fd, device);
 
         _cleanup_close_ int namespace_fd = -EBADF;
-        namespace_fd = open_mkdir_at(subsystem_fd, "namespaces/1", O_EXCL|O_RDONLY|O_CLOEXEC, 0777);
+        namespace_fd = open_mkdir_at(subsystem_fd, "namespaces/1", O_EXCL|O_RDONLY, 0777);
         if (namespace_fd < 0)
                 return log_error_errno(namespace_fd, "Failed to create NVME namespace '1': %m");
 
@@ -499,9 +477,9 @@ static int nvme_port_unlink(NvmePort *p) {
         if (p->nvme_port_fd >= 0) {
                 _cleanup_close_ int subsystems_dir_fd = -EBADF;
 
-                subsystems_dir_fd = openat(p->nvme_port_fd, "subsystems", O_DIRECTORY|O_RDONLY|O_CLOEXEC);
+                subsystems_dir_fd = xopenat(p->nvme_port_fd, "subsystems", O_DIRECTORY|O_RDONLY);
                 if (subsystems_dir_fd < 0)
-                        log_warning_errno(errno, "Failed to open 'subsystems' dir of port %" PRIu16 ", ignoring: %m", p->portnr);
+                        log_warning_errno(subsystems_dir_fd, "Failed to open 'subsystems' dir of port %" PRIu16 ", ignoring: %m", p->portnr);
                 else {
                         _cleanup_free_ DirectoryEntries *de = NULL;
 
@@ -567,7 +545,7 @@ static int nvme_port_add_portnr(
                 return log_oom();
 
         _cleanup_close_ int port_fd = -EBADF;
-        port_fd = open_mkdir_at(ports_fd, fname, O_EXCL|O_RDONLY|O_CLOEXEC, 0777);
+        port_fd = open_mkdir_at(ports_fd, fname, O_EXCL|O_RDONLY, 0777);
         if (port_fd < 0) {
                 if (port_fd != -EEXIST)
                         return log_error_errno(port_fd, "Failed to create port %" PRIu16 ": %m", portnr);
@@ -633,7 +611,7 @@ static int nvme_port_add(const char *name, int ip_family, NvmePort **ret) {
         assert(ret);
 
         _cleanup_close_ int ports_fd = -EBADF;
-        ports_fd = RET_NERRNO(open("/sys/kernel/config/nvmet/ports", O_DIRECTORY|O_RDONLY|O_CLOEXEC));
+        ports_fd = xopenat(AT_FDCWD, "/sys/kernel/config/nvmet/ports", O_DIRECTORY|O_RDONLY);
         if (ports_fd < 0)
                 return log_error_errno(ports_fd, "Failed to open %s: %m", "/sys/kernel/config/nvmet/ports");
 
@@ -649,7 +627,7 @@ static int nvme_port_add(const char *name, int ip_family, NvmePort **ret) {
                 if (attempt > 16)
                         return log_error_errno(SYNTHETIC_ERRNO(EBUSY), "Can't find free NVME port after %u attempts.", attempt);
 
-                log_debug_errno(port_fd, "NVME port %" PRIu16 " exists already, randomizing port.", portnr);
+                log_debug("NVME port %" PRIu16 " exists already, randomizing port.", portnr);
 
                 portnr = calculate_next_port(ip_family);
         }
@@ -708,7 +686,7 @@ static int nvme_subsystem_report(NvmeSubsystem *subsystem, NvmePort *ipv4, NvmeP
 
         _cleanup_free_ struct local_address *addresses = NULL;
         int n_addresses;
-        n_addresses = local_addresses(NULL, 0, AF_UNSPEC, &addresses);
+        n_addresses = local_addresses(/* context= */ NULL, /* ifindex= */ 0, AF_UNSPEC, &addresses);
         if (n_addresses < 0)
                 return log_error_errno(n_addresses, "Failed to determine local IP addresses: %m");
 
@@ -746,12 +724,14 @@ static int plymouth_notify_port(NvmePort *port, struct local_address *a) {
 }
 
 static int nvme_port_report(NvmePort *port, bool *plymouth_done) {
+        POINTER_MAY_BE_NULL(plymouth_done);
+
         if (!port)
                 return 0;
 
         _cleanup_free_ struct local_address *addresses = NULL;
         int n_addresses;
-        n_addresses = local_addresses(NULL, 0, port->ip_family, &addresses);
+        n_addresses = local_addresses(/* context= */ NULL, /* ifindex= */ 0, port->ip_family, &addresses);
         if (n_addresses < 0)
                 return log_error_errno(n_addresses, "Failed to determine local IP addresses: %m");
 
@@ -935,7 +915,7 @@ static int device_added(Context *c, sd_device *device) {
 
         log_device_debug(device, "new block device '%s'", sysname);
 
-        if (STARTSWITH_SET(sysname, "loop", "zram")) /* Ignore some devices */
+        if (STARTSWITH_SET(sysname, "loop", "ram", "zram")) /* Ignore some devices */
                 return 0;
 
         const char *devname;
@@ -966,7 +946,7 @@ static int device_added(Context *c, sd_device *device) {
                 return 0;
         }
 
-        int fd = sd_device_open(device, O_RDWR|O_CLOEXEC|O_NONBLOCK);
+        int fd = device_open(device, O_RDWR|O_NONBLOCK);
         if (fd < 0) {
                 log_device_warning_errno(device, fd, "Failed to open newly acquired device '%s', ignoring device: %m", devname);
                 return 0;
@@ -1089,7 +1069,7 @@ static int on_address_change(sd_netlink *rtnl, sd_netlink_message *mm, void *use
                                 /* ret= */ NULL,
                                 CLOCK_MONOTONIC,
                                 750 * USEC_PER_MSEC,
-                                0,
+                                /* accuracy= */ 0,
                                 on_display_refresh,
                                 c);
                 if (r < 0)
